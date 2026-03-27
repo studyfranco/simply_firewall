@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Simply Firewall Dashboard</title>
+    <meta name="description" content="Centralized Firewall and ACL Management API Dashboard">
+    <link rel="stylesheet" href="/style.css">
+    <script src="/app.js" defer></script>
+</head>
+<body>
+    <div class="container">
+        <!-- Header -->
+        <header class="header-bar">
+            <h1 class="title">Simply Firewall Dashboard</h1>
+            <div id="rule-status" class="toast"></div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="grid-2">
+            <!-- ACL Management Action Card -->
+            <section class="card card-hover">
+                <h2 class="section-title">Manage Access Rules</h2>
+                
+                <div class="form-group">
+                    <label for="api-key-input" class="label">API Key</label>
+                    <input type="password" id="api-key-input" class="input" placeholder="Enter your API Key" required>
+                </div>
+
+                <div class="form-group">
+                    <label for="target-ip" class="label">Target IP Address or CIDR</label>
+                    <input type="text" id="target-ip" class="input" placeholder="e.g. 192.168.1.50 or 10.0.0.0/24" required>
+                </div>
+
+                <div class="flex-between mt-4">
+                    <button id="btn-ban" class="btn btn-primary" style="background-color: var(--danger); border-color: var(--danger);">
+                        Ban IP
+                    </button>
+                    <button id="btn-white" class="btn btn-primary">
+                        Whitelist IP
+                    </button>
+                </div>
+            </section>
+
+            <!-- IP List Viewer Card -->
+            <section class="card">
+                <h2 class="section-title">Active Rules</h2>
+
+                <div class="flex-between mb-4 gap-2">
+                    <input type="text" id="search-input" class="input flex-1" placeholder="Search IP address..." style="flex: 1; margin-right: 0.5rem;">
+                    
+                    <select id="status-select" class="input" style="width: 150px;">
+                        <option value="">All Statuses</option>
+                        <option value="ban">Banned</option>
+                        <option value="white">Whitelisted</option>
+                    </select>
+                </div>
+
+                <div class="dir-browser-container" style="max-height: 400px; overflow-y: auto;">
+                    <table class="w-full text-left" style="border-collapse: collapse;">
+                        <thead>
+                            <tr style="border-bottom: 1px solid var(--border); color: var(--text-muted); padding-bottom: 0.5rem;">
+                                <th style="padding: 0.5rem;">Address/CIDR</th>
+                                <th style="padding: 0.5rem;">Status</th>
+                                <th style="padding: 0.5rem;">Created</th>
+                                <th style="padding: 0.5rem;">Updated</th>
+                            </tr>
+                        </thead>
+                        <tbody id="table-body">
+                            <!-- Populated by app.js -->
+                            <tr>
+                                <td colspan="4" class="text-center text-muted" style="padding: 1rem;">Loading rules...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+
+                <div class="flex-between items-center mt-4">
+                    <button id="prev-btn" class="btn btn-secondary btn-sm" disabled>Previous</button>
+                    <span id="page-indicator" class="text-muted font-mono">Page 1</span>
+                    <button id="next-btn" class="btn btn-secondary btn-sm" disabled>Next</button>
+                </div>
+            </section>
+        </main>
+    </div>
+</body>
+</html>

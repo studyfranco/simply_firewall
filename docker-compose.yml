@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  simply-firewall:
+    build: .
+    container_name: simply_firewall
+    ports:
+      - "3000:3000"
+    environment:
+      - DATABASE_URL=sqlite://data/firewall.db?mode=rwc
+      - RUST_LOG=info
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
