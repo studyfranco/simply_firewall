@@ -1,2 +1,2 @@
 # simply_firewall
-How make a iptables firewall without idea.
+Simply efficient. A homelab firewall.
