@@ -7,7 +7,7 @@ use chrono::Utc;
 use ipnetwork::IpNetwork;
 use rand::Rng;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
+    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
     PaginatorTrait,
 };
 use serde::{Deserialize, Serialize};

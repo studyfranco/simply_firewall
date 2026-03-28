@@ -81,12 +81,22 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing with env-filter + fmt as the very first thing.
+    // Set RUST_LOG=info (or debug/trace) to control verbosity.
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(false)
+        .with_line_number(false)
         .init();
 
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://firewall.db?mode=rwc".to_owned());
-    
+    let db_url = std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "sqlite://firewall.db?mode=rwc".to_owned());
+
     tracing::info!("Connecting to database: {}", db_url);
     let db: DatabaseConnection = Database::connect(&db_url).await?;
 
@@ -96,6 +106,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bootstrap master key if api_keys table is empty
     bootstrap_master_key(&db).await?;
 
+    // Create the MPSC channel for webhook events.
+    // We keep the original `tx` handle separate so we can explicitly drop it
+    // after Axum shuts down, guaranteeing the channel closes and the worker
+    // can drain its JoinSet.
     let (tx, rx) = mpsc::channel::<WebhookEvent>(100);
 
     tracing::info!("Starting webhook background worker...");
@@ -104,7 +118,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         webhooks::run_webhook_worker(db_worker, rx).await;
     });
 
-    let state = AppState { db, webhook_tx: tx };
+    let state = AppState {
+        db,
+        webhook_tx: tx.clone(),
+    };
 
     // Protected API routes (ban, white, admin CRUD)
     let api_routes = Router::new()
@@ -146,9 +163,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
-    tracing::info!("Server stopped accepting HTTP connections. Awaiting webhook worker completion...");
-    let _ = worker_handle.await;
-    tracing::info!("Graceful shutdown complete.");
+    // ── Graceful Shutdown Sequence ──────────────────────────
+    // At this point Axum has stopped accepting new connections and all
+    // in-flight requests have completed. The Router (and thus the cloned
+    // AppState it holds) has been dropped, releasing its Sender clone.
+    //
+    // We now explicitly drop our original `tx` handle. This is the last
+    // remaining Sender — dropping it closes the channel, causing the
+    // worker's `rx.recv()` to return `None`, which breaks the event loop
+    // and lets the worker drain its JoinSet of pending HTTP dispatches.
+    tracing::info!("Server stopped accepting HTTP connections. Dropping MPSC sender...");
+    drop(tx);
 
+    tracing::info!("Awaiting webhook worker completion (draining pending dispatches)...");
+    match worker_handle.await {
+        Ok(()) => tracing::info!("Webhook worker finished cleanly."),
+        Err(e) => tracing::error!("Webhook worker task panicked: {}", e),
+    }
+
+    tracing::info!("Graceful shutdown complete.");
     Ok(())
 }
