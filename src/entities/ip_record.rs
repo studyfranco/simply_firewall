@@ -9,6 +9,7 @@ pub struct Model {
     pub address: String, // CIDR or IP
     pub is_whitelist: bool,
     pub group_id: Option<Uuid>,
+    pub cause: Option<String>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }

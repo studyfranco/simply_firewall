@@ -3,6 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="description" content="Simply Firewall — Centralized IP ban and whitelist management dashboard.">
     <title>Simply Firewall Dashboard</title>
     <link rel="stylesheet" href="style.css">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
@@ -25,28 +26,28 @@
                 <section class="card form-section">
                     <h2>Manage Access</h2>
                     <p class="subtitle">Add a new IP address or CIDR to the firewall.</p>
-                    
+
                     <form id="manage-form" class="manage-form">
                         <div class="form-group">
                             <label for="ip-address">IP Address or CIDR <span>*</span></label>
                             <input type="text" id="ip-address" placeholder="e.g. 192.168.1.50 or 10.0.0.0/24" required class="input-field">
                         </div>
-                        
+
                         <div class="form-group">
                             <label for="group-id">Group ID (Optional)</label>
-                            <input type="text" id="group-id" placeholder="UUID" class="input-field">
+                            <input type="text" id="group-id" placeholder="UUID of the target group" class="input-field">
                         </div>
-                        
+
                         <div class="form-group">
-                            <label for="cause">Cause/Reason (Optional)</label>
+                            <label for="cause">Cause / Reason (Optional)</label>
                             <input type="text" id="cause" placeholder="Reason for ban or whitelist" class="input-field">
                         </div>
-                        
+
                         <div class="form-actions">
                             <button type="submit" id="btn-ban" class="btn btn-danger">Ban IP</button>
                             <button type="button" id="btn-white" class="btn btn-success">Whitelist IP</button>
                         </div>
-                        
+
                         <div id="form-message" class="message hidden"></div>
                     </form>
                 </section>
@@ -62,25 +63,26 @@
                             </select>
                         </div>
                     </div>
-                    
+
                     <div class="table-container">
                         <table id="ip-table" class="data-table">
                             <thead>
                                 <tr>
                                     <th>Address</th>
                                     <th>Status</th>
+                                    <th>Cause</th>
                                     <th>Group ID</th>
                                     <th>Updated At</th>
                                 </tr>
                             </thead>
                             <tbody id="ip-table-body">
                                 <tr>
-                                    <td colspan="4" class="text-center text-muted">Loading data...</td>
+                                    <td colspan="5" class="text-center text-muted">Loading data...</td>
                                 </tr>
                             </tbody>
                         </table>
                     </div>
-                    
+
                     <div class="pagination">
                         <button id="btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
                         <span id="page-indicator">Page 1</span>
@@ -90,6 +92,8 @@
             </div>
         </main>
     </div>
+
+    <div id="toast-container" class="toast-container"></div>
 
     <script src="app.js"></script>
 </body>
