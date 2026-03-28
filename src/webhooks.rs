@@ -146,7 +146,7 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
 
 /// Non-blocking reap of completed JoinSet tasks.
 /// Frees memory from finished futures without waiting.
-fn reap_completed<T>(join_set: &mut JoinSet<T>) {
+fn reap_completed<T: 'static>(join_set: &mut JoinSet<T>) {
     loop {
         match join_set.try_join_next() {
             Some(Ok(_)) => {}
