@@ -1,172 +1,183 @@
-const PAGE_SIZE = 50;
-let currentPage = 1;
-
-const searchInput = document.getElementById('search-input');
-const statusSelect = document.getElementById('status-select');
-const prevBtn = document.getElementById('prev-btn');
-const nextBtn = document.getElementById('next-btn');
-const pageIndicator = document.getElementById('page-indicator');
-const tableBody = document.getElementById('table-body');
-
-const apiKeyInput = document.getElementById('api-key-input');
-const targetIpInput = document.getElementById('target-ip');
-const btnBan = document.getElementById('btn-ban');
-const btnWhite = document.getElementById('btn-white');
-const ruleStatus = document.getElementById('rule-status');
-
-// Debounce for input
-let typingTimer;
-const doneTypingInterval = 300; // ms
-
-async function fetchIps(page) {
-    const search = searchInput.value.trim();
-    const status = statusSelect.value;
-    const offset = (page - 1) * PAGE_SIZE;
-
-    const query = new URLSearchParams({
-        limit: PAGE_SIZE,
-        offset: offset
+document.addEventListener("DOMContentLoaded", () => {
+    const apiKeyInput = document.getElementById("api-key-input");
+    const ipTableBody = document.getElementById("ip-table-body");
+    const statusFilter = document.getElementById("status-filter");
+    const refreshBtn = document.getElementById("refresh-btn");
+    
+    // Pagination state
+    let currentPage = 0;
+    const limit = 10;
+    
+    // Auto-save API key
+    const savedKey = localStorage.getItem("simply_firewall_key");
+    if (savedKey) apiKeyInput.value = savedKey;
+    
+    apiKeyInput.addEventListener("change", (e) => {
+        localStorage.setItem("simply_firewall_key", e.target.value);
+        loadData();
     });
-
-    if (status) query.append('status', status);
-
-    try {
-        const response = await fetch(`/api/ips?${query.toString()}`);
-        if (!response.ok) throw new Error('Failed to fetch data');
-        const data = await response.json();
-
-        tableBody.innerHTML = '';
-        if (data.length === 0 && page === 1) {
-            tableBody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No records found.</td></tr>';
-        } else {
-            const renderedData = search
-                ? data.filter(r => r.address.includes(search))
-                : data;
-
-            renderedData.forEach(ip => {
-                const tr = document.createElement('tr');
-                tr.className = 'ip-row file-row';
-
-                const addressTd = document.createElement('td');
-                addressTd.className = 'font-mono';
-                addressTd.textContent = ip.address;
-
-                const statusTd = document.createElement('td');
-                const badge = document.createElement('span');
-                badge.className = `badge ${ip.is_whitelist ? 'white' : 'ban'}`;
-                badge.style.border = `1px solid ${ip.is_whitelist ? 'var(--success)' : 'var(--danger)'}`;
-                badge.style.color = ip.is_whitelist ? 'var(--success)' : 'var(--danger)';
-                badge.style.padding = '3px 8px';
-                badge.style.borderRadius = '4px';
-                badge.textContent = ip.is_whitelist ? 'Whitelist' : 'Banned';
-                statusTd.appendChild(badge);
-
-                const createdTd = document.createElement('td');
-                createdTd.textContent = ip.created_at.replace('T', ' ');
-                createdTd.className = 'text-muted';
-
-                const updatedTd = document.createElement('td');
-                updatedTd.textContent = ip.updated_at.replace('T', ' ');
-                updatedTd.className = 'text-muted';
-
-                tr.appendChild(addressTd);
-                tr.appendChild(statusTd);
-                tr.appendChild(createdTd);
-                tr.appendChild(updatedTd);
-
-                tableBody.appendChild(tr);
-            });
-
-            if (renderedData.length === 0) {
-                tableBody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No records matched your search in this subset.</td></tr>';
-            }
+    
+    // Initial fetch
+    if (savedKey) loadData();
+    
+    refreshBtn.addEventListener("click", () => {
+        currentPage = 0;
+        loadData();
+    });
+    
+    statusFilter.addEventListener("change", () => {
+        currentPage = 0;
+        loadData();
+    });
+    
+    document.getElementById("btn-prev").addEventListener("click", () => {
+        if (currentPage > 0) {
+            currentPage--;
+            loadData();
         }
-
-        currentPage = page;
-        pageIndicator.textContent = `Page ${page}`;
-        prevBtn.disabled = page === 1;
-        nextBtn.disabled = data.length < PAGE_SIZE;
-
-    } catch (e) {
-        console.error('Error:', e);
-        tableBody.innerHTML = '<tr><td colspan="4" class="text-center" style="color:var(--danger)">Failed to load data.</td></tr>';
-    }
-}
-
-async function mutateRule(isWhitelist) {
-    const key = apiKeyInput.value.trim();
-    const target = targetIpInput.value.trim();
-
-    ruleStatus.className = 'toast text-sm mt-2 visible';
-    if (!key || !target) {
-        ruleStatus.className = 'toast toast-error text-sm mt-2 visible';
-        ruleStatus.style.color = 'var(--danger)';
-        ruleStatus.textContent = 'API Key and Target IP are required.';
-        return;
-    }
-
-    ruleStatus.style.color = 'var(--text-main)';
-    ruleStatus.textContent = 'Processing request...';
-
-    const endpoint = isWhitelist ? '/api/white' : '/api/ban';
-
-    try {
-        const res = await fetch(endpoint, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                'X-API-Key': key
-            },
-            body: JSON.stringify({
-                address: target,
-                group_id: null,
-                cause: null
-            })
+    });
+    
+    document.getElementById("btn-next").addEventListener("click", () => {
+        currentPage++;
+        loadData();
+    });
+    
+    async function loadData() {
+        const key = apiKeyInput.value.trim();
+        if (!key) return; // Silent return if no key
+        
+        const params = new URLSearchParams({
+            limit: limit,
+            page: currentPage
         });
-
-        if (res.ok) {
-            ruleStatus.className = 'toast toast-success text-sm mt-2 visible';
-            ruleStatus.style.color = 'var(--success)';
-            ruleStatus.textContent = `Successfully ${isWhitelist ? 'whitelisted' : 'banned'} ${target}.`;
-            targetIpInput.value = '';
-            // Refresh table dynamically to Page 1 to see the new addition
-            fetchIps(1);
-        } else {
-            let errorText = await res.text();
-            ruleStatus.className = 'toast toast-error text-sm mt-2 visible';
-            ruleStatus.style.color = 'var(--danger)';
-            ruleStatus.textContent = `Error ${res.status}: ${errorText || 'Unauthorized or Bad Request'}`;
+        
+        if (statusFilter.value) {
+            params.append("status", statusFilter.value);
         }
-    } catch (err) {
-        ruleStatus.className = 'toast toast-error text-sm mt-2 visible';
-        ruleStatus.style.color = 'var(--danger)';
-        ruleStatus.textContent = `Network Error: ${err.message}`;
+        
+        try {
+            const res = await fetch(`/api/ips?${params.toString()}`, {
+                headers: { "x-api-key": key }
+            });
+            
+            if (!res.ok) {
+                if (res.status === 401 || res.status === 403) {
+                    showTableError("Unauthorized or Forbidden: Check API Key and IP bindings.");
+                } else {
+                    showTableError(`Error fetching data (${res.status})`);
+                }
+                return;
+            }
+            
+            const data = await res.json();
+            renderTable(data);
+            
+            document.getElementById("page-indicator").textContent = `Page ${currentPage + 1}`;
+            document.getElementById("btn-prev").disabled = currentPage === 0;
+            // Best guess for next button (if data len < limit, disable next)
+            document.getElementById("btn-next").disabled = data.length < limit;
+            
+        } catch (err) {
+            showTableError("Network Error or Server Unreachable.");
+        }
     }
     
-    setTimeout(() => {
-        ruleStatus.classList.remove('visible');
-    }, 4000);
-}
-
-// Event Listeners
-searchInput.addEventListener('input', () => {
-    clearTimeout(typingTimer);
-    typingTimer = setTimeout(() => {
-        fetchIps(1);
-    }, doneTypingInterval);
+    function renderTable(data) {
+        if (!data || data.length === 0) {
+            ipTableBody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">No records found.</td></tr>`;
+            return;
+        }
+        
+        ipTableBody.innerHTML = data.map(record => {
+            const statusClass = record.is_whitelist ? "badge-white" : "badge-ban";
+            const statusText = record.is_whitelist ? "Whitelist" : "Banned";
+            const date = new Date(record.updated_at).toLocaleString();
+            
+            return `
+                <tr>
+                    <td style="font-family: monospace;">${record.address}</td>
+                    <td><span class="badge ${statusClass}">${statusText}</span></td>
+                    <td class="text-muted" style="font-size: 0.8rem;">${record.group_id || '-'}</td>
+                    <td>${date}</td>
+                </tr>
+            `;
+        }).join("");
+    }
+    
+    function showTableError(msg) {
+        ipTableBody.innerHTML = `<tr><td colspan="4" class="text-center" style="color: var(--danger);">${msg}</td></tr>`;
+    }
+    
+    // Form Submissions
+    document.getElementById("manage-form").addEventListener("submit", (e) => {
+        e.preventDefault();
+        // Since Ban IP is the submit button, this catches Enter key or explicit ban
+        submitIpAction(false);
+    });
+    
+    document.getElementById("btn-ban").addEventListener("click", (e) => {
+        e.preventDefault();
+        submitIpAction(false);
+    });
+    
+    document.getElementById("btn-white").addEventListener("click", (e) => {
+        e.preventDefault();
+        submitIpAction(true);
+    });
+    
+    async function submitIpAction(isWhitelist) {
+        const key = apiKeyInput.value.trim();
+        if (!key) {
+            showMessage("Please enter your API Key first.", "error");
+            return;
+        }
+        
+        const address = document.getElementById("ip-address").value.trim();
+        const groupId = document.getElementById("group-id").value.trim() || null;
+        const cause = document.getElementById("cause").value.trim() || null;
+        
+        if (!address) return;
+        
+        const endpoint = isWhitelist ? "/api/white" : "/api/ban";
+        
+        try {
+            const res = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "x-api-key": key
+                },
+                body: JSON.stringify({
+                    address,
+                    group_id: groupId,
+                    cause
+                })
+            });
+            
+            if (res.ok) {
+                showMessage(`Successfully ${isWhitelist ? 'whitelisted' : 'banned'} ${address}`, "success");
+                document.getElementById("ip-address").value = "";
+                document.getElementById("cause").value = "";
+                // Leave group ID for subsequent adds
+                currentPage = 0;
+                loadData();
+            } else {
+                const text = await res.text().catch(()=>"");
+                showMessage(`Failed: Server returned ${res.status}. ${text}`, "error");
+            }
+        } catch (err) {
+            showMessage("Network Error.", "error");
+        }
+    }
+    
+    function showMessage(msg, type) {
+        const msgDiv = document.getElementById("form-message");
+        msgDiv.textContent = msg;
+        msgDiv.className = `message ${type}`;
+        msgDiv.classList.remove("hidden");
+        
+        setTimeout(() => {
+            msgDiv.classList.add("hidden");
+        }, 5000);
+    }
 });
-
-statusSelect.addEventListener('change', () => {
-    fetchIps(1);
-});
-
-prevBtn.addEventListener('click', () => {
-    if (currentPage > 1) fetchIps(currentPage - 1);
-});
-
-nextBtn.addEventListener('click', () => {
-    fetchIps(currentPage + 1);
-});
-
-btnBan.addEventListener('click', () => mutateRule(false));
-btnWhite.addEventListener('click', () => mutateRule(true));

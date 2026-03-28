@@ -5,7 +5,7 @@ use axum::{
 };
 use chrono::Utc;
 use ipnetwork::IpNetwork;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, PaginatorTrait};
 use serde::Deserialize;
 use uuid::Uuid;
 
@@ -104,7 +104,7 @@ pub struct QueryFilters {
     pub group_id: Option<Uuid>,
     pub updated_after: Option<chrono::NaiveDateTime>,
     pub limit: Option<u64>,
-    pub offset: Option<u64>,
+    pub page: Option<u64>,
 }
 
 pub async fn list_ips(
@@ -130,13 +130,14 @@ pub async fn list_ips(
     }
 
     let limit = filters.limit.unwrap_or(50);
-    let offset = filters.offset.unwrap_or(0);
+    let page = filters.page.unwrap_or(0);
 
-    let results = query
+    let paginator = query
         .order_by_desc(ip_record::Column::UpdatedAt)
-        .limit(limit)
-        .offset(offset)
-        .all(&state.db)
+        .paginate(&state.db, limit);
+
+    let results = paginator
+        .fetch_page(page)
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 

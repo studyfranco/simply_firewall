@@ -3,10 +3,12 @@ use crate::state::WebhookEvent;
 use reqwest::Client;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio::sync::mpsc::Receiver;
+use tokio::task::JoinSet;
 use tracing::{error, info};
 
 pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<WebhookEvent>) {
     let client = Client::new();
+    let mut join_set = JoinSet::new();
 
     while let Some(event) = rx.recv().await {
         info!("Processing webhook event for IP: {}", event.address);
@@ -34,7 +36,7 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
             let event = event.clone();
             
             // Spawn a task for each request to not block other webhooks
-            tokio::spawn(async move {
+            join_set.spawn(async move {
                 match client.post(&config.target_url).json(&event).send().await {
                     Ok(resp) => {
                         if !resp.status().is_success() {
@@ -48,4 +50,12 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
             });
         }
     }
+
+    info!("Webhook mpsc channel closed. Awaiting {} pending requests...", join_set.len());
+    while let Some(res) = join_set.join_next().await {
+        if let Err(e) = res {
+            error!("Background webhook task panicked: {}", e);
+        }
+    }
+    info!("All webhook tasks drained.");
 }
