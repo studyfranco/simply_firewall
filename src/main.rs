@@ -47,7 +47,7 @@ async fn shutdown_signal() {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://firewall.db?mode=rwc".to_owned());

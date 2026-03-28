@@ -53,8 +53,12 @@ async fn handle_ip_upsert(
                     return Err(StatusCode::BAD_REQUEST);
                 }
             }
-            std::net::IpAddr::V6(_) => {
-                // Ignore comprehensive V6 private checks for simplicity in this example
+            std::net::IpAddr::V6(v6) => {
+                let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+                let is_unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00;
+                if v6.is_loopback() || v6.is_unspecified() || is_link_local || is_unique_local {
+                    return Err(StatusCode::BAD_REQUEST);
+                }
             }
         }
     }
