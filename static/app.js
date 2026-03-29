@@ -29,7 +29,7 @@ document.addEventListener("DOMContentLoaded", () => {
      */
     async function apiFetch(url, options = {}) {
         const key = localStorage.getItem(STORAGE_KEY);
-        
+
         // Merge headers
         const headers = {
             "X-API-Key": key || "",
@@ -66,7 +66,7 @@ document.addEventListener("DOMContentLoaded", () => {
         localStorage.setItem(STORAGE_KEY, key);
 
         const res = await apiFetch("/api/ips?limit=1");
-        
+
         // If it failed or was unauthorized, don't keep the key
         if (!res || !res.ok) {
             if (originalKey) localStorage.setItem(STORAGE_KEY, originalKey);
@@ -296,7 +296,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const res = await apiFetch(endpoint, {
             method: "POST",
-            body: JSON.stringify({ address, group_id: groupId, cause }),
+            body: JSON.stringify({ target_address: address, group_id: groupId, cause }),
         });
 
         if (!res) return;
