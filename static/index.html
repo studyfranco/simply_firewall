@@ -10,25 +10,27 @@
 </head>
 
 <body>
+    <!-- Login Screen Overlay -->
     <div id="login-screen" class="login-screen">
         <div class="login-card">
             <div class="logo">
                 <div class="logo-icon"></div>
                 <h1>Simply Firewall</h1>
             </div>
-            <h2>Welcome Back</h2>
+            <h2>Authentication Required</h2>
             <p class="subtitle">Please enter your API key to access the dashboard.</p>
             <form id="login-form" class="login-form">
                 <div class="form-group">
-                    <label for="login-key">X-API-Key</label>
-                    <input type="password" id="login-key" placeholder="Enter your key..." required class="input-field">
+                    <label for="login-key">API Key</label>
+                    <input type="password" id="login-key" placeholder="Enter X-API-Key..." required class="input-field">
                 </div>
-                <button type="submit" class="btn btn-primary">Unlock Dashboard</button>
+                <button type="submit" id="login-submit" class="btn btn-primary">Unlock Dashboard</button>
             </form>
             <div id="login-error" class="message error hidden"></div>
         </div>
     </div>
 
+    <!-- Main Dashboard Container -->
     <div id="dashboard-container" class="container hidden">
         <header class="header">
             <div class="logo">

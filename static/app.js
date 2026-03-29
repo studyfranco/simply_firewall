@@ -4,6 +4,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const loginForm = document.getElementById("login-form");
     const loginKeyInput = document.getElementById("login-key");
     const loginError = document.getElementById("login-error");
+    const loginSubmit = document.getElementById("login-submit");
 
     const dashboardContainer = document.getElementById("dashboard-container");
     const logoutBtn = document.getElementById("logout-btn");
@@ -13,25 +14,74 @@ document.addEventListener("DOMContentLoaded", () => {
     const statusFilter = document.getElementById("status-filter");
     const toastContainer = document.getElementById("toast-container");
 
+    const STORAGE_KEY = "api_key";
     const TABLE_COLS = 5;
-    const STORAGE_KEY = "simply_firewall_api_key";
     const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     // ─── State ─────────────────────────────────────────────
     let currentPage = 0;
     const limit = 10;
 
-    // ─── Auth Logic ────────────────────────────────────────
+    // ─── API Wrapper (Centralized Auth Interceptor) ─────────
 
-    function getStoredKey() {
-        return localStorage.getItem(STORAGE_KEY);
+    /**
+     * Centralized fetch wrapper that injects API key and handles 401/403.
+     */
+    async function apiFetch(url, options = {}) {
+        const key = localStorage.getItem(STORAGE_KEY);
+        
+        // Merge headers
+        const headers = {
+            "X-API-Key": key || "",
+            "Content-Type": "application/json",
+            ...(options.headers || {})
+        };
+
+        try {
+            const response = await fetch(url, { ...options, headers });
+
+            // Global 401/403 Handling
+            if (response.status === 401 || response.status === 403) {
+                const wasLoggedIn = !!localStorage.getItem(STORAGE_KEY);
+                handleSessionExpired(wasLoggedIn);
+                return null;
+            }
+
+            return response;
+        } catch (error) {
+            console.error("Fetch error:", error);
+            showToast("Network error. Please check your connection.", "error");
+            return null;
+        }
     }
 
-    function setStoredKey(key) {
-        if (key) {
-            localStorage.setItem(STORAGE_KEY, key);
-        } else {
-            localStorage.removeItem(STORAGE_KEY);
+    // ─── Auth Logic ────────────────────────────────────────
+
+    /**
+     * Validates the API key by making a lightweight request.
+     */
+    async function validateKey(key) {
+        // Temporarily set the key for the validation request
+        const originalKey = localStorage.getItem(STORAGE_KEY);
+        localStorage.setItem(STORAGE_KEY, key);
+
+        const res = await apiFetch("/api/ips?limit=1");
+        
+        // If it failed or was unauthorized, don't keep the key
+        if (!res || !res.ok) {
+            if (originalKey) localStorage.setItem(STORAGE_KEY, originalKey);
+            else localStorage.removeItem(STORAGE_KEY);
+            return false;
+        }
+
+        return true;
+    }
+
+    function handleSessionExpired(notify = true) {
+        localStorage.removeItem(STORAGE_KEY);
+        showLogin();
+        if (notify) {
+            alert("Your session or API key has expired. Please log in again.");
         }
     }
 
@@ -40,6 +90,7 @@ document.addEventListener("DOMContentLoaded", () => {
         dashboardContainer.classList.remove("hidden");
         // Trigger initial load
         loadData();
+        showToast("Dashboard unlocked", "success");
     }
 
     function showLogin(errorMsg = null) {
@@ -54,61 +105,53 @@ document.addEventListener("DOMContentLoaded", () => {
     }
 
     function logout() {
-        setStoredKey(null);
+        localStorage.removeItem(STORAGE_KEY);
         showLogin();
+        showToast("Logged out successfully");
     }
 
-    // ─── API Wrapper ───────────────────────────────────────
+    // ─── Initialization & Auto-Login ───────────────────────
 
-    async function apiRequest(url, options = {}) {
-        const key = getStoredKey();
-        if (!key) {
-            showLogin();
-            return null;
-        }
-
-        const headers = {
-            "x-api-key": key,
-            "Content-Type": "application/json",
-            ...options.headers,
-        };
-
-        try {
-            const res = await fetch(url, { ...options, headers });
-
-            if (res.status === 401 || res.status === 403) {
-                logout();
-                showLogin("Session expired or invalid API key.");
-                return null;
+    async function init() {
+        const savedKey = localStorage.getItem(STORAGE_KEY);
+        if (savedKey) {
+            // Background validation test
+            const isValid = await validateKey(savedKey);
+            if (isValid) {
+                showDashboard();
+            } else {
+                handleSessionExpired(false);
             }
-
-            return res;
-        } catch (err) {
-            console.error("API Request Error:", err);
-            showToast("Network Error or Server Unreachable.", "error");
-            return null;
+        } else {
+            showLogin();
         }
     }
 
-    // ─── Initialization ────────────────────────────────────
-
-    const savedKey = getStoredKey();
-    if (savedKey) {
-        showDashboard();
-    } else {
-        showLogin();
-    }
+    init();
 
     // ─── Event Listeners ───────────────────────────────────
 
-    loginForm.addEventListener("submit", (e) => {
+    loginForm.addEventListener("submit", async (e) => {
         e.preventDefault();
         const key = loginKeyInput.value.trim();
-        if (key) {
-            setStoredKey(key);
+        if (!key) return;
+
+        loginSubmit.disabled = true;
+        loginSubmit.textContent = "Validating...";
+        loginError.classList.add("hidden");
+
+        const isValid = await validateKey(key);
+
+        if (isValid) {
+            localStorage.setItem(STORAGE_KEY, key);
             showDashboard();
             loginKeyInput.value = "";
+        } else {
+            showLogin("Invalid API Key. Please try again.");
         }
+
+        loginSubmit.disabled = false;
+        loginSubmit.textContent = "Unlock Dashboard";
     });
 
     logoutBtn.addEventListener("click", logout);
@@ -164,7 +207,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const params = new URLSearchParams({ limit, page: currentPage });
         if (statusFilter.value) params.append("status", statusFilter.value);
 
-        const res = await apiRequest(`/api/ips?${params.toString()}`);
+        const res = await apiFetch(`/api/ips?${params.toString()}`);
         if (!res) return;
 
         if (!res.ok) {
@@ -251,7 +294,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const endpoint = isWhitelist ? "/api/white" : "/api/ban";
 
-        const res = await apiRequest(endpoint, {
+        const res = await apiFetch(endpoint, {
             method: "POST",
             body: JSON.stringify({ address, group_id: groupId, cause }),
         });
@@ -298,7 +341,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const boundIp = document.getElementById("apikey-bound-ip").value.trim();
         if (!boundIp) return;
 
-        const res = await apiRequest("/api/admin/api-keys", {
+        const res = await apiFetch("/api/admin/api-keys", {
             method: "POST",
             body: JSON.stringify({ bound_ip: boundIp }),
         });
@@ -322,7 +365,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function loadApiKeys() {
         const tbody = document.getElementById("apikeys-table-body");
-        const res = await apiRequest("/api/admin/api-keys");
+        const res = await apiFetch("/api/admin/api-keys");
         if (!res) return;
 
         if (!res.ok) {
@@ -352,7 +395,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function deleteApiKey(id) {
         if (!confirm("Delete this API key?")) return;
-        const res = await apiRequest(`/api/admin/api-keys/${id}`, {
+        const res = await apiFetch(`/api/admin/api-keys/${id}`, {
             method: "DELETE",
         });
         if (!res) return;
@@ -372,7 +415,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const name = document.getElementById("group-name").value.trim();
         if (!name) return;
 
-        const res = await apiRequest("/api/admin/ip-groups", {
+        const res = await apiFetch("/api/admin/ip-groups", {
             method: "POST",
             body: JSON.stringify({ name }),
         });
@@ -391,7 +434,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function loadIpGroups() {
         const tbody = document.getElementById("groups-table-body");
-        const res = await apiRequest("/api/admin/ip-groups");
+        const res = await apiFetch("/api/admin/ip-groups");
         if (!res) return;
 
         if (!res.ok) {
@@ -421,7 +464,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function deleteIpGroup(id) {
         if (!confirm("Delete this IP group?")) return;
-        const res = await apiRequest(`/api/admin/ip-groups/${id}`, {
+        const res = await apiFetch(`/api/admin/ip-groups/${id}`, {
             method: "DELETE",
         });
         if (!res) return;
@@ -452,7 +495,7 @@ document.addEventListener("DOMContentLoaded", () => {
             groupId = groupIdRaw;
         }
 
-        const res = await apiRequest("/api/admin/webhooks", {
+        const res = await apiFetch("/api/admin/webhooks", {
             method: "POST",
             body: JSON.stringify({ target_url: targetUrl, group_id: groupId }),
         });
@@ -472,7 +515,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function loadWebhooks() {
         const tbody = document.getElementById("webhooks-table-body");
-        const res = await apiRequest("/api/admin/webhooks");
+        const res = await apiFetch("/api/admin/webhooks");
         if (!res) return;
 
         if (!res.ok) {
@@ -503,7 +546,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function deleteWebhook(id) {
         if (!confirm("Delete this webhook?")) return;
-        const res = await apiRequest(`/api/admin/webhooks/${id}`, {
+        const res = await apiFetch(`/api/admin/webhooks/${id}`, {
             method: "DELETE",
         });
         if (!res) return;
