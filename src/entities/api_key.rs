@@ -7,7 +7,7 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     pub key_hash: String,
-    pub bound_ip: String, // CIDR string
+    pub bound_ip: String, // CIDR e.g. "0.0.0.0/0"
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

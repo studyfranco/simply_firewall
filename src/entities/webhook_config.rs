@@ -17,7 +17,7 @@ pub enum Relation {
         from = "Column::GroupId",
         to = "super::ip_group::Column::Id",
         on_update = "NoAction",
-        on_delete = "Cascade"
+        on_delete = "SetNull"
     )]
     IpGroup,
 }

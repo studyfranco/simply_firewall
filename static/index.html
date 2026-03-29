@@ -1,13 +1,14 @@
 <!DOCTYPE html>
 <html lang="en">
+
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <meta name="description" content="Simply Firewall — Centralized IP ban and whitelist management dashboard.">
     <title>Simply Firewall Dashboard</title>
     <link rel="stylesheet" href="style.css">
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 </head>
+
 <body>
     <div class="container">
         <header class="header">
@@ -16,7 +17,8 @@
                 <h1>Simply Firewall</h1>
             </div>
             <div class="api-key-container">
-                <input type="password" id="api-key-input" placeholder="Enter X-API-Key..." class="input-field header-input">
+                <input type="password" id="api-key-input" placeholder="Enter X-API-Key..."
+                    class="input-field header-input">
                 <button id="refresh-btn" class="btn btn-secondary">Refresh Data</button>
             </div>
         </header>
@@ -39,7 +41,8 @@
                     <form id="manage-form" class="manage-form">
                         <div class="form-group">
                             <label for="ip-address">IP Address or CIDR <span>*</span></label>
-                            <input type="text" id="ip-address" placeholder="e.g. 203.0.113.50 or 10.0.0.0/24" required class="input-field">
+                            <input type="text" id="ip-address" placeholder="e.g. 203.0.113.50 or 10.0.0.0/24" required
+                                class="input-field">
                         </div>
 
                         <div class="form-group">
@@ -116,7 +119,8 @@
                         <div class="form-row">
                             <div class="form-group form-group-grow">
                                 <label for="apikey-bound-ip">Bound IP / CIDR <span>*</span></label>
-                                <input type="text" id="apikey-bound-ip" placeholder="e.g. 0.0.0.0/0 or 10.0.0.0/8" required class="input-field">
+                                <input type="text" id="apikey-bound-ip" placeholder="e.g. 0.0.0.0/0 or 10.0.0.0/8"
+                                    required class="input-field">
                             </div>
                             <div class="form-group form-group-action">
                                 <label class="label-spacer">&nbsp;</label>
@@ -140,7 +144,9 @@
                                 </tr>
                             </thead>
                             <tbody id="apikeys-table-body">
-                                <tr><td colspan="3" class="text-center text-muted">No API keys loaded.</td></tr>
+                                <tr>
+                                    <td colspan="3" class="text-center text-muted">No API keys loaded.</td>
+                                </tr>
                             </tbody>
                         </table>
                     </div>
@@ -155,7 +161,8 @@
                         <div class="form-row">
                             <div class="form-group form-group-grow">
                                 <label for="group-name">Group Name <span>*</span></label>
-                                <input type="text" id="group-name" placeholder="e.g. production-servers" required class="input-field">
+                                <input type="text" id="group-name" placeholder="e.g. production-servers" required
+                                    class="input-field">
                             </div>
                             <div class="form-group form-group-action">
                                 <label class="label-spacer">&nbsp;</label>
@@ -174,7 +181,9 @@
                                 </tr>
                             </thead>
                             <tbody id="groups-table-body">
-                                <tr><td colspan="3" class="text-center text-muted">No groups loaded.</td></tr>
+                                <tr>
+                                    <td colspan="3" class="text-center text-muted">No groups loaded.</td>
+                                </tr>
                             </tbody>
                         </table>
                     </div>
@@ -189,7 +198,8 @@
                         <div class="form-row">
                             <div class="form-group form-group-grow">
                                 <label for="webhook-url">Target URL <span>*</span></label>
-                                <input type="url" id="webhook-url" placeholder="https://example.com/hook" required class="input-field">
+                                <input type="url" id="webhook-url" placeholder="https://example.com/hook" required
+                                    class="input-field">
                             </div>
                             <div class="form-group">
                                 <label for="webhook-group-id">Group ID (Optional)</label>
@@ -213,7 +223,9 @@
                                 </tr>
                             </thead>
                             <tbody id="webhooks-table-body">
-                                <tr><td colspan="4" class="text-center text-muted">No webhook configs loaded.</td></tr>
+                                <tr>
+                                    <td colspan="4" class="text-center text-muted">No webhook configs loaded.</td>
+                                </tr>
                             </tbody>
                         </table>
                     </div>
@@ -227,4 +239,5 @@
 
     <script src="app.js"></script>
 </body>
+
 </html>

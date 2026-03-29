@@ -54,6 +54,7 @@ impl MigrationTrait for Migration {
             .await?;
 
         // Create ip_records table
+        // Note: Unique constraint on Address to allow on_conflict (upsert) later
         manager
             .create_table(
                 Table::create()
