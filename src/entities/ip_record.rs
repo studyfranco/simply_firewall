@@ -10,6 +10,7 @@ pub struct Model {
     pub is_whitelist: bool,
     pub group_id: Option<Uuid>,
     pub cause: Option<String>,
+    pub is_locked: bool,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }

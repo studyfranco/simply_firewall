@@ -12,6 +12,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     const ipTableBody = document.getElementById("ip-table-body");
     const statusFilter = document.getElementById("status-filter");
+    const groupFilter = document.getElementById("group-filter");
     const toastContainer = document.getElementById("toast-container");
 
     const STORAGE_KEY = "api_key";
@@ -189,6 +190,11 @@ document.addEventListener("DOMContentLoaded", () => {
         loadData();
     });
 
+    groupFilter.addEventListener("input", debounce(() => {
+        currentPage = 0;
+        loadData();
+    }, 500));
+
     document.getElementById("btn-prev").addEventListener("click", () => {
         if (currentPage > 0) {
             currentPage--;
@@ -206,6 +212,7 @@ document.addEventListener("DOMContentLoaded", () => {
     async function loadData() {
         const params = new URLSearchParams({ limit, page: currentPage });
         if (statusFilter.value) params.append("status", statusFilter.value);
+        if (groupFilter.value) params.append("group_name", groupFilter.value.trim());
 
         const res = await apiFetch(`/api/ips?${params.toString()}`);
         if (!res) return;
@@ -237,14 +244,14 @@ document.addEventListener("DOMContentLoaded", () => {
                 const statusText = record.is_whitelist ? "Whitelist" : "Banned";
                 const date = new Date(record.updated_at).toLocaleString();
                 const cause = escapeHtml(record.cause || "—");
-                const groupId = record.group_id || "—";
+                const groupName = record.group_name || "—";
 
                 return `
                 <tr>
                     <td class="font-mono">${escapeHtml(record.address)}</td>
                     <td><span class="badge ${statusClass}">${statusText}</span></td>
                     <td class="text-sm">${cause}</td>
-                    <td class="text-muted text-sm">${escapeHtml(String(groupId))}</td>
+                    <td class="text-muted text-sm">${escapeHtml(String(groupName))}</td>
                     <td class="text-sm">${date}</td>
                 </tr>`;
             })
@@ -274,29 +281,16 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function submitIpAction(isWhitelist) {
         const address = document.getElementById("ip-address").value.trim();
-        const groupIdRaw = document.getElementById("group-id").value.trim();
+        const groupName = document.getElementById("group-name").value.trim() || null;
         const cause = document.getElementById("cause").value.trim() || null;
 
         if (!address) return;
-
-        // UUID validation for group_id
-        const groupIdInput = document.getElementById("group-id");
-        let groupId = null;
-        if (groupIdRaw) {
-            if (!UUID_REGEX.test(groupIdRaw)) {
-                groupIdInput.classList.add("input-error");
-                showMessage("Group ID must be a valid UUID.", "error");
-                return;
-            }
-            groupId = groupIdRaw;
-        }
-        groupIdInput.classList.remove("input-error");
 
         const endpoint = isWhitelist ? "/api/white" : "/api/ban";
 
         const res = await apiFetch(endpoint, {
             method: "POST",
-            body: JSON.stringify({ target_address: address, group_id: groupId, cause }),
+            body: JSON.stringify({ target_address: address, group_name: groupName, cause }),
         });
 
         if (!res) return;
@@ -307,7 +301,7 @@ document.addEventListener("DOMContentLoaded", () => {
             showToast(`${address} ${action} successfully`, "success");
             document.getElementById("ip-address").value = "";
             document.getElementById("cause").value = "";
-            document.getElementById("group-id").value = "";
+            document.getElementById("group-name").value = "";
             currentPage = 0;
             loadData();
         } else {
@@ -579,5 +573,17 @@ document.addEventListener("DOMContentLoaded", () => {
         const div = document.createElement("div");
         div.appendChild(document.createTextNode(str));
         return div.innerHTML;
+    }
+
+    function debounce(func, wait) {
+        let timeout;
+        return function executedFunction(...args) {
+            const later = () => {
+                clearTimeout(timeout);
+                func(...args);
+            };
+            clearTimeout(timeout);
+            timeout = setTimeout(later, wait);
+        };
     }
 });

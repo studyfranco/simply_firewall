@@ -5,7 +5,7 @@ use axum::{
     routing::{delete, get, post},
     Router,
 };
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection, EntityTrait};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use tokio::{net::TcpListener, sync::mpsc};
 use tower_http::services::ServeDir;
@@ -94,7 +94,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| "sqlite://firewall.db?mode=rwc".to_owned());
 
     tracing::info!("Connecting to database...");
-    let db: DatabaseConnection = Database::connect(&db_url).await?;
+    let mut opt = ConnectOptions::new(db_url);
+    opt.sqlx_logging_level(log::LevelFilter::Debug);
+    let db: DatabaseConnection = Database::connect(opt).await?;
 
     tracing::info!("Running database migrations...");
     migration::Migrator::up(&db, None).await?;

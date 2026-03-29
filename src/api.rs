@@ -6,7 +6,7 @@ use chrono::Utc;
 use ipnetwork::IpNetwork;
 use rand::Rng;
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
     sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
@@ -23,8 +23,8 @@ use crate::state::{AppState, WebhookEvent};
 
 #[derive(Deserialize)]
 pub struct BanWhitePayload {
-    pub target_address: String, // Matches user request field name
-    pub group_id: Option<Uuid>,
+    pub target_address: String,
+    pub group_name: Option<String>,
     pub cause: Option<String>,
 }
 
@@ -51,6 +51,18 @@ async fn handle_ip_upsert(
     let network: IpNetwork = payload.target_address.parse()
         .map_err(|_| AppError::InvalidInput("Invalid IP or CIDR format".to_owned()))?;
 
+    // Check if protected (is_locked)
+    let existing = ip_record::Entity::find()
+        .filter(ip_record::Column::Address.eq(payload.target_address.clone()))
+        .one(&state.db)
+        .await?;
+
+    if let Some(record) = existing {
+        if record.is_locked {
+            return Err(AppError::Forbidden("This IP is protected and cannot be modified".to_owned()));
+        }
+    }
+
     // Rule: Don't allow banning loopback, unspecified, link-local, or private if it's a "ban" action
     if !is_whitelist {
         let ip = network.network();
@@ -65,14 +77,33 @@ async fn handle_ip_upsert(
                 }
             }
             std::net::IpAddr::V6(v6) => {
-                // Link-local: fe80::/10
                 let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
-                // Unique-local: fc00::/7
                 let is_unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00;
                 if is_link_local || is_unique_local {
                      return Err(AppError::InvalidInput("Cannot ban link-local or unique-local IPv6 addresses".to_owned()));
                 }
             }
+        }
+    }
+
+    // Resolve or create IP Group
+    let mut group_id = None;
+    if let Some(name) = &payload.group_name {
+        let existing_group = ip_group::Entity::find()
+            .filter(ip_group::Column::Name.eq(name))
+            .one(&state.db)
+            .await?;
+
+        if let Some(g) = existing_group {
+            group_id = Some(g.id);
+        } else {
+            let id = Uuid::new_v4();
+            let new_group = ip_group::ActiveModel {
+                id: Set(id),
+                name: Set(name.clone()),
+            };
+            ip_group::Entity::insert(new_group).exec(&state.db).await?;
+            group_id = Some(id);
         }
     }
 
@@ -83,8 +114,9 @@ async fn handle_ip_upsert(
         id: Set(Uuid::new_v4()),
         address: Set(payload.target_address.clone()),
         is_whitelist: Set(is_whitelist),
-        group_id: Set(payload.group_id),
+        group_id: Set(group_id),
         cause: Set(payload.cause.clone()),
+        is_locked: Set(false), // Default to false for new entries
         created_at: Set(now),
         updated_at: Set(now),
     };
@@ -107,7 +139,7 @@ async fn handle_ip_upsert(
     let event = WebhookEvent {
         address: payload.target_address.clone(),
         is_whitelist,
-        group_id: payload.group_id,
+        group_id,
         cause: payload.cause,
     };
     let _ = state.webhook_tx.send(event).await;
@@ -121,17 +153,33 @@ async fn handle_ip_upsert(
 
 #[derive(Deserialize)]
 pub struct QueryFilters {
-    pub status: Option<String>, // "ban" or "white"
-    pub group_id: Option<Uuid>,
+    pub status: Option<String>,
+    pub group_name: Option<String>,
     pub limit: Option<u64>,
-    pub offset: Option<u64>, // Requirement asked for limit/offset
+    pub offset: Option<u64>,
+}
+
+#[derive(Serialize)]
+pub struct IpRecordResponse {
+    pub id: Uuid,
+    pub address: String,
+    pub is_whitelist: bool,
+    pub group_id: Option<Uuid>,
+    pub group_name: Option<String>,
+    pub cause: Option<String>,
+    pub is_locked: bool,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
 }
 
 pub async fn list_ips(
     State(state): State<AppState>,
     Query(filters): Query<QueryFilters>,
 ) -> Result<impl IntoResponse, AppError> {
-    let mut query = IpRecord::find();
+    use sea_orm::QuerySelect;
+
+    let mut query = ip_record::Entity::find()
+        .find_also_related(ip_group::Entity);
 
     if let Some(st) = &filters.status {
         match st.as_str() {
@@ -141,19 +189,33 @@ pub async fn list_ips(
         }
     }
 
-    if let Some(gid) = filters.group_id {
-        query = query.filter(ip_record::Column::GroupId.eq(gid));
+    if let Some(name) = &filters.group_name {
+        query = query.filter(ip_group::Column::Name.eq(name));
     }
 
     let limit = filters.limit.unwrap_or(20);
     let offset = filters.offset.unwrap_or(0);
 
-    let items: Vec<ip_record::Model> = query
+    let results: Vec<(ip_record::Model, Option<ip_group::Model>)> = query
         .order_by_desc(ip_record::Column::UpdatedAt)
         .limit(limit)
         .offset(offset)
         .all(&state.db)
         .await?;
+    
+    let items: Vec<IpRecordResponse> = results.into_iter().map(|(record, group)| {
+        IpRecordResponse {
+            id: record.id,
+            address: record.address,
+            is_whitelist: record.is_whitelist,
+            group_id: record.group_id,
+            group_name: group.map(|g| g.name),
+            cause: record.cause,
+            is_locked: record.is_locked,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        }
+    }).collect();
     
     Ok(Json(items))
 }

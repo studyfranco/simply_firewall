@@ -8,6 +8,7 @@ pub enum IpRecords {
     IsWhitelist,
     GroupId,
     Cause,
+    IsLocked,
     CreatedAt,
     UpdatedAt,
 }
@@ -65,6 +66,7 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(IpRecords::IsWhitelist).boolean().not_null())
                     .col(ColumnDef::new(IpRecords::GroupId).uuid())
                     .col(ColumnDef::new(IpRecords::Cause).string())
+                    .col(ColumnDef::new(IpRecords::IsLocked).boolean().not_null().default(false))
                     .col(ColumnDef::new(IpRecords::CreatedAt).date_time().not_null())
                     .col(ColumnDef::new(IpRecords::UpdatedAt).date_time().not_null())
                     .foreign_key(
