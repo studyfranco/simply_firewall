@@ -1,7 +1,6 @@
 use std::net::SocketAddr;
 
 
-use axum_client_ip::SecureClientIpSource;
 use axum::{
     routing::{delete, get, post},
     Router,
@@ -142,7 +141,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/ips", get(api::list_ips)) // Public listing (or add middleware if desired)
         .nest("/api", api_routes)
         .layer(TraceLayer::new_for_http())
-        .layer(SecureClientIpSource::RightmostXForwardedFor.into_extension())
         .with_state(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));

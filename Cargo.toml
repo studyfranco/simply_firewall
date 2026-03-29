@@ -9,7 +9,6 @@ tokio = { version = "1.37.0", features = ["full"] }
 sea-orm = { version = "1.0.0", features = ["sqlx-sqlite", "runtime-tokio-rustls", "macros", "with-uuid", "with-chrono"] }
 sea-orm-migration = { version = "1.0.0", features = ["runtime-tokio-rustls", "sqlx-sqlite"] }
 ipnetwork = "0.20.0"
-axum-client-ip = "0.6.0"
 reqwest = { version = "0.12.4", default-features = false, features = ["json", "rustls-tls"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt"] }

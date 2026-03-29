@@ -5,7 +5,6 @@ use axum::{
     middleware::Next,
     response::Response,
 };
-use axum_client_ip::SecureClientIp;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
 use ipnetwork::IpNetwork;
@@ -16,10 +15,20 @@ use crate::state::AppState;
 
 pub async fn auth_middleware(
     State(state): State<AppState>,
-    SecureClientIp(client_ip): SecureClientIp,
+    headers: axum::http::HeaderMap,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
+    // Resilient IP resolution logic
+    let client_ip = headers
+        .get("X-Forwarded-For")
+        .and_then(|h| h.to_str().ok())
+        .and_then(|s| s.split(',').last()) // Rightmost IP
+        .map(|s| s.trim())
+        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
+        .unwrap_or(addr.ip()); // Fallback to raw TCP IP
+
     let auth_header = req
         .headers()
         .get("X-API-Key")
