@@ -5,7 +5,7 @@ use reqwest::Client;
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinSet;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INFLIGHT: usize = 64;
@@ -64,7 +64,7 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
         }
         
         // Clean up finished tasks periodically
-        while let Ok(Some(_)) = join_set.try_join_next() {}
+        while let Some(Ok(_)) = join_set.try_join_next() {}
     }
 
     info!("Webhook channel closed, draining pending tasks...");

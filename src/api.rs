@@ -6,8 +6,8 @@ use chrono::Utc;
 use ipnetwork::IpNetwork;
 use rand::Rng;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder,
-    PaginatorTrait, sea_query::OnConflict,
+    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect,
+    sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -148,7 +148,7 @@ pub async fn list_ips(
     let limit = filters.limit.unwrap_or(20);
     let offset = filters.offset.unwrap_or(0);
 
-    let items = query
+    let items: Vec<ip_record::Model> = query
         .order_by_desc(ip_record::Column::UpdatedAt)
         .limit(limit)
         .offset(offset)

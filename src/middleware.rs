@@ -1,7 +1,7 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::Request,
     middleware::Next,
     response::Response,
 };
@@ -11,6 +11,7 @@ use sha2::{Digest, Sha256};
 use ipnetwork::IpNetwork;
 
 use crate::entities::prelude::ApiKey;
+use crate::error::AppError;
 use crate::state::AppState;
 
 pub async fn auth_middleware(
@@ -18,12 +19,12 @@ pub async fn auth_middleware(
     SecureClientIp(client_ip): SecureClientIp,
     req: Request<Body>,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, AppError> {
     let auth_header = req
         .headers()
         .get("X-API-Key")
         .and_then(|h| h.to_str().ok())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .ok_or(AppError::Unauthorized("Missing API Key".to_owned()))?;
 
     // Hash the provided key
     let mut hasher = Sha256::new();
@@ -35,13 +36,13 @@ pub async fn auth_middleware(
         .filter(crate::entities::api_key::Column::KeyHash.eq(key_hash))
         .one(&state.db)
         .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .map_err(AppError::DbError)?
+        .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
 
     // Validate the client IP against the bound CIDR
     let bound_net: IpNetwork = key_record.bound_ip.parse().map_err(|_| {
         tracing::error!("Invalid CIDR in database: {}", key_record.bound_ip);
-        StatusCode::INTERNAL_SERVER_ERROR
+        AppError::Internal
     })?;
 
     if !bound_net.contains(client_ip) {
@@ -50,7 +51,7 @@ pub async fn auth_middleware(
             client_ip,
             bound_net
         );
-        return Err(StatusCode::FORBIDDEN);
+        return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
     }
 
     Ok(next.run(req).await)
