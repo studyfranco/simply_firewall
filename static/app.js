@@ -1,28 +1,122 @@
 document.addEventListener("DOMContentLoaded", () => {
     // ─── DOM References ────────────────────────────────────
-    const apiKeyInput = document.getElementById("api-key-input");
+    const loginScreen = document.getElementById("login-screen");
+    const loginForm = document.getElementById("login-form");
+    const loginKeyInput = document.getElementById("login-key");
+    const loginError = document.getElementById("login-error");
+
+    const dashboardContainer = document.getElementById("dashboard-container");
+    const logoutBtn = document.getElementById("logout-btn");
+    const refreshBtn = document.getElementById("refresh-btn");
+
     const ipTableBody = document.getElementById("ip-table-body");
     const statusFilter = document.getElementById("status-filter");
-    const refreshBtn = document.getElementById("refresh-btn");
     const toastContainer = document.getElementById("toast-container");
 
     const TABLE_COLS = 5;
+    const STORAGE_KEY = "simply_firewall_api_key";
     const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
     // ─── State ─────────────────────────────────────────────
     let currentPage = 0;
     const limit = 10;
 
-    // ─── API Key persistence ───────────────────────────────
-    const savedKey = localStorage.getItem("simply_firewall_key");
-    if (savedKey) apiKeyInput.value = savedKey;
+    // ─── Auth Logic ────────────────────────────────────────
 
-    apiKeyInput.addEventListener("change", (e) => {
-        localStorage.setItem("simply_firewall_key", e.target.value);
+    function getStoredKey() {
+        return localStorage.getItem(STORAGE_KEY);
+    }
+
+    function setStoredKey(key) {
+        if (key) {
+            localStorage.setItem(STORAGE_KEY, key);
+        } else {
+            localStorage.removeItem(STORAGE_KEY);
+        }
+    }
+
+    function showDashboard() {
+        loginScreen.classList.add("hidden");
+        dashboardContainer.classList.remove("hidden");
+        // Trigger initial load
         loadData();
+    }
+
+    function showLogin(errorMsg = null) {
+        dashboardContainer.classList.add("hidden");
+        loginScreen.classList.remove("hidden");
+        if (errorMsg) {
+            loginError.textContent = errorMsg;
+            loginError.classList.remove("hidden");
+        } else {
+            loginError.classList.add("hidden");
+        }
+    }
+
+    function logout() {
+        setStoredKey(null);
+        showLogin();
+    }
+
+    // ─── API Wrapper ───────────────────────────────────────
+
+    async function apiRequest(url, options = {}) {
+        const key = getStoredKey();
+        if (!key) {
+            showLogin();
+            return null;
+        }
+
+        const headers = {
+            "x-api-key": key,
+            "Content-Type": "application/json",
+            ...options.headers,
+        };
+
+        try {
+            const res = await fetch(url, { ...options, headers });
+
+            if (res.status === 401 || res.status === 403) {
+                logout();
+                showLogin("Session expired or invalid API key.");
+                return null;
+            }
+
+            return res;
+        } catch (err) {
+            console.error("API Request Error:", err);
+            showToast("Network Error or Server Unreachable.", "error");
+            return null;
+        }
+    }
+
+    // ─── Initialization ────────────────────────────────────
+
+    const savedKey = getStoredKey();
+    if (savedKey) {
+        showDashboard();
+    } else {
+        showLogin();
+    }
+
+    // ─── Event Listeners ───────────────────────────────────
+
+    loginForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const key = loginKeyInput.value.trim();
+        if (key) {
+            setStoredKey(key);
+            showDashboard();
+            loginKeyInput.value = "";
+        }
     });
 
-    if (savedKey) loadData();
+    logoutBtn.addEventListener("click", logout);
+
+    refreshBtn.addEventListener("click", () => {
+        currentPage = 0;
+        loadData();
+    });
 
     // ─── Tab Navigation ────────────────────────────────────
     document.querySelectorAll(".tab-btn").forEach((btn) => {
@@ -46,10 +140,6 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     // ─── Firewall — Event Listeners ────────────────────────
-    refreshBtn.addEventListener("click", () => {
-        currentPage = 0;
-        loadData();
-    });
 
     statusFilter.addEventListener("change", () => {
         currentPage = 0;
@@ -71,35 +161,23 @@ document.addEventListener("DOMContentLoaded", () => {
     // ─── Firewall — Data Loading ───────────────────────────
 
     async function loadData() {
-        const key = apiKeyInput.value.trim();
-        if (!key) return;
-
         const params = new URLSearchParams({ limit, page: currentPage });
         if (statusFilter.value) params.append("status", statusFilter.value);
 
-        try {
-            const res = await fetch(`/api/ips?${params.toString()}`, {
-                headers: { "x-api-key": key },
-            });
+        const res = await apiRequest(`/api/ips?${params.toString()}`);
+        if (!res) return;
 
-            if (!res.ok) {
-                if (res.status === 401 || res.status === 403) {
-                    showTableError("Unauthorized or Forbidden: Check API Key and IP bindings.");
-                } else {
-                    showTableError(`Error fetching data (${res.status})`);
-                }
-                return;
-            }
-
-            const data = await res.json();
-            renderTable(data);
-
-            document.getElementById("page-indicator").textContent = `Page ${currentPage + 1}`;
-            document.getElementById("btn-prev").disabled = currentPage === 0;
-            document.getElementById("btn-next").disabled = data.length < limit;
-        } catch (err) {
-            showTableError("Network Error or Server Unreachable.");
+        if (!res.ok) {
+            showTableError(`Error fetching data (${res.status})`);
+            return;
         }
+
+        const data = await res.json();
+        renderTable(data);
+
+        document.getElementById("page-indicator").textContent = `Page ${currentPage + 1}`;
+        document.getElementById("btn-prev").disabled = currentPage === 0;
+        document.getElementById("btn-next").disabled = data.length < limit;
     }
 
     // ─── Firewall — Table Rendering ────────────────────────
@@ -152,12 +230,6 @@ document.addEventListener("DOMContentLoaded", () => {
     });
 
     async function submitIpAction(isWhitelist) {
-        const key = apiKeyInput.value.trim();
-        if (!key) {
-            showMessage("Please enter your API Key first.", "error");
-            return;
-        }
-
         const address = document.getElementById("ip-address").value.trim();
         const groupIdRaw = document.getElementById("group-id").value.trim();
         const cause = document.getElementById("cause").value.trim() || null;
@@ -170,7 +242,7 @@ document.addEventListener("DOMContentLoaded", () => {
         if (groupIdRaw) {
             if (!UUID_REGEX.test(groupIdRaw)) {
                 groupIdInput.classList.add("input-error");
-                showMessage("Group ID must be a valid UUID (e.g. 550e8400-e29b-41d4-a716-446655440000).", "error");
+                showMessage("Group ID must be a valid UUID.", "error");
                 return;
             }
             groupId = groupIdRaw;
@@ -179,30 +251,25 @@ document.addEventListener("DOMContentLoaded", () => {
 
         const endpoint = isWhitelist ? "/api/white" : "/api/ban";
 
-        try {
-            const res = await fetch(endpoint, {
-                method: "POST",
-                headers: {
-                    "Content-Type": "application/json",
-                    "x-api-key": key,
-                },
-                body: JSON.stringify({ address, group_id: groupId, cause }),
-            });
+        const res = await apiRequest(endpoint, {
+            method: "POST",
+            body: JSON.stringify({ address, group_id: groupId, cause }),
+        });
 
-            if (res.ok) {
-                const action = isWhitelist ? "whitelisted" : "banned";
-                showMessage(`Successfully ${action} ${address}`, "success");
-                showToast(`${address} ${action} successfully`, "success");
-                document.getElementById("ip-address").value = "";
-                document.getElementById("cause").value = "";
-                currentPage = 0;
-                loadData();
-            } else {
-                const text = await res.text().catch(() => "");
-                showMessage(`Failed: Server returned ${res.status}. ${text}`, "error");
-            }
-        } catch (err) {
-            showMessage("Network Error.", "error");
+        if (!res) return;
+
+        if (res.ok) {
+            const action = isWhitelist ? "whitelisted" : "banned";
+            showMessage(`Successfully ${action} ${address}`, "success");
+            showToast(`${address} ${action} successfully`, "success");
+            document.getElementById("ip-address").value = "";
+            document.getElementById("cause").value = "";
+            document.getElementById("group-id").value = "";
+            currentPage = 0;
+            loadData();
+        } else {
+            const text = await res.text().catch(() => "");
+            showMessage(`Failed: Server returned ${res.status}. ${text}`, "error");
         }
     }
 
@@ -220,19 +287,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // ADMIN PANEL
     // ═══════════════════════════════════════════════════════
 
-    function getApiKey() {
-        return apiKeyInput.value.trim();
-    }
-
-    function adminHeaders() {
-        return {
-            "Content-Type": "application/json",
-            "x-api-key": getApiKey(),
-        };
-    }
-
     async function loadAdminData() {
-        if (!getApiKey()) return;
         await Promise.all([loadApiKeys(), loadIpGroups(), loadWebhooks()]);
     }
 
@@ -240,89 +295,73 @@ document.addEventListener("DOMContentLoaded", () => {
 
     document.getElementById("form-create-apikey").addEventListener("submit", async (e) => {
         e.preventDefault();
-        const key = getApiKey();
-        if (!key) { showToast("Enter your API key first.", "error"); return; }
-
         const boundIp = document.getElementById("apikey-bound-ip").value.trim();
         if (!boundIp) return;
 
-        try {
-            const res = await fetch("/api/admin/api-keys", {
-                method: "POST",
-                headers: adminHeaders(),
-                body: JSON.stringify({ bound_ip: boundIp }),
-            });
+        const res = await apiRequest("/api/admin/api-keys", {
+            method: "POST",
+            body: JSON.stringify({ bound_ip: boundIp }),
+        });
 
-            if (!res.ok) {
-                showToast(`Failed to create API key (${res.status})`, "error");
-                return;
-            }
+        if (!res) return;
 
-            const data = await res.json();
-
-            // Show the one-time plaintext key
-            const revealBox = document.getElementById("apikey-created");
-            document.getElementById("apikey-plaintext").textContent = data.plaintext_key;
-            revealBox.classList.remove("hidden");
-
-            showToast("API Key created successfully", "success");
-            document.getElementById("apikey-bound-ip").value = "";
-            loadApiKeys();
-        } catch (err) {
-            showToast("Network error creating API key.", "error");
+        if (!res.ok) {
+            showToast(`Failed to create API key (${res.status})`, "error");
+            return;
         }
+
+        const data = await res.json();
+        const revealBox = document.getElementById("apikey-created");
+        document.getElementById("apikey-plaintext").textContent = data.plaintext_key;
+        revealBox.classList.remove("hidden");
+
+        showToast("API Key created successfully", "success");
+        document.getElementById("apikey-bound-ip").value = "";
+        loadApiKeys();
     });
 
     async function loadApiKeys() {
         const tbody = document.getElementById("apikeys-table-body");
-        try {
-            const res = await fetch("/api/admin/api-keys", {
-                headers: { "x-api-key": getApiKey() },
-            });
-            if (!res.ok) {
-                tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Failed to load (${res.status})</td></tr>`;
-                return;
-            }
-            const data = await res.json();
-            if (!data.length) {
-                tbody.innerHTML = `<tr><td colspan="3" class="text-center text-muted">No API keys found.</td></tr>`;
-                return;
-            }
-            tbody.innerHTML = data
-                .map(
-                    (k) => `
-                <tr>
-                    <td class="font-mono text-sm">${escapeHtml(k.id)}</td>
-                    <td class="font-mono">${escapeHtml(k.bound_ip)}</td>
-                    <td><button class="btn-danger-outline" data-delete-apikey="${k.id}">Delete</button></td>
-                </tr>`
-                )
-                .join("");
+        const res = await apiRequest("/api/admin/api-keys");
+        if (!res) return;
 
-            // Attach delete handlers
-            tbody.querySelectorAll("[data-delete-apikey]").forEach((btn) => {
-                btn.addEventListener("click", () => deleteApiKey(btn.dataset.deleteApikey));
-            });
-        } catch (err) {
-            tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Network error.</td></tr>`;
+        if (!res.ok) {
+            tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Failed to load (${res.status})</td></tr>`;
+            return;
         }
+        const data = await res.json();
+        if (!data.length) {
+            tbody.innerHTML = `<tr><td colspan="3" class="text-center text-muted">No API keys found.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = data
+            .map(
+                (k) => `
+            <tr>
+                <td class="font-mono text-sm">${escapeHtml(k.id)}</td>
+                <td class="font-mono">${escapeHtml(k.bound_ip)}</td>
+                <td><button class="btn-danger-outline" data-delete-apikey="${k.id}">Delete</button></td>
+            </tr>`
+            )
+            .join("");
+
+        tbody.querySelectorAll("[data-delete-apikey]").forEach((btn) => {
+            btn.addEventListener("click", () => deleteApiKey(btn.dataset.deleteApikey));
+        });
     }
 
     async function deleteApiKey(id) {
-        if (!confirm("Delete this API key? This action cannot be undone.")) return;
-        try {
-            const res = await fetch(`/api/admin/api-keys/${id}`, {
-                method: "DELETE",
-                headers: { "x-api-key": getApiKey() },
-            });
-            if (res.ok || res.status === 204) {
-                showToast("API Key deleted.", "success");
-                loadApiKeys();
-            } else {
-                showToast(`Delete failed (${res.status})`, "error");
-            }
-        } catch (err) {
-            showToast("Network error.", "error");
+        if (!confirm("Delete this API key?")) return;
+        const res = await apiRequest(`/api/admin/api-keys/${id}`, {
+            method: "DELETE",
+        });
+        if (!res) return;
+
+        if (res.ok || res.status === 204) {
+            showToast("API Key deleted.", "success");
+            loadApiKeys();
+        } else {
+            showToast(`Delete failed (${res.status})`, "error");
         }
     }
 
@@ -330,81 +369,68 @@ document.addEventListener("DOMContentLoaded", () => {
 
     document.getElementById("form-create-group").addEventListener("submit", async (e) => {
         e.preventDefault();
-        const key = getApiKey();
-        if (!key) { showToast("Enter your API key first.", "error"); return; }
-
         const name = document.getElementById("group-name").value.trim();
         if (!name) return;
 
-        try {
-            const res = await fetch("/api/admin/ip-groups", {
-                method: "POST",
-                headers: adminHeaders(),
-                body: JSON.stringify({ name }),
-            });
+        const res = await apiRequest("/api/admin/ip-groups", {
+            method: "POST",
+            body: JSON.stringify({ name }),
+        });
 
-            if (!res.ok) {
-                showToast(`Failed to create group (${res.status})`, "error");
-                return;
-            }
+        if (!res) return;
 
-            showToast("IP Group created.", "success");
-            document.getElementById("group-name").value = "";
-            loadIpGroups();
-        } catch (err) {
-            showToast("Network error creating group.", "error");
+        if (!res.ok) {
+            showToast(`Failed to create group (${res.status})`, "error");
+            return;
         }
+
+        showToast("IP Group created.", "success");
+        document.getElementById("group-name").value = "";
+        loadIpGroups();
     });
 
     async function loadIpGroups() {
         const tbody = document.getElementById("groups-table-body");
-        try {
-            const res = await fetch("/api/admin/ip-groups", {
-                headers: { "x-api-key": getApiKey() },
-            });
-            if (!res.ok) {
-                tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Failed to load (${res.status})</td></tr>`;
-                return;
-            }
-            const data = await res.json();
-            if (!data.length) {
-                tbody.innerHTML = `<tr><td colspan="3" class="text-center text-muted">No groups found.</td></tr>`;
-                return;
-            }
-            tbody.innerHTML = data
-                .map(
-                    (g) => `
-                <tr>
-                    <td class="font-mono text-sm">${escapeHtml(g.id)}</td>
-                    <td>${escapeHtml(g.name)}</td>
-                    <td><button class="btn-danger-outline" data-delete-group="${g.id}">Delete</button></td>
-                </tr>`
-                )
-                .join("");
+        const res = await apiRequest("/api/admin/ip-groups");
+        if (!res) return;
 
-            tbody.querySelectorAll("[data-delete-group]").forEach((btn) => {
-                btn.addEventListener("click", () => deleteIpGroup(btn.dataset.deleteGroup));
-            });
-        } catch (err) {
-            tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Network error.</td></tr>`;
+        if (!res.ok) {
+            tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Failed to load (${res.status})</td></tr>`;
+            return;
         }
+        const data = await res.json();
+        if (!data.length) {
+            tbody.innerHTML = `<tr><td colspan="3" class="text-center text-muted">No groups found.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = data
+            .map(
+                (g) => `
+            <tr>
+                <td class="font-mono text-sm">${escapeHtml(g.id)}</td>
+                <td>${escapeHtml(g.name)}</td>
+                <td><button class="btn-danger-outline" data-delete-group="${g.id}">Delete</button></td>
+            </tr>`
+            )
+            .join("");
+
+        tbody.querySelectorAll("[data-delete-group]").forEach((btn) => {
+            btn.addEventListener("click", () => deleteIpGroup(btn.dataset.deleteGroup));
+        });
     }
 
     async function deleteIpGroup(id) {
-        if (!confirm("Delete this IP group? Associated records will have their group_id set to NULL.")) return;
-        try {
-            const res = await fetch(`/api/admin/ip-groups/${id}`, {
-                method: "DELETE",
-                headers: { "x-api-key": getApiKey() },
-            });
-            if (res.ok || res.status === 204) {
-                showToast("IP Group deleted.", "success");
-                loadIpGroups();
-            } else {
-                showToast(`Delete failed (${res.status})`, "error");
-            }
-        } catch (err) {
-            showToast("Network error.", "error");
+        if (!confirm("Delete this IP group?")) return;
+        const res = await apiRequest(`/api/admin/ip-groups/${id}`, {
+            method: "DELETE",
+        });
+        if (!res) return;
+
+        if (res.ok || res.status === 204) {
+            showToast("IP Group deleted.", "success");
+            loadIpGroups();
+        } else {
+            showToast(`Delete failed (${res.status})`, "error");
         }
     }
 
@@ -412,104 +438,85 @@ document.addEventListener("DOMContentLoaded", () => {
 
     document.getElementById("form-create-webhook").addEventListener("submit", async (e) => {
         e.preventDefault();
-        const key = getApiKey();
-        if (!key) { showToast("Enter your API key first.", "error"); return; }
-
         const targetUrl = document.getElementById("webhook-url").value.trim();
         const groupIdRaw = document.getElementById("webhook-group-id").value.trim();
 
         if (!targetUrl) return;
 
-        // UUID validation for optional group_id
-        const groupInput = document.getElementById("webhook-group-id");
         let groupId = null;
         if (groupIdRaw) {
             if (!UUID_REGEX.test(groupIdRaw)) {
-                groupInput.classList.add("input-error");
                 showToast("Group ID must be a valid UUID.", "error");
                 return;
             }
             groupId = groupIdRaw;
         }
-        groupInput.classList.remove("input-error");
 
-        try {
-            const res = await fetch("/api/admin/webhooks", {
-                method: "POST",
-                headers: adminHeaders(),
-                body: JSON.stringify({ target_url: targetUrl, group_id: groupId }),
-            });
+        const res = await apiRequest("/api/admin/webhooks", {
+            method: "POST",
+            body: JSON.stringify({ target_url: targetUrl, group_id: groupId }),
+        });
 
-            if (!res.ok) {
-                showToast(`Failed to create webhook (${res.status})`, "error");
-                return;
-            }
+        if (!res) return;
 
-            showToast("Webhook created.", "success");
-            document.getElementById("webhook-url").value = "";
-            document.getElementById("webhook-group-id").value = "";
-            loadWebhooks();
-        } catch (err) {
-            showToast("Network error creating webhook.", "error");
+        if (!res.ok) {
+            showToast(`Failed to create webhook (${res.status})`, "error");
+            return;
         }
+
+        showToast("Webhook created.", "success");
+        document.getElementById("webhook-url").value = "";
+        document.getElementById("webhook-group-id").value = "";
+        loadWebhooks();
     });
 
     async function loadWebhooks() {
         const tbody = document.getElementById("webhooks-table-body");
-        try {
-            const res = await fetch("/api/admin/webhooks", {
-                headers: { "x-api-key": getApiKey() },
-            });
-            if (!res.ok) {
-                tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">Failed to load (${res.status})</td></tr>`;
-                return;
-            }
-            const data = await res.json();
-            if (!data.length) {
-                tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">No webhook configs found.</td></tr>`;
-                return;
-            }
-            tbody.innerHTML = data
-                .map(
-                    (w) => `
-                <tr>
-                    <td class="font-mono text-sm">${escapeHtml(w.id)}</td>
-                    <td class="truncate">${escapeHtml(w.target_url)}</td>
-                    <td class="text-muted text-sm">${w.group_id ? escapeHtml(w.group_id) : "—"}</td>
-                    <td><button class="btn-danger-outline" data-delete-webhook="${w.id}">Delete</button></td>
-                </tr>`
-                )
-                .join("");
+        const res = await apiRequest("/api/admin/webhooks");
+        if (!res) return;
 
-            tbody.querySelectorAll("[data-delete-webhook]").forEach((btn) => {
-                btn.addEventListener("click", () => deleteWebhook(btn.dataset.deleteWebhook));
-            });
-        } catch (err) {
-            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">Network error.</td></tr>`;
+        if (!res.ok) {
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">Failed to load (${res.status})</td></tr>`;
+            return;
         }
+        const data = await res.json();
+        if (!data.length) {
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">No webhook configs found.</td></tr>`;
+            return;
+        }
+        tbody.innerHTML = data
+            .map(
+                (w) => `
+            <tr>
+                <td class="font-mono text-sm">${escapeHtml(w.id)}</td>
+                <td class="truncate">${escapeHtml(w.target_url)}</td>
+                <td class="text-muted text-sm">${w.group_id ? escapeHtml(w.group_id) : "—"}</td>
+                <td><button class="btn-danger-outline" data-delete-webhook="${w.id}">Delete</button></td>
+            </tr>`
+            )
+            .join("");
+
+        tbody.querySelectorAll("[data-delete-webhook]").forEach((btn) => {
+            btn.addEventListener("click", () => deleteWebhook(btn.dataset.deleteWebhook));
+        });
     }
 
     async function deleteWebhook(id) {
-        if (!confirm("Delete this webhook configuration?")) return;
-        try {
-            const res = await fetch(`/api/admin/webhooks/${id}`, {
-                method: "DELETE",
-                headers: { "x-api-key": getApiKey() },
-            });
-            if (res.ok || res.status === 204) {
-                showToast("Webhook deleted.", "success");
-                loadWebhooks();
-            } else {
-                showToast(`Delete failed (${res.status})`, "error");
-            }
-        } catch (err) {
-            showToast("Network error.", "error");
+        if (!confirm("Delete this webhook?")) return;
+        const res = await apiRequest(`/api/admin/webhooks/${id}`, {
+            method: "DELETE",
+        });
+        if (!res) return;
+
+        if (res.ok || res.status === 204) {
+            showToast("Webhook deleted.", "success");
+            loadWebhooks();
+        } else {
+            showToast(`Delete failed (${res.status})`, "error");
         }
     }
 
-    // ═══════════════════════════════════════════════════════
-    // SHARED UTILITIES
-    // ═══════════════════════════════════════════════════════
+    // ─── Shared Utilities ──────────────────────────────────
 
     function showToast(msg, type = "success") {
         const toast = document.createElement("div");
