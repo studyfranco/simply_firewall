@@ -106,6 +106,7 @@
                                     <th>Cause</th>
                                     <th>Group</th>
                                     <th>Updated At</th>
+                                    <th>Actions</th>
                                 </tr>
                             </thead>
                             <tbody id="ip-table-body">
@@ -137,16 +138,61 @@
                     <p class="subtitle">Create and manage API keys for authentication.</p>
 
                     <form id="form-create-apikey" class="admin-form">
-                        <div class="form-row">
-                            <div class="form-group form-group-grow">
-                                <label for="apikey-bound-ip">Bound IP / CIDR <span>*</span></label>
-                                <input type="text" id="apikey-bound-ip" placeholder="e.g. 0.0.0.0/0 or 10.0.0.0/8"
-                                    required class="input-field">
+                        <div class="form-grid">
+                            <div class="form-group">
+                                <label for="apikey-name">Key Name <span>*</span></label>
+                                <input type="text" id="apikey-name" placeholder="e.g. Monitoring Script" required class="input-field">
                             </div>
-                            <div class="form-group form-group-action">
-                                <label class="label-spacer">&nbsp;</label>
-                                <button type="submit" class="btn btn-primary">Create Key</button>
+                            <div class="form-group">
+                                <label for="apikey-bound-ips">Bound IPs (CIDR, comma-separated) <span>*</span></label>
+                                <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32, 10.0.0.0/8" required class="input-field" rows="2"></textarea>
                             </div>
+                            <div class="form-group">
+                                <label for="apikey-group-id">Scope to Group (ID)</label>
+                                <input type="text" id="apikey-group-id" placeholder="Optional UUID" class="input-field">
+                            </div>
+                        </div>
+
+                        <div class="permissions-grid">
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-is-master">
+                                <span class="checkmark"></span>
+                                Master Access (Bypass RBAC)
+                            </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-view-ips">
+                                <span class="checkmark"></span>
+                                View IPs
+                            </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-add-ips">
+                                <span class="checkmark"></span>
+                                Add IPs
+                            </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-edit-ips">
+                                <span class="checkmark"></span>
+                                Edit IPs
+                            </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-delete-ips">
+                                <span class="checkmark"></span>
+                                Delete IPs
+                            </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-manage-keys">
+                                <span class="checkmark"></span>
+                                Manage Keys
+                            </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-manage-webhooks">
+                                <span class="checkmark"></span>
+                                Manage Webhooks
+                            </label>
+                        </div>
+
+                        <div class="form-actions mt-4">
+                            <button type="submit" class="btn btn-primary">Create API Key</button>
                         </div>
                     </form>
 
@@ -159,8 +205,9 @@
                         <table class="data-table">
                             <thead>
                                 <tr>
-                                    <th>ID</th>
-                                    <th>Bound IP</th>
+                                    <th>Name</th>
+                                    <th>Bound IPs</th>
+                                    <th>Permissions</th>
                                     <th>Actions</th>
                                 </tr>
                             </thead>

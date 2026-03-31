@@ -22,6 +22,7 @@ document.addEventListener("DOMContentLoaded", () => {
     // ─── State ─────────────────────────────────────────────
     let currentPage = 0;
     const limit = 10;
+    let currentUser = null; // Stores RBAC permissions
 
     // ─── API Wrapper (Centralized Auth Interceptor) ─────────
 
@@ -59,23 +60,20 @@ document.addEventListener("DOMContentLoaded", () => {
     // ─── Auth Logic ────────────────────────────────────────
 
     /**
-     * Validates the API key by making a lightweight request.
+     * Validates the API key by fetching the user's profile.
      */
     async function validateKey(key) {
-        // Temporarily set the key for the validation request
-        const originalKey = localStorage.getItem(STORAGE_KEY);
-        localStorage.setItem(STORAGE_KEY, key);
-
-        const res = await apiFetch("/api/ips?limit=1");
-
-        // If it failed or was unauthorized, don't keep the key
-        if (!res || !res.ok) {
-            if (originalKey) localStorage.setItem(STORAGE_KEY, originalKey);
-            else localStorage.removeItem(STORAGE_KEY);
-            return false;
+        const headers = { "X-API-Key": key };
+        try {
+            const res = await fetch("/api/auth/me", { headers });
+            if (res.ok) {
+                currentUser = await res.json();
+                return true;
+            }
+        } catch (e) {
+            console.error("Auth validation failed", e);
         }
-
-        return true;
+        return false;
     }
 
     function handleSessionExpired(notify = true) {
@@ -89,9 +87,36 @@ document.addEventListener("DOMContentLoaded", () => {
     function showDashboard() {
         loginScreen.classList.add("hidden");
         dashboardContainer.classList.remove("hidden");
+        
+        applyPermissionsUI();
+        
         // Trigger initial load
         loadData();
-        showToast("Dashboard unlocked", "success");
+        showToast(`Welcome back, ${currentUser.name}`, "success");
+    }
+
+    function applyPermissionsUI() {
+        if (!currentUser) return;
+
+        // Tabs Visibility
+        const adminTab = document.querySelector('[data-tab="admin"]');
+        const hasAdminAccess = currentUser.is_master || currentUser.can_manage_keys || currentUser.can_manage_webhooks;
+        if (adminTab) adminTab.classList.toggle("hidden", !hasAdminAccess);
+
+        // Action Buttons Visibility
+        const banBtn = document.getElementById("btn-ban");
+        const whiteBtn = document.getElementById("btn-white");
+        const canAddOriginal = currentUser.is_master || currentUser.can_add_ips;
+        if (banBtn) banBtn.style.display = canAddOriginal ? "inline-flex" : "none";
+        if (whiteBtn) whiteBtn.style.display = canAddOriginal ? "inline-flex" : "none";
+
+        // Hide specific admin sections if partial permissions
+        const keysSection = document.querySelector('.admin-section:nth-of-type(1)');
+        const groupsSection = document.querySelector('.admin-section:nth-of-type(2)'); // Usually everyone can see groups if they can admin
+        const webhooksSection = document.querySelector('.admin-section:nth-of-type(3)');
+
+        if (keysSection) keysSection.classList.toggle("hidden", !currentUser.is_master && !currentUser.can_manage_keys);
+        if (webhooksSection) webhooksSection.classList.toggle("hidden", !currentUser.is_master && !currentUser.can_manage_webhooks);
     }
 
     function showLogin(errorMsg = null) {
@@ -245,6 +270,11 @@ document.addEventListener("DOMContentLoaded", () => {
                 const date = new Date(record.updated_at).toLocaleString();
                 const cause = escapeHtml(record.cause || "—");
                 const groupName = record.group_name || "—";
+                
+                const canDelete = currentUser.is_master || currentUser.can_delete_ips;
+                const deleteBtn = canDelete 
+                    ? `<button class="btn-danger-outline btn-sm" data-delete-ip="${record.id}">Delete</button>`
+                    : `<span class="text-muted">—</span>`;
 
                 return `
                 <tr>
@@ -253,9 +283,27 @@ document.addEventListener("DOMContentLoaded", () => {
                     <td class="text-sm">${cause}</td>
                     <td class="text-muted text-sm">${escapeHtml(String(groupName))}</td>
                     <td class="text-sm">${date}</td>
+                    <td>${deleteBtn}</td>
                 </tr>`;
             })
             .join("");
+
+        ipTableBody.querySelectorAll("[data-delete-ip]").forEach(btn => {
+            btn.addEventListener("click", () => deleteIpRecord(btn.dataset.deleteIp));
+        });
+    }
+
+    async function deleteIpRecord(id) {
+        if (!confirm("Are you sure you want to remove this IP record?")) return;
+        
+        const res = await apiFetch(`/api/ips/${id}`, { method: "DELETE" });
+        if (res && (res.ok || res.status === 204)) {
+            showToast("Record deleted successfully", "success");
+            loadData();
+        } else if (res) {
+            const err = await res.text();
+            showToast(`Delete failed: ${err}`, "error");
+        }
     }
 
     function showTableError(msg) {
@@ -332,18 +380,32 @@ document.addEventListener("DOMContentLoaded", () => {
 
     document.getElementById("form-create-apikey").addEventListener("submit", async (e) => {
         e.preventDefault();
-        const boundIp = document.getElementById("apikey-bound-ip").value.trim();
-        if (!boundIp) return;
+        
+        const payload = {
+            name: document.getElementById("apikey-name").value.trim(),
+            bound_ips: document.getElementById("apikey-bound-ips").value.trim(),
+            group_id: document.getElementById("apikey-group-id").value.trim() || null,
+            is_master: document.getElementById("apikey-is-master").checked,
+            can_view_ips: document.getElementById("apikey-can-view-ips").checked,
+            can_add_ips: document.getElementById("apikey-can-add-ips").checked,
+            can_edit_ips: document.getElementById("apikey-can-edit-ips").checked,
+            can_delete_ips: document.getElementById("apikey-can-delete-ips").checked,
+            can_manage_keys: document.getElementById("apikey-can-manage-keys").checked,
+            can_manage_webhooks: document.getElementById("apikey-can-manage-webhooks").checked,
+        };
 
-        const res = await apiFetch("/api/admin/api-keys", {
+        if (!payload.name || !payload.bound_ips) return;
+
+        const res = await apiFetch("/api/keys", {
             method: "POST",
-            body: JSON.stringify({ bound_ip: boundIp }),
+            body: JSON.stringify(payload),
         });
 
         if (!res) return;
 
         if (!res.ok) {
-            showToast(`Failed to create API key (${res.status})`, "error");
+            const err = await res.text();
+            showToast(`Failed to create API key: ${err}`, "error");
             return;
         }
 
@@ -353,32 +415,48 @@ document.addEventListener("DOMContentLoaded", () => {
         revealBox.classList.remove("hidden");
 
         showToast("API Key created successfully", "success");
-        document.getElementById("apikey-bound-ip").value = "";
+        e.target.reset();
         loadApiKeys();
     });
 
     async function loadApiKeys() {
         const tbody = document.getElementById("apikeys-table-body");
-        const res = await apiFetch("/api/admin/api-keys");
+        const res = await apiFetch("/api/keys");
         if (!res) return;
 
         if (!res.ok) {
-            tbody.innerHTML = `<tr><td colspan="3" class="text-center text-danger">Failed to load (${res.status})</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-danger">Failed to load (${res.status})</td></tr>`;
             return;
         }
         const data = await res.json();
         if (!data.length) {
-            tbody.innerHTML = `<tr><td colspan="3" class="text-center text-muted">No API keys found.</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="4" class="text-center text-muted">No API keys found.</td></tr>`;
             return;
         }
         tbody.innerHTML = data
             .map(
-                (k) => `
-            <tr>
-                <td class="font-mono text-sm">${escapeHtml(k.id)}</td>
-                <td class="font-mono">${escapeHtml(k.bound_ip)}</td>
-                <td><button class="btn-danger-outline" data-delete-apikey="${k.id}">Delete</button></td>
-            </tr>`
+                (k) => {
+                    const perms = [];
+                    if (k.is_master) perms.push("Master");
+                    else {
+                        if (k.can_view_ips) perms.push("View");
+                        if (k.can_add_ips) perms.push("Add");
+                        if (k.can_edit_ips) perms.push("Edit");
+                        if (k.can_delete_ips) perms.push("Delete");
+                    }
+                    const permsStr = perms.join(", ") || "None";
+                    
+                    return `
+                    <tr>
+                        <td>
+                            <div class="font-semibold">${escapeHtml(k.name)}</div>
+                            <div class="text-xs text-muted font-mono">${escapeHtml(k.id)}</div>
+                        </td>
+                        <td class="font-mono text-xs">${escapeHtml(k.bound_ips)}</td>
+                        <td><span class="text-sm">${permsStr}</span></td>
+                        <td><button class="btn-danger-outline btn-sm" data-delete-apikey="${k.id}">Delete</button></td>
+                    </tr>`;
+                }
             )
             .join("");
 
@@ -389,7 +467,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function deleteApiKey(id) {
         if (!confirm("Delete this API key?")) return;
-        const res = await apiFetch(`/api/admin/api-keys/${id}`, {
+        const res = await apiFetch(`/api/keys/${id}`, {
             method: "DELETE",
         });
         if (!res) return;
@@ -398,7 +476,8 @@ document.addEventListener("DOMContentLoaded", () => {
             showToast("API Key deleted.", "success");
             loadApiKeys();
         } else {
-            showToast(`Delete failed (${res.status})`, "error");
+            const err = await res.text();
+            showToast(`Delete failed: ${err}`, "error");
         }
     }
 
@@ -409,7 +488,7 @@ document.addEventListener("DOMContentLoaded", () => {
         const name = document.getElementById("group-name").value.trim();
         if (!name) return;
 
-        const res = await apiFetch("/api/admin/ip-groups", {
+        const res = await apiFetch("/api/groups", {
             method: "POST",
             body: JSON.stringify({ name }),
         });
@@ -428,7 +507,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function loadIpGroups() {
         const tbody = document.getElementById("groups-table-body");
-        const res = await apiFetch("/api/admin/ip-groups");
+        const res = await apiFetch("/api/groups");
         if (!res) return;
 
         if (!res.ok) {
@@ -458,7 +537,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function deleteIpGroup(id) {
         if (!confirm("Delete this IP group?")) return;
-        const res = await apiFetch(`/api/admin/ip-groups/${id}`, {
+        const res = await apiFetch(`/api/groups/${id}`, {
             method: "DELETE",
         });
         if (!res) return;
@@ -489,7 +568,7 @@ document.addEventListener("DOMContentLoaded", () => {
             groupId = groupIdRaw;
         }
 
-        const res = await apiFetch("/api/admin/webhooks", {
+        const res = await apiFetch("/api/webhooks", {
             method: "POST",
             body: JSON.stringify({ target_url: targetUrl, group_id: groupId }),
         });
@@ -509,7 +588,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function loadWebhooks() {
         const tbody = document.getElementById("webhooks-table-body");
-        const res = await apiFetch("/api/admin/webhooks");
+        const res = await apiFetch("/api/webhooks");
         if (!res) return;
 
         if (!res.ok) {
@@ -540,7 +619,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     async function deleteWebhook(id) {
         if (!confirm("Delete this webhook?")) return;
-        const res = await apiFetch(`/api/admin/webhooks/${id}`, {
+        const res = await apiFetch(`/api/webhooks/${id}`, {
             method: "DELETE",
         });
         if (!res) return;

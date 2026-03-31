@@ -64,17 +64,29 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     let model = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
         key_hash: Set(key_hash),
-        bound_ip: Set(bound_ip.clone()),
+        name: Set("System Master".to_owned()),
+        bound_ips: Set(bound_ip.clone()),
+        is_master: Set(true),
+        can_manage_keys: Set(true),
+        can_manage_webhooks: Set(true),
+        can_view_ips: Set(true),
+        can_add_ips: Set(true),
+        can_edit_ips: Set(true),
+        can_delete_ips: Set(true),
+        group_id: Set(None),
     };
 
     model.insert(db).await?;
 
-    println!("\n╔══════════════════════════════════════════════════════════════╗");
-    println!("║  BOOTSTRAP: Master API Key Generated                       ║");
-    println!("║  Key:    {}  ║", plaintext_key);
-    println!("║  Bound:  {:54}║", bound_ip);
-    println!("║  ⚠ This key will NOT be shown again. Store it securely!    ║");
-    println!("╚══════════════════════════════════════════════════════════════╝\n");
+    tracing::info!(
+        "\n╔══════════════════════════════════════════════════════════════╗\n\
+         ║  BOOTSTRAP: Master API Key Generated                       ║\n\
+         ║  Key:    {}  ║\n\
+         ║  Bound:  {:54}║\n\
+         ║  ⚠ This key will NOT be shown again. Store it securely!    ║\n\
+         ╚══════════════════════════════════════════════════════════════╝",
+        plaintext_key, bound_ip
+    );
 
     Ok(())
 }
@@ -120,19 +132,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Protected API routes
     let api_routes = Router::new()
+        .route("/auth/me", get(api::get_me))
+        .route("/ips", get(api::list_ips))
+        .route("/ips/:id", delete(api::delete_ip))
         .route("/ban", post(api::handle_ban))
         .route("/white", post(api::handle_white))
-        // Admin endpoints for managing the system itself
-        .route("/admin/api-keys", post(api::create_api_key))
-        .route("/admin/api-keys", get(api::list_api_keys))
-        .route("/admin/api-keys/:id", delete(api::delete_api_key))
-        .route("/admin/ip-groups", post(api::create_ip_group))
-        .route("/admin/ip-groups", get(api::list_ip_groups))
-        .route("/admin/ip-groups/:id", delete(api::delete_ip_group))
-        .route("/admin/webhooks", post(api::create_webhook))
-        .route("/admin/webhooks", get(api::list_webhooks))
-        .route("/admin/webhooks/:id", delete(api::delete_webhook))
-        .route_layer(axum::middleware::from_fn_with_state(
+        // Admin endpoints for managing the system itself (mapped to the same handlers but following REST)
+        .route("/keys", post(api::create_api_key))
+        .route("/keys", get(api::list_api_keys))
+        .route("/keys/:id", delete(api::delete_api_key))
+        .route("/groups", post(api::create_ip_group))
+        .route("/groups", get(api::list_ip_groups))
+        .route("/groups/:id", delete(api::delete_ip_group))
+        .route("/webhooks", post(api::create_webhook))
+        .route("/webhooks", get(api::list_webhooks))
+        .route("/webhooks/:id", delete(api::delete_webhook))
+        .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,
         ));
@@ -140,7 +155,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Root Router
     let app = Router::new()
         .fallback_service(ServeDir::new("static"))
-        .route("/api/ips", get(api::list_ips)) // Public listing (or add middleware if desired)
         .nest("/api", api_routes)
         .layer(TraceLayer::new_for_http())
         .with_state(state);

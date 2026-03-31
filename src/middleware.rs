@@ -48,20 +48,32 @@ pub async fn auth_middleware(
         .map_err(AppError::DbError)?
         .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
 
-    // Validate the client IP against the bound CIDR
-    let bound_net: IpNetwork = key_record.bound_ip.parse().map_err(|_| {
-        tracing::error!("Invalid CIDR in database: {}", key_record.bound_ip);
-        AppError::Internal
-    })?;
+    // Validate the client IP against the bound CIDRs
+    let networks: Vec<IpNetwork> = key_record
+        .bound_ips
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| {
+            tracing::error!("Invalid CIDR in database: {}", key_record.bound_ips);
+            AppError::Internal
+        })?;
 
-    if !bound_net.contains(client_ip) {
+    let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(client_ip));
+
+    if !is_allowed && !key_record.is_master {
         tracing::warn!(
-            "Access denied: Client IP {} not in bound network {}",
+            "Access denied: Client IP {} not in bound networks {}",
             client_ip,
-            bound_net
+            key_record.bound_ips
         );
         return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
     }
+
+    let mut req = req;
+    req.extensions_mut().insert(key_record);
 
     Ok(next.run(req).await)
 }

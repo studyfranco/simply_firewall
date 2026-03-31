@@ -1,6 +1,7 @@
 use axum::{
     extract::{Json, Path, Query, State},
     response::IntoResponse,
+    Extension,
 };
 use chrono::Utc;
 use ipnetwork::IpNetwork;
@@ -30,23 +31,61 @@ pub struct BanWhitePayload {
 
 pub async fn handle_ban(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
     Json(payload): Json<BanWhitePayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    handle_ip_upsert(state, payload, false).await
+    if !key.is_master && !key.can_add_ips {
+        return Err(AppError::Forbidden("You do not have permission to add IPs".to_owned()));
+    }
+    handle_ip_upsert(state, key, payload, false).await
 }
 
 pub async fn handle_white(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
     Json(payload): Json<BanWhitePayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    handle_ip_upsert(state, payload, true).await
+    if !key.is_master && !key.can_add_ips {
+        return Err(AppError::Forbidden("You do not have permission to add IPs".to_owned()));
+    }
+    handle_ip_upsert(state, key, payload, true).await
 }
 
 async fn handle_ip_upsert(
     state: AppState,
-    payload: BanWhitePayload,
+    key: api_key::Model,
+    mut payload: BanWhitePayload,
     is_whitelist: bool,
 ) -> Result<impl IntoResponse, AppError> {
+    // If not master and scoped to a group, force the group
+    if !key.is_master && key.group_id.is_some() {
+        let group = ip_group::Entity::find_by_id(key.group_id.unwrap())
+            .one(&state.db)
+            .await?
+            .ok_or_else(|| AppError::Internal)?;
+        payload.group_name = Some(group.name);
+    }
+
+    // Check permissions for editing
+    let existing = ip_record::Entity::find()
+        .filter(ip_record::Column::Address.eq(payload.target_address.clone()))
+        .one(&state.db)
+        .await?;
+
+    if let Some(record) = existing {
+        if !key.is_master && !key.can_edit_ips {
+            return Err(AppError::Forbidden("You do not have permission to edit IPs".to_owned()));
+        }
+
+        // Check group ownership if scoped
+        if !key.is_master && key.group_id.is_some() && record.group_id != key.group_id {
+            return Err(AppError::Forbidden("This IP belongs to another group".to_owned()));
+        }
+
+        if record.is_locked {
+            return Err(AppError::Forbidden("This IP is protected and cannot be modified".to_owned()));
+        }
+    }
     // Strict IP Network Validation
     let network: IpNetwork = payload.target_address.parse()
         .map_err(|_| AppError::InvalidInput("Invalid IP or CIDR format".to_owned()))?;
@@ -174,8 +213,22 @@ pub struct IpRecordResponse {
 
 pub async fn list_ips(
     State(state): State<AppState>,
-    Query(filters): Query<QueryFilters>,
+    Extension(key): Extension<api_key::Model>,
+    Query(mut filters): Query<QueryFilters>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_view_ips {
+        return Err(AppError::Forbidden("You do not have permission to view IPs".to_owned()));
+    }
+
+    // Apply tenancy filter if scoped
+    if !key.is_master && key.group_id.is_some() {
+        let group = ip_group::Entity::find_by_id(key.group_id.unwrap())
+            .one(&state.db)
+            .await?
+            .ok_or_else(|| AppError::Internal)?;
+        filters.group_name = Some(group.name);
+    }
+
     use sea_orm::QuerySelect;
 
     let mut query = ip_record::Entity::find()
@@ -220,28 +273,109 @@ pub async fn list_ips(
     Ok(Json(items))
 }
 
+pub async fn delete_ip(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_delete_ips {
+        return Err(AppError::Forbidden("You do not have permission to delete IPs".to_owned()));
+    }
+
+    let record = ip_record::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if !key.is_master && key.group_id.is_some() && record.group_id != key.group_id {
+        return Err(AppError::Forbidden("This IP belongs to another group".to_owned()));
+    }
+
+    if record.is_locked {
+        return Err(AppError::Forbidden("Protected records cannot be deleted".to_owned()));
+    }
+
+    ip_record::Entity::delete_by_id(id).exec(&state.db).await?;
+    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Auth Handlers
+// ─────────────────────────────────────────────────────────────
+
+pub async fn get_me(
+    Extension(key): Extension<api_key::Model>,
+) -> Result<impl IntoResponse, AppError> {
+    #[derive(Serialize)]
+    struct MeResponse {
+        pub id: Uuid,
+        pub name: String,
+        pub bound_ips: String,
+        pub is_master: bool,
+        pub can_manage_keys: bool,
+        pub can_manage_webhooks: bool,
+        pub can_view_ips: bool,
+        pub can_add_ips: bool,
+        pub can_edit_ips: bool,
+        pub can_delete_ips: bool,
+        pub group_id: Option<Uuid>,
+    }
+
+    Ok(Json(MeResponse {
+        id: key.id,
+        name: key.name,
+        bound_ips: key.bound_ips,
+        is_master: key.is_master,
+        can_manage_keys: key.can_manage_keys,
+        can_manage_webhooks: key.can_manage_webhooks,
+        can_view_ips: key.can_view_ips,
+        can_add_ips: key.can_add_ips,
+        can_edit_ips: key.can_edit_ips,
+        can_delete_ips: key.can_delete_ips,
+        group_id: key.group_id,
+    }))
+}
+
 // ─────────────────────────────────────────────────────────────
 // Admin CRUD — API Keys
 // ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
 pub struct CreateApiKeyPayload {
-    pub bound_ip: String, // CIDR e.g. "0.0.0.0/0"
+    pub name: String,
+    pub bound_ips: String,
+    pub is_master: bool,
+    pub can_manage_keys: bool,
+    pub can_manage_webhooks: bool,
+    pub can_view_ips: bool,
+    pub can_add_ips: bool,
+    pub can_edit_ips: bool,
+    pub can_delete_ips: bool,
+    pub group_id: Option<Uuid>,
 }
 
 #[derive(Serialize)]
 pub struct CreateApiKeyResponse {
     pub id: Uuid,
     pub plaintext_key: String,
-    pub bound_ip: String,
+    pub name: String,
+    pub bound_ips: String,
 }
 
 pub async fn create_api_key(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
     Json(payload): Json<CreateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    let _: IpNetwork = payload.bound_ip.parse()
-        .map_err(|_| AppError::InvalidInput("Invalid bound IP CIDR".to_owned()))?;
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    // Validate CIDRs
+    for cidr in payload.bound_ips.split(',') {
+        let _ : IpNetwork = cidr.trim().parse()
+            .map_err(|_| AppError::InvalidInput(format!("Invalid CIDR: {}", cidr)))?;
+    }
 
     let plaintext_key = generate_random_key();
     let key_hash = hash_key(&plaintext_key);
@@ -250,7 +384,16 @@ pub async fn create_api_key(
     let model = api_key::ActiveModel {
         id: Set(id),
         key_hash: Set(key_hash),
-        bound_ip: Set(payload.bound_ip.clone()),
+        name: Set(payload.name.clone()),
+        bound_ips: Set(payload.bound_ips.clone()),
+        is_master: Set(payload.is_master),
+        can_manage_keys: Set(payload.can_manage_keys),
+        can_manage_webhooks: Set(payload.can_manage_webhooks),
+        can_view_ips: Set(payload.can_view_ips),
+        can_add_ips: Set(payload.can_add_ips),
+        can_edit_ips: Set(payload.can_edit_ips),
+        can_delete_ips: Set(payload.can_delete_ips),
+        group_id: Set(payload.group_id),
     };
 
     api_key::Entity::insert(model).exec(&state.db).await?;
@@ -258,21 +401,36 @@ pub async fn create_api_key(
     Ok(Json(CreateApiKeyResponse {
         id,
         plaintext_key,
-        bound_ip: payload.bound_ip,
+        name: payload.name,
+        bound_ips: payload.bound_ips,
     }))
 }
 
 pub async fn list_api_keys(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
     let keys = ApiKey::find().all(&state.db).await?;
     Ok(Json(keys))
 }
 
 pub async fn delete_api_key(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    if id == key.id {
+        return Err(AppError::Forbidden("Cannot delete yourself".to_owned()));
+    }
+
     let result = ApiKey::delete_by_id(id).exec(&state.db).await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);

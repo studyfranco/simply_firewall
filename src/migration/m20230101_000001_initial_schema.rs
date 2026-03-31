@@ -25,7 +25,16 @@ pub enum ApiKeys {
     Table,
     Id,
     KeyHash,
-    BoundIp,
+    Name,
+    BoundIps,
+    IsMaster,
+    CanManageKeys,
+    CanManageWebhooks,
+    CanViewIps,
+    CanAddIps,
+    CanEditIps,
+    CanDeleteIps,
+    GroupId,
 }
 
 #[derive(DeriveIden)]
@@ -89,7 +98,24 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(ColumnDef::new(ApiKeys::Id).uuid().not_null().primary_key())
                     .col(ColumnDef::new(ApiKeys::KeyHash).string().not_null())
-                    .col(ColumnDef::new(ApiKeys::BoundIp).string().not_null())
+                    .col(ColumnDef::new(ApiKeys::Name).string().not_null())
+                    .col(ColumnDef::new(ApiKeys::BoundIps).string().not_null())
+                    .col(ColumnDef::new(ApiKeys::IsMaster).boolean().not_null().default(false))
+                    .col(ColumnDef::new(ApiKeys::CanManageKeys).boolean().not_null().default(false))
+                    .col(ColumnDef::new(ApiKeys::CanManageWebhooks).boolean().not_null().default(false))
+                    .col(ColumnDef::new(ApiKeys::CanViewIps).boolean().not_null().default(false))
+                    .col(ColumnDef::new(ApiKeys::CanAddIps).boolean().not_null().default(false))
+                    .col(ColumnDef::new(ApiKeys::CanEditIps).boolean().not_null().default(false))
+                    .col(ColumnDef::new(ApiKeys::CanDeleteIps).boolean().not_null().default(false))
+                    .col(ColumnDef::new(ApiKeys::GroupId).uuid())
+                    .foreign_key(
+                        ForeignKey::create()
+                            .name("fk-api_keys-group_id")
+                            .from(ApiKeys::Table, ApiKeys::GroupId)
+                            .to(IpGroups::Table, IpGroups::Id)
+                            .on_delete(ForeignKeyAction::SetNull)
+                            .on_update(ForeignKeyAction::NoAction),
+                    )
                     .to_owned(),
             )
             .await?;
