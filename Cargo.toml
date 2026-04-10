@@ -23,3 +23,7 @@ rand = "0.8.5"
 thiserror = "1.0.61"
 dotenvy = "0.15.7"
 log = "0.4.29"
+
+[dev-dependencies]
+tower = { version = "0.4.13", features = ["util"] }
+axum = { version = "0.7.5", features = ["macros"] }

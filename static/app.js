@@ -485,7 +485,7 @@ document.addEventListener("DOMContentLoaded", () => {
 
     document.getElementById("form-create-group").addEventListener("submit", async (e) => {
         e.preventDefault();
-        const name = document.getElementById("group-name").value.trim();
+        const name = document.getElementById("create-group-name").value.trim();
         if (!name) return;
 
         const res = await apiFetch("/api/groups", {

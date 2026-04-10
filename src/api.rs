@@ -90,18 +90,6 @@ async fn handle_ip_upsert(
     let network: IpNetwork = payload.target_address.parse()
         .map_err(|_| AppError::InvalidInput("Invalid IP or CIDR format".to_owned()))?;
 
-    // Check if protected (is_locked)
-    let existing = ip_record::Entity::find()
-        .filter(ip_record::Column::Address.eq(payload.target_address.clone()))
-        .one(&state.db)
-        .await?;
-
-    if let Some(record) = existing {
-        if record.is_locked {
-            return Err(AppError::Forbidden("This IP is protected and cannot be modified".to_owned()));
-        }
-    }
-
     // Rule: Don't allow banning loopback, unspecified, link-local, or private if it's a "ban" action
     if !is_whitelist {
         let ip = network.network();
@@ -449,8 +437,13 @@ pub struct CreateIpGroupPayload {
 
 pub async fn create_ip_group(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
     Json(payload): Json<CreateIpGroupPayload>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
     let id = Uuid::new_v4();
     let model = ip_group::ActiveModel {
         id: Set(id),
@@ -462,15 +455,25 @@ pub async fn create_ip_group(
 
 pub async fn list_ip_groups(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
     let groups = IpGroup::find().all(&state.db).await?;
     Ok(Json(groups))
 }
 
 pub async fn delete_ip_group(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
     let result = IpGroup::delete_by_id(id).exec(&state.db).await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
@@ -490,8 +493,13 @@ pub struct CreateWebhookPayload {
 
 pub async fn create_webhook(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
     Json(payload): Json<CreateWebhookPayload>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_webhooks {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
     let id = Uuid::new_v4();
     let model = webhook_config::ActiveModel {
         id: Set(id),
@@ -504,15 +512,25 @@ pub async fn create_webhook(
 
 pub async fn list_webhooks(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_webhooks {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
     let webhooks = WebhookConfig::find().all(&state.db).await?;
     Ok(Json(webhooks))
 }
 
 pub async fn delete_webhook(
     State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_webhooks {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
     let result = WebhookConfig::delete_by_id(id).exec(&state.db).await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
