@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WebhookEvent {
+    pub event_type: String, // "ban", "white", or "delete"
     pub address: String,
     pub is_whitelist: bool,
     pub group_id: Option<Uuid>,

@@ -30,6 +30,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/keys", post(api::create_api_key))
         .route("/keys", get(api::list_api_keys))
         .route("/keys/:id", delete(api::delete_api_key))
+        .route("/keys/:id/groups", post(api::update_key_group_permissions))
         .route("/groups", post(api::create_ip_group))
         .route("/groups", get(api::list_ip_groups))
         .route("/groups/:id", delete(api::delete_ip_group))

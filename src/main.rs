@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use axum::extract::ConnectInfo;
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection, EntityTrait};
 use sea_orm_migration::MigratorTrait;
 use tokio::net::TcpListener;
@@ -51,11 +50,7 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
         is_master: Set(true),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
-        can_view_ips: Set(true),
-        can_add_ips: Set(true),
-        can_edit_ips: Set(true),
-        can_delete_ips: Set(true),
-        group_id: Set(None),
+        can_create_groups: Set(true),
     };
 
     model.insert(db).await?;

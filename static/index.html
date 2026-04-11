@@ -17,7 +17,7 @@
                 <div class="logo-icon"></div>
                 <h1>Simply Firewall</h1>
             </div>
-            <h2>Authentication Required</h2>
+            <h2>Enterprise Auth Router</h2>
             <p class="subtitle">Please enter your API key to access the dashboard.</p>
             <form id="login-form" class="login-form">
                 <div class="form-group">
@@ -54,7 +54,7 @@
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-firewall" class="tab-panel active">
             <div class="grid-layout">
-                <section class="card form-section">
+                <section class="card form-section" id="manage-ip-section">
                     <h2>Manage Access</h2>
                     <p class="subtitle">Add a new IP address or CIDR to the firewall.</p>
 
@@ -66,8 +66,8 @@
                         </div>
 
                         <div class="form-group">
-                            <label for="group-name">Group Name (Optional)</label>
-                            <input type="text" id="group-name" placeholder="e.g. production-servers" class="input-field">
+                            <label for="group-name">Group Name (Literal) <span>*</span></label>
+                            <input type="text" id="group-name" placeholder="e.g. production-servers" required class="input-field">
                         </div>
 
                         <div class="form-group">
@@ -88,7 +88,9 @@
                     <div class="list-header">
                         <h2>Recent IP Records</h2>
                         <div class="filters">
+                            <input type="text" id="ip-filter" placeholder="Filter by IP..." class="input-field">
                             <input type="text" id="group-filter" placeholder="Filter by group..." class="input-field">
+                            <input type="text" id="cause-filter" placeholder="Filter by cause..." class="input-field">
                             <select id="status-filter" class="input-field select-field">
                                 <option value="">All Statuses</option>
                                 <option value="ban">Banned</option>
@@ -111,7 +113,7 @@
                             </thead>
                             <tbody id="ip-table-body">
                                 <tr>
-                                    <td colspan="5" class="text-center text-muted">Loading data...</td>
+                                    <td colspan="6" class="text-center text-muted">Loading data...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -133,9 +135,9 @@
             <div class="admin-grid">
 
                 <!-- API Keys -->
-                <section class="card admin-section">
+                <section class="card admin-section" id="apikey-section">
                     <h2>API Keys</h2>
-                    <p class="subtitle">Create and manage API keys for authentication.</p>
+                    <p class="subtitle">Create and manage API keys (Global Scopes).</p>
 
                     <form id="form-create-apikey" class="admin-form">
                         <div class="form-grid">
@@ -144,40 +146,16 @@
                                 <input type="text" id="apikey-name" placeholder="e.g. Monitoring Script" required class="input-field">
                             </div>
                             <div class="form-group">
-                                <label for="apikey-bound-ips">Bound IPs (CIDR, comma-separated) <span>*</span></label>
-                                <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32, 10.0.0.0/8" required class="input-field" rows="2"></textarea>
-                            </div>
-                            <div class="form-group">
-                                <label for="apikey-group-id">Scope to Group (ID)</label>
-                                <input type="text" id="apikey-group-id" placeholder="Optional UUID" class="input-field">
+                                <label for="apikey-bound-ips">Bound IPs (CIDR) <span>*</span></label>
+                                <textarea id="apikey-bound-ips" placeholder="e.g. 127.0.0.1/32" required class="input-field" rows="2"></textarea>
                             </div>
                         </div>
 
-                        <div class="permissions-grid">
+                        <div class="permissions-grid mt-2 mb-4">
                             <label class="checkbox-container">
                                 <input type="checkbox" id="apikey-is-master">
                                 <span class="checkmark"></span>
-                                Master Access (Bypass RBAC)
-                            </label>
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-view-ips">
-                                <span class="checkmark"></span>
-                                View IPs
-                            </label>
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-add-ips">
-                                <span class="checkmark"></span>
-                                Add IPs
-                            </label>
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-edit-ips">
-                                <span class="checkmark"></span>
-                                Edit IPs
-                            </label>
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-can-delete-ips">
-                                <span class="checkmark"></span>
-                                Delete IPs
+                                Master Access
                             </label>
                             <label class="checkbox-container">
                                 <input type="checkbox" id="apikey-can-manage-keys">
@@ -189,6 +167,11 @@
                                 <span class="checkmark"></span>
                                 Manage Webhooks
                             </label>
+                            <label class="checkbox-container">
+                                <input type="checkbox" id="apikey-can-create-groups">
+                                <span class="checkmark"></span>
+                                Can Create Groups
+                            </label>
                         </div>
 
                         <div class="form-actions mt-4">
@@ -197,7 +180,7 @@
                     </form>
 
                     <div id="apikey-created" class="key-reveal hidden">
-                        <p class="key-reveal-label">New API Key (copy now — shown only once):</p>
+                        <p class="key-reveal-label">New API Key (copy now):</p>
                         <code id="apikey-plaintext" class="key-reveal-value"></code>
                     </div>
 
@@ -207,7 +190,6 @@
                                 <tr>
                                     <th>Name</th>
                                     <th>Bound IPs</th>
-                                    <th>Permissions</th>
                                     <th>Actions</th>
                                 </tr>
                             </thead>
@@ -218,94 +200,122 @@
                             </tbody>
                         </table>
                     </div>
+
+                    <!-- Manage Rights for Existing Keys -->
+                    <div class="mt-4 pt-4" style="border-top: 1px solid var(--border);">
+                        <h4>Manage Group Rights</h4>
+                        <p class="subtitle text-sm">Assign isolated rights to an existing key.</p>
+                        <form id="form-manage-rights" class="admin-form">
+                            <div class="form-grid">
+                                <div class="form-group">
+                                    <label for="manage-rights-key">Target Key <span>*</span></label>
+                                    <select id="manage-rights-key" class="input-field select-field" required>
+                                        <option value="">-- Select API Key --</option>
+                                    </select>
+                                </div>
+                                <div class="form-group">
+                                    <label for="manage-rights-group">Group Name <span>*</span></label>
+                                    <input type="text" id="manage-rights-group" placeholder="e.g. backend-servers" required class="input-field">
+                                </div>
+                            </div>
+                            <div class="permissions-grid mt-2 mb-4">
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="manage-rights-read">
+                                    <span class="checkmark"></span> Read
+                                </label>
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="manage-rights-write">
+                                    <span class="checkmark"></span> Write
+                                </label>
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="manage-rights-delete">
+                                    <span class="checkmark"></span> Delete
+                                </label>
+                            </div>
+                            <div class="form-actions">
+                                <button type="submit" class="btn btn-secondary">Assign Group Rights</button>
+                            </div>
+                        </form>
+                    </div>
+
                 </section>
 
                 <!-- IP Groups -->
-                <section class="card admin-section">
+                <section class="card admin-section" id="groups-section">
                     <h2>IP Groups</h2>
-                    <p class="subtitle">Organize IP records into logical groups.</p>
-
+                    <p class="subtitle">Organize IP records.</p>
                     <form id="form-create-group" class="admin-form">
                         <div class="form-row">
                             <div class="form-group form-group-grow">
                                 <label for="create-group-name">Group Name <span>*</span></label>
-                                <input type="text" id="create-group-name" placeholder="e.g. production-servers" required
-                                    class="input-field">
+                                <input type="text" id="create-group-name" required class="input-field">
                             </div>
                             <div class="form-group form-group-action">
                                 <label class="label-spacer">&nbsp;</label>
-                                <button type="submit" class="btn btn-primary">Create Group</button>
+                                <button type="submit" class="btn btn-primary">Create</button>
                             </div>
                         </div>
                     </form>
-
                     <div class="table-container mt-4">
                         <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>Name</th>
-                                    <th>Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody id="groups-table-body">
-                                <tr>
-                                    <td colspan="3" class="text-center text-muted">No groups loaded.</td>
-                                </tr>
-                            </tbody>
+                            <thead><tr><th>ID</th><th>Name</th><th>Actions</th></tr></thead>
+                            <tbody id="groups-table-body"></tbody>
                         </table>
                     </div>
                 </section>
 
                 <!-- Webhook Configs -->
-                <section class="card admin-section">
+                <section class="card admin-section" id="webhooks-section">
                     <h2>Webhook Configs</h2>
-                    <p class="subtitle">Configure webhook endpoints for event notifications.</p>
-
+                    <p class="subtitle">Configure advanced templated webhook events.</p>
                     <form id="form-create-webhook" class="admin-form">
-                        <div class="form-row">
-                            <div class="form-group form-group-grow">
+                        <div class="form-grid">
+                            <div class="form-group">
                                 <label for="webhook-url">Target URL <span>*</span></label>
-                                <input type="url" id="webhook-url" placeholder="https://example.com/hook" required
-                                    class="input-field">
+                                <input type="url" id="webhook-url" placeholder="https://example.com" required class="input-field">
+                            </div>
+                            <div class="permissions-grid form-group mt-4">
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="webhook-ban" checked>
+                                    <span class="checkmark"></span> Ban
+                                </label>
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="webhook-white">
+                                    <span class="checkmark"></span> White
+                                </label>
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="webhook-delete">
+                                    <span class="checkmark"></span> Delete
+                                </label>
                             </div>
                             <div class="form-group">
-                                <label for="webhook-group-id">Group ID (Optional)</label>
-                                <input type="text" id="webhook-group-id" placeholder="UUID" class="input-field">
+                                <label for="webhook-auth-name">Auth Header Name</label>
+                                <input type="text" id="webhook-auth-name" placeholder="X-API-Key" class="input-field">
                             </div>
-                            <div class="form-group form-group-action">
-                                <label class="label-spacer">&nbsp;</label>
-                                <button type="submit" class="btn btn-primary">Create Webhook</button>
+                            <div class="form-group">
+                                <label for="webhook-auth-token">Auth Token</label>
+                                <input type="password" id="webhook-auth-token" placeholder="Secret" class="input-field">
+                            </div>
+                            <div class="form-group col-span-2">
+                                <label for="webhook-template">Payload Template <span>*</span></label>
+                                <textarea id="webhook-template" required class="input-field">{"action": "$event_type", "ip": "$ip", "cause": "$cause"}</textarea>
                             </div>
                         </div>
+                        <div class="form-actions mt-4">
+                            <button type="submit" class="btn btn-primary">Create Webhook</button>
+                        </div>
                     </form>
-
                     <div class="table-container mt-4">
                         <table class="data-table">
-                            <thead>
-                                <tr>
-                                    <th>ID</th>
-                                    <th>Target URL</th>
-                                    <th>Group ID</th>
-                                    <th>Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody id="webhooks-table-body">
-                                <tr>
-                                    <td colspan="4" class="text-center text-muted">No webhook configs loaded.</td>
-                                </tr>
-                            </tbody>
+                            <thead><tr><th>ID</th><th>URL</th><th>Events</th><th>Actions</th></tr></thead>
+                            <tbody id="webhooks-table-body"></tbody>
                         </table>
                     </div>
                 </section>
-
             </div>
         </main>
     </div>
-
     <div id="toast-container" class="toast-container"></div>
-
     <script src="app.js"></script>
 </body>
-
 </html>
