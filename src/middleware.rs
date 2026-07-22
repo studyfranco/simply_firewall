@@ -1,3 +1,5 @@
+//! Authentication middleware
+
 use axum::{
     body::Body,
     extract::State,
@@ -13,6 +15,7 @@ use crate::entities::prelude::ApiKey;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// Middleware to enforce API Key authentication and IP restrictions
 pub async fn auth_middleware(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -24,7 +27,7 @@ pub async fn auth_middleware(
     let client_ip = headers
         .get("X-Forwarded-For")
         .and_then(|h| h.to_str().ok())
-        .and_then(|s| s.split(',').last()) // Rightmost IP
+        .and_then(|s| s.split(',').next_back()) // Rightmost IP
         .map(|s| s.trim())
         .and_then(|s| s.parse::<std::net::IpAddr>().ok())
         .unwrap_or(addr.ip()); // Fallback to raw TCP IP
@@ -49,15 +52,15 @@ pub async fn auth_middleware(
         .ok_or(AppError::Unauthorized("Invalid API Key".to_owned()))?;
 
     // Validate the client IP against the bound CIDRs
-    let networks: Vec<IpNetwork> = key_record
-        .bound_ips
+    let bound_ips_str = key_record.bound_ips.as_deref().unwrap_or("");
+    let networks: Vec<IpNetwork> = bound_ips_str
         .split(',')
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .map(|s| s.parse())
         .collect::<Result<Vec<_>, _>>()
         .map_err(|_| {
-            tracing::error!("Invalid CIDR in database: {}", key_record.bound_ips);
+            tracing::error!("Invalid CIDR in database: {:?}", key_record.bound_ips);
             AppError::Internal
         })?;
 
@@ -65,7 +68,7 @@ pub async fn auth_middleware(
 
     if !is_allowed && !key_record.is_master {
         tracing::warn!(
-            "Access denied: Client IP {} not in bound networks {}",
+            "Access denied: Client IP {} not in bound networks {:?}",
             client_ip,
             key_record.bound_ips
         );

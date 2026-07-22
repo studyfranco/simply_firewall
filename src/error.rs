@@ -1,3 +1,5 @@
+//! Application errors
+
 use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
@@ -6,23 +8,30 @@ use axum::{
 use serde_json::json;
 use thiserror::Error;
 
+/// Global application error type
 #[derive(Error, Debug)]
 pub enum AppError {
+    /// Database error
     #[error("Database error: {0}")]
     DbError(#[from] sea_orm::DbErr),
 
+    /// Invalid input
     #[error("Invalid input: {0}")]
     InvalidInput(String),
 
+    /// Unauthorized access
     #[error("Unauthorized: {0}")]
     Unauthorized(String),
 
+    /// Forbidden access
     #[error("Forbidden: {0}")]
     Forbidden(String),
 
+    /// Resource not found
     #[error("Not Found")]
     NotFound,
 
+    /// Internal server error
     #[error("Internal Server Error")]
     Internal,
 }

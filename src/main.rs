@@ -42,15 +42,21 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     let key_hash = api::hash_key(&plaintext_key);
     let bound_ip = std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0".to_owned());
 
+    let prefix = plaintext_key.chars().take(8).collect::<String>();
+    let now = chrono::Utc::now().naive_utc();
+
     let model = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
         key_hash: Set(key_hash),
         name: Set("System Master".to_owned()),
-        bound_ips: Set(bound_ip.clone()),
+        prefix: Set(prefix),
+        bound_ips: Set(Some(bound_ip.clone())),
         is_master: Set(true),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        created_at: Set(now),
+        updated_at: Set(now),
     };
 
     model.insert(db).await?;

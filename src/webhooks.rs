@@ -1,15 +1,64 @@
+//! Webhook background worker
+
 use std::time::Duration;
+use std::str::FromStr;
+use std::net::IpAddr;
 use crate::entities::{prelude::*, webhook_config};
 use crate::state::WebhookEvent;
 use reqwest::{Client, header::{HeaderMap, HeaderName, HeaderValue}};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinSet;
-use tracing::{error, info};
+use tracing::{error, info, warn};
+use hmac::{Hmac, Mac, KeyInit};
+use sha2::Sha256;
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INFLIGHT: usize = 64;
 
+async fn is_url_safe(url_str: &str, allow_private: bool) -> bool {
+    if allow_private { return true; }
+    
+    let url = match reqwest::Url::parse(url_str) {
+        Ok(u) => u,
+        Err(_) => return false,
+    };
+    
+    let host_str = match url.host_str() {
+        Some(h) => h,
+        None => return false,
+    };
+    
+    let port = url.port_or_known_default().unwrap_or(80);
+    
+    let addrs = match tokio::net::lookup_host((host_str, port)).await {
+        Ok(mut addrs) => {
+            if let Some(addr) = addrs.next() {
+                addr.ip()
+            } else {
+                return false;
+            }
+        },
+        Err(_) => return false,
+    };
+    
+    match addrs {
+        IpAddr::V4(v4) => {
+            if v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
+                return false;
+            }
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return false;
+            }
+        }
+    }
+    
+    true
+}
+
+/// Runs the background webhook worker, processing events and dispatching HTTP requests
 pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<WebhookEvent>) {
     let client = Client::builder()
         .timeout(WEBHOOK_TIMEOUT)
@@ -18,19 +67,22 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
         .expect("Failed to build reqwest client");
 
     let mut join_set = JoinSet::new();
+    let allow_private_webhooks = std::env::var("ALLOW_PRIVATE_WEBHOOKS").unwrap_or_else(|_| "false".to_owned()) == "true";
 
     info!("Webhook worker started.");
 
     while let Some(event) = rx.recv().await {
         info!(address = %event.address, event_type = %event.event_type, "Processing event for webhooks");
 
-        // Fetch configs matching the group_id or global configs (group_id is null)
-        let mut condition = webhook_config::Column::GroupId.is_null();
-        if let Some(gid) = event.group_id {
-            condition = condition.or(webhook_config::Column::GroupId.eq(gid));
-        }
+        let gid = match event.group_id {
+            Some(id) => id,
+            None => continue,
+        };
 
-        let configs = match WebhookConfig::find().filter(condition).all(&db).await {
+        let configs = match WebhookConfig::find()
+            .filter(webhook_config::Column::GroupId.eq(gid))
+            .filter(webhook_config::Column::IsActive.eq(true))
+            .all(&db).await {
             Ok(c) => c,
             Err(e) => {
                 error!("Failed to fetch webhook configs: {}", e);
@@ -39,43 +91,57 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
         };
 
         for config in configs {
-            // Check if this config cares about this event type
-            let triggers: Vec<&str> = config.trigger_events.split(',').map(|s| s.trim()).collect();
-            if !triggers.contains(&event.event_type.as_str()) {
-                continue;
-            }
-
-            // Respect max inflight tasks to prevent memory issues
             if join_set.len() >= MAX_INFLIGHT {
                 let _ = join_set.join_next().await;
             }
 
             let client = client.clone();
             
-            // Generate payload from template
             let mut payload = config.payload_template.clone();
+            payload = payload.replace("$target_address", &event.address);
             payload = payload.replace("$ip", &event.address);
             payload = payload.replace("$cause", event.cause.as_deref().unwrap_or("Unknown"));
-            
-            // To resolve GroupName we would typically need another DB query, but to keep worker fast
-            // and avoiding locks we inject the group_id if no name was provided over events.
-            let gid_str = event.group_id.map(|id| id.to_string()).unwrap_or_else(|| "Global".to_string());
-            payload = payload.replace("$group_name", &gid_str);
+            payload = payload.replace("$group_name", &gid.to_string()); 
 
             let mut headers = HeaderMap::new();
-            if let (Some(auth_name), Some(auth_value)) = (&config.auth_header_name, &config.auth_token) {
-                if !auth_name.is_empty() && !auth_value.is_empty() {
-                    if let (Ok(h_name), Ok(h_val)) = (HeaderName::from_bytes(auth_name.as_bytes()), HeaderValue::from_str(auth_value)) {
-                        headers.insert(h_name, h_val);
+            headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+            
+            if let Some(hjson) = &config.headers_json {
+                if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(hjson) {
+                    for (k, v) in map {
+                        if let (Ok(h_name), Ok(h_val)) = (HeaderName::from_str(&k), HeaderValue::from_str(&v)) {
+                            headers.insert(h_name, h_val);
+                        }
                     }
                 }
             }
             
-            headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+            let mac_result = Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes());
+            let mut mac = match mac_result {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::error!("Failed to create HMAC key: {}", e);
+                    continue;
+                }
+            };
+            // Safe: KeyInit::new_from_slice is infallible for HMAC with variable-size keys
+            mac.update(payload.as_bytes());
+            let result = mac.finalize();
+            let hex_sig = hex::encode(result.into_bytes());
+            let sig_val = format!("sha256={}", hex_sig);
+            
+            if let Ok(hv) = HeaderValue::from_str(&sig_val) {
+                headers.insert("X-Signature-256", hv);
+            }
 
             let target_url = config.target_url.clone();
 
             join_set.spawn(async move {
+                if !is_url_safe(&target_url, allow_private_webhooks).await {
+                    warn!(url = %target_url, "Webhook blocked by SSRF protection");
+                    return;
+                }
+                
                 match client.post(&target_url).headers(headers).body(payload).send().await {
                     Ok(resp) => {
                         if !resp.status().is_success() {
@@ -93,6 +159,6 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
     }
 
     info!("Webhook channel closed, draining pending tasks...");
-    while let Some(_) = join_set.join_next().await {}
+    while join_set.join_next().await.is_some() {}
     info!("Webhook worker shut down.");
 }

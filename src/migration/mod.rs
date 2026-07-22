@@ -1,3 +1,4 @@
+#![allow(missing_docs)]
 pub use sea_orm_migration::prelude::*;
 
 mod m20230101_000001_initial_schema;

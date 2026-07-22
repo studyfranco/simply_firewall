@@ -219,17 +219,17 @@ class FirewallClient {
 
         tbody.innerHTML = this.state.ips.map(ip => `
             <tr>
-                <td class="font-mono">${escapeHtml(ip.address)} ${ip.is_locked ? '<span title="Locked" class="badge">🔒 Locked</span>' : ''}</td>
+                <td class="font-mono">${escapeHtml(ip.target_address)} ${ip.is_locked ? '<span title="Locked" class="badge">🔒 Locked</span>' : ''}</td>
                 <td>
-                    <span class="badge ${ip.is_whitelist ? 'badge-success' : 'badge-danger'}">
-                        ${ip.is_whitelist ? 'Whitelisted' : 'Banned'}
+                    <span class="badge ${ip.cause ? 'badge-danger' : 'badge-success'}">
+                        Active
                     </span>
                 </td>
                 <td>${escapeHtml(ip.cause || '-')}</td>
                 <td><span class="badge badge-group">${escapeHtml(ip.group_name || 'Global')}</span></td>
-                <td>${new Date(ip.updated_at).toLocaleString()}</td>
+                <td>${new Date(ip.last_seen_at).toLocaleString()}</td>
                 <td>
-                    <button class="btn btn-sm btn-danger" onclick="window.app.deleteIp('${ip.id}')" ${ip.is_locked ? 'disabled' : ''}>Delete</button>
+                    <button class="btn btn-sm btn-danger" onclick="window.app.deleteIp('${escapeHtml(ip.target_address)}', '${escapeHtml(ip.group_name)}')" ${ip.is_locked ? 'disabled' : ''}>Delete</button>
                 </td>
             </tr>
         `).join('');
@@ -292,8 +292,8 @@ class FirewallClient {
         tbody.innerHTML = this.state.webhooks.map(w => `
             <tr>
                 <td class="font-mono text-sm">${w.id.split('-')[0]}...</td>
+                <td><strong>${escapeHtml(w.name)}</strong></td>
                 <td class="font-mono text-sm">${escapeHtml(w.target_url)}</td>
-                <td><span class="badge badge-group">${escapeHtml(w.trigger_events)}</span></td>
                 <td>
                     <button class="btn btn-sm btn-danger" onclick="window.app.deleteWebhook('${w.id}')">Delete</button>
                 </td>
@@ -332,10 +332,11 @@ class FirewallClient {
         } catch(e) {}
     }
 
-    async deleteIp(id) {
+    async deleteIp(targetAddress, groupName) {
         if (!confirm("Are you sure you want to delete this rule?")) return;
         try {
-            await this.apiFetch(`/ips/${id}`, { method: 'DELETE' });
+            const params = new URLSearchParams({ target_address: targetAddress, group_name: groupName });
+            await this.apiFetch(`/ips?${params.toString()}`, { method: 'DELETE' });
             this.showToast("Record deleted", 'success');
             this.loadInitialData();
         } catch(e) {}
@@ -418,21 +419,12 @@ class FirewallClient {
     async createWebhook(e) {
         e.preventDefault();
 
-        const tags = [];
-        if (document.getElementById('webhook-ban').checked) tags.push('ban');
-        if (document.getElementById('webhook-white').checked) tags.push('white');
-        if (document.getElementById('webhook-delete').checked) tags.push('delete');
-
-        if (tags.length === 0) {
-            this.showToast("Select at least one trigger event.", 'error');
-            return;
-        }
-
         const payload = {
+            name: document.getElementById('webhook-name').value,
             target_url: document.getElementById('webhook-url').value,
-            trigger_events: tags.join(','),
-            auth_header_name: document.getElementById('webhook-auth-name').value || null,
-            auth_token: document.getElementById('webhook-auth-token').value || null,
+            secret_token: document.getElementById('webhook-secret').value,
+            group_id: document.getElementById('webhook-group-id').value,
+            headers_json: document.getElementById('webhook-headers').value || null,
             payload_template: document.getElementById('webhook-template').value
         };
 

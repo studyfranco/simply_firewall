@@ -1,3 +1,7 @@
+#![warn(missing_docs)]
+//! Simply Firewall Library
+//! This module provides the core API router, state, and webhook logic.
+
 use axum::{
     routing::{delete, get, post},
     Router,
@@ -23,20 +27,20 @@ pub fn create_app(state: AppState) -> Router {
     let api_routes = Router::new()
         .route("/auth/me", get(api::get_me))
         .route("/ips", get(api::list_ips))
-        .route("/ips/:id", delete(api::delete_ip))
+        .route("/ips", delete(api::delete_ip))
         .route("/ban", post(api::handle_ban))
         .route("/white", post(api::handle_white))
         // Admin endpoints
         .route("/keys", post(api::create_api_key))
         .route("/keys", get(api::list_api_keys))
-        .route("/keys/:id", delete(api::delete_api_key))
-        .route("/keys/:id/groups", post(api::update_key_group_permissions))
+        .route("/keys/{id}", delete(api::delete_api_key))
+        .route("/keys/{id}/groups", post(api::update_key_group_permissions))
         .route("/groups", post(api::create_ip_group))
         .route("/groups", get(api::list_ip_groups))
-        .route("/groups/:id", delete(api::delete_ip_group))
+        .route("/groups/{id}", delete(api::delete_ip_group))
         .route("/webhooks", post(api::create_webhook))
         .route("/webhooks", get(api::list_webhooks))
-        .route("/webhooks/:id", delete(api::delete_webhook))
+        .route("/webhooks/{id}", delete(api::delete_webhook))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,

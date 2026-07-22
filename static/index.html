@@ -273,32 +273,25 @@
                             <div class="form-group">
                                 <label for="webhook-url">Target URL <span>*</span></label>
                                 <input type="url" id="webhook-url" placeholder="https://example.com" required class="input-field">
-                            </div>
-                            <div class="permissions-grid form-group mt-4">
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="webhook-ban" checked>
-                                    <span class="checkmark"></span> Ban
-                                </label>
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="webhook-white">
-                                    <span class="checkmark"></span> White
-                                </label>
-                                <label class="checkbox-container">
-                                    <input type="checkbox" id="webhook-delete">
-                                    <span class="checkmark"></span> Delete
-                                </label>
+                            <div class="form-group">
+                                <label for="webhook-name">Webhook Name <span>*</span></label>
+                                <input type="text" id="webhook-name" placeholder="My Alert Hook" required class="input-field">
                             </div>
                             <div class="form-group">
-                                <label for="webhook-auth-name">Auth Header Name</label>
-                                <input type="text" id="webhook-auth-name" placeholder="X-API-Key" class="input-field">
+                                <label for="webhook-secret">HMAC Secret <span>*</span></label>
+                                <input type="password" id="webhook-secret" placeholder="Shared Secret" required class="input-field">
                             </div>
                             <div class="form-group">
-                                <label for="webhook-auth-token">Auth Token</label>
-                                <input type="password" id="webhook-auth-token" placeholder="Secret" class="input-field">
+                                <label for="webhook-group-id">Target Group ID <span>*</span></label>
+                                <input type="text" id="webhook-group-id" placeholder="UUID" required class="input-field">
+                            </div>
+                            <div class="form-group">
+                                <label for="webhook-headers">Custom Headers (JSON)</label>
+                                <input type="text" id="webhook-headers" placeholder='{"Authorization": "Bearer token"}' class="input-field">
                             </div>
                             <div class="form-group col-span-2">
                                 <label for="webhook-template">Payload Template <span>*</span></label>
-                                <textarea id="webhook-template" required class="input-field">{"action": "$event_type", "ip": "$ip", "cause": "$cause"}</textarea>
+                                <textarea id="webhook-template" required class="input-field">{"target_address": "$target_address", "cause": "$cause", "group_name": "$group_name"}</textarea>
                             </div>
                         </div>
                         <div class="form-actions mt-4">
@@ -307,7 +300,7 @@
                     </form>
                     <div class="table-container mt-4">
                         <table class="data-table">
-                            <thead><tr><th>ID</th><th>URL</th><th>Events</th><th>Actions</th></tr></thead>
+                            <thead><tr><th>ID</th><th>Name</th><th>URL</th><th>Actions</th></tr></thead>
                             <tbody id="webhooks-table-body"></tbody>
                         </table>
                     </div>
