@@ -1,59 +1,108 @@
 # Simply Firewall - AI Agent Context & Directives
 
-Hello AI Agent! If you are reading this, you are assisting with the development of the `simply_firewall` repository. Please read and strictly adhere to the architectural guidelines below before modifying any code.
+Hello AI Agent! You are assisting with the development of `simply_firewall`. Read and strictly adhere to these guidelines before inspecting or writing any code.
+
+---
+
+## 📄 Document & Context Hierarchy
+
+To keep this context clean and modular, responsibilities are split across three files:
+1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, documentation standards, and testing directives.
+2. **`SCHEMA.MD`**: Official Database Schema, SeaORM Entity relations, M:N RBAC definitions, and Enum specifications.
+3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
+
+---
 
 ## 🎯 Project Overview
 
-`simply_firewall` is an "Enterprise Grade", centralized Firewall and ACL management API written in Rust. It serves as a single source of truth for IP banning/whitelisting and dispatches templated webhook events when rules change. It includes a multi-tenant, advanced Role-Based Access Control (RBAC) web dashboard built without modern frontend frameworks.
+`simply_firewall` is an enterprise-grade, central Firewall and ACL management API written in Rust. It acts as the single source of truth for IP banning/whitelisting and dispatches signed, templated webhook events to downstream systems or other `simply_firewall` instances. It features an integrated Vanilla JS dashboard governed by a granular multi-tenant Role-Based Access Control (RBAC) system.
+
+---
 
 ## 🛠️ Tech Stack & Constraints
 
-- **Backend:** Rust + Axum + Tokio.
-- **ORM (SQL-Agnostic):** SeaORM. Defaults to **SQLite** for zero-configuration testing, but the architecture MUST remain strictly **SQL-agnostic** (PostgreSQL or MySQL ready). Do not write SQLite-specific raw queries.
-- **Frontend:** STRICTLY Vanilla JS, HTML5, and standard CSS. **Absolutely NO external dependencies** (No React, Vue, Tailwind, Bootstrap, CDN links, or Axios). Native `fetch()` only.
-- **Quality:** Code must compile cleanly and pass `cargo clippy` without warnings. No `.unwrap()` or `.expect()` in HTTP handlers.
+- **Backend:** Rust + Axum (0.8+) + Tokio (1.x).
+- **ORM (SQL-Agnostic):** SeaORM (2.0+). Defaults to **SQLite** for zero-config local development/testing, but MUST remain strictly **SQL-agnostic** (PostgreSQL-ready). **Never write vendor-specific raw SQL queries.**
+- **Frontend:** STRICTLY Vanilla JS, HTML5, and CSS3. **NO external dependencies** (No React, Vue, Tailwind, Bootstrap, CDN links, or Axios). Native `fetch()` only.
+- **Quality & Safety:**
+  - Zero compiler warnings, zero `clippy` warnings.
+  - **Zero `.unwrap()` or `.expect()`** in production or HTTP handlers. Use structured `AppError` and Axum's `IntoResponse`.
+  - **Mandatory `rustdoc`**: All public modules, structs, enums, functions, and Axum handlers MUST be documented using `///` (or `//!` for crates/modules). Enforce `#![warn(missing_docs)]` in `lib.rs`.
+
+---
 
 ## 🏛️ Core Architectural Rules
 
 ### 1. Security & Network (Zero-Trust)
 
-- Every route under `/api/*` is protected by a custom middleware (`src/middleware.rs`).
-- Authentication requires an `X-API-Key` header.
-- **CIDR Validation:** Keys are bound to specific network ranges (`bound_ips`, supporting multiple comma-separated CIDRs like `127.0.0.1/32, ::/0`). The middleware MUST validate the client's IP against these ranges.
-- **Resilient IP Extraction:** We DO NOT use external crates like `axum-client-ip`. The middleware safely extracts the rightmost IP from `X-Forwarded-For` and falls back to `axum::extract::ConnectInfo` for direct TCP access.
+- **Middleware Protection:** All `/api/v1/*` routes pass through custom authentication middleware (`src/middleware.rs`).
+- **Authentication:** Verified via `X-API-Key` header.
+- **CIDR Restriction:** API Keys are bound to CIDR network ranges (`bound_ips`, supporting comma-separated IPv4/IPv6 ranges like `127.0.0.1/32, 10.0.0.0/8, ::/0`). Middleware MUST validate the client's IP against these bounds.
+- **Resilient IP Extraction:** Do NOT use external IP extraction crates. Extract the rightmost IP from `X-Forwarded-For` or `X-Real-IP`, falling back safely to `axum::extract::ConnectInfo`.
 
-### 2. Granular RBAC & Tenant Isolation (Many-to-Many)
+### 2. Granular Multi-Tenant RBAC (M:N)
 
-- **Global vs Scoped:** An `ApiKey` can be `is_master` (bypasses all rules) or have global boolean rights (`can_manage_keys`, `can_manage_webhooks`, `can_create_groups`).
-- **M:N IP Permissions:** IP management rights are managed via a Many-to-Many junction table (`ApiKeyGroupPermission`) linking the API Key to an `IpGroup` with specific booleans (`can_read`, `can_write`, `can_delete`).
-- **Rule of Least Privilege:** `can_write` and `can_delete` inherently require `can_read` to be true.
-- **Auto-Provisioning:** If an API key creates a new group, the backend MUST automatically grant that key read/write/delete permissions for this new group.
+- **Global Rights:** An `ApiKey` can be `is_master` (bypasses all checks) or hold global booleans (`can_manage_keys`, `can_manage_webhooks`, `can_create_groups`).
+- **Group Rights:** Managed via junction table `ApiKeyGroupPermission` linking keys to `IpGroup` with explicit flags (`can_read`, `can_write`, `can_delete`).
+- **Least Privilege:** `can_write` or `can_delete` require `can_read` to be true.
+- **Auto-Provisioning:** When an API Key creates a new `IpGroup`, the backend MUST automatically generate full read/write/delete permissions for that key on the new group.
 
-### 3. Advanced Webhooks
+### 3. IP Management & Query Filtering
 
-- Webhooks trigger on specific actions (e.g., `ban`, `white`, `delete`).
-- They support **Payload Templating** to inject variables dynamically (e.g., `{"address": "$ip", "reason": "$cause"}`).
-- They support custom authentication headers (e.g., injecting `X-API-Key: <secret>`) to chain instances together.
+- **IPv4 & IPv6 CIDRs:** Full support for single IPs and subnet ranges (e.g., `/24`, `/64`).
+- **Rerecord Tracking:** Store `created_at` and `last_seen_at`. Re-registering an existing IP updates `last_seen_at` rather than failing.
+- **Multi-Group Membership:** An IP can belong to multiple `IpGroup`s simultaneously.
+- **Group Tagging:** A group can be tag as whitelist or banlist. By default it is a banlist.
+- **Flexible Fetching (`GET /api/v1/ips`):**
+  - Parameter `groups=fail2ban,sshd`: Filters IPs belonging to specified groups. If omitted, returns all IPs accessible to the API Key.
+  - Parameter `max_age=3600` or `since=<timestamp>`: Temporal filtering based on `last_seen_at`. (No automatic TTL deletion worker exists; filtering is strictly query-driven).
 
-### 4. Database Handling & First Boot
+### 4. Advanced & Secure Webhooks
 
-- Database connections use `ConnectOptions` with SQLx logging set to `DEBUG` to prevent console spam.
-- Migrations are run automatically on application startup.
-- **Master Key Auto-Gen:** If the `api_keys` table is empty on startup (e.g., newly generated DB), the application auto-generates a default Master Key and logs it to the console. This is crucial for initial setup and testing.
-- **Key Recovery:** If the developer loses the Master Key in a local/test environment, the standard procedure is to delete the `.sqlite` file and restart the application to generate a new database and a new master key.
+- **Group Scoping:** Webhooks are bound to specific `IpGroup`s. Actions on IPs in those groups dispatch asynchronous HTTP POST requests via Tokio tasks.
+- **Templating & Headers:** Custom JSON payload templates (e.g., `{"ip": "$target_address", "group": "$group_name"}`) and custom HTTP headers (e.g., `X-API-Key` for chaining `simply_firewall` instances).
+- **HMAC Signatures:** All webhook dispatches MUST include a signature header: `X-Signature-256: sha256=<hex_hmac>` calculated using the webhook's secret token.
+- **SSRF Prevention:** Validate target URLs. Reject private/loopback IP ranges (RFC 1918, RFC 4193, loopback) unless `ALLOW_PRIVATE_WEBHOOKS=true` is set in environment.
 
-### 5. Frontend Paradigm
+### 5. Frontend Integration & Dynamic UI
 
 - The UI is a Single Page Application (SPA). Authentication state is held in `localStorage`.
-- The JS implements a global fetch wrapper that automatically injects the `X-API-Key` header and intercepts `401/403` responses to instantly clear the token and log the user out.
-- The UI dynamically hides/shows elements (including Webhook and API Key management menus) based on the RBAC payload received from `GET /api/auth/me`.
+- Single Page Application served from `static/`.
+- Authenticates via `X-API-Key` stored in `localStorage`.
+- **Dynamic Permission Rendering:** On startup, `app.js` calls `GET /api/v1/auth/me`. The UI dynamically renders/hides tabs and controls (e.g., Webhooks, Key Management) based solely on the returned permissions based on the RBAC payload received from `GET /api/v1/auth/me`.
+- The JS implements a global fetch wrapper that automatically injects the `X-API-Key` header and intercepts `401/403` responses to clear the token and return to the login screen.
 
-### 6. Testing (cURL + cargo)
+### 6. Audit Logging
 
-Compilation via `cargo build` or `cargo check` is allowed and recommended to validate syntax.
-To test endpoints manually, developers use `curl`. Examples:
+- Every write/delete operation generates an `AuditLog` entry storing `api_key_id`, `action`, `target_ip`, affected groups, and timestamp.
 
-- **Auth check:** `curl -H "X-API-Key: <KEY>" http://localhost:3000/api/auth/me`
-- **List IPs:** `curl -H "X-API-Key: <KEY>" "http://localhost:3000/api/ips?limit=10&offset=0"`
-- **Ban IP:** `curl -X POST -H "X-API-Key: <KEY>" -H "Content-Type: application/json" -d '{"target_address": "192.168.1.100/32", "group_name": "Test Group", "cause": "Malicious activity"}' http://localhost:3000/api/ban`
+### 7. Database Bootstrapping
+
+- Database connections use `ConnectOptions` with SQLx logging set to `DEBUG` to prevent console spam.
+- Migrations run automatically on startup.
+- **Master Key Auto-Gen:** If `api_keys` contains no master keys at boot, generate a default Master Key and output it once clearly to `stdout`.
+
+---
+
+## 🧪 Testing & Validation Standards
+
+- **Integration Tests:** Located in `tests/`. Use SQLite in-memory (`sqlite::memory:`) for test isolation.
+- **Coverage Mandatory Requirements:**
+  1. **Positive RBAC:** Authorized keys successfully read/write allowed groups.
+  2. **Negative RBAC:** Unauthorized attempts MUST return HTTP `403 Forbidden`.
+  3. **Webhook Signatures:** Mock HTTP endpoints (e.g., via Tokio task) verifying payload delivery and HMAC `X-Signature-256` validity.
+  4. **Multi-Group & Temporal Querying:** Validate `GET /api/v1/ips` with group filters and `max_age` constraints.
+
+Compilation via `cargo build` or `cargo check` is recommended to validate syntax. Integration tests reside in `tests/` using SQLite in-memory (`sqlite::memory:`).
+To test endpoints manually during development, use `curl`:
+
+- **Auth check:**
+  `curl -H "X-API-Key: <KEY>" http://localhost:3000/api/v1/auth/me`
+- **Add multiples IP:**
+  `curl -X POST -H "X-API-Key: <KEY>" -H "Content-Type: application/json" -d '{"target_address": "192.168.1.100/32", "group_name": "fail2ban", "cause": "SSH brute force"}' http://localhost:3000/api/v1/ips`
+- **List IPs (Filtered by groups):**
+  `curl -H "X-API-Key: <KEY>" "http://localhost:3000/api/v1/ips?groups=fail2ban,sshd&limit=10"`
+- **Delete IP:**
+  `curl -X DELETE -H "X-API-Key: <KEY>" "http://localhost:3000/api/v1/ips?target_address=192.168.1.100/32&group_name=fail2ban"`
+
 *End of directives. Write safe, panic-free (`no .unwrap()`), and elegant Rust code.*
