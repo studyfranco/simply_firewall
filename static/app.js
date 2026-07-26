@@ -173,16 +173,29 @@ class FirewallClient {
                 throw new Error("Session expired or invalid API key — please log in again.");
             }
 
+            // Read the body as text first and only attempt to parse it when there's actually
+            // something to parse. Several endpoints (e.g. POST /api/keys/:id/groups) return a
+            // bare 200 with no body at all — exactly as "empty" as a real 204 as far as parsing
+            // is concerned — and `res.json()` throws "Unexpected end of JSON input" on either.
+            // A parse failure on a genuinely non-empty body (e.g. an upstream proxy's HTML error
+            // page, not actually JSON) falls back to the raw text rather than crashing.
+            const text = await res.text();
+            let data = {};
+            if (text && text.trim().length > 0) {
+                try {
+                    data = JSON.parse(text);
+                } catch {
+                    data = text;
+                }
+            }
+
             if (!res.ok) {
-                const isJson = res.headers.get('content-type')?.includes('application/json');
-                const errData = isJson ? await res.json() : await res.text();
-                const errMsg = errData.error || errData || `HTTP ${res.status}`;
+                const errMsg = (data && typeof data === 'object' ? data.error : null) || (typeof data === 'string' ? data : null) || `HTTP ${res.status}`;
                 throw new Error(errMsg);
             }
 
-            if (res.status === 204) return null;
-            return await res.json();
-            
+            return data;
+
         } catch (error) {
             this.showToast(error.message, 'error');
             throw error;
@@ -506,19 +519,25 @@ class FirewallClient {
     renderGroupsTable() {
         const tbody = document.getElementById('groups-table-body');
         if (this.state.groups.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">No groups.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No groups.</td></tr>';
             return;
         }
 
-        tbody.innerHTML = this.state.groups.map(g => `
+        tbody.innerHTML = this.state.groups.map(g => {
+            const typeBadge = g.group_type === 'whitelist'
+                ? '<span class="badge badge-white">Whitelist</span>'
+                : '<span class="badge badge-ban">Banlist</span>';
+            return `
             <tr>
                 <td class="font-mono text-sm">${g.id.substring(0, 8)}...</td>
                 <td><strong>${escapeHtml(g.name)}</strong></td>
+                <td>${typeBadge}</td>
                 <td>
                     <button class="btn btn-sm btn-danger" onclick="window.app.deleteGroup('${g.id}')">Delete</button>
                 </td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
     }
 
     renderWebhooksTable() {
@@ -730,8 +749,9 @@ class FirewallClient {
     async createGroup(e) {
         e.preventDefault();
         const name = document.getElementById('create-group-name').value;
+        const group_type = document.getElementById('group-type-select').value;
         try {
-            await this.apiFetch('/groups', { method: 'POST', body: JSON.stringify({ name }) });
+            await this.apiFetch('/groups', { method: 'POST', body: JSON.stringify({ name, group_type }) });
             document.getElementById('form-create-group').reset();
             this.loadGroups();
             this.showToast("Group created", 'success');

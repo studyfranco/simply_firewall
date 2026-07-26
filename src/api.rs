@@ -45,6 +45,34 @@ pub fn hash_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Canonicalizes an IP address or CIDR string so the same address always has exactly one
+/// string representation, regardless of how the caller wrote it. An IPv4 `/32` or IPv6 `/128` —
+/// a "network" of exactly one host — is stripped down to the plain host address: without this,
+/// `188.190.74.128/32` and `188.190.74.128` would be stored/matched as two different
+/// `ip_records.target_address` values despite meaning the same thing. Genuine subnets (`/24`,
+/// `/64`, ...) keep their CIDR notation exactly as given — `IpNetwork::ip()` returns the address
+/// as parsed, not masked to the network base, so a non-aligned host-within-a-subnet like
+/// `188.190.74.130/24` round-trips unchanged rather than becoming `188.190.74.0/24`.
+///
+/// Infallible by design: input that doesn't parse as a valid IP/CIDR at all is returned
+/// unchanged. This function's job is normalization, not validation — callers that need to reject
+/// malformed input (e.g. `handle_ip_upsert`) already parse and validate it themselves; callers
+/// that use this for a best-effort match (e.g. `list_ips`'s substring filter, `delete_ip`'s
+/// lookup) need a plain fragment like `"74.128"` to keep working exactly as before.
+pub fn normalize_ip_or_cidr(input: &str) -> String {
+    match input.parse::<IpNetwork>() {
+        Ok(net) => {
+            let is_single_host = (net.is_ipv4() && net.prefix() == 32) || (net.is_ipv6() && net.prefix() == 128);
+            if is_single_host {
+                net.ip().to_string()
+            } else {
+                net.to_string()
+            }
+        }
+        Err(_) => input.to_owned(),
+    }
+}
+
 /// Helper to insert an audit log entry. `key` denormalizes the acting key's name/prefix into the
 /// row so the audit trail stays legible even after that key is later deleted (its `api_key_id` FK
 /// is `ON DELETE SET NULL`, per `SCHEMA.MD`, but the name/prefix survive as a point-in-time
@@ -222,6 +250,11 @@ async fn handle_ip_upsert(
 ) -> Result<impl IntoResponse, AppError> {
     let network: IpNetwork = payload.target_address.parse()
         .map_err(|_| AppError::InvalidInput("Invalid IP or CIDR format".to_owned()))?;
+    // Canonicalized once, up front, and used for every lookup/storage/event below instead of the
+    // raw client-submitted string — otherwise "X/32" and "X" would be treated as different
+    // addresses (two ip_records rows, a "not found" on delete, etc.) despite meaning the same
+    // thing.
+    let normalized_address = normalize_ip_or_cidr(&payload.target_address);
 
     if !is_whitelist {
         let ip = network.network();
@@ -339,7 +372,7 @@ async fn handle_ip_upsert(
     // connection for SQLite, so operations are fully serialized).
     loop {
         let existing_record = ip_record::Entity::find()
-            .filter(ip_record::Column::TargetAddress.eq(payload.target_address.clone()))
+            .filter(ip_record::Column::TargetAddress.eq(normalized_address.clone()))
             .one(&state.db)
             .await?;
 
@@ -362,7 +395,7 @@ async fn handle_ip_upsert(
         let new_id = Uuid::new_v4();
         let model = ip_record::ActiveModel {
             id: Set(new_id),
-            target_address: Set(payload.target_address.clone()),
+            target_address: Set(normalized_address.clone()),
             cause: Set(payload.cause.clone()),
             is_locked: Set(false),
             created_at: Set(now),
@@ -413,14 +446,14 @@ async fn handle_ip_upsert(
         Some(&key),
         Some(client_ip),
         action,
-        Some(payload.target_address.clone()),
+        Some(normalized_address.clone()),
         Some(resolved_group_name),
         Some(format!("Added IP to group. Whitelist: {}", is_whitelist))
     ).await?;
 
     let event = WebhookEvent {
         action: action.to_owned(),
-        address: payload.target_address.clone(),
+        address: normalized_address,
         is_whitelist,
         group_id: Some(target_group_id),
         cause: payload.cause,
@@ -570,7 +603,11 @@ pub async fn list_ips(
     if let Some(ip) = &filters.ip
         && !ip.is_empty()
     {
-        query = query.filter(ip_record::Column::TargetAddress.contains(ip.trim()));
+        // Best-effort: if the filter value happens to be a full, parseable address/CIDR (e.g. a
+        // caller pastes "188.190.74.128/32" to look up a record stored as the bare host form),
+        // normalize it so the substring match still finds it. A genuine partial fragment like
+        // "74.128" doesn't parse and passes through unchanged, preserving substring search.
+        query = query.filter(ip_record::Column::TargetAddress.contains(normalize_ip_or_cidr(ip.trim())));
     }
 
     if let Some(cause) = &filters.cause
@@ -670,6 +707,9 @@ pub async fn delete_ip(
         .target_address
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::InvalidInput("target_address is required (query or JSON body)".to_owned()))?;
+    // Canonicalize before the lookup below: a record banned as "X/32" must still be found (and
+    // deletable) by a caller passing plain "X", and vice versa.
+    let target_address = normalize_ip_or_cidr(&target_address);
 
     let group = resolve_group_ref(&state.db, params.group_id, params.group_name.as_deref())
         .await?
@@ -1239,6 +1279,9 @@ pub async fn revoke_key_group_permission(
 pub struct CreateIpGroupPayload {
     /// Group Name
     pub name: String,
+    /// Group type: `"banlist"` or `"whitelist"`. Defaults to `"banlist"` if omitted or set to
+    /// anything else — this endpoint deliberately never rejects the request over this field.
+    pub group_type: Option<String>,
 }
 
 /// Handles POST /api/v1/groups
@@ -1252,12 +1295,17 @@ pub async fn create_ip_group(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
+    let group_type = match payload.group_type.as_deref() {
+        Some("whitelist") => "whitelist",
+        _ => "banlist",
+    };
+
     let id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
     let model = ip_group::ActiveModel {
         id: Set(id),
         name: Set(payload.name.clone()),
-        group_type: Set("banlist".to_owned()),
+        group_type: Set(group_type.to_owned()),
         description: Set(None),
         created_at: Set(now),
     };
@@ -1286,7 +1334,7 @@ pub async fn create_ip_group(
     
     create_audit_log(&state.db, Some(&key), Some(client_ip.0), "GROUP_CREATE", None, Some(payload.name.clone()), None).await?;
 
-    Ok(Json(serde_json::json!({ "id": id, "name": payload.name })))
+    Ok(Json(serde_json::json!({ "id": id, "name": payload.name, "group_type": group_type })))
 }
 
 /// Handles GET /api/v1/groups

@@ -1412,6 +1412,107 @@ async fn test_cidr_and_ipv6_boundary_validation() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
+/// `normalize_ip_or_cidr` must strip a single-host CIDR suffix (`/32` for IPv4, `/128` for IPv6)
+/// down to the plain address, leave genuine subnets — including their original, possibly
+/// non-network-aligned host bits — untouched, and pass unparseable input through unchanged rather
+/// than erroring: it's a normalization helper, not a validator.
+#[tokio::test]
+async fn test_normalize_ip_or_cidr_strips_single_host_prefixes_only() {
+    use simply_firewall::api::normalize_ip_or_cidr;
+
+    assert_eq!(normalize_ip_or_cidr("188.190.74.128/32"), "188.190.74.128");
+    assert_eq!(normalize_ip_or_cidr("188.190.74.128"), "188.190.74.128");
+    assert_eq!(normalize_ip_or_cidr("::1/128"), "::1");
+    assert_eq!(normalize_ip_or_cidr("2001:db8::1"), "2001:db8::1");
+
+    // Genuine subnets keep their CIDR notation, including non-network-aligned host bits (not
+    // masked down to the network address).
+    assert_eq!(normalize_ip_or_cidr("10.0.0.0/24"), "10.0.0.0/24");
+    assert_eq!(normalize_ip_or_cidr("188.190.74.130/24"), "188.190.74.130/24");
+    assert_eq!(normalize_ip_or_cidr("2001:db8::/64"), "2001:db8::/64");
+
+    // Unparseable input (garbage, or a genuine partial substring fragment as used by the
+    // /api/ips filter) passes through unchanged rather than being rejected.
+    assert_eq!(normalize_ip_or_cidr("not-an-ip"), "not-an-ip");
+    assert_eq!(normalize_ip_or_cidr("74.128"), "74.128");
+}
+
+/// End-to-end proof that canonicalization actually prevents the duplicate-storage bug it exists
+/// to fix: banning the same address once as "X/32" and once as bare "X" must produce exactly one
+/// stored record (not two), in canonical (bare) form — and DELETE must find and remove a record
+/// regardless of which representation it was originally created with vs. looked up by.
+#[tokio::test]
+async fn test_ban_deduplicates_slash_32_and_bare_ip_representations() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    // Ban the /32 form first.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "188.190.74.128/32", "group_name": "canon-group" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Ban the bare form of the SAME address — must update the same row, not create a second one.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "188.190.74.128", "group_name": "canon-group", "cause": "re-banned bare" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=canon-group")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(items.len(), 1, "the /32 and bare forms must be treated as the SAME address, not two records");
+    assert_eq!(items[0]["target_address"], "188.190.74.128", "stored in canonical (bare) form");
+    assert_eq!(items[0]["cause"], "re-banned bare", "the second call updated the same row");
+
+    // Deleting via the bare form must find and remove the record, even though nothing was ever
+    // literally stored or requested with that exact string until now — canonicalization, not
+    // string luck, is what makes this work.
+    let req = inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri("/api/ips?target_address=188.190.74.128&group_name=canon-group")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    // And deleting via the /32 form of an address that was actually stored bare must ALSO work.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "203.0.113.77", "group_name": "canon-group" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri("/api/ips?target_address=203.0.113.77/32&group_name=canon-group")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+}
+
 /// Proves webhook dispatch is genuinely non-blocking: `POST /api/ban` must return almost
 /// immediately even when the only registered webhook for that group targets an endpoint that
 /// takes several seconds to respond. The handler only ever hands the event off over an mpsc

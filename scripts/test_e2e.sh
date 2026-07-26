@@ -12,9 +12,11 @@
 # event filtering (events=IP_ADD/IP_UPDATE/IP_DELETE), RBAC-before-group-type-validation precedence
 # and strict banlist/whitelist type enforcement on /api/ban and /api/white, auto-granted creator
 # permissions on both explicit (POST /api/groups) and implicit (ban/white auto-create) group
-# creation, and the group-identification bug fixes (duplicate-name 409, flexible group_id/
-# group_name). Every request is logged with a timestamp, method, full URL, color-coded status, and
-# jq-formatted body.
+# creation, explicit group_type selection on group creation (with a lenient default-to-banlist
+# fallback for an omitted/invalid value), IP/CIDR canonicalization (a bare address and its /32 or
+# /128 form are the same stored record, while genuine subnets keep their notation), and the
+# group-identification bug fixes (duplicate-name 409, flexible group_id/group_name). Every request
+# is logged with a timestamp, method, full URL, color-coded status, and jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
 # Requires: curl, jq. Needs port 3000 free (the app's listen address is not configurable).
@@ -832,6 +834,59 @@ api_call GET "/api/auth/me" "$GROUP_CREATOR_KEY"
 check "200" "fetch the creator key's profile again after implicit group creation"
 check_true "[.group_permissions[] | select(.group_id == \"$IMPLICIT_CREATOR_GROUP_ID\")][0] | .can_read and .can_write and .can_delete" \
     "the implicitly-created group also grants full can_read/can_write/can_delete"
+
+# ── 17. Group type creation & display ───────────────────────────────────────
+
+log_section "17. Group Type Creation & Display"
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"explicit-whitelist-group","group_type":"whitelist"}'
+check "200" "create a group with an explicit group_type=whitelist"
+check_jq ".group_type" "whitelist" "the response reports group_type=whitelist"
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"explicit-banlist-group","group_type":"banlist"}'
+check "200" "create a group with an explicit group_type=banlist"
+check_jq ".group_type" "banlist" "the response reports group_type=banlist"
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"default-type-group"}'
+check "200" "create a group omitting group_type entirely"
+check_jq ".group_type" "banlist" "an omitted group_type defaults to banlist"
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"invalid-type-group","group_type":"not-a-real-type"}'
+check "200" "an invalid group_type value is NOT rejected with 400..."
+check_jq ".group_type" "banlist" "...it silently falls back to the banlist default instead"
+
+api_call GET "/api/groups" "$MASTER_KEY"
+check "200" "list groups to confirm the whitelist group's type persisted"
+check_true '[.[] | select(.name=="explicit-whitelist-group")][0].group_type == "whitelist"' \
+    "GET /api/groups shows the persisted whitelist type, not just the create response"
+
+# ── 18. IP address canonicalization (/32, /128 stripping) ───────────────────
+
+log_section "18. IP Address Canonicalization"
+
+log "Banning the same address once as '/32' and once bare must produce exactly ONE record..."
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"188.190.74.128/32","group_name":"canon-e2e-group","cause":"first as /32"}'
+check "200" "ban the /32 form"
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"188.190.74.128","group_name":"canon-e2e-group","cause":"second as bare"}'
+check "200" "ban the bare form of the SAME address"
+
+api_call GET "/api/ips?groups=canon-e2e-group" "$MASTER_KEY"
+check "200" "list the canonicalization test group"
+check_jq "length" "1" "the /32 and bare forms collapsed into exactly one stored record"
+check_jq ".[0].target_address" "188.190.74.128" "stored in canonical (bare) form, not '.../32'"
+check_jq ".[0].cause" "second as bare" "the second call updated the same row (proving it was a re-registration, not a duplicate insert)"
+
+log "Deleting via the /32 form must remove a record that is actually stored bare..."
+api_call DELETE "/api/ips?target_address=188.190.74.128/32&group_name=canon-e2e-group" "$MASTER_KEY"
+check "204" "delete succeeds even though the stored value has no '/32' suffix"
+api_call GET "/api/ips?groups=canon-e2e-group" "$MASTER_KEY"
+check_jq "length" "0" "the record is actually gone"
+
+log "A genuine subnet (not a single-host CIDR) must keep its CIDR notation unchanged..."
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.0/24","group_name":"canon-e2e-group","cause":"real subnet"}'
+check "200" "ban a /24 subnet"
+api_call GET "/api/ips?groups=canon-e2e-group" "$MASTER_KEY"
+check_jq ".[0].target_address" "203.0.113.0/24" "a /24 is stored with its CIDR notation intact, not stripped like /32"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

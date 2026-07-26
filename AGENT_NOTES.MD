@@ -1417,3 +1417,125 @@ this session was scoped entirely to `src/api.rs`'s ban/white handler and the fro
 - `static/`: HTML tag balance, duplicate-id, `getElementById`, `data-tab`, and combobox-class
   cross-checks all clean (no HTML changed this session; re-run to confirm the JS changes didn't
   introduce any new unresolved references).
+
+---
+
+## 2026-07-26 (session 12) — group_type on creation, JSON.parse crash fix, IP canonicalization
+
+Three independent fixes this session, one of which (`apiFetch`'s crash) traced back to a real,
+previously-undiscovered backend inconsistency rather than being purely a frontend bug.
+
+### Task 2: `apiFetch` crashed on any 200-with-empty-body response, not just 204
+
+Root cause: `update_key_group_permissions` and `handle_ip_upsert` both return a bare
+`Ok(axum::http::StatusCode::OK)` — 200 with **no body at all** — while the old `apiFetch` only
+special-cased genuine `204`s (`if (res.status === 204) return null;`) before unconditionally
+calling `await res.json()`. Any successful call to `POST /api/keys/:id/groups` (i.e. every
+"Assign Group Rights" submission) or `/api/ban`/`/api/white` (every ban/whitelist submission) hit
+`res.json()` against zero bytes and threw `SyntaxError: Unexpected end of JSON input` — this was
+likely happening on some of the most common actions in the app, not an edge case.
+
+Rewrote the body-handling in `static/app.js`'s `apiFetch` to read the body as text once, then
+`JSON.parse` only when non-empty (falling back to `{}` for a genuinely empty body), with the
+`JSON.parse` itself wrapped in a `try`/`catch` that falls back to the raw text — this also
+subsumed the old error-path's separate `content-type`-sniffing branch (`isJson ? await res.json()
+: await res.text()`), which had the identical crash risk on a JSON-content-typed-but-empty error
+body. Confirmed no call site anywhere in `app.js` checks the return value against `=== null`
+before making this change (`grep`ped for it), so collapsing "204" and "200 empty body" into the
+same `{}` return value is behavior-neutral for every existing caller.
+
+### Task 1: `group_type` on `POST /api/groups`
+
+`CreateIpGroupPayload` gained `pub group_type: Option<String>`; `create_ip_group` now does
+`match payload.group_type.as_deref() { Some("whitelist") => "whitelist", _ => "banlist" }` —
+deliberately never rejects the request over this field, matching the task's explicit
+"defaulting to banlist if omitted **or invalid**" (a typo'd `group_type` silently becomes
+banlist rather than a 400, which is arguably debatable but is exactly what was specified). The
+create response now also echoes back `group_type` so the frontend doesn't need a full reload to
+know what it just created.
+
+`static/index.html`: added `<select id="group-type-select">` (Banlist selected by default,
+Whitelist as the other option) next to the group-name input, and a `Type` column to the groups
+table. `static/app.js`: `createGroup()` reads the select and includes `group_type` in the POST
+body; `renderGroupsTable()` renders it as a badge, reusing the *existing* `.badge-ban`/
+`.badge-white` classes (already used by the IP-records status column) rather than inventing
+parallel new ones — same red/green semantics the task asked for, already in the stylesheet.
+
+### Task 3: IP/CIDR canonicalization
+
+Added `pub fn normalize_ip_or_cidr(input: &str) -> String` in `src/api.rs`, using the crate
+already in `Cargo.toml` (`ipnetwork`, not the `ipnet` the task's example mentioned — functionally
+equivalent, and introducing a second network-address crate for one function would've been pure
+duplication). Infallible by design: unparseable input passes through unchanged, since two of its
+three call sites need that fallback to keep working as a substring/best-effort match rather than
+becoming a new validation gate:
+
+```rust
+pub fn normalize_ip_or_cidr(input: &str) -> String {
+    match input.parse::<IpNetwork>() {
+        Ok(net) => {
+            let is_single_host = (net.is_ipv4() && net.prefix() == 32) || (net.is_ipv6() && net.prefix() == 128);
+            if is_single_host { net.ip().to_string() } else { net.to_string() }
+        }
+        Err(_) => input.to_owned(),
+    }
+}
+```
+
+Verified `ipnetwork::IpNetwork::ip()` returns the address exactly as parsed, not masked to the
+network base (checked the crate source directly rather than assuming) — this is what makes a
+non-aligned host-within-a-subnet like `188.190.74.130/24` round-trip unchanged instead of
+silently becoming `188.190.74.0/24`, which the task's "subnets retain their CIDR notation"
+requirement depends on.
+
+Applied at all three places that actually needed it:
+- `handle_ip_upsert` (`/api/ban`, `/api/white`): computed once as `normalized_address` right
+  after the existing parse/validation, then used for the DB lookup, the stored `target_address`,
+  the audit log, and the webhook event — replacing every prior use of the raw
+  `payload.target_address`.
+- `delete_ip`: normalized immediately after extracting `target_address` from the merged query/body
+  params (shadowed in place), before the exact-match DB lookup — a record banned as `"X/32"` is
+  now deletable by a caller passing plain `"X"`, and vice versa.
+- `list_ips`'s `ip=` substring filter: best-effort only — normalizes the filter value if it
+  happens to parse as a full address/CIDR, otherwise passes a genuine partial fragment (e.g.
+  `"74.128"`) through unchanged, since that's a substring `.contains()` match, not an exact
+  lookup, and over-normalizing would break legitimate partial searches.
+
+No change was needed anywhere `WebhookEvent.address`/audit `target_address` read from an
+already-fetched `ip_record` row (e.g. `delete_ip`'s webhook event uses `record.target_address`) —
+those are already correct by construction once writes are canonicalized, since whatever's actually
+stored in the DB is definitionally already in canonical form.
+
+### Tests
+
+- `tests/rbac_integration_tests.rs`, 2 new (Rust-side scope was explicitly canonicalization only
+  per the task; group_type creation coverage was explicitly scoped to the E2E script instead —
+  followed that split rather than second-guessing it):
+  `test_normalize_ip_or_cidr_strips_single_host_prefixes_only` (direct calls into
+  `simply_firewall::api::normalize_ip_or_cidr`, matching the established pattern already used for
+  `generate_random_key`/`hash_key` — a table of `/32`, `/128`, bare, real-subnet, non-aligned-host,
+  and unparseable-input cases) and `test_ban_deduplicates_slash_32_and_bare_ip_representations`
+  (end-to-end: ban `/32` then bare → exactly one record in canonical form; delete via `/32` a
+  record that's actually stored bare, and vice versa).
+- `scripts/test_e2e.sh`, 2 new sections: **§17 Group Type Creation & Display** (explicit
+  whitelist, explicit banlist, omitted → banlist default, invalid value → banlist default
+  rather than 400, and confirms the type persists through `GET /api/groups` not just the create
+  response) and **§18 IP Address Canonicalization** (the same dedup/cross-representation-delete
+  scenario as the Rust test, driven over real HTTP via curl, plus a negative case proving a `/24`
+  subnet's notation survives unstripped).
+
+No changes were needed to `src/error.rs`, `src/middleware.rs`, `src/state.rs`,
+`src/migration/`, or any entity this session.
+
+### Final verification (session 12)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **34/34 pass** (32 carried over + 2 new).
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `scripts/test_e2e.sh`: **157/157 checks pass**, twice in a row (137 carried over from session 11
+  + 20 new: 5 group-type-creation checks + 2 group-type-persistence checks in §17, plus 4
+  dedup/canonical-form checks + 2 cross-representation-delete checks + 2 subnet-preservation
+  checks in §18, plus the intermediate seed/list checks each section also runs), exit code `0`
+  both times, both port 3000 and the webhook receiver's port 18763 confirmed free after each run.
+- `static/`: HTML tag balance, duplicate-id, `getElementById`, `data-tab`, and combobox-class
+  cross-checks all clean.

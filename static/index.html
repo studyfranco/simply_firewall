@@ -144,6 +144,13 @@
                                 <label for="create-group-name">Group Name <span>*</span></label>
                                 <input type="text" id="create-group-name" required class="input-field">
                             </div>
+                            <div class="form-group">
+                                <label for="group-type-select">Type</label>
+                                <select id="group-type-select" class="input-field select-field">
+                                    <option value="banlist" selected>Banlist</option>
+                                    <option value="whitelist">Whitelist</option>
+                                </select>
+                            </div>
                             <div class="form-group form-group-action">
                                 <label class="label-spacer">&nbsp;</label>
                                 <button type="submit" class="btn btn-primary">Create</button>
@@ -152,7 +159,7 @@
                     </form>
                     <div class="table-container mt-4">
                         <table class="data-table">
-                            <thead><tr><th>ID</th><th>Name</th><th>Actions</th></tr></thead>
+                            <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Actions</th></tr></thead>
                             <tbody id="groups-table-body"></tbody>
                         </table>
                     </div>
