@@ -385,3 +385,95 @@ the server and exercising its most basic, most common operation twice in a row. 
 that gap for the specific paths exercised above. Recommend that any future change touching
 `on_conflict(...)` double-check whether `.do_nothing()` is used and, if so, use
 `exec_without_returning` — this is a recurring SeaORM pitfall, not a one-off typo.
+
+---
+
+## 2026-07-26 (session 3) — README, doc-path fix, expanded RBAC/key-lifecycle tests, commit
+
+### Found: working tree was already committed (and pushed) under a WIP message
+
+At the start of this session `git status`/`git diff` were both empty — `git log` showed a new top
+commit, `c4c0bd6 "Try to debug"`, containing the entirety of sessions 1 and 2's changes (confirmed
+via `git show --stat`, which matches the file list from both prior worklog entries). `git branch -vv`
+showed `master` exactly matching `origin/master` — **that commit is already pushed**. This turn's
+task asked for "a clean, structured commit" with a specific message; since the existing commit is
+already on the shared remote, amending/rewriting it would require a force-push, which is out of
+scope for a task that didn't ask for one. Instead, this session's new work (below) is committed
+fresh on top, using the requested message/title for that new commit — see the end of this entry.
+
+### Found & fixed: `AGENT.MD` documented `/api/v1/*`, but the router mounts at `/api`
+
+This session's task (and `AGENT.MD` itself, in half a dozen places) referred to the API living
+under `/api/v1/*`. The actual router (`src/lib.rs`) does `.nest("/api", api_routes)` — there has
+never been a `/v1` segment. Also found in the same block: the `AGENT.MD` "Add multiples IP" `curl`
+example posted to `/api/v1/ips`, which isn't a route at all (no handler is registered for `POST
+/ips`; adding an IP is `POST /ban` or `POST /white`). Given:
+- three independent sources (`AGENT.MD`, this task's own text, and the original curl examples)
+  all assumed `/api/v1`, but
+- actually adding a real `/v1` prefix would be an invasive, wide-reaching change (touching the
+  router, `static/app.js`'s `apiBase`, and every path string across the whole test suite) that
+  wasn't asked for and risks regressions right before a "final sanity check",
+
+the fix applied was to correct the **documentation** to match the actual, tested, working paths
+(`/api/...`), and fix the broken example to use `POST /api/ban` instead of a non-existent `POST
+/api/ips`. Flagging here explicitly in case the intent really was to add versioning to the live
+API — that's a bigger, separate decision this session did not make unilaterally.
+
+### `README.md`
+
+Was previously just a two-line stub (title + tagline, no setup/usage/API docs at all). Rewritten
+to cover: prerequisites, `cargo run`, exactly what happens on first boot (migrations, the
+master-key bootstrap banner and that it's a one-time, unrecoverable reveal — including that
+deleting all master keys causes a fresh one to be generated on next boot, matching the fix from
+session 1), the environment variable table (`DATABASE_URL`, `BOOTSTRAP_SUBNET`,
+`ALLOW_PRIVATE_WEBHOOKS`, `RUST_LOG` — cross-checked against actual `std::env::var(...)` call sites
+in `src/main.rs`/`src/webhooks.rs`, not assumed), Docker usage, a full route table with the real
+`/api` paths and `GET /api/ips` query parameters, worked `curl` examples, and a development section
+(`cargo check --all-targets`, `cargo test`, `cargo clippy`).
+
+### `tests/rbac_integration_tests.rs` — three new tests (API key lifecycle & RBAC)
+
+Added a small `insert_key(...)` test helper (name + all four boolean flags → `(Uuid, plaintext)`)
+to cut down on the boilerplate the existing tests all repeated by hand, and three new
+`#[tokio::test]`s:
+
+- **`test_key_creation_lifecycle`**: a master key creates a new key via `POST /api/keys` with
+  `bound_ips` and specific global flags (`can_manage_keys`, `can_manage_webhooks`); asserts the
+  create response *and* the row actually persisted in the DB match what was requested (not just an
+  echo of the input), and that a non-privileged key gets `403` attempting the same call.
+- **`test_group_permission_assignment_boundaries`**: `Key_B` with zero global rights is granted
+  `can_read=true, can_write=false` on `Group_X` via `POST /api/keys/{id}/groups`; asserts it can
+  read (`200`, correct data) but not write (`403`); the grant is then upgraded to `can_write=true`
+  and the same write that was just forbidden now succeeds (`200`) — proves permission changes take
+  effect immediately, no caching.
+- **`test_key_deletion_revokes_access_and_cascades_permissions`**: after confirming `Key_B` works,
+  master deletes it via `DELETE /api/keys/{id}`; asserts every subsequent request using that key's
+  header gets `401` immediately (not just that it's absent from `GET /api/keys`), and queries
+  `api_key_group_permissions` directly to confirm the `ON DELETE CASCADE` FK left zero orphaned
+  rows for the deleted key.
+
+Needed to add `ColumnTrait`/`QueryFilter` to the file's `sea_orm` import (the two new DB assertions
+needed `.filter(...)`, which the file hadn't required before).
+
+### Final verification (session 3)
+
+- `cargo check --tests`: clean.
+- `cargo test --all-targets`: **11/11 pass** (8 carried over from sessions 1–2 + 3 new this
+  session).
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- `grep -rn -E "\.unwrap\(\)|\.expect\(" src/`: no matches.
+
+### Git
+
+Reviewed `git status`/`git diff` for this session's changes (`AGENT.MD`, `README.md`,
+`AGENT_NOTES.MD`, `tests/rbac_integration_tests.rs`) before staging — nothing unexpected, no
+secrets, no unrelated files. Committed with:
+
+```
+feat: upgrade to Rust 2024, fix SeaORM re-ban conflict bug, harden webhooks and improve UI
+```
+
+as the title (as requested), with a body listing this commit's actual contents (README, doc-path
+fix, new tests) plus a note that it builds on the already-pushed `c4c0bd6` for the bulk of the
+Rust-2024/bug-fix/UI work the title refers to — kept the title the user asked for while keeping the
+body honest about which changes are actually in this diff. Not pushed — no push was requested.

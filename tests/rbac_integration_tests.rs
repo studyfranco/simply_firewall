@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection, EntityTrait};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait, QueryFilter};
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use tower::ServiceExt;
@@ -663,4 +663,257 @@ async fn test_create_webhook_rejects_invalid_url() {
 
     let res = app.clone().oneshot(make_req("https://example.com/hook")).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+}
+
+// ─────────────────────────────────────────────────────────────
+// API Key lifecycle & RBAC permission enforcement
+// ─────────────────────────────────────────────────────────────
+
+async fn insert_key(
+    db: &DatabaseConnection,
+    name: &str,
+    is_master: bool,
+    can_manage_keys: bool,
+    can_manage_webhooks: bool,
+    can_create_groups: bool,
+) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let plaintext = simply_firewall::api::generate_random_key();
+    let hash = simply_firewall::api::hash_key(&plaintext);
+    simply_firewall::entities::api_key::ActiveModel {
+        id: Set(id),
+        key_hash: Set(hash),
+        name: Set(name.to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(is_master),
+        can_manage_keys: Set(can_manage_keys),
+        can_manage_webhooks: Set(can_manage_webhooks),
+        can_create_groups: Set(can_create_groups),
+        prefix: Set("dummy123".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    (id, plaintext)
+}
+
+/// Covers: a master key can create a new API key with specific global flags and `bound_ips`; a
+/// non-privileged key gets `403 Forbidden` attempting the same.
+#[tokio::test]
+async fn test_key_creation_lifecycle() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/keys")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "name": "CI Bot",
+            "bound_ips": "10.0.0.0/8",
+            "can_manage_keys": true,
+            "can_manage_webhooks": true
+        }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(created["plaintext_key"].as_str().is_some_and(|s| !s.is_empty()));
+    assert_eq!(created["bound_ips"], "10.0.0.0/8");
+    let new_key_id = created["id"].as_str().unwrap();
+
+    // Confirm the persisted flags actually match what was requested (not just the create
+    // response echoing the input back).
+    let stored = simply_firewall::entities::api_key::Entity::find_by_id(Uuid::parse_str(new_key_id).unwrap())
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.can_manage_keys);
+    assert!(stored.can_manage_webhooks);
+    assert!(!stored.can_create_groups);
+    assert_eq!(stored.bound_ips.as_deref(), Some("10.0.0.0/8"));
+
+    // A non-privileged key (no is_master, no can_manage_keys) must be forbidden from creating keys.
+    let (_plain_id, plain_key) = insert_key(&db, "Plain", false, false, false, false).await;
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/keys")
+        .header("X-API-Key", &plain_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "name": "Should Not Exist" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+}
+
+/// Covers: a key with zero global rights, scoped only via `ApiKeyGroupPermission`, is correctly
+/// gated by `can_read`/`can_write` independently, and a live permission upgrade takes effect
+/// immediately on the next request (no caching/staleness).
+#[tokio::test]
+async fn test_group_permission_assignment_boundaries() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (key_b_id, key_b) = insert_key(&db, "Key_B", false, false, false, false).await;
+
+    // Master grants Key_B read-only rights on "Group_X" (auto-provisions the group).
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{key_b_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_name": "Group_X",
+            "can_read": true,
+            "can_write": false,
+            "can_delete": false
+        }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Master seeds an address into Group_X so there is something for Key_B to read.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "203.0.113.1", "group_name": "Group_X" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Key_B can read Group_X.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=Group_X")
+        .header("X-API-Key", &key_b))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["target_address"], "203.0.113.1");
+
+    // Key_B cannot write to Group_X yet.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &key_b)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "203.0.113.2", "group_name": "Group_X" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    // Master upgrades Key_B to can_write = true.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{key_b_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_name": "Group_X",
+            "can_read": true,
+            "can_write": true,
+            "can_delete": false
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Key_B can now write to Group_X.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &key_b)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "203.0.113.2", "group_name": "Group_X" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+}
+
+/// Covers: deleting an API key immediately invalidates it (`401` on next use, not just "no longer
+/// listed"), and the FK `ON DELETE CASCADE` on `api_key_group_permissions.api_key_id` leaves no
+/// orphaned permission rows behind.
+#[tokio::test]
+async fn test_key_deletion_revokes_access_and_cascades_permissions() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (key_b_id, key_b) = insert_key(&db, "Key_B", false, false, false, false).await;
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{key_b_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_name": "Group_X",
+            "can_read": true,
+            "can_write": true,
+            "can_delete": false
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Sanity check: Key_B actually works before deletion.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &key_b))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let perms_before = simply_firewall::entities::api_key_group_permission::Entity::find()
+        .filter(simply_firewall::entities::api_key_group_permission::Column::ApiKeyId.eq(key_b_id))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(perms_before.len(), 1);
+
+    // Master deletes Key_B.
+    let req = inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{key_b_id}"))
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    // Immediately, any request using Key_B's header must be rejected as unauthorized.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &key_b))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=Group_X")
+        .header("X-API-Key", &key_b))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // No orphaned api_key_group_permissions rows survive the deleted key.
+    let perms_after = simply_firewall::entities::api_key_group_permission::Entity::find()
+        .filter(simply_firewall::entities::api_key_group_permission::Column::ApiKeyId.eq(key_b_id))
+        .all(&db)
+        .await
+        .unwrap();
+    assert!(perms_after.is_empty());
 }
