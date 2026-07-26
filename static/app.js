@@ -97,10 +97,9 @@ class FirewallClient {
         // Enforce RBAC logic
         const p = this.state.profile;
         const manageIpEl = document.getElementById('manage-ip-section');
-        const adminTab = document.querySelector('button[data-tab="admin"]');
+        const keysTab = document.getElementById('keys-tab-btn');
+        const webhooksTab = document.getElementById('webhooks-tab-btn');
         const auditTab = document.getElementById('audit-tab-btn');
-        const keysSection = document.getElementById('apikey-section');
-        const webhooksSection = document.getElementById('webhooks-section');
         const groupsSection = document.getElementById('groups-section');
 
         // Manage IPs
@@ -110,17 +109,17 @@ class FirewallClient {
             manageIpEl.style.display = 'block';
         }
 
-        // Admin Tab
-        let showAdminInfo = p.is_master || p.can_manage_keys || p.can_manage_webhooks;
+        // IP Groups card lives on the IPs & Groups tab; kept visible under the same condition
+        // that used to gate the whole shared "Administration" tab, since either scope previously
+        // implied seeing it.
+        const showAdminInfo = p.is_master || p.can_manage_keys || p.can_manage_webhooks;
+        groupsSection.style.display = showAdminInfo ? 'block' : 'none';
 
-        if (showAdminInfo) {
-            adminTab.style.display = 'inline-block';
-            keysSection.style.display = (p.is_master || p.can_manage_keys) ? 'block' : 'none';
-            webhooksSection.style.display = (p.is_master || p.can_manage_webhooks) ? 'block' : 'none';
-            groupsSection.style.display = 'block';
-        } else {
-            adminTab.style.display = 'none';
-        }
+        // API Keys & Permissions tab
+        keysTab.style.display = (p.is_master || p.can_manage_keys) ? 'inline-block' : 'none';
+
+        // Webhooks tab
+        webhooksTab.style.display = (p.is_master || p.can_manage_webhooks) ? 'inline-block' : 'none';
 
         // Audit Logs Tab — the backend restricts GET /audit-logs to master keys, so hide the tab
         // entirely rather than show it and let every request 403.
@@ -135,6 +134,10 @@ class FirewallClient {
         await this.loadIps();
         if (this.state.profile.is_master || this.state.profile.can_manage_keys) {
             await this.loadKeys();
+        }
+        // Groups feed both the Keys tab's "Manage Group Rights" selector and the Webhooks tab's
+        // "Target Group" selector, so either scope needs the list loaded — not just can_manage_keys.
+        if (this.state.profile.is_master || this.state.profile.can_manage_keys || this.state.profile.can_manage_webhooks) {
             await this.loadGroups();
         }
         if (this.state.profile.is_master || this.state.profile.can_manage_webhooks) {
@@ -185,6 +188,7 @@ class FirewallClient {
             this.state.groups = await this.apiFetch('/groups');
             this.renderGroupsTable();
             this.updateGroupSelector();
+            this.updateWebhookGroupSelector();
         } catch(e) {}
     }
 
@@ -358,6 +362,20 @@ class FirewallClient {
         const previousValue = sel.value;
         sel.innerHTML = '<option value="">-- Select Group --</option>' + this.state.groups.map(g =>
             `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`
+        ).join('');
+        if (previousValue) sel.value = previousValue;
+    }
+
+    // Populates the Webhooks tab's "Target Group" dropdown. Unlike updateGroupSelector() above,
+    // this one needs the group's UUID (not its name): CreateWebhookPayload.group_id is a strict
+    // Uuid field with no flexible name-or-id resolution like the permission-assignment endpoints.
+    updateWebhookGroupSelector() {
+        const sel = document.getElementById('webhook-group-id');
+        if (!sel) return;
+
+        const previousValue = sel.value;
+        sel.innerHTML = '<option value="">-- Select Group --</option>' + this.state.groups.map(g =>
+            `<option value="${g.id}">${escapeHtml(g.name)}</option>`
         ).join('');
         if (previousValue) sel.value = previousValue;
     }

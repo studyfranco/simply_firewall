@@ -1024,3 +1024,124 @@ entirely in the shell E2E script's coverage and its readiness-probe target.
 - `scripts/test_e2e.sh`: **95/95 checks pass**, twice in a row (78 carried over from session 7 + 17
   new: 1 JSON-body-delete sequence + 8 webhook-lifecycle checks + 8 key-deletion checks), exit code
   `0` both times, port 3000 confirmed free after each run.
+
+---
+
+## 2026-07-26 (session 9) — Dedicated Webhooks tab, UI polish, 2 more edge-case E2E tests
+
+Scope this session: frontend-only navigation restructuring (`static/`) plus two more E2E edge
+cases (invalid IP validation, group-deletion cascade). No backend logic changes were required for
+either — both behaviors already existed and just needed test coverage.
+
+### `static/index.html` + `static/app.js`: 3 tabs → 4 tabs
+
+Split the old 3-tab layout (Firewall Rules / Administration / Audit Logs) into 4, per the task's
+explicit naming: **IPs & Groups**, **API Keys & Permissions**, **Webhooks**, **Audit Logs**. The
+old "Administration" tab had crammed three unrelated sections (API Keys, IP Groups, Webhook
+Configs) into one shared panel; this session gives each its own top-level tab, moving IP Groups
+alongside IP records (both are "the firewall's data model", unlike Keys/Webhooks which are
+"who's allowed to touch it").
+
+- `data-tab`/`id="tab-*"` pairs: kept `firewall` (relabeled "IPs & Groups" — the internal id
+  didn't need to match the new display text) and `audit` unchanged; added `keys` and `webhooks` as
+  new top-level tabs. The existing generic tab-click handler (`document.getElementById(\`tab-${trg.dataset.tab}\`)`)
+  needed zero changes — it was already fully data-driven.
+- `enforceRBACUI()`: previously toggled `display` on 3 sections nested inside one shared `adminTab`
+  button; rewritten to show/hide the `keys-tab-btn` and `webhooks-tab-btn` buttons independently
+  (`is_master || can_manage_keys` and `is_master || can_manage_webhooks` respectively — unchanged
+  logic, just re-targeted at two buttons instead of one). The IP Groups card's visibility rule was
+  left exactly as before (visible whenever `is_master || can_manage_keys || can_manage_webhooks`)
+  to avoid a behavior change beyond what was asked.
+- **Found and fixed a pre-existing markup bug** while relocating the Webhook Configs section: the
+  `webhook-url` field's `<div class="form-group">` was never closed, so `webhook-name`,
+  `webhook-secret`, `webhook-group-id`, `webhook-headers`, and `webhook-template` were all nested
+  *inside* the URL field's div instead of being siblings. Browsers silently tolerate this (no
+  visible symptom), but it was still wrong markup; fixed while the section was already being
+  touched.
+- **Webhook "Target Group" upgraded from a raw text input to a `<select>`**: it previously asked
+  the operator to hand-type a group UUID with a placeholder of `"UUID"` — a copy-paste-or-guess
+  field with no validation until submit. Added `updateWebhookGroupSelector()` (mirrors the
+  existing `updateGroupSelector()` pattern used by "Manage Group Rights"), populated with
+  `<option value="${g.id}">${g.name}</option>` since `CreateWebhookPayload.group_id` is a strict
+  `Uuid` with no name-or-id flexible resolution (unlike the permission-assignment endpoints) — the
+  dropdown shows names but still submits a real UUID underneath.
+  - This introduced a real dependency that didn't exist before: populating that dropdown needs
+    `this.state.groups` loaded, but `loadInitialData()` previously only called `loadGroups()` under
+    `is_master || can_manage_keys` — a key with `can_manage_webhooks` alone (a legitimate,
+    intentional RBAC combination per `AGENT.MD`) would reach the Webhooks tab but find the group
+    dropdown permanently empty. Fixed by broadening that condition to
+    `is_master || can_manage_keys || can_manage_webhooks`; confirmed `GET /api/groups` itself has
+    no scope requirement beyond authentication, so this doesn't over-fetch anything a
+    webhooks-only key wasn't already allowed to see.
+- Custom Headers field changed from a single-line `<input>` to a 2-row `<textarea>`, matching the
+  task's framing of this as "a dedicated page for webhook configuration, custom headers, and
+  payload templates" — cosmetic only, `document.getElementById('webhook-headers').value` reads
+  identically off either element so no JS logic changed.
+- `static/style.css`: **no changes needed.** The existing utility classes (`.admin-grid` as a
+  single-column card wrapper, `.tab-nav`'s already-responsive flex row with mobile
+  `overflow-x: auto`, `.select-field`, `.input-field` applying uniformly to both `<input>` and
+  `<textarea>`) already fully supported the new 4-tab structure. Forcing a CSS edit just to touch
+  the file would have been unjustified churn.
+
+### UI verification: static analysis, not a live browser
+
+Attempted to launch a real headless browser to click through the new tabs and screenshot them
+(the established pattern from an earlier session's UI check). Headless Chromium crashes
+immediately in this container on startup (`Trace/breakpoint trap`, exit 133) regardless of
+`--no-sandbox`, `--disable-dev-shm-usage`, `--single-process`, or disabling the Bash tool's own
+sandbox — `crashpad`'s own diagnostics point to `pread64: Input/output error` against
+`/proc/*/mem`, indicating the restriction is enforced by the container runtime itself, below
+anything a Chromium flag or this tool's sandbox setting can reach. `chromedriver` (also present)
+hits the identical crash when it launches Chromium under the hood. No project skill for driving
+this app's UI existed to fall back to.
+
+Rather than claim a visual verification that didn't happen, substituted a static structural check
+(`html.parser`-based, in `scripts/` scratch space, not committed) that: parses `index.html` for
+unclosed/mismatched tags (would have caught the `webhook-url` div bug above on its own), checks
+every element `id` is unique, cross-references all 70 `getElementById()` calls in `app.js` against
+real ids in `index.html`, and confirms the 4 `data-tab` values and 4 `id="tab-*"` panels are an
+exact bijection. All checks passed. This is weaker evidence than an actual rendered screenshot and
+is disclosed as such — if real browser rendering is ever needed again, this container needs
+investigation outside Claude Code's own sandboxing (or testing from a different environment).
+
+### `scripts/test_e2e.sh`: 2 new edge-case sections (11, 12)
+
+- **§11 Invalid Input Validation**: `POST /api/ban` with `target_address: "999.999.999.999"`
+  asserts `400`. Traced the path first rather than assuming: `handle_ip_upsert` calls
+  `payload.target_address.parse::<IpNetwork>()`, which rejects the malformed address, mapping to
+  `AppError::InvalidInput` → `StatusCode::BAD_REQUEST` in `src/error.rs`. No backend change needed.
+- **§12 Group Deletion Cascade**: creates `cascade-test-group`, adds an IP record and a key
+  permission to it, deletes the group, and asserts: the `DELETE` itself is `204` (not an FK-
+  violation error), the group is gone from `GET /api/groups`, the IP record's row disappears from
+  `GET /api/ips` (not just becomes group-less — see below), and re-granting a permission against
+  the now-dead UUID returns `404`.
+  - Verified this would actually pass *before* running it, since AGENT.MD documents `(CASCADE)` FKs
+    but doesn't guarantee SQLite enforces them: `grep`ped the whole repo for `foreign_keys`/`PRAGMA`
+    and found it's never explicitly set anywhere. Checked `sqlx-sqlite`'s own source
+    (`~/.cargo/registry/.../sqlx-sqlite-0.9.0/src/options/mod.rs:187`) and confirmed
+    `SqliteConnectOptions` defaults `PRAGMA foreign_keys` to `ON` per-connection — unlike raw
+    SQLite's own C-library default (off) — so the declarative `ON DELETE CASCADE` in the
+    migrations is genuinely enforced, not just documentation. No latent orphan-row bug found.
+  - Also confirmed why the *IP record itself* disappears from `GET /api/ips?ip=...` rather than
+    surviving with no group: `list_ips` is rooted at
+    `ip_record_group_membership::Entity::find().find_also_related(ip_record::Entity)` — a query
+    that starts from the membership join table, not `ip_records` directly. Cascading away the
+    group's only membership row for that address removes it from every possible `GET /api/ips`
+    result, since there's no membership row left to join through.
+- Both new sections use the same `api_call`/`check`/`check_jq`/`check_true` helpers as every other
+  section — no new script infrastructure needed.
+
+No changes were needed to `src/main.rs`, `src/api.rs`, `src/error.rs`, `src/migration/`, or
+`tests/rbac_integration_tests.rs` this session — every behavior exercised by the two new E2E
+sections was already correctly implemented; the gap was purely in test coverage.
+
+### Final verification (session 9)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **28/28 pass**, unchanged (no Rust source touched this session).
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `scripts/test_e2e.sh`: **104/104 checks pass**, twice in a row (95 carried over from session 8 +
+  9 new: 1 invalid-input check + 8 group-deletion-cascade checks), exit code `0` both times, port
+  3000 confirmed free after each run.
+- `static/`: HTML tag balance, duplicate-id, and `getElementById`/tab-wiring cross-checks all
+  clean (see "UI verification" above for why this substitutes for a live screenshot here).

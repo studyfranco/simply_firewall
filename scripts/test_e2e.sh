@@ -571,6 +571,45 @@ check "401" "the deleted key's secret is rejected immediately after deletion"
 api_call DELETE "/api/keys/$DISPOSABLE_ID" "$MASTER_KEY"
 check "404" "deleting an already-deleted key returns 404, not another 204"
 
+# ── 11. Invalid input validation ────────────────────────────────────────────
+
+log_section "11. Invalid Input Validation"
+
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"999.999.999.999","group_name":"Group-A","cause":"malformed"}'
+check "400" "banning a malformed address (999.999.999.999) is rejected with 400 Bad Request"
+
+# ── 12. Group deletion cascade ───────────────────────────────────────────────
+
+log_section "12. Group Deletion Cascade"
+
+log "Creating a temporary group, then attaching an IP record and a key permission to it..."
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"cascade-test-group"}'
+check "200" "create the temporary cascade-test-group"
+CASCADE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.90","group_name":"cascade-test-group","cause":"cascade delete test"}'
+check "200" "add an IP record into the temporary group"
+
+create_scoped_key "Cascade Test Key"
+CASCADE_KEY_ID="$CREATED_ID"
+api_call POST "/api/keys/$CASCADE_KEY_ID/groups" "$MASTER_KEY" \
+    "{\"group_id\":\"$CASCADE_GROUP_ID\",\"can_read\":true,\"can_write\":true,\"can_delete\":false}"
+check "200" "grant a key permission on the temporary group"
+
+log "Deleting the group while it still owns an IP record and a key permission..."
+api_call DELETE "/api/groups/$CASCADE_GROUP_ID" "$MASTER_KEY"
+check "204" "the group with attached records/permissions is removed cleanly, with no FK error"
+
+api_call GET "/api/groups" "$MASTER_KEY"
+check_true "all(.[]; .id != \"$CASCADE_GROUP_ID\")" "the deleted group no longer appears in the group list"
+
+api_call GET "/api/ips?ip=198.51.100.90" "$MASTER_KEY"
+check_jq "length" "0" "its IP record's membership was cascade-deleted along with the group"
+
+api_call POST "/api/keys/$CASCADE_KEY_ID/groups" "$MASTER_KEY" \
+    "{\"group_id\":\"$CASCADE_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "404" "re-granting a permission against the now-deleted group id fails (group no longer resolvable)"
+
 # ── Summary ──────────────────────────────────────────────────────────────────
 
 log_section "Summary"

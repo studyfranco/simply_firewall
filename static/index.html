@@ -45,13 +45,14 @@
 
         <!-- Tab Navigation -->
         <nav class="tab-nav" role="tablist">
-            <button class="tab-btn active" data-tab="firewall" role="tab" aria-selected="true">Firewall Rules</button>
-            <button class="tab-btn" data-tab="admin" role="tab" aria-selected="false">Administration</button>
+            <button class="tab-btn active" data-tab="firewall" role="tab" aria-selected="true">IPs &amp; Groups</button>
+            <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
+            <button class="tab-btn" data-tab="webhooks" id="webhooks-tab-btn" role="tab" aria-selected="false">Webhooks</button>
             <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
 
         <!-- ═══════════════════════════════════════════════ -->
-        <!-- TAB: Firewall Rules                            -->
+        <!-- TAB: IPs & Groups                               -->
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-firewall" class="tab-panel active">
             <div class="grid-layout">
@@ -127,12 +128,38 @@
                     </div>
                 </section>
             </div>
+
+            <div class="admin-grid mt-4">
+                <!-- IP Groups -->
+                <section class="card admin-section" id="groups-section">
+                    <h2>IP Groups</h2>
+                    <p class="subtitle">Organize IP records.</p>
+                    <form id="form-create-group" class="admin-form">
+                        <div class="form-row">
+                            <div class="form-group form-group-grow">
+                                <label for="create-group-name">Group Name <span>*</span></label>
+                                <input type="text" id="create-group-name" required class="input-field">
+                            </div>
+                            <div class="form-group form-group-action">
+                                <label class="label-spacer">&nbsp;</label>
+                                <button type="submit" class="btn btn-primary">Create</button>
+                            </div>
+                        </div>
+                    </form>
+                    <div class="table-container mt-4">
+                        <table class="data-table">
+                            <thead><tr><th>ID</th><th>Name</th><th>Actions</th></tr></thead>
+                            <tbody id="groups-table-body"></tbody>
+                        </table>
+                    </div>
+                </section>
+            </div>
         </main>
 
         <!-- ═══════════════════════════════════════════════ -->
-        <!-- TAB: Administration                            -->
+        <!-- TAB: API Keys & Permissions                     -->
         <!-- ═══════════════════════════════════════════════ -->
-        <main id="tab-admin" class="tab-panel">
+        <main id="tab-keys" class="tab-panel">
             <div class="admin-grid">
 
                 <!-- API Keys -->
@@ -243,40 +270,25 @@
                     </div>
 
                 </section>
+            </div>
+        </main>
 
-                <!-- IP Groups -->
-                <section class="card admin-section" id="groups-section">
-                    <h2>IP Groups</h2>
-                    <p class="subtitle">Organize IP records.</p>
-                    <form id="form-create-group" class="admin-form">
-                        <div class="form-row">
-                            <div class="form-group form-group-grow">
-                                <label for="create-group-name">Group Name <span>*</span></label>
-                                <input type="text" id="create-group-name" required class="input-field">
-                            </div>
-                            <div class="form-group form-group-action">
-                                <label class="label-spacer">&nbsp;</label>
-                                <button type="submit" class="btn btn-primary">Create</button>
-                            </div>
-                        </div>
-                    </form>
-                    <div class="table-container mt-4">
-                        <table class="data-table">
-                            <thead><tr><th>ID</th><th>Name</th><th>Actions</th></tr></thead>
-                            <tbody id="groups-table-body"></tbody>
-                        </table>
-                    </div>
-                </section>
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: Webhooks                                   -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-webhooks" class="tab-panel">
+            <div class="admin-grid">
 
                 <!-- Webhook Configs -->
                 <section class="card admin-section" id="webhooks-section">
                     <h2>Webhook Configs</h2>
-                    <p class="subtitle">Configure advanced templated webhook events.</p>
+                    <p class="subtitle">Configure advanced templated webhook events, custom headers, and payload templates.</p>
                     <form id="form-create-webhook" class="admin-form">
                         <div class="form-grid">
                             <div class="form-group">
                                 <label for="webhook-url">Target URL <span>*</span></label>
                                 <input type="url" id="webhook-url" placeholder="https://example.com" required class="input-field">
+                            </div>
                             <div class="form-group">
                                 <label for="webhook-name">Webhook Name <span>*</span></label>
                                 <input type="text" id="webhook-name" placeholder="My Alert Hook" required class="input-field">
@@ -286,16 +298,18 @@
                                 <input type="password" id="webhook-secret" placeholder="Shared Secret" required class="input-field">
                             </div>
                             <div class="form-group">
-                                <label for="webhook-group-id">Target Group ID <span>*</span></label>
-                                <input type="text" id="webhook-group-id" placeholder="UUID" required class="input-field">
+                                <label for="webhook-group-id">Target Group <span>*</span></label>
+                                <select id="webhook-group-id" class="input-field select-field" required>
+                                    <option value="">-- Select Group --</option>
+                                </select>
                             </div>
-                            <div class="form-group">
+                            <div class="form-group col-span-2">
                                 <label for="webhook-headers">Custom Headers (JSON)</label>
-                                <input type="text" id="webhook-headers" placeholder='{"Authorization": "Bearer token"}' class="input-field">
+                                <textarea id="webhook-headers" placeholder='{"Authorization": "Bearer token"}' class="input-field" rows="2"></textarea>
                             </div>
                             <div class="form-group col-span-2">
                                 <label for="webhook-template">Payload Template <span>*</span></label>
-                                <textarea id="webhook-template" required class="input-field">{"target_address": "$target_address", "cause": "$cause", "group_name": "$group_name"}</textarea>
+                                <textarea id="webhook-template" required class="input-field" rows="3">{"target_address": "$target_address", "cause": "$cause", "group_name": "$group_name"}</textarea>
                             </div>
                         </div>
                         <div class="form-actions mt-4">
