@@ -5,9 +5,12 @@
 # Builds the project, boots a fresh instance against a throwaway SQLite database with a
 # deterministic bootstrap master key (via INITIAL_MASTER_KEY — no log-scraping), and drives the
 # whole HTTP API with curl + jq: RBAC across a multi-key permission matrix, IP add/list/filter/
-# update/delete across multiple groups (including banlist/whitelist overlap), key lifecycle
-# (create/update/rotate), bound-IP CIDR enforcement, audit log generation + pagination, and the
-# group-identification bug fixes (duplicate-name 409, flexible group_id/group_name).
+# update/delete across multiple groups (including banlist/whitelist overlap, and deletion via
+# both query-string params and a JSON body), key lifecycle (create/update/rotate/delete), bound-IP
+# CIDR enforcement, audit log generation + pagination, webhook lifecycle (create/list/delete, with
+# the mandatory `name` field), and the group-identification bug fixes (duplicate-name 409,
+# flexible group_id/group_name). Every request is logged with a timestamp, method, full URL,
+# color-coded status, and jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
 # Requires: curl, jq. Needs port 3000 free (the app's listen address is not configurable).
@@ -109,7 +112,7 @@ api_call() {
     RESP_STATUS=$(curl "${args[@]}" "$BASE_URL$path")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     local color; color=$(status_color "$RESP_STATUS")
-    printf "%s ${color}[%s]${RESET} %-6s %s\n" "$(ts)" "$RESP_STATUS" "$method" "$path" >&2
+    printf "%s ${color}[%s]${RESET} %-6s %s\n" "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" >&2
     print_response_body
 }
 
@@ -207,12 +210,19 @@ for _ in $(seq 1 60); do
         cat "$SERVER_LOG" >&2
         exit 1
     fi
-    # Readiness is decided purely by whether the HTTP listener answers — never by log content,
-    # which may be buffered and lag behind the process actually being ready to serve.
-    if curl -s -f "$BASE_URL/" >/dev/null 2>&1; then
-        READY=1
-        break
-    fi
+    # Readiness is decided purely by whether the HTTP listener answers on a real API route —
+    # never by log content, which may be buffered and lag behind the process actually being
+    # ready to serve. `/api/groups` sits behind auth middleware, so an unauthenticated probe
+    # never returns a plain connection failure once the server is up; any of 200/401/404 proves
+    # the listener is live and axum is routing requests (curl's own exit code, not `-f`, is what
+    # actually distinguishes "no HTTP response yet" from "got a response").
+    STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/groups" 2>/dev/null)
+    case "$STATUS_CODE" in
+        200|401|404)
+            READY=1
+            break
+            ;;
+    esac
     sleep 0.5
 done
 if [ "$READY" -ne 1 ]; then
@@ -340,11 +350,19 @@ api_call GET "/api/ips?ip=203.0.113.10" "$MASTER_KEY"
 check_jq ".[0].cause" "updated-cause" "the cause was actually updated"
 check_jq "length" "1" "still exactly one row — no duplicate created"
 
-log "Deleting 203.0.113.10 from Group B..."
+log "Deleting 203.0.113.10 from Group B via query-string parameters..."
 api_call DELETE "/api/ips?target_address=203.0.113.10&group_name=Group-B" "$MASTER_KEY"
-check "204" "delete succeeds"
+check "204" "delete via query string succeeds"
 api_call GET "/api/ips?ip=203.0.113.10" "$MASTER_KEY"
-check_jq "length" "0" "the deleted address is gone"
+check_jq "length" "0" "the query-string-deleted address is gone"
+
+log "Adding 203.0.113.20 to Group B, then deleting it via a JSON request body instead..."
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.20","group_name":"Group-B","cause":"json-body-delete-test"}'
+check "200" "add 203.0.113.20 to Group B for the JSON-body delete test"
+api_call DELETE "/api/ips" "$MASTER_KEY" '{"target_address":"203.0.113.20","group_name":"Group-B"}'
+check "204" "delete via JSON body (no query string at all) succeeds"
+api_call GET "/api/ips?ip=203.0.113.20" "$MASTER_KEY"
+check_jq "length" "0" "the JSON-body-deleted address is gone"
 
 # ── 4. Multi-group overlap / conflict detection ─────────────────────────────
 
@@ -499,6 +517,59 @@ check "200" "grant rights on the SAME group via its UUID, seamlessly alongside t
 api_call GET "/api/ips?group_name=fail2ban_nginx" "$NOACCESS_KEY"
 check "200" "the group_name-granted key can read fail2ban_nginx"
 check_jq "length" "1" "and sees the seeded address"
+
+# ── 9. Webhook lifecycle ─────────────────────────────────────────────────────
+
+log_section "9. Webhook Lifecycle (Create / List / Delete)"
+
+log "Omitting the mandatory 'name' field reproduces the originally-reported 422 bug..."
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"target_url\":\"https://webhook.site/e2e-missing-name\",\"secret_token\":\"whsec_e2e\",\"payload_template\":\"{}\",\"group_id\":\"$GROUP_A_ID\"}"
+check "422" "creating a webhook without 'name' is rejected with 422 (missing required field)"
+
+log "Creating a webhook with the correct payload shape (name/target_url/secret_token/payload_template/group_id)..."
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"slack_alert\",\"target_url\":\"https://webhook.site/e2e-test-endpoint\",\"secret_token\":\"whsec_e2e_test_secret\",\"payload_template\":\"{\\\"ip\\\":\\\"{{target_address}}\\\"}\",\"group_id\":\"$GROUP_A_ID\"}"
+check "200" "create the webhook"
+WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+log "Webhook id: $WEBHOOK_ID"
+
+api_call GET "/api/webhooks" "$MASTER_KEY"
+check "200" "list webhooks"
+check_true "any(.[]; .id == \"$WEBHOOK_ID\" and .name == \"slack_alert\")" "the created webhook appears in the list with the right name"
+check_true 'all(.[]; has("secret_token") | not)' "no listed webhook ever exposes its secret_token"
+
+api_call DELETE "/api/webhooks/$WEBHOOK_ID" "$MASTER_KEY"
+check "204" "delete the webhook"
+
+api_call GET "/api/webhooks" "$MASTER_KEY"
+check_true "all(.[]; .id != \"$WEBHOOK_ID\")" "the deleted webhook no longer appears in the list"
+
+api_call DELETE "/api/webhooks/$WEBHOOK_ID" "$MASTER_KEY"
+check "404" "deleting an already-deleted webhook returns 404, not another 204"
+
+# ── 10. Key deletion ─────────────────────────────────────────────────────────
+
+log_section "10. Key Deletion"
+
+log "Creating a disposable key to delete..."
+create_scoped_key "Disposable Key"
+DISPOSABLE_KEY="$CREATED_KEY"; DISPOSABLE_ID="$CREATED_ID"
+
+api_call GET "/api/auth/me" "$DISPOSABLE_KEY"
+check "200" "the disposable key authenticates before deletion"
+
+api_call DELETE "/api/keys/$WRITEONLY_ID" "$NOACCESS_KEY"
+check "403" "a key without can_manage_keys cannot delete other keys"
+
+api_call DELETE "/api/keys/$DISPOSABLE_ID" "$MASTER_KEY"
+check "204" "master deletes the disposable key"
+
+api_call GET "/api/auth/me" "$DISPOSABLE_KEY"
+check "401" "the deleted key's secret is rejected immediately after deletion"
+
+api_call DELETE "/api/keys/$DISPOSABLE_ID" "$MASTER_KEY"
+check "404" "deleting an already-deleted key returns 404, not another 204"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

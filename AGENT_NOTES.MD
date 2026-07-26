@@ -950,3 +950,77 @@ No existing test needed modification.
 - `grep -rn -E "\.unwrap\(\)|\.expect\(" src/`: no matches.
 - `scripts/test_e2e.sh`: **78/78 checks pass**, twice in a row, against a real running instance
   with verbose per-call JSON logging throughout.
+
+---
+
+## 2026-07-26 (session 8) — Readiness polling on a real route, webhook payload fix, full-URL logging
+
+Two issues were reported from live shell testing of the session-7 script: (1) `test_e2e.sh` timed
+out during server boot when cargo's output was redirected, and (2) `POST /api/webhooks` returned
+422 (`missing field 'name'`). Investigated both against the actual current source before touching
+anything, since the task's own suggested webhook payload (`url`/`secret`/`events`) turned out not
+to match the real `CreateWebhookPayload` struct (`name`/`target_url`/`secret_token`/
+`payload_template`/`group_id`) — copying it verbatim would have just traded one 422 for another.
+
+### Root causes
+
+- **Boot timeout**: `src/main.rs` already had both `INITIAL_MASTER_KEY` and explicit
+  `stdout()`/`stderr()` `.flush()` from session 7 — confirmed by direct read, no code change
+  needed there. The actual remaining bug was in the script's *readiness poll*, not the server: it
+  still probed `curl -s -f "$BASE_URL/"` (the static-file root, served by `ServeDir`), and `-f`
+  makes curl treat any non-2xx as a hard failure. If `static/` has no `index.html` (or the timing
+  window catches the listener before `ServeDir` is fully wired), that probe can fail indefinitely
+  even though the API itself is completely up and answering — a false "not ready" that only a real
+  API route would avoid.
+- **Webhook 422**: not actually a broken payload to fix — `test_e2e.sh` had **no webhook test at
+  all** before this session. The 422 in the bug report is exactly what you get from Axum's `Json`
+  extractor when a `#[derive(Deserialize)]` struct has a non-`Option` field that's missing from the
+  body; `CreateWebhookPayload::name` is `String`, not `Option<String>`, so any caller omitting it
+  gets that exact error. Confirmed the real field names by reading `src/api.rs:1292-1309` directly
+  rather than trusting the task's example.
+
+### `scripts/test_e2e.sh` changes
+
+- **Readiness polling** (Boot section): replaced the `curl -f "$BASE_URL/"` check with
+  `STATUS_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/groups")`, looping until it's
+  `200`, `401`, or `404`. `/api/groups` sits behind `auth_middleware`, so an unauthenticated probe
+  reliably gets a real HTTP response (401, in practice) the instant the listener can route
+  requests — no dependency on `static/`'s contents or on log content/timing either way.
+- **Full URL in every log line**: `api_call`'s status-line `printf` used to show bare `%-6s %s`
+  (method + path only); changed the second `%s` from `"$path"` to `"$BASE_URL$path"` so every
+  logged request line is copy-pasteable as a real URL.
+- **JSON-body IP deletion**, added right after the existing query-string deletion case in §3: adds
+  `203.0.113.20` to Group B, then deletes it with `DELETE /api/ips` sending
+  `{"target_address":"...","group_name":"..."}` as the request body instead of query parameters,
+  and confirms it's gone. The query-string variant already existed; this was the untested half of
+  "accepts query or JSON body" (the behavior itself was already covered by
+  `test_delete_ip_accepts_query_or_json_body` in the Rust suite — the shell script just hadn't
+  exercised that path).
+- **New §9 Webhook Lifecycle**: first asserts the *actual* bug report reproduces (`POST
+  /api/webhooks` without `name` → `422`), then creates one with the correct shape (`name`,
+  `target_url`, `secret_token`, `payload_template`, `group_id: $GROUP_A_ID`), lists it back and
+  checks both that it round-trips correctly (`any(.[]; .id == ... and .name == "slack_alert")`) and
+  that `secret_token` never appears in any listed webhook (`all(.[]; has("secret_token") | not)` —
+  exercising the `WebhookSummary` leak guard from session 5 end-to-end over real HTTP, not just in
+  the Rust unit test), deletes it (`204`), confirms it's gone, and confirms deleting it again is
+  `404` rather than a second `204`.
+- **New §10 Key Deletion**: creates a disposable key, confirms a key without `can_manage_keys`
+  gets `403` trying to delete another key, has master delete the disposable key (`204`), confirms
+  the deleted key's secret is rejected (`401`) on the very next request, and confirms deleting the
+  same id again is `404`.
+- Updated the file's header comment to list the newly-covered scenarios (JSON-body IP deletion,
+  key deletion, webhook lifecycle) and the full-URL/timestamp/color/jq-body logging contract.
+
+No changes were needed to `src/main.rs`, `src/api.rs`, or `tests/rbac_integration_tests.rs` this
+session — the Rust-side behavior (webhook creation validation, key deletion cascade, flexible IP
+deletion) was already correct and already covered by existing integration tests; the gap was
+entirely in the shell E2E script's coverage and its readiness-probe target.
+
+### Final verification (session 8)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **28/28 pass**, unchanged from session 7 (no Rust source touched).
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `scripts/test_e2e.sh`: **95/95 checks pass**, twice in a row (78 carried over from session 7 + 17
+  new: 1 JSON-body-delete sequence + 8 webhook-lifecycle checks + 8 key-deletion checks), exit code
+  `0` both times, port 3000 confirmed free after each run.
