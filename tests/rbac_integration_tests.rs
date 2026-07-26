@@ -529,6 +529,158 @@ async fn test_webhook_hmac_signature_and_delivery() {
     assert!(body.contains("5.5.5.5"));
 }
 
+/// A webhook scoped to `events: "IP_ADD"` must fire for a genuinely new address (`IP_ADD`) but
+/// must be skipped for a re-registration of that same address (`IP_UPDATE`) and for its deletion
+/// (`IP_DELETE`) — the dispatcher's per-config event allowlist in `run_webhook_worker`.
+#[tokio::test]
+async fn test_webhook_event_filtering_skips_non_matching_actions() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+
+    let hit_count = Arc::new(AtomicUsize::new(0));
+    let hit_count_for_handler = hit_count.clone();
+
+    let hook_app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move || {
+            let hit_count = hit_count_for_handler.clone();
+            async move {
+                hit_count.fetch_add(1, Ordering::SeqCst);
+                StatusCode::OK
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hook_addr = listener.local_addr().unwrap();
+    let _hook_server = tokio::spawn(async move {
+        axum::serve(listener, hook_app).await.unwrap();
+    });
+
+    unsafe {
+        std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true");
+    }
+
+    let db = setup_test_db().await;
+    let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
+    let db_for_worker = db.clone();
+    let _worker_handle = tokio::spawn(async move {
+        simply_firewall::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+    });
+
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let key_id = Uuid::new_v4();
+    let plaintext = simply_firewall::api::generate_random_key();
+    let hash = simply_firewall::api::hash_key(&plaintext);
+    simply_firewall::entities::api_key::ActiveModel {
+        id: Set(key_id),
+        key_hash: Set(hash),
+        name: Set("Event Filter Tester".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(true),
+        can_manage_keys: Set(true),
+        can_manage_webhooks: Set(true),
+        can_create_groups: Set(true),
+        prefix: Set("dummy123".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let group_id = Uuid::new_v4();
+    simply_firewall::entities::ip_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("event-filter-group".to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let hook_url = format!("http://{hook_addr}/hook");
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "name": "Add-Only Hook",
+            "target_url": hook_url,
+            "secret_token": "irrelevant-for-this-test",
+            "payload_template": "{\"ip\":\"$target_address\"}",
+            "group_id": group_id.to_string(),
+            "events": "IP_ADD",
+        }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // A brand-new address is an IP_ADD — the webhook IS subscribed to this, so it must fire.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "9.9.9.9", "group_name": "event-filter-group" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let mut saw_add_delivery = false;
+    for _ in 0..40 {
+        if hit_count.load(Ordering::SeqCst) >= 1 {
+            saw_add_delivery = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(saw_add_delivery, "IP_ADD should have been delivered to the events:\"IP_ADD\" webhook");
+    assert_eq!(hit_count.load(Ordering::SeqCst), 1, "exactly one delivery so far");
+
+    // Re-registering the SAME address in the SAME group is an IP_UPDATE — not subscribed, must
+    // be skipped. There's no "it happened" signal to poll for here, so wait a fixed, generous
+    // window (dispatch to a local loopback listener normally completes in low single-digit ms)
+    // and confirm the hit count did NOT advance.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "9.9.9.9", "group_name": "event-filter-group", "cause": "updated" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert_eq!(hit_count.load(Ordering::SeqCst), 1, "IP_UPDATE must NOT be delivered to an events:\"IP_ADD\"-only webhook");
+
+    // Deleting it is an IP_DELETE — also not subscribed, must also be skipped.
+    let req = inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri("/api/ips?target_address=9.9.9.9&group_name=event-filter-group")
+        .header("X-API-Key", &plaintext))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NO_CONTENT);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    unsafe {
+        std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "false");
+    }
+
+    assert_eq!(hit_count.load(Ordering::SeqCst), 1, "IP_DELETE must NOT be delivered to an events:\"IP_ADD\"-only webhook");
+}
+
 /// Regression test for a bug found by manual exploratory testing: re-banning an address into a
 /// group it already belongs to used `Entity::insert(..).on_conflict(..).do_nothing().exec(db)`
 /// for the membership row, which raises `DbErr::RecordNotInserted` ("None of the records are

@@ -455,6 +455,65 @@ body {
     cursor: pointer;
 }
 
+/* ─── Searchable Combobox ───────────────────────────────── */
+/* A text input + live-filtered dropdown list, progressively enhancing either a free-text filter
+   (the input's own value IS the filter, e.g. the IP Group filter) or a strict select-from-list
+   field backed by a separate hidden value input (e.g. Webhook Target Group). See
+   `SearchableSelect` in app.js. */
+
+.combobox {
+    position: relative;
+}
+
+.combobox-input {
+    cursor: text;
+}
+
+.combobox-menu {
+    position: absolute;
+    top: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    z-index: 100;
+    max-height: 220px;
+    overflow-y: auto;
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow-lg);
+    padding: 0.25rem;
+}
+
+.combobox-option {
+    padding: 0.5rem 0.65rem;
+    border-radius: var(--radius);
+    font-size: 0.88rem;
+    color: var(--text-main);
+    cursor: pointer;
+    transition: background-color var(--transition-fast);
+}
+
+.combobox-option:hover,
+.combobox-option.highlighted {
+    background-color: rgba(28, 220, 154, 0.12);
+    color: var(--accent);
+}
+
+.combobox-empty {
+    padding: 0.5rem 0.65rem;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    font-style: italic;
+}
+
+/* ─── Toggle Buttons (e.g. "Conflicted IPs Only" quick filter) ─── */
+
+.btn-toggle.active {
+    background-color: rgba(243, 156, 18, 0.15);
+    color: var(--warning);
+    border-color: rgba(243, 156, 18, 0.45);
+}
+
 .form-actions {
     display: flex;
     gap: 0.75rem;

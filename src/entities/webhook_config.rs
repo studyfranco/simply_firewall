@@ -28,6 +28,9 @@ pub struct Model {
     pub group_id: Uuid,
     /// Toggle to enable/disable webhook dispatching without deleting the configuration.
     pub is_active: bool,
+    /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook should fire for.
+    /// `None` means all events (the historical, pre-filtering behavior).
+    pub events: Option<String>,
     /// Creation timestamp.
     pub created_at: DateTime,
 }

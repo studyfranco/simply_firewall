@@ -21,7 +21,12 @@ use crate::entities::{
     ip_record_group_membership, prelude::*, webhook_config,
 };
 use crate::error::AppError;
+use crate::middleware::ClientIp;
 use crate::state::{AppState, WebhookEvent};
+
+/// The three webhook-filterable IP mutation actions, in the vocabulary shared by
+/// `audit_log::Model::action` and `webhook_config::Model::events`.
+const IP_EVENT_ACTIONS: [&str; 3] = ["IP_ADD", "IP_UPDATE", "IP_DELETE"];
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -40,10 +45,15 @@ pub fn hash_key(key: &str) -> String {
     hex::encode(hasher.finalize())
 }
 
-/// Helper to insert an audit log entry
+/// Helper to insert an audit log entry. `key` denormalizes the acting key's name/prefix into the
+/// row so the audit trail stays legible even after that key is later deleted (its `api_key_id` FK
+/// is `ON DELETE SET NULL`, per `SCHEMA.MD`, but the name/prefix survive as a point-in-time
+/// snapshot rather than a live join). `client_ip` is the resolved caller address from
+/// [`crate::middleware::ClientIp`].
 async fn create_audit_log(
     db: &sea_orm::DatabaseConnection,
-    api_key_id: Option<Uuid>,
+    key: Option<&api_key::Model>,
+    client_ip: Option<std::net::IpAddr>,
     action: &str,
     target_address: Option<String>,
     group_names: Option<String>,
@@ -51,7 +61,10 @@ async fn create_audit_log(
 ) -> Result<(), AppError> {
     let log = audit_log::ActiveModel {
         id: Set(Uuid::new_v4()),
-        api_key_id: Set(api_key_id),
+        api_key_id: Set(key.map(|k| k.id)),
+        api_key_name: Set(key.map(|k| k.name.clone())),
+        api_key_prefix: Set(key.map(|k| k.prefix.clone())),
+        client_ip: Set(client_ip.map(|ip| ip.to_string())),
         action: Set(action.to_owned()),
         target_address: Set(target_address),
         group_names: Set(group_names),
@@ -184,23 +197,26 @@ pub struct BanWhitePayload {
 pub async fn handle_ban(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Json(payload): Json<BanWhitePayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    handle_ip_upsert(state, key, payload, false).await
+    handle_ip_upsert(state, key, client_ip.0, payload, false).await
 }
 
 /// Handles POST /api/v1/white to add an IP to a whitelist group
 pub async fn handle_white(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Json(payload): Json<BanWhitePayload>,
 ) -> Result<impl IntoResponse, AppError> {
-    handle_ip_upsert(state, key, payload, true).await
+    handle_ip_upsert(state, key, client_ip.0, payload, true).await
 }
 
 async fn handle_ip_upsert(
     state: AppState,
     key: api_key::Model,
+    client_ip: std::net::IpAddr,
     payload: BanWhitePayload,
     is_whitelist: bool,
 ) -> Result<impl IntoResponse, AppError> {
@@ -357,8 +373,11 @@ async fn handle_ip_upsert(
     // `exec_without_returning` is required here (not `exec`): when `DO NOTHING` actually
     // suppresses the insert because the membership already exists, there is no row to return,
     // and SeaORM's `exec` treats that as `DbErr::RecordNotInserted` ("None of the records are
-    // inserted") instead of the no-op success it actually is.
-    ip_record_group_membership::Entity::insert(mem)
+    // inserted") instead of the no-op success it actually is. For a single-row `Insert`, it
+    // returns the affected-row count directly as a `u64`, which doubles as the add-vs-update
+    // signal below: 1 means this (address, group) pairing is genuinely new, 0 means `DO NOTHING`
+    // suppressed it because the address was already a member of this exact group.
+    let mem_result = ip_record_group_membership::Entity::insert(mem)
         .on_conflict(
             OnConflict::columns([ip_record_group_membership::Column::IpRecordId, ip_record_group_membership::Column::GroupId])
                 .do_nothing()
@@ -367,17 +386,25 @@ async fn handle_ip_upsert(
         .exec_without_returning(&state.db)
         .await?;
 
+    // Deliberately keyed off the *membership* being new, not the underlying `ip_record` row: an
+    // address already banned in Group A that now also gets added to Group B is an `IP_ADD` from
+    // Group B's perspective (and Group B's webhooks) even though the `ip_record` row itself
+    // already existed — only a re-registration into a group it's *already* a member of is a true
+    // `IP_UPDATE`.
+    let action = if mem_result > 0 { "IP_ADD" } else { "IP_UPDATE" };
+
     create_audit_log(
         &state.db,
-        Some(key.id),
-        "IP_ADD",
+        Some(&key),
+        Some(client_ip),
+        action,
         Some(payload.target_address.clone()),
         Some(resolved_group_name),
         Some(format!("Added IP to group. Whitelist: {}", is_whitelist))
     ).await?;
 
     let event = WebhookEvent {
-        event_type: if is_whitelist { "white".to_owned() } else { "ban".to_owned() },
+        action: action.to_owned(),
         address: payload.target_address.clone(),
         is_whitelist,
         group_id: Some(target_group_id),
@@ -612,6 +639,7 @@ impl DeleteIpQuery {
 pub async fn delete_ip(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Query(query_params): Query<DeleteIpQuery>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
@@ -671,7 +699,8 @@ pub async fn delete_ip(
 
     create_audit_log(
         &state.db,
-        Some(key.id),
+        Some(&key),
+        Some(client_ip.0),
         "IP_DELETE",
         Some(target_address),
         Some(group.name.clone()),
@@ -679,7 +708,7 @@ pub async fn delete_ip(
     ).await?;
 
     let event = WebhookEvent {
-        event_type: "delete".to_owned(),
+        action: "IP_DELETE".to_owned(),
         address: record.target_address.clone(),
         is_whitelist: group.group_type == "whitelist",
         group_id: Some(group.id),
@@ -824,6 +853,7 @@ pub struct CreateApiKeyResponse {
 pub async fn create_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Json(payload): Json<CreateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
@@ -859,7 +889,7 @@ pub async fn create_api_key(
 
     api_key::Entity::insert(model).exec(&state.db).await?;
     
-    create_audit_log(&state.db, Some(key.id), "KEY_CREATE", None, None, Some(payload.name.clone())).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_CREATE", None, None, Some(payload.name.clone())).await?;
 
     Ok(Json(CreateApiKeyResponse {
         id,
@@ -956,6 +986,7 @@ pub async fn list_api_keys(
 pub async fn delete_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
@@ -971,7 +1002,7 @@ pub async fn delete_api_key(
         return Err(AppError::NotFound);
     }
     
-    create_audit_log(&state.db, Some(key.id), "KEY_DELETE", None, None, Some(id.to_string())).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_DELETE", None, None, Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -997,6 +1028,7 @@ pub struct UpdateApiKeyPayload {
 pub async fn update_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
     Json(payload): Json<UpdateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1032,7 +1064,7 @@ pub async fn update_api_key(
     active.updated_at = Set(Utc::now().naive_utc());
     let updated = active.update(&state.db).await?;
 
-    create_audit_log(&state.db, Some(key.id), "KEY_UPDATE", None, None, Some(id.to_string())).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_UPDATE", None, None, Some(id.to_string())).await?;
 
     Ok(Json(build_api_key_summary(&state.db, updated).await?))
 }
@@ -1052,6 +1084,7 @@ pub struct RotateKeyResponse {
 pub async fn rotate_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
@@ -1070,7 +1103,7 @@ pub async fn rotate_api_key(
     active.updated_at = Set(Utc::now().naive_utc());
     active.update(&state.db).await?;
 
-    create_audit_log(&state.db, Some(key.id), "KEY_ROTATE", None, None, Some(id.to_string())).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_ROTATE", None, None, Some(id.to_string())).await?;
 
     Ok(Json(RotateKeyResponse { id, plaintext_key }))
 }
@@ -1079,6 +1112,7 @@ pub async fn rotate_api_key(
 pub async fn update_key_group_permissions(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
     Json(payload): Json<GroupPermInput>,
 ) -> Result<impl IntoResponse, AppError> {
@@ -1142,7 +1176,7 @@ pub async fn update_key_group_permissions(
         .exec(&state.db)
         .await?;
 
-    create_audit_log(&state.db, Some(key.id), "KEY_PERM_UPDATE", None, Some(resolved_group_name), Some(id.to_string())).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_PERM_UPDATE", None, Some(resolved_group_name), Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::OK)
 }
@@ -1152,6 +1186,7 @@ pub async fn update_key_group_permissions(
 pub async fn revoke_key_group_permission(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path((id, group_identifier)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
@@ -1175,7 +1210,7 @@ pub async fn revoke_key_group_permission(
         return Err(AppError::NotFound);
     }
 
-    create_audit_log(&state.db, Some(key.id), "KEY_PERM_REVOKE", None, Some(group.name), Some(id.to_string())).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_PERM_REVOKE", None, Some(group.name), Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -1195,6 +1230,7 @@ pub struct CreateIpGroupPayload {
 pub async fn create_ip_group(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Json(payload): Json<CreateIpGroupPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_create_groups {
@@ -1233,7 +1269,7 @@ pub async fn create_ip_group(
         api_key_group_permission::Entity::insert(perm).exec(&state.db).await?;
     }
     
-    create_audit_log(&state.db, Some(key.id), "GROUP_CREATE", None, Some(payload.name.clone()), None).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "GROUP_CREATE", None, Some(payload.name.clone()), None).await?;
 
     Ok(Json(serde_json::json!({ "id": id, "name": payload.name })))
 }
@@ -1269,6 +1305,7 @@ pub async fn list_ip_groups(
 pub async fn delete_ip_group(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
@@ -1280,7 +1317,7 @@ pub async fn delete_ip_group(
         return Err(AppError::NotFound);
     }
     
-    create_audit_log(&state.db, Some(key.id), "GROUP_DELETE", None, None, Some(id.to_string())).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "GROUP_DELETE", None, None, Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -1306,12 +1343,16 @@ pub struct CreateWebhookPayload {
     pub group_id: Uuid,
     /// Is Active
     pub is_active: Option<bool>,
+    /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` to trigger on. `None` (the
+    /// default if omitted) means all events — the historical, pre-filtering behavior.
+    pub events: Option<String>,
 }
 
 /// Handles POST /api/v1/webhooks
 pub async fn create_webhook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Json(payload): Json<CreateWebhookPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_webhooks {
@@ -1327,6 +1368,17 @@ pub async fn create_webhook(
         return Err(AppError::InvalidInput("Invalid target_url: missing host".to_owned()));
     }
 
+    if let Some(events) = &payload.events {
+        for token in events.split(',').map(|s| s.trim()) {
+            if !IP_EVENT_ACTIONS.contains(&token) {
+                return Err(AppError::InvalidInput(format!(
+                    "Invalid events entry '{token}': must be one of {}",
+                    IP_EVENT_ACTIONS.join(", ")
+                )));
+            }
+        }
+    }
+
     let id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
     let model = webhook_config::ActiveModel {
@@ -1338,11 +1390,12 @@ pub async fn create_webhook(
         payload_template: Set(payload.payload_template.clone()),
         group_id: Set(payload.group_id),
         is_active: Set(payload.is_active.unwrap_or(true)),
+        events: Set(payload.events.clone()),
         created_at: Set(now),
     };
     webhook_config::Entity::insert(model).exec(&state.db).await?;
-    
-    create_audit_log(&state.db, Some(key.id), "WEBHOOK_CREATE", None, None, Some(payload.target_url.clone())).await?;
+
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "WEBHOOK_CREATE", None, None, Some(payload.target_url.clone())).await?;
 
     Ok(Json(serde_json::json!({ "id": id, "target_url": payload.target_url })))
 }
@@ -1367,6 +1420,9 @@ pub struct WebhookSummary {
     pub group_id: Uuid,
     /// Whether dispatching is currently enabled
     pub is_active: bool,
+    /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook fires for; `None`
+    /// means all events.
+    pub events: Option<String>,
     /// Creation timestamp
     pub created_at: chrono::NaiveDateTime,
 }
@@ -1381,6 +1437,7 @@ impl From<webhook_config::Model> for WebhookSummary {
             payload_template: w.payload_template,
             group_id: w.group_id,
             is_active: w.is_active,
+            events: w.events,
             created_at: w.created_at,
         }
     }
@@ -1404,6 +1461,7 @@ pub async fn list_webhooks(
 pub async fn delete_webhook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_webhooks {
@@ -1414,8 +1472,8 @@ pub async fn delete_webhook(
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
-    
-    create_audit_log(&state.db, Some(key.id), "WEBHOOK_DELETE", None, None, Some(id.to_string())).await?;
+
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "WEBHOOK_DELETE", None, None, Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

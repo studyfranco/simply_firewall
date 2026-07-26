@@ -7,13 +7,16 @@
 # whole HTTP API with curl + jq: RBAC across a multi-key permission matrix, IP add/list/filter/
 # update/delete across multiple groups (including banlist/whitelist overlap, and deletion via
 # both query-string params and a JSON body), key lifecycle (create/update/rotate/delete), bound-IP
-# CIDR enforcement, audit log generation + pagination, webhook lifecycle (create/list/delete, with
-# the mandatory `name` field), and the group-identification bug fixes (duplicate-name 409,
-# flexible group_id/group_name). Every request is logged with a timestamp, method, full URL,
-# color-coded status, and jq-formatted body.
+# CIDR enforcement, audit log generation + pagination + enrichment (client IP, API key name/
+# prefix), webhook lifecycle (create/list/delete, with the mandatory `name` field) and per-webhook
+# event filtering (events=IP_ADD/IP_UPDATE/IP_DELETE), and the group-identification bug fixes
+# (duplicate-name 409, flexible group_id/group_name). Every request is logged with a timestamp,
+# method, full URL, color-coded status, and jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
 # Requires: curl, jq. Needs port 3000 free (the app's listen address is not configurable).
+# Optional: python3 (only for live webhook-delivery verification in §13; that one section degrades
+# to a skip + warning without it, everything else is unaffected).
 # Exit code: 0 if every check passed, 1 otherwise.
 
 set -uo pipefail
@@ -35,6 +38,12 @@ DB_PATH="$WORK_DIR/e2e.db"
 SERVER_LOG="$WORK_DIR/server.log"
 RESP_BODY_FILE="$WORK_DIR/resp_body"
 SERVER_PID=""
+# Local loopback listener used only by the webhook event-filtering section to observe whether a
+# dispatch actually happened; started lazily there, but declared here so `cleanup()` can always
+# safely check it even if the script exits before that section runs.
+RECEIVER_PORT="${RECEIVER_PORT:-18763}"
+RECEIVER_LOG="$WORK_DIR/receiver_hits.log"
+RECEIVER_PID=""
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -162,6 +171,11 @@ cleanup() {
         kill "$SERVER_PID" 2>/dev/null || true
         wait "$SERVER_PID" 2>/dev/null || true
     fi
+    if [ -n "$RECEIVER_PID" ] && kill -0 "$RECEIVER_PID" 2>/dev/null; then
+        log "Stopping local webhook receiver (pid $RECEIVER_PID)..."
+        kill "$RECEIVER_PID" 2>/dev/null || true
+        wait "$RECEIVER_PID" 2>/dev/null || true
+    fi
     rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT INT TERM
@@ -184,6 +198,16 @@ if command -v fuser >/dev/null 2>&1 && fuser 3000/tcp >/dev/null 2>&1; then
     exit 1
 fi
 
+# python3 is a *soft* dependency: only the live webhook-delivery verification (§13) needs a local
+# HTTP listener to observe whether a dispatch actually happened. Its absence — or the receiver
+# port being busy — degrades that one section to a warning + skip rather than failing the suite,
+# since every other check (including the events-field API contract itself) needs only curl/jq.
+if command -v python3 >/dev/null 2>&1; then
+    log "Found python3: $(command -v python3) (used for live webhook-delivery verification)"
+else
+    warn "python3 not found — live webhook-delivery verification (§13) will be skipped."
+fi
+
 # ── Build & start ────────────────────────────────────────────────────────────
 
 log_section "Build"
@@ -198,7 +222,11 @@ log "Build succeeded."
 log_section "Boot"
 log "Starting server against a fresh database at $DB_PATH"
 log "Using INITIAL_MASTER_KEY for deterministic bootstrap (no log-scraping needed)"
+# ALLOW_PRIVATE_WEBHOOKS=true: §13 targets a webhook at a loopback receiver to observe deliveries,
+# which SSRF protection would otherwise block by default. Every other webhook test in this script
+# targets a real public host, so this doesn't loosen anything they depend on.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
+    ALLOW_PRIVATE_WEBHOOKS=true \
     "$PROJECT_ROOT/target/debug/simply_firewall" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -609,6 +637,129 @@ check_jq "length" "0" "its IP record's membership was cascade-deleted along with
 api_call POST "/api/keys/$CASCADE_KEY_ID/groups" "$MASTER_KEY" \
     "{\"group_id\":\"$CASCADE_GROUP_ID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
 check "404" "re-granting a permission against the now-deleted group id fails (group no longer resolvable)"
+
+# ── 13. Webhook event filtering ─────────────────────────────────────────────
+
+log_section "13. Webhook Event Filtering"
+
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"bad-events-hook\",\"target_url\":\"https://webhook.site/e2e-bad-events\",\"secret_token\":\"x\",\"payload_template\":\"{}\",\"group_id\":\"$GROUP_A_ID\",\"events\":\"NOT_A_REAL_EVENT\"}"
+check "400" "creating a webhook with an unrecognized events entry is rejected with 400"
+
+WEBHOOK_RECEIVER_AVAILABLE=0
+if command -v python3 >/dev/null 2>&1; then
+    if command -v fuser >/dev/null 2>&1 && fuser "$RECEIVER_PORT/tcp" >/dev/null 2>&1; then
+        warn "Port $RECEIVER_PORT is already in use; skipping live webhook-delivery verification."
+    else
+        cat > "$WORK_DIR/receiver.py" <<'PYEOF'
+import http.server
+import sys
+
+port = int(sys.argv[1])
+log_path = sys.argv[2]
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        length = int(self.headers.get('Content-Length', 0))
+        self.rfile.read(length)
+        with open(log_path, 'a') as f:
+            f.write('hit\n')
+        self.send_response(200)
+        self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
+
+http.server.HTTPServer(('127.0.0.1', port), Handler).serve_forever()
+PYEOF
+        : > "$RECEIVER_LOG"
+        python3 "$WORK_DIR/receiver.py" "$RECEIVER_PORT" "$RECEIVER_LOG" &
+        RECEIVER_PID=$!
+        sleep 0.3
+        if kill -0 "$RECEIVER_PID" 2>/dev/null; then
+            WEBHOOK_RECEIVER_AVAILABLE=1
+            log "Local webhook receiver listening on 127.0.0.1:$RECEIVER_PORT (pid $RECEIVER_PID)"
+        else
+            warn "Local webhook receiver failed to start; skipping live webhook-delivery verification."
+        fi
+    fi
+else
+    warn "python3 not found; skipping live webhook-delivery verification."
+fi
+
+count_receiver_hits() {
+    wc -l < "$RECEIVER_LOG" 2>/dev/null | tr -d ' '
+}
+
+if [ "$WEBHOOK_RECEIVER_AVAILABLE" -eq 1 ]; then
+    api_call POST "/api/groups" "$MASTER_KEY" '{"name":"event-filter-group"}'
+    check "200" "create a dedicated group for event-filtering tests"
+    EVENT_FILTER_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"add-only-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/hook\",\"secret_token\":\"x\",\"payload_template\":\"{}\",\"group_id\":\"$EVENT_FILTER_GROUP_ID\",\"events\":\"IP_ADD\"}"
+    check "200" "create a webhook restricted to events=IP_ADD"
+    EVENT_FILTER_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call GET "/api/webhooks" "$MASTER_KEY"
+    check_true "any(.[]; .id == \"$EVENT_FILTER_WEBHOOK_ID\" and .events == \"IP_ADD\")" "the events field round-trips and is visible when listing webhooks"
+
+    log "Banning a brand-new address (IP_ADD) — the events:\"IP_ADD\" webhook should fire..."
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.250","group_name":"event-filter-group","cause":"event filter test"}'
+    check "200" "add the address (IP_ADD)"
+
+    HITS=0
+    for _ in $(seq 1 20); do
+        HITS=$(count_receiver_hits)
+        [ "${HITS:-0}" -ge 1 ] && break
+        sleep 0.2
+    done
+    if [ "${HITS:-0}" == "1" ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} IP_ADD was delivered to the events:\"IP_ADD\" webhook (1 hit)" >&2
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} expected exactly 1 delivery after IP_ADD, got ${HITS:-0}" >&2
+    fi
+
+    log "Re-registering the same address (IP_UPDATE) — must NOT fire (not subscribed)..."
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.250","group_name":"event-filter-group","cause":"updated"}'
+    check "200" "re-register the address (IP_UPDATE)"
+    sleep 1
+    HITS=$(count_receiver_hits)
+    if [ "${HITS:-0}" == "1" ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} IP_UPDATE was correctly skipped (still 1 hit)" >&2
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} expected delivery count to stay at 1 after IP_UPDATE, got ${HITS:-0}" >&2
+    fi
+
+    log "Deleting the address (IP_DELETE) — must also NOT fire..."
+    api_call DELETE "/api/ips?target_address=192.0.2.250&group_name=event-filter-group" "$MASTER_KEY"
+    check "204" "delete the address (IP_DELETE)"
+    sleep 1
+    HITS=$(count_receiver_hits)
+    if [ "${HITS:-0}" == "1" ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} IP_DELETE was correctly skipped (still 1 hit)" >&2
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} expected delivery count to stay at 1 after IP_DELETE, got ${HITS:-0}" >&2
+    fi
+else
+    warn "Live webhook-delivery verification skipped (see above); the events-field API contract check above still ran."
+fi
+
+# ── 14. Audit log enrichment (client IP, API key name/prefix) ──────────────
+
+log_section "14. Audit Log Enrichment (Client IP, API Key Name/Prefix)"
+
+api_call GET "/api/audit-logs?action=GROUP_CREATE&limit=1" "$MASTER_KEY"
+check "200" "fetch the most recent GROUP_CREATE audit entry to inspect enrichment fields"
+check_jq ".[0].client_ip" "127.0.0.1" "the audit entry's client_ip is populated with the real caller address"
+check_jq ".[0].api_key_name" "System Master" "the audit entry's api_key_name is denormalized from the acting key"
+check_true '(.[0].api_key_prefix | length) == 8' "the audit entry's api_key_prefix is present and 8 characters"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

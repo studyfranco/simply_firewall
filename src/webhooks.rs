@@ -78,7 +78,7 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
     info!("Webhook worker started.");
 
     while let Some(event) = rx.recv().await {
-        info!(address = %event.address, event_type = %event.event_type, "Processing event for webhooks");
+        info!(address = %event.address, action = %event.action, "Processing event for webhooks");
 
         let gid = match event.group_id {
             Some(id) => id,
@@ -97,6 +97,15 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
         };
 
         for config in configs {
+            // `events` is `None` for "all events" (the historical default); when set, it's a
+            // comma-separated allowlist of actions this specific webhook cares about.
+            if let Some(events) = &config.events {
+                let subscribed = events.split(',').map(|s| s.trim()).any(|a| a == event.action);
+                if !subscribed {
+                    continue;
+                }
+            }
+
             if join_set.len() >= MAX_INFLIGHT {
                 let _ = join_set.join_next().await;
             }

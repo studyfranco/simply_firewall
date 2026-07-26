@@ -8,8 +8,10 @@ use serde::{Deserialize, Serialize};
 /// Represents a webhook event triggered by the system
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WebhookEvent {
-    /// Type of the event (ban, white, delete)
-    pub event_type: String, // "ban", "white", or "delete"
+    /// The action that occurred: `"IP_ADD"`, `"IP_UPDATE"`, or `"IP_DELETE"` — matches
+    /// `audit_log::Model::action`'s vocabulary and is what `webhook_config::Model::events`
+    /// filters against in the dispatcher.
+    pub action: String,
     /// Target address
     pub address: String,
     /// Is whitelist

@@ -91,13 +91,17 @@
                         <h2>Recent IP Records</h2>
                         <div class="filters">
                             <input type="text" id="ip-filter" placeholder="Filter by IP..." class="input-field">
-                            <input type="text" id="group-filter" placeholder="Filter by group..." class="input-field">
+                            <div class="combobox" id="group-filter-combobox">
+                                <input type="text" id="group-filter" placeholder="Filter by group..." class="input-field combobox-input" autocomplete="off">
+                                <div class="combobox-menu hidden"></div>
+                            </div>
                             <input type="text" id="cause-filter" placeholder="Filter by cause..." class="input-field">
                             <select id="status-filter" class="input-field select-field">
                                 <option value="">All Statuses</option>
                                 <option value="ban">Banned</option>
                                 <option value="white">Whitelisted</option>
                             </select>
+                            <button type="button" id="conflict-filter-btn" class="btn btn-icon btn-toggle" title="Show only addresses present in both a banlist and a whitelist group">⚠️ Conflicted IPs Only</button>
                         </div>
                     </div>
 
@@ -243,10 +247,12 @@
                                     </select>
                                 </div>
                                 <div class="form-group">
-                                    <label for="manage-rights-group">Group <span>*</span></label>
-                                    <select id="manage-rights-group" class="input-field select-field" required>
-                                        <option value="">-- Select Group --</option>
-                                    </select>
+                                    <label for="manage-rights-group-search">Group <span>*</span></label>
+                                    <div class="combobox" id="manage-rights-group-combobox">
+                                        <input type="text" id="manage-rights-group-search" class="input-field combobox-input" placeholder="-- Select Group --" autocomplete="off" required>
+                                        <input type="hidden" id="manage-rights-group">
+                                        <div class="combobox-menu hidden"></div>
+                                    </div>
                                 </div>
                             </div>
                             <div class="permissions-grid mt-2 mb-4">
@@ -298,10 +304,12 @@
                                 <input type="password" id="webhook-secret" placeholder="Shared Secret" required class="input-field">
                             </div>
                             <div class="form-group">
-                                <label for="webhook-group-id">Target Group <span>*</span></label>
-                                <select id="webhook-group-id" class="input-field select-field" required>
-                                    <option value="">-- Select Group --</option>
-                                </select>
+                                <label for="webhook-group-search">Target Group <span>*</span></label>
+                                <div class="combobox" id="webhook-group-combobox">
+                                    <input type="text" id="webhook-group-search" class="input-field combobox-input" placeholder="-- Select Group --" autocomplete="off" required>
+                                    <input type="hidden" id="webhook-group-id">
+                                    <div class="combobox-menu hidden"></div>
+                                </div>
                             </div>
                             <div class="form-group col-span-2">
                                 <label for="webhook-headers">Custom Headers (JSON)</label>
@@ -310,6 +318,23 @@
                             <div class="form-group col-span-2">
                                 <label for="webhook-template">Payload Template <span>*</span></label>
                                 <textarea id="webhook-template" required class="input-field" rows="3">{"target_address": "$target_address", "cause": "$cause", "group_name": "$group_name"}</textarea>
+                            </div>
+                            <div class="form-group col-span-2">
+                                <label>Trigger On Events <span>*</span></label>
+                                <div class="permissions-grid mt-2">
+                                    <label class="checkbox-container">
+                                        <input type="checkbox" id="webhook-event-add" checked>
+                                        <span class="checkmark"></span> IP Added
+                                    </label>
+                                    <label class="checkbox-container">
+                                        <input type="checkbox" id="webhook-event-update" checked>
+                                        <span class="checkmark"></span> IP Updated
+                                    </label>
+                                    <label class="checkbox-container">
+                                        <input type="checkbox" id="webhook-event-delete" checked>
+                                        <span class="checkmark"></span> IP Deleted
+                                    </label>
+                                </div>
                             </div>
                         </div>
                         <div class="form-actions mt-4">
@@ -338,6 +363,8 @@
                         <thead>
                             <tr>
                                 <th>Timestamp</th>
+                                <th>API Key</th>
+                                <th>Client IP</th>
                                 <th>Action</th>
                                 <th>Target</th>
                                 <th>Groups</th>
@@ -346,7 +373,7 @@
                         </thead>
                         <tbody id="audit-logs-table-body">
                             <tr>
-                                <td colspan="5" class="text-center text-muted">Loading data...</td>
+                                <td colspan="7" class="text-center text-muted">Loading data...</td>
                             </tr>
                         </tbody>
                     </table>

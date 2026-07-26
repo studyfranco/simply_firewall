@@ -1,6 +1,107 @@
 // Simply Firewall SPA Client
 // No external dependencies (Vanilla JS)
 
+// Reusable searchable dropdown ("combobox"): a text input plus a live-filtered option list.
+// Two modes, chosen by whether searchId and valueId are the same element:
+//   - allowFreeText: true  — searchId === valueId; the input's own text IS the value (used by
+//     the IP Group filter, which already does substring matching server-side). The dropdown is
+//     purely a convenience of known-group suggestions; typing anything not in the list still
+//     works exactly as the old plain <input> did.
+//   - allowFreeText: false — searchId !== valueId; the search input only displays a label, and
+//     valueId (a hidden input) only changes when the user actually picks a listed option. Typing
+//     without picking a fresh option clears the hidden value, so a stale prior selection can
+//     never be silently resubmitted alongside now-mismatched displayed text.
+class SearchableSelect {
+    constructor({ rootId, searchId, valueId, allowFreeText = false, onSelect }) {
+        this.root = document.getElementById(rootId);
+        this.search = document.getElementById(searchId);
+        this.valueInput = document.getElementById(valueId);
+        this.menu = this.root.querySelector('.combobox-menu');
+        this.allowFreeText = allowFreeText;
+        this.onSelect = onSelect || (() => {});
+        this.options = [];
+
+        this.search.addEventListener('input', () => {
+            if (!this.allowFreeText) {
+                this.valueInput.value = '';
+            }
+            this.renderMenu(this.search.value);
+            this.openMenu();
+        });
+        this.search.addEventListener('focus', () => {
+            this.renderMenu(this.search.value);
+            this.openMenu();
+        });
+        this.search.addEventListener('keydown', (e) => {
+            if (e.key === 'Escape') {
+                this.closeMenu();
+            } else if (e.key === 'Enter') {
+                const first = this.menu.querySelector('.combobox-option');
+                if (first) {
+                    e.preventDefault();
+                    first.dispatchEvent(new MouseEvent('mousedown'));
+                }
+            }
+        });
+        document.addEventListener('click', (e) => {
+            if (!this.root.contains(e.target)) this.closeMenu();
+        });
+    }
+
+    // options: [{ value, label }]
+    setOptions(options) {
+        this.options = options;
+        // Keep an already-selected strict value's displayed label in sync if the underlying
+        // group list changed (e.g. renamed) while this control wasn't being actively edited.
+        if (!this.allowFreeText && this.valueInput.value) {
+            const current = this.options.find(o => String(o.value) === this.valueInput.value);
+            if (current) this.search.value = current.label;
+        }
+    }
+
+    renderMenu(filterText) {
+        const q = (filterText || '').trim().toLowerCase();
+        const filtered = this.options.filter(o => o.label.toLowerCase().includes(q));
+        if (filtered.length === 0) {
+            this.menu.innerHTML = '<div class="combobox-empty">No matching groups</div>';
+            return;
+        }
+        this.menu.innerHTML = filtered.map((o, i) =>
+            `<div class="combobox-option" data-index="${i}">${escapeHtml(o.label)}</div>`
+        ).join('');
+        this.menu.querySelectorAll('.combobox-option').forEach((el, i) => {
+            // mousedown (not click) with preventDefault: fires before — and suppresses — the
+            // search input's own blur, so the selection always registers on the first press
+            // instead of the menu disappearing out from under the click.
+            el.addEventListener('mousedown', (e) => {
+                e.preventDefault();
+                this.select(filtered[i]);
+            });
+        });
+    }
+
+    select(opt) {
+        this.search.value = opt.label;
+        if (this.valueInput !== this.search) {
+            this.valueInput.value = opt.value;
+        } else {
+            // Programmatic .value assignment doesn't fire 'input' on its own; dispatch one so
+            // the pre-existing debounced filter listener on this element still reacts to it.
+            this.search.dispatchEvent(new Event('input', { bubbles: true }));
+        }
+        this.onSelect(opt.value);
+        this.closeMenu();
+    }
+
+    openMenu() {
+        this.menu.classList.remove('hidden');
+    }
+
+    closeMenu() {
+        this.menu.classList.add('hidden');
+    }
+}
+
 class FirewallClient {
     constructor() {
         this.apiKey = localStorage.getItem('simply_firewall_key') || '';
@@ -13,8 +114,30 @@ class FirewallClient {
             webhooks: [],
             auditLogs: [],
             pagination: { limit: 15, offset: 0, hasMore: true },
-            auditPagination: { limit: 15, offset: 0, hasMore: true }
+            auditPagination: { limit: 15, offset: 0, hasMore: true },
+            showConflictsOnly: false
         };
+
+        // Searchable group comboboxes — populated from this.state.groups by loadGroups() via
+        // setOptions() on each. The IP-group filter is free-text (its value IS the substring
+        // filter sent to the API); the other two require picking an actual existing group.
+        this.groupFilterCombobox = new SearchableSelect({
+            rootId: 'group-filter-combobox',
+            searchId: 'group-filter',
+            valueId: 'group-filter',
+            allowFreeText: true
+        });
+        this.rightsGroupCombobox = new SearchableSelect({
+            rootId: 'manage-rights-group-combobox',
+            searchId: 'manage-rights-group-search',
+            valueId: 'manage-rights-group'
+        });
+        this.webhookGroupCombobox = new SearchableSelect({
+            rootId: 'webhook-group-combobox',
+            searchId: 'webhook-group-search',
+            valueId: 'webhook-group-id'
+        });
+
         this.init();
     }
 
@@ -135,11 +258,11 @@ class FirewallClient {
         if (this.state.profile.is_master || this.state.profile.can_manage_keys) {
             await this.loadKeys();
         }
-        // Groups feed both the Keys tab's "Manage Group Rights" selector and the Webhooks tab's
-        // "Target Group" selector, so either scope needs the list loaded — not just can_manage_keys.
-        if (this.state.profile.is_master || this.state.profile.can_manage_keys || this.state.profile.can_manage_webhooks) {
-            await this.loadGroups();
-        }
+        // Unconditional (not scope-gated): GET /api/groups is safe for any authenticated key —
+        // the backend already narrows results to what that key can read — and the result feeds
+        // the IP Group filter's suggestion combobox for every user, not just the admin-only
+        // "Manage Group Rights" and "Target Group" selectors on the Keys/Webhooks tabs.
+        await this.loadGroups();
         if (this.state.profile.is_master || this.state.profile.can_manage_webhooks) {
             await this.loadWebhooks();
         }
@@ -187,8 +310,14 @@ class FirewallClient {
         try {
             this.state.groups = await this.apiFetch('/groups');
             this.renderGroupsTable();
-            this.updateGroupSelector();
-            this.updateWebhookGroupSelector();
+            // manage-rights-group and the IP filter both operate on group NAME (the API's
+            // group_name field is flexible/name-based); the webhook target needs the real UUID,
+            // since CreateWebhookPayload.group_id has no name-or-id flexible resolution.
+            const byName = this.state.groups.map(g => ({ value: g.name, label: g.name }));
+            const byId = this.state.groups.map(g => ({ value: g.id, label: g.name }));
+            this.groupFilterCombobox.setOptions(byName);
+            this.rightsGroupCombobox.setOptions(byName);
+            this.webhookGroupCombobox.setOptions(byId);
         } catch(e) {}
     }
 
@@ -261,14 +390,23 @@ class FirewallClient {
 
     renderIpTable() {
         const tbody = document.getElementById('ip-table-body');
-        if (this.state.ips.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No records found.</td></tr>';
+        const conflicts = this.findConflictingAddresses();
+
+        // Client-side only: conflicts (and this filter) can only ever be detected among rows
+        // already present in the currently loaded page, same as the conflict badge itself.
+        const rows = this.state.showConflictsOnly
+            ? this.state.ips.filter(ip => conflicts.has(ip.target_address))
+            : this.state.ips;
+
+        if (rows.length === 0) {
+            const msg = this.state.showConflictsOnly
+                ? 'No conflicting records in the current view.'
+                : 'No records found.';
+            tbody.innerHTML = `<tr><td colspan="6" class="text-center text-muted">${msg}</td></tr>`;
             return;
         }
 
-        const conflicts = this.findConflictingAddresses();
-
-        tbody.innerHTML = this.state.ips.map(ip => {
+        tbody.innerHTML = rows.map(ip => {
             const isConflicting = conflicts.has(ip.target_address);
             const statusBadge = ip.group_type === 'whitelist'
                 ? '<span class="badge badge-white">Whitelisted</span>'
@@ -352,34 +490,6 @@ class FirewallClient {
         }).join('');
     }
 
-    // Populates the "Manage Group Rights" group dropdown from currently known groups, replacing
-    // the old free-text group name input (which allowed unnoticed typos to silently auto-create a
-    // brand-new, wrong group instead of granting rights on the intended one).
-    updateGroupSelector() {
-        const sel = document.getElementById('manage-rights-group');
-        if (!sel) return;
-
-        const previousValue = sel.value;
-        sel.innerHTML = '<option value="">-- Select Group --</option>' + this.state.groups.map(g =>
-            `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`
-        ).join('');
-        if (previousValue) sel.value = previousValue;
-    }
-
-    // Populates the Webhooks tab's "Target Group" dropdown. Unlike updateGroupSelector() above,
-    // this one needs the group's UUID (not its name): CreateWebhookPayload.group_id is a strict
-    // Uuid field with no flexible name-or-id resolution like the permission-assignment endpoints.
-    updateWebhookGroupSelector() {
-        const sel = document.getElementById('webhook-group-id');
-        if (!sel) return;
-
-        const previousValue = sel.value;
-        sel.innerHTML = '<option value="">-- Select Group --</option>' + this.state.groups.map(g =>
-            `<option value="${g.id}">${escapeHtml(g.name)}</option>`
-        ).join('');
-        if (previousValue) sel.value = previousValue;
-    }
-
     renderGroupsTable() {
         const tbody = document.getElementById('groups-table-body');
         if (this.state.groups.length === 0) {
@@ -430,19 +540,26 @@ class FirewallClient {
     renderAuditLogsTable() {
         const tbody = document.getElementById('audit-logs-table-body');
         if (this.state.auditLogs.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No audit log entries.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No audit log entries.</td></tr>';
             return;
         }
 
-        tbody.innerHTML = this.state.auditLogs.map(log => `
+        tbody.innerHTML = this.state.auditLogs.map(log => {
+            const keyDisplay = log.api_key_name
+                ? `${escapeHtml(log.api_key_name)}${log.api_key_prefix ? ` <span class="text-muted text-sm">(${escapeHtml(log.api_key_prefix)}...)</span>` : ''}`
+                : '<span class="text-muted">System</span>';
+            return `
             <tr>
                 <td class="text-sm">${new Date(log.timestamp).toLocaleString()}</td>
+                <td class="text-sm">${keyDisplay}</td>
+                <td class="font-mono text-sm">${escapeHtml(log.client_ip || '-')}</td>
                 <td><span class="badge badge-scope">${escapeHtml(log.action)}</span></td>
                 <td class="font-mono text-sm">${escapeHtml(log.target_address || '-')}</td>
                 <td class="text-sm">${escapeHtml(log.group_names || '-')}</td>
                 <td class="text-sm">${escapeHtml(log.details || '-')}</td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
     }
 
     updateAuditPaginationUI() {
@@ -514,7 +631,10 @@ class FirewallClient {
         const keyId = document.getElementById('manage-rights-key').value;
         const groupName = document.getElementById('manage-rights-group').value;
 
-        if (!keyId || !groupName) return;
+        if (!keyId || !groupName) {
+            this.showToast('Please select both a target key and a group', 'error');
+            return;
+        }
 
         const payload = {
             group_name: groupName,
@@ -617,13 +737,32 @@ class FirewallClient {
     async createWebhook(e) {
         e.preventDefault();
 
+        const groupId = document.getElementById('webhook-group-id').value;
+        if (!groupId) {
+            this.showToast('Please select a valid target group from the list', 'error');
+            return;
+        }
+
+        const eventKeys = { add: 'IP_ADD', update: 'IP_UPDATE', delete: 'IP_DELETE' };
+        const checkedEvents = Object.entries(eventKeys)
+            .filter(([id]) => document.getElementById(`webhook-event-${id}`).checked)
+            .map(([, action]) => action);
+        if (checkedEvents.length === 0) {
+            this.showToast('Select at least one event for this webhook to trigger on', 'error');
+            return;
+        }
+        // All three checked is equivalent to (and sent as) "no filter" — the backend's own
+        // default for an omitted `events` field — rather than a redundant explicit list.
+        const events = checkedEvents.length === Object.keys(eventKeys).length ? null : checkedEvents.join(',');
+
         const payload = {
             name: document.getElementById('webhook-name').value,
             target_url: document.getElementById('webhook-url').value,
             secret_token: document.getElementById('webhook-secret').value,
-            group_id: document.getElementById('webhook-group-id').value,
+            group_id: groupId,
             headers_json: document.getElementById('webhook-headers').value || null,
-            payload_template: document.getElementById('webhook-template').value
+            payload_template: document.getElementById('webhook-template').value,
+            events
         };
 
         try {
@@ -684,6 +823,11 @@ class FirewallClient {
         document.getElementById('status-filter').addEventListener('change', () => {
             this.state.pagination.offset = 0;
             this.loadIps();
+        });
+        document.getElementById('conflict-filter-btn').addEventListener('click', (e) => {
+            this.state.showConflictsOnly = !this.state.showConflictsOnly;
+            e.currentTarget.classList.toggle('active', this.state.showConflictsOnly);
+            this.renderIpTable();
         });
 
         // Pagination

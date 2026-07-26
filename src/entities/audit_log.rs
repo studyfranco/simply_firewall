@@ -12,8 +12,17 @@ pub struct Model {
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
     /// The API key that performed the action, if any (`None` for system/bootstrap actions, or
-    /// if the key was later deleted).
+    /// if the key was later deleted — the FK is `ON DELETE SET NULL`).
     pub api_key_id: Option<Uuid>,
+    /// The acting key's name, denormalized at write time so the audit trail stays legible even
+    /// after that key is later deleted (unlike `api_key_id`, this is never nulled out by a
+    /// cascade — it's a point-in-time snapshot, not a live join).
+    pub api_key_name: Option<String>,
+    /// The acting key's prefix, denormalized for the same reason as `api_key_name`.
+    pub api_key_prefix: Option<String>,
+    /// The caller's resolved client IP (rightmost `X-Forwarded-For` hop, `X-Real-IP`, or raw TCP
+    /// peer address — see `middleware::auth_middleware`), if available.
+    pub client_ip: Option<String>,
     /// Operation type, e.g. `IP_ADD`, `IP_DELETE`, `KEY_CREATE`, `KEY_DELETE`, `KEY_PERM_UPDATE`,
     /// `GROUP_CREATE`, `GROUP_DELETE`, `WEBHOOK_CREATE`, `WEBHOOK_DELETE` (non-exhaustive).
     pub action: String,

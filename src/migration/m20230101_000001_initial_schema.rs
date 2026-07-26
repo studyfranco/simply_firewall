@@ -68,6 +68,7 @@ pub enum WebhookConfigs {
     PayloadTemplate,
     GroupId,
     IsActive,
+    Events,
     CreatedAt,
 }
 
@@ -76,6 +77,9 @@ pub enum AuditLogs {
     Table,
     Id,
     ApiKeyId,
+    ApiKeyName,
+    ApiKeyPrefix,
+    ClientIp,
     Action,
     TargetAddress,
     GroupNames,
@@ -247,6 +251,7 @@ impl MigrationTrait for Migration {
                     .col(ColumnDef::new(WebhookConfigs::PayloadTemplate).text().not_null())
                     .col(ColumnDef::new(WebhookConfigs::GroupId).uuid().not_null())
                     .col(ColumnDef::new(WebhookConfigs::IsActive).boolean().not_null().default(true))
+                    .col(ColumnDef::new(WebhookConfigs::Events).string())
                     .col(ColumnDef::new(WebhookConfigs::CreatedAt).date_time().not_null())
                     .foreign_key(
                         ForeignKey::create()
@@ -268,6 +273,9 @@ impl MigrationTrait for Migration {
                     .if_not_exists()
                     .col(ColumnDef::new(AuditLogs::Id).uuid().not_null().primary_key())
                     .col(ColumnDef::new(AuditLogs::ApiKeyId).uuid())
+                    .col(ColumnDef::new(AuditLogs::ApiKeyName).string())
+                    .col(ColumnDef::new(AuditLogs::ApiKeyPrefix).string())
+                    .col(ColumnDef::new(AuditLogs::ClientIp).string())
                     .col(ColumnDef::new(AuditLogs::Action).string().not_null())
                     .col(ColumnDef::new(AuditLogs::TargetAddress).string())
                     .col(ColumnDef::new(AuditLogs::GroupNames).string())

@@ -15,6 +15,14 @@ use crate::entities::prelude::ApiKey;
 use crate::error::AppError;
 use crate::state::AppState;
 
+/// The resolved client IP for the current request (rightmost `X-Forwarded-For` hop, `X-Real-IP`,
+/// or raw TCP peer address — see [`auth_middleware`]). Inserted into request extensions so
+/// downstream handlers can attribute audit log entries to a real client address without
+/// re-deriving it. A dedicated newtype (rather than a bare `Extension<std::net::IpAddr>`) avoids
+/// ever silently colliding with some other, unrelated `IpAddr` extension in the future.
+#[derive(Clone, Copy, Debug)]
+pub struct ClientIp(pub std::net::IpAddr);
+
 /// Normalizes an IPv4-mapped IPv6 address (e.g. `::ffff:192.168.1.1`) down to its plain
 /// IPv4 form so it can be matched against IPv4 CIDR ranges in `bound_ips`. Reverse proxies and
 /// dual-stack sockets commonly surface IPv4 clients this way, which would otherwise silently fail
@@ -106,6 +114,7 @@ pub async fn auth_middleware(
     }
 
     let mut req = req;
+    req.extensions_mut().insert(ClientIp(client_ip));
     req.extensions_mut().insert(key_record);
 
     Ok(next.run(req).await)

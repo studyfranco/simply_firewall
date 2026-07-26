@@ -137,6 +137,7 @@ Defines HTTP endpoints to notify when IP events occur within a specific group.
 | `payload_template` | `Text` | Not Null | Template string with dynamic variables (e.g. `{"ip":"$target_address","group":"$group_name"}`) |
 | `group_id` | `UUID` | FK -> `ip_groups.id` (CASCADE) | Monitored IP Group |
 | `is_active` | `Boolean` | Default: `true` | Toggle to enable/disable webhook dispatching |
+| `events` | `String` | Nullable | Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook fires on. `NULL` means all events |
 | `created_at` | `DateTimeUtc` | Not Null | Creation timestamp |
 
 ---
@@ -148,7 +149,10 @@ Security audit trail tracking mutating operations across the application.
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique audit log entry ID |
 | `api_key_id` | `UUID` | Nullable, FK -> `api_keys.id` (SET NULL) | Performing API key ID (Null if triggered by system auto-gen) |
-| `action` | `String` | Not Null, Indexed | Operation type, e.g. `IP_ADD`, `IP_DELETE`, `KEY_CREATE`, `KEY_DELETE`, `KEY_PERM_UPDATE`, `GROUP_CREATE`, `GROUP_DELETE`, `WEBHOOK_CREATE`, `WEBHOOK_DELETE` (non-exhaustive — any mutating action may log its own type) |
+| `api_key_name` | `String` | Nullable | Performing key's name, denormalized at write time so it survives that key later being deleted (unlike `api_key_id`, never nulled out by the FK's `SET NULL`) |
+| `api_key_prefix` | `String` | Nullable | Performing key's prefix, denormalized for the same reason as `api_key_name` |
+| `client_ip` | `String` | Nullable | Caller's resolved client IP (rightmost `X-Forwarded-For` hop, `X-Real-IP`, or raw TCP peer address) |
+| `action` | `String` | Not Null, Indexed | Operation type, e.g. `IP_ADD`, `IP_UPDATE`, `IP_DELETE`, `KEY_CREATE`, `KEY_DELETE`, `KEY_PERM_UPDATE`, `GROUP_CREATE`, `GROUP_DELETE`, `WEBHOOK_CREATE`, `WEBHOOK_DELETE` (non-exhaustive — any mutating action may log its own type) |
 | `target_address` | `String` | Nullable | Target IP or CIDR range affected |
 | `group_names` | `String` | Nullable | Comma-separated list of group names involved |
 | `details` | `Text` | Nullable | Additional context or raw payload overview |

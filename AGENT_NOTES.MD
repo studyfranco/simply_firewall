@@ -1145,3 +1145,158 @@ sections was already correctly implemented; the gap was purely in test coverage.
   3000 confirmed free after each run.
 - `static/`: HTML tag balance, duplicate-id, and `getElementById`/tab-wiring cross-checks all
   clean (see "UI verification" above for why this substitutes for a live screenshot here).
+
+---
+
+## 2026-07-26 (session 10) — Webhook event filtering, searchable group combobox, enriched audit logs, IP conflict view
+
+Four features this session: (1) per-webhook event filtering, (2) a reusable searchable-dropdown
+component replacing three group `<select>`s, (3) audit log enrichment with client IP and acting
+key name/prefix, (4) a "Conflicted IPs Only" quick filter. Backend first (validated with
+`cargo check`/`test`/`clippy` before touching the frontend), then frontend, then E2E tests.
+
+### Schema (`src/migration/m20230101_000001_initial_schema.rs`)
+
+Edited the single existing migration in place rather than adding a new one — confirmed this is
+the established convention for this project (the file already carries the M:N RBAC junction table
+added in an earlier session's "update schema migrations" commit; there's no second migration file
+anywhere, and no production deployment yet whose existing data would need an incremental path).
+Added `webhook_configs.events` (nullable string) and `audit_logs.{api_key_name,api_key_prefix,
+client_ip}` (all nullable strings). Mirrored into `src/entities/webhook_config.rs` and
+`src/entities/audit_log.rs`.
+
+### Webhook event filtering (`src/api.rs`, `src/webhooks.rs`, `src/state.rs`)
+
+- `WebhookEvent.event_type` (previously `"ban"`/`"white"`/`"delete"`, used only for a tracing log
+  field) renamed to `action`, now carrying `"IP_ADD"`/`"IP_UPDATE"`/`"IP_DELETE"` — the same
+  vocabulary `audit_log.action` already used. This removed a genuinely redundant field rather than
+  adding a second one alongside it: `is_whitelist` already separately captured ban-vs-whitelist,
+  so `event_type`'s old ban/white/delete distinction was never adding information beyond what
+  `is_whitelist` + the new `action` together now express more clearly.
+- **Found and fixed a real accuracy bug while wiring this up**: `handle_ip_upsert` unconditionally
+  logged `"IP_ADD"` to the audit trail even when the address already existed and was merely being
+  re-registered (cause/`last_seen_at` refresh) — there was no `IP_UPDATE` concept anywhere. Fixed
+  by keying add-vs-update off whether the (address, group) *membership* row was newly inserted
+  (via the existing `ON CONFLICT DO NOTHING` membership insert's returned row count), not whether
+  the underlying `ip_records` row was new. This distinction matters: an address already banned in
+  Group A that now *also* gets added to Group B is an `IP_ADD` from Group B's (and Group B's
+  webhooks') perspective even though the `ip_records` row itself already existed — only
+  re-registering into a group it's *already* a member of is a true `IP_UPDATE`.
+- `run_webhook_worker`: for each candidate webhook config, if `events` is `Some`, skip dispatch
+  unless the incoming event's `action` is in that comma-separated list. `None` (the default when
+  the field is omitted) means all events, matching the pre-existing behavior exactly.
+- `CreateWebhookPayload.events: Option<String>` validates each comma-separated token is one of
+  `IP_ADD`/`IP_UPDATE`/`IP_DELETE` at creation time (400 on anything else) rather than silently
+  accepting a typo that would make the webhook never fire for anything. `WebhookSummary` now
+  includes `events` so the UI can display/edit it.
+- New Rust integration test `test_webhook_event_filtering_skips_non_matching_actions`: a webhook
+  scoped to `events: "IP_ADD"` against a real in-process mock HTTP server (same pattern as the
+  existing `test_webhook_hmac_signature_and_delivery`) — asserts it fires exactly once for a new
+  address, then stays at exactly one hit through both a re-registration (`IP_UPDATE`) and a
+  deletion (`IP_DELETE`) of that same address.
+
+### Audit log enrichment (`src/middleware.rs`, `src/api.rs`)
+
+- Added `middleware::ClientIp(pub std::net::IpAddr)`, a dedicated newtype extension (not a bare
+  `Extension<IpAddr>`, to avoid ever silently colliding with some unrelated future `IpAddr`
+  extension) inserted into request extensions by `auth_middleware` right alongside the existing
+  `key_record` — it already computes this exact resolved address for CIDR-bound-key checking, so
+  this just exposes it downstream instead of discarding it.
+- `create_audit_log`'s signature changed from `api_key_id: Option<Uuid>` to
+  `key: Option<&api_key::Model>` plus a new `client_ip: Option<std::net::IpAddr>` — deriving
+  `api_key_id`/`api_key_name`/`api_key_prefix` from the one model reference instead of asking
+  every call site to spell out three separate fields that must always come from the same key
+  anyway. All 12 call sites updated (every mutating handler now also takes
+  `Extension(client_ip): Extension<ClientIp>`): `handle_ip_upsert` (ban/white), `delete_ip`,
+  `create_api_key`, `delete_api_key`, `update_api_key`, `rotate_api_key`,
+  `update_key_group_permissions`, `revoke_key_group_permission`, `create_ip_group`,
+  `delete_ip_group`, `create_webhook`, `delete_webhook`.
+- `api_key_name`/`api_key_prefix` are denormalized (copied at write time), not live-joined: the
+  `audit_logs.api_key_id` FK is `ON DELETE SET NULL` (per `SCHEMA.MD`), so a live join would go
+  blank the moment the acting key is deleted, defeating the point of an audit trail surviving the
+  thing it's auditing. `client_ip` is stored as a plain string (`IpAddr::to_string()`).
+- `list_audit_logs` needed no response-shape changes — it already serializes the raw
+  `audit_log::Model` directly (unlike webhooks, which need a `WebhookSummary` DTO to strip
+  `secret_token`), so the three new columns just appear once added to the entity.
+
+### Frontend: reusable searchable group combobox (`static/app.js`, `static/index.html`, `static/style.css`)
+
+- New `SearchableSelect` class: a text input plus a live-filtered `<div>` dropdown, click-to-select,
+  Enter-selects-first-match, Escape/click-outside closes. Two modes selected by whether its
+  `searchId`/`valueId` point at the same element: **free-text** (IP Group filter — the input's own
+  text still IS the substring filter sent to `GET /api/ips?group_name=...`, unchanged from before;
+  the dropdown is purely a suggestion convenience) or **strict-select** (Webhook Target Group,
+  Manage Group Rights' Group field — a separate hidden input only changes value when an option is
+  actually clicked, and typing without picking a fresh option clears it so a stale prior selection
+  can never be silently resubmitted next to now-mismatched displayed text).
+- Deliberately kept the pre-existing hidden-value element **ids** (`webhook-group-id`,
+  `manage-rights-group`) unchanged when converting them from `<select>` to `<input type="hidden">`
+  — `createWebhook()`/`manageKeyRights()` still read `.value` off the same id, so neither needed
+  any change beyond a small explicit "did the user actually pick something" guard (a `<select
+  required>` blocks submission natively; a hidden input's `required` attribute is not enforced by
+  HTML constraint validation at all, so this check is now load-bearing, not just redundant).
+- `loadGroups()`'s gate in `loadInitialData()` was removed entirely (previously
+  `is_master || can_manage_keys || can_manage_webhooks`): `GET /api/groups` is safe for any
+  authenticated key — the backend already narrows results to what that key can read — and the
+  group-filter combobox's suggestions need it for every user, not just admins. The two admin-only
+  consumers of the same data (groups table, key-rights/webhook selectors) stay correctly hidden by
+  their own tab/section visibility regardless.
+- `static/style.css`: new `.combobox`/`.combobox-menu`/`.combobox-option`/`.combobox-empty` rules
+  and a `.btn-toggle.active` state (reused for the conflict-filter button below).
+
+### Frontend: webhook event checkboxes, conflict-only filter, audit log columns
+
+- Webhook form gained three checkboxes (IP Added/Updated/Deleted, default all checked). All three
+  checked is sent as `events: null` (the backend's own "no filter" default) rather than a
+  redundant explicit three-item list; unchecking all three is blocked client-side with a toast
+  (a webhook subscribed to nothing would just silently never fire — better to say so up front).
+- "⚠️ Conflicted IPs Only" toggle button in the IP filters bar: purely a client-side re-filter of
+  the already-loaded `this.state.ips` through the existing `findConflictingAddresses()` helper
+  (added in an earlier session for the conflict *badge*) — inherits that helper's same
+  current-page-only scope, not a new limitation.
+- Audit Logs table gained **API Key** and **Client IP** columns (placed right after Timestamp,
+  before Action — "who, from where, did what" reads more naturally than appending them at the
+  end); a key-less system action renders as "System" rather than a blank cell.
+
+### UI verification
+
+Same constraint as session 9: headless Chromium still cannot start in this container (confirmed
+this limitation is environmental, not something that changed). Used the same static-analysis
+substitute — `html.parser`-based tag balance/duplicate-id check plus a full `getElementById`/
+`data-tab` cross-reference between `app.js` and `index.html` — extended this session to also grep-
+verify the three `.combobox`/`.combobox-menu` pairs `SearchableSelect` depends on via
+`querySelector` (not caught by the `getElementById`-only cross-check). All clean.
+
+### `scripts/test_e2e.sh`: 2 new sections (13, 14)
+
+- **§13 Webhook Event Filtering**: first confirms an unrecognized `events` token is rejected with
+  `400` (pure API-contract check, no new infrastructure). Then, if `python3` is available and its
+  receiver port is free, starts a tiny stdlib-only local HTTP listener (written via heredoc into
+  the work dir) and drives a *real* delivery-vs-skip verification against an `events: "IP_ADD"`
+  webhook: bans a new address (expects exactly 1 hit), re-registers it (expects the count to stay
+  at 1), deletes it (expects it to stay at 1 again). `python3` is a soft dependency — its absence,
+  or the receiver port being busy, degrades this specific section to a warning + skip rather than
+  failing the whole suite; every other check in the script only ever needed curl/jq. Required
+  adding `ALLOW_PRIVATE_WEBHOOKS=true` to the server's boot env so a loopback webhook target isn't
+  blocked by SSRF protection (every *other* webhook test in the script already targets a real
+  public host, so this doesn't loosen anything they depend on).
+- **§14 Audit Log Enrichment**: fetches the most recent `GROUP_CREATE` entry and asserts
+  `client_ip == "127.0.0.1"` (curl always connects over IPv4 loopback here — `BASE_URL` is
+  `127.0.0.1`, not `localhost`, precisely to keep this deterministic), `api_key_name == "System
+  Master"`, and `api_key_prefix` is present and exactly 8 characters.
+
+No changes were needed to `tests/rbac_integration_tests.rs`'s existing tests, `src/error.rs`, or
+`src/middleware.rs` beyond the `ClientIp` addition described above.
+
+### Final verification (session 10)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **29/29 pass** (28 carried over + 1 new:
+  `test_webhook_event_filtering_skips_non_matching_actions`).
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `scripts/test_e2e.sh`: **118/118 checks pass**, twice in a row (104 carried over from session 9
+  + 14 new: 1 invalid-events-value check + 8 live-delivery-filtering checks + 1 events-round-trip
+  check + 4 audit-log-enrichment checks), exit code `0` both times, both port 3000 and the webhook
+  receiver's port 18763 confirmed free after each run.
+- `static/`: HTML tag balance, duplicate-id, `getElementById`, `data-tab`, and combobox-class
+  cross-checks all clean.
