@@ -1548,3 +1548,165 @@ async fn test_audit_log_query_returns_entries_after_mutations() {
     assert_eq!(items[0]["target_address"], "88.1.1.1");
     assert_eq!(items[0]["group_names"], "audit-check-group");
 }
+
+// ─────────────────────────────────────────────────────────────
+// Regression tests: duplicate group creation, flexible group_id,
+// and the write/delete-requires-read invariant
+// ─────────────────────────────────────────────────────────────
+
+/// `POST /api/groups` must not `500` on a duplicate name — the raw `UNIQUE constraint failed`
+/// `DbErr` should be caught and turned into a clean `409 Conflict`.
+#[tokio::test]
+async fn test_create_duplicate_group_returns_conflict_not_500() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let make_req = || {
+        inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/groups")
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json"))
+            .body(Body::from(json!({ "name": "duplicate-group-test" }).to_string()))
+            .unwrap()
+    };
+
+    let res = app.clone().oneshot(make_req()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = app.clone().oneshot(make_req()).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT, "duplicate group name must be 409, not 500");
+
+    // Only one row actually exists — the failed second attempt didn't leave anything behind.
+    let count = simply_firewall::entities::ip_group::Entity::find()
+        .filter(simply_firewall::entities::ip_group::Column::Name.eq("duplicate-group-test"))
+        .all(&db)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(count, 1);
+}
+
+/// `POST /api/keys/{id}/groups` (and its `/permissions` alias) must accept a group's UUID *or*
+/// its literal name in the `group_id` field — previously `group_id` was strictly typed as `Uuid`,
+/// so a name-shaped string there failed Axum's deserialization with `422` before the handler ran.
+#[tokio::test]
+async fn test_group_permission_assignment_accepts_uuid_or_name_in_group_id_field() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (key_e_id, _key_e) = insert_key(&db, "Key_E", false, false, false, false).await;
+    let (key_f_id, _key_f) = insert_key(&db, "Key_F", false, false, false, false).await;
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/groups")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "name": "flex-id-group" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let group_uuid = created["id"].as_str().unwrap().to_owned();
+
+    // A NAME string in the group_id field — previously a guaranteed 422.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{key_e_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_id": "flex-id-group",
+            "can_read": true,
+            "can_write": false,
+            "can_delete": false
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // An actual UUID string in the group_id field, via the /permissions alias.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{key_f_id}/permissions"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_id": group_uuid,
+            "can_read": true,
+            "can_write": true,
+            "can_delete": false
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Both grants landed on the exact same group.
+    let perms = simply_firewall::entities::api_key_group_permission::Entity::find().all(&db).await.unwrap();
+    let group_ids: std::collections::HashSet<String> = perms.iter().map(|p| p.group_id.to_string()).collect();
+    assert_eq!(group_ids.len(), 1);
+    assert_eq!(group_ids.into_iter().next().unwrap(), group_uuid);
+}
+
+/// `can_write`/`can_delete` without `can_read` violates AGENT.MD's least-privilege rule and must
+/// be rejected with `400`, not silently persisted as a nonsensical grant.
+#[tokio::test]
+async fn test_group_permission_write_or_delete_requires_read() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (key_id, _key_plain) = insert_key(&db, "Key_G", false, false, false, false).await;
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{key_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_name": "no-read-group",
+            "can_read": false,
+            "can_write": true,
+            "can_delete": false
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{key_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_name": "no-read-group",
+            "can_read": false,
+            "can_write": false,
+            "can_delete": true
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+    // can_read alone, or read+write together, are both fine.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{key_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_name": "no-read-group",
+            "can_read": true,
+            "can_write": true,
+            "can_delete": false
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+}

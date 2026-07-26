@@ -31,6 +31,10 @@ pub enum AppError {
     #[error("Not Found")]
     NotFound,
 
+    /// The request conflicts with the current state of a resource (e.g. a unique-name collision)
+    #[error("Conflict: {0}")]
+    Conflict(String),
+
     /// Internal server error
     #[error("Internal Server Error")]
     Internal,
@@ -47,6 +51,7 @@ impl IntoResponse for AppError {
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             AppError::NotFound => (StatusCode::NOT_FOUND, "Resource not found".to_string()),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             AppError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "An internal server error occurred".to_string()),
         };
 

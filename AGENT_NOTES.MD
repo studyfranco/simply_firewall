@@ -745,3 +745,119 @@ revocation. Two items beyond the literal ask were fixed because they were direct
 work and represent real, live security/documentation gaps: the `secret_token` leak on
 `GET /webhooks`, and the broken rustdoc link. Neither required expanding scope beyond files already
 being edited for the requested work.
+
+---
+
+## 2026-07-26 (session 6) — Two live-cURL bug fixes, a real E2E shell suite, and a scripting lesson
+
+### Bug fix #1: `POST /api/groups` 500'd on a duplicate name
+
+`create_ip_group` did a bare `ip_group::Entity::insert(...).exec(...).await?` with no conflict
+handling — a second request for a name that already exists hit `ip_groups.name`'s unique
+constraint and propagated a raw `DbErr` straight to a `500`. This is the exact same *shape* of bug
+fixed for the auto-create-on-write paths in an earlier session (`get_or_create_group`'s
+`on_conflict().do_nothing()`), but this is a genuinely different code path — the *explicit*
+"create a group" endpoint — which was deliberately left alone at the time on the theory that an
+explicit create hitting a genuine duplicate is a more defensible edge case than a fail2ban-style
+implicit-create race. Live testing showed that reasoning doesn't hold up: it's still just a
+500 for an entirely predictable, common mistake (calling create twice, or two admins racing to set
+up the same group name). Fixed by adding `AppError::Conflict(String)` (`409`) to `src/error.rs` and
+catching `SqlErr::UniqueConstraintViolation` specifically around the insert (same
+`DbErr::sql_err()` classifier used for the `ip_records` upsert race in an earlier session), rather
+than silently falling back to "return the existing group" — an explicit create endpoint getting a
+clean `409` on a genuine name collision is the more correct REST semantic, and it still tells the
+caller unambiguously what happened.
+
+### Bug fix #2: `POST /api/keys/{id}/groups` 422'd when `group_id` held a name
+
+`GroupPermInput.group_id` was `Option<Uuid>` — strict typing that Axum/serde reject at
+deserialization time, before the handler ever runs, if the JSON value isn't UUID-shaped. A client
+passing a group's name into `group_id` (an easy mistake once `group_id`/`group_name` are supposed
+to be interchangeable, which was the whole point of introducing `group_id` in the first place)
+got a `422` with no chance for the server's own resolution logic to help. Fixed by changing
+`group_id`'s type to `Option<String>` and adding `resolve_group_ref_flexible()`, which reuses the
+existing `resolve_group_by_identifier()` helper (built for the `DELETE .../permissions/{id}` route
+in an earlier session) to try UUID-parse-then-name-lookup on whatever string is in `group_id`.
+`group_id` still never auto-creates (whether it looks like a UUID or a name) — only the dedicated
+`group_name` field can do that — so the existing "an identifier is a 404, a name is create-or-use"
+distinction from the previous session is preserved, just extended to tolerate either shape in the
+`group_id` slot specifically.
+
+### Adjacent finding fixed while in this code: least-privilege was documented but not enforced
+
+AGENT.MD states "`can_write` or `can_delete` require `can_read` to be true" as a Core Architectural
+Rule. Grepping `update_key_group_permissions` for any check of this turned up nothing — a client
+could set `can_write: true, can_read: false` and it would be persisted as-is. Added a validation
+check (before group resolution, so it fails fast) returning `400` when `can_write || can_delete`
+is set without `can_read`. Locked in with `test_group_permission_write_or_delete_requires_read`.
+
+### `tests/rbac_integration_tests.rs`: 3 new tests, all passing alongside the 21 carried over
+
+- `test_create_duplicate_group_returns_conflict_not_500`
+- `test_group_permission_assignment_accepts_uuid_or_name_in_group_id_field` (also exercises the
+  new `/permissions` alias route from an earlier session)
+- `test_group_permission_write_or_delete_requires_read`
+
+No existing test needed changes — `GroupPermInput.group_id` going from `Uuid` to `String` is
+wire-compatible (a UUID serializes identically either way), confirmed by all pre-existing tests
+passing unmodified.
+
+### `scripts/test_e2e.sh`: a real, repeatable, self-contained E2E suite
+
+Builds the project, boots a fresh instance against a throwaway `mktemp -d` SQLite database,
+scrapes the one-time bootstrap master key out of the server's own log, drives the full HTTP API
+with `curl`+`jq`, tears the server down and cleans up on exit (`trap cleanup EXIT INT TERM`) no
+matter how the script ends. Covers, in order: basic auth (missing/invalid/valid key); a 4-key
+permission matrix on a shared "Group A" (Master / Read-Only / Write-Only / No-Access — "Write-Only"
+means *read+write, no delete*, not literally write-without-read, since that would itself violate
+the least-privilege rule just added); add/list/filter(by IP substring, group, status)/update
+(re-registration)/delete of IPs spanning three groups (a banlist, a second banlist, and a
+whitelist); key update + secret rotation with old-secret invalidation; bound-IP CIDR enforcement
+via `X-Forwarded-For` (including the rightmost-hop-is-trusted case); master-only audit log access
+and content; and both bugs fixed above, live over HTTP. Every status code is timestamped
+(`HH:MM:SS.mmm`) and color-coded (2xx green, 401/403/404/409/422 yellow, 5xx red); every ID/key
+used is captured from real API responses via `jq`, never hardcoded.
+
+**A real bash bug found and fixed while writing it, worth recording because it's a recurring trap,
+not a one-off typo:** the first version used
+`mapfile -t _RO < <(create_scoped_key "Read-Only Key")` to capture a helper function's "return
+values" (a created key's plaintext + id) via command substitution. Every one of that function's
+*diagnostic* prints (`log`, the `api_call` status line, the `check` PASS/FAIL line) also went to
+stdout — and process substitution captures a command's entire stdout, so `mapfile` scooped up the
+diagnostic lines right along with the two real values, leaving `_RO[0]`/`_RO[1]` full of garbage
+instead of the key/id. That cascaded into the vast majority of the script's first-run failures
+(23 of them) — every subsequent call using the corrupted `$READONLY_ID` etc. hit a malformed URL
+and got a `400` from Axum's own path-parameter parsing, which looked at first glance like a wall of
+unrelated backend bugs. It wasn't: it was one bash mistake with a very wide blast radius. Fixed by
+(a) routing every diagnostic helper (`log`/`warn`/`err`/`log_section`/the status line in
+`api_call`/the PASS-FAIL lines in `check`/`check_jq`) to stderr unconditionally, so stdout is
+*never* anything but an intentional return value, and (b) rewriting `create_scoped_key` to set
+plain global variables (`$CREATED_KEY`/`$CREATED_ID`) instead of relying on stdout capture through
+a subshell at all — simpler, and sidesteps subshells silently losing `PASS_COUNT`/`FAIL_COUNT`
+increments too (process substitution runs in a subshell; variables it sets don't propagate back).
+Separately (a genuine test-design bug, not a bash mechanics one): the first version banned one
+address into "Group B" then tried to `/white` a second address into the *same* group name,
+expecting per-address ban/whitelist semantics — but group type is fixed at creation and doesn't
+vary per membership, so the second address silently landed in a banlist group and the
+`status=white` filter correctly found nothing. Fixed by giving the whitelist example its own group.
+
+Re-ran the fixed script twice back-to-back: **51/51 checks pass both times**, clean shutdown, port
+3000 free afterward.
+
+### Final verification (session 6)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **24/24 pass** (21 carried over from sessions 1–5 + 3 new this
+  session).
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- `cargo doc --no-deps`: clean.
+- `grep -rn -E "\.unwrap\(\)|\.expect\(" src/`: no matches.
+- `scripts/test_e2e.sh`: **51/51 checks pass**, twice in a row, against a real running instance.
+
+### Environment note carried forward
+
+Before running anything that binds port 3000 (including this new script), `fuser 3000/tcp` first —
+this session, like session 5, found a stale `simply_firewall` process still holding the port from
+earlier manual testing before either the script or a fresh manual run could bind it. The E2E
+script itself now checks for this up front and exits with a clear message instead of limping along
+against a leftover instance the way manual testing did in session 5.

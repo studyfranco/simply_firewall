@@ -136,6 +136,32 @@ async fn resolve_group_by_identifier(
         .await?)
 }
 
+/// Resolves a group given an optional flexible `group_id` and/or `group_name`; exactly one must
+/// be supplied. Unlike [`resolve_group_ref`], `group_id` here is a plain string rather than a
+/// strictly-typed UUID: a client that passes a group's name into the `group_id` field (or a UUID
+/// into it, which also works) gets a correct lookup instead of Axum rejecting the request with a
+/// `422` before this code ever runs. Never auto-creates via `group_id`, matching
+/// [`resolve_group_by_identifier`]'s semantics — only `group_name` can create.
+async fn resolve_group_ref_flexible(
+    db: &sea_orm::DatabaseConnection,
+    group_id: Option<&str>,
+    group_name: Option<&str>,
+) -> Result<Option<ip_group::Model>, AppError> {
+    match (group_id, group_name) {
+        (Some(_), Some(_)) => Err(AppError::InvalidInput(
+            "Provide either group_id or group_name, not both".to_owned(),
+        )),
+        (None, None) => Err(AppError::InvalidInput(
+            "Either group_id or group_name is required".to_owned(),
+        )),
+        (Some(identifier), None) => resolve_group_by_identifier(db, identifier).await,
+        (None, Some(name)) => Ok(ip_group::Entity::find()
+            .filter(ip_group::Column::Name.eq(name))
+            .one(db)
+            .await?),
+    }
+}
+
 // ─────────────────────────────────────────────────────────────
 // IP Ban / Whitelist
 // ─────────────────────────────────────────────────────────────
@@ -748,16 +774,19 @@ pub async fn get_me(
 /// Input to update group permissions
 #[derive(Deserialize)]
 pub struct GroupPermInput {
-    /// Target group, by ID. Provide this or `group_name`, not both.
-    pub group_id: Option<Uuid>,
-    /// Target group, by name. Provide this or `group_id`, not both. A name that doesn't exist
-    /// yet may be auto-created (permission allowing); an unknown `group_id` is a `404` instead.
+    /// Target group, by ID *or* by name (a plain string, not a strictly-typed UUID, so passing a
+    /// name here doesn't trip Axum's deserialization). Provide this or `group_name`, not both.
+    pub group_id: Option<String>,
+    /// Target group, by name. Equivalent to putting a name into `group_id`; kept as a separate
+    /// field for backward compatibility. Provide this or `group_id`, not both. A name that
+    /// doesn't exist yet may be auto-created (permission allowing); an unresolvable `group_id`
+    /// (whether UUID- or name-shaped) is a `404` instead — an identifier is never auto-created.
     pub group_name: Option<String>,
     /// Can read
     pub can_read: bool,
-    /// Can write
+    /// Can write. Requires `can_read` (AGENT.MD least-privilege rule).
     pub can_write: bool,
-    /// Can delete
+    /// Can delete. Requires `can_read` (AGENT.MD least-privilege rule).
     pub can_delete: bool,
 }
 
@@ -1064,9 +1093,15 @@ pub async fn update_key_group_permissions(
         return Err(AppError::InvalidInput("Cannot configure M:N permissions on a master key".to_owned()));
     }
 
+    if (payload.can_write || payload.can_delete) && !payload.can_read {
+        return Err(AppError::InvalidInput(
+            "can_write or can_delete require can_read to be true".to_owned(),
+        ));
+    }
+
     let target_group_id: Uuid;
     let resolved_group_name: String;
-    let existing_group = resolve_group_ref(&state.db, payload.group_id, payload.group_name.as_deref()).await?;
+    let existing_group = resolve_group_ref_flexible(&state.db, payload.group_id.as_deref(), payload.group_name.as_deref()).await?;
 
     if let Some(g) = existing_group {
         target_group_id = g.id;
@@ -1175,7 +1210,15 @@ pub async fn create_ip_group(
         description: Set(None),
         created_at: Set(now),
     };
-    ip_group::Entity::insert(model).exec(&state.db).await?;
+    if let Err(err) = ip_group::Entity::insert(model).exec(&state.db).await {
+        if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
+            return Err(AppError::Conflict(format!(
+                "A group named '{}' already exists",
+                payload.name
+            )));
+        }
+        return Err(err.into());
+    }
 
     if !key.is_master {
         let perm = api_key_group_permission::ActiveModel {
