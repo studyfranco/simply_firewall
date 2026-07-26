@@ -9,9 +9,12 @@
 # both query-string params and a JSON body), key lifecycle (create/update/rotate/delete), bound-IP
 # CIDR enforcement, audit log generation + pagination + enrichment (client IP, API key name/
 # prefix), webhook lifecycle (create/list/delete, with the mandatory `name` field) and per-webhook
-# event filtering (events=IP_ADD/IP_UPDATE/IP_DELETE), and the group-identification bug fixes
-# (duplicate-name 409, flexible group_id/group_name). Every request is logged with a timestamp,
-# method, full URL, color-coded status, and jq-formatted body.
+# event filtering (events=IP_ADD/IP_UPDATE/IP_DELETE), RBAC-before-group-type-validation precedence
+# and strict banlist/whitelist type enforcement on /api/ban and /api/white, auto-granted creator
+# permissions on both explicit (POST /api/groups) and implicit (ban/white auto-create) group
+# creation, and the group-identification bug fixes (duplicate-name 409, flexible group_id/
+# group_name). Every request is logged with a timestamp, method, full URL, color-coded status, and
+# jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
 # Requires: curl, jq. Needs port 3000 free (the app's listen address is not configurable).
@@ -760,6 +763,75 @@ check "200" "fetch the most recent GROUP_CREATE audit entry to inspect enrichmen
 check_jq ".[0].client_ip" "127.0.0.1" "the audit entry's client_ip is populated with the real caller address"
 check_jq ".[0].api_key_name" "System Master" "the audit entry's api_key_name is denormalized from the acting key"
 check_true '(.[0].api_key_prefix | length) == 8' "the audit entry's api_key_prefix is present and 8 characters"
+
+# ── 15. RBAC precedence & strict group-type validation ──────────────────────
+
+log_section "15. RBAC Precedence & Strict Group Type Validation"
+
+log "Master creates a whitelist group and a banlist group for the type-validation scenarios..."
+api_call POST "/api/white" "$MASTER_KEY" '{"target_address":"203.0.113.60","group_name":"rbac-precedence-whitelist","cause":"seed"}'
+check "200" "seed the whitelist group"
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.61","group_name":"rbac-precedence-banlist","cause":"seed"}'
+check "200" "seed the banlist group"
+
+log "A key with NO permission mapping on the whitelist group attempts to ban into it..."
+api_call POST "/api/ban" "$NOACCESS_KEY" '{"target_address":"198.51.100.30","group_name":"rbac-precedence-whitelist"}'
+check "403" "no-access key gets 403 (RBAC), not 400 (type mismatch) — permission is checked first"
+check_true '.error | contains("Permission denied")' "the 403 body is a genuine permission-denied error, not a type-validation one"
+
+log "Granting a dedicated key full read+write on both groups..."
+create_scoped_key "Type Validation Key"
+TYPE_CHECK_KEY="$CREATED_KEY"; TYPE_CHECK_ID="$CREATED_ID"
+api_call POST "/api/keys/$TYPE_CHECK_ID/groups" "$MASTER_KEY" \
+    '{"group_name":"rbac-precedence-whitelist","can_read":true,"can_write":true,"can_delete":false}'
+check "200" "grant the type-validation key rights on the whitelist group"
+api_call POST "/api/keys/$TYPE_CHECK_ID/groups" "$MASTER_KEY" \
+    '{"group_name":"rbac-precedence-banlist","can_read":true,"can_write":true,"can_delete":false}'
+check "200" "grant the type-validation key rights on the banlist group"
+
+log "Now authorized: banning into the whitelist group is rejected with the exact 400 message..."
+api_call POST "/api/ban" "$TYPE_CHECK_KEY" '{"target_address":"198.51.100.31","group_name":"rbac-precedence-whitelist"}'
+check "400" "banning into a whitelist group is rejected with 400, not 200 or 403"
+check_jq ".error" "Cannot ban IP into group 'rbac-precedence-whitelist': group type is 'whitelist'. Use /api/white or target a banlist group." \
+    "the error message exactly matches the spec"
+
+log "Whitelisting into the banlist group is rejected with the exact reverse 400 message..."
+api_call POST "/api/white" "$TYPE_CHECK_KEY" '{"target_address":"198.51.100.32","group_name":"rbac-precedence-banlist"}'
+check "400" "whitelisting into a banlist group is rejected with 400, not 200 or 403"
+check_jq ".error" "Cannot whitelist IP into group 'rbac-precedence-banlist': group type is 'banlist'. Use /api/ban or target a whitelist group." \
+    "the error message exactly matches the reverse spec"
+
+# ── 16. Auto-grant full permissions on group creation ───────────────────────
+
+log_section "16. Auto-Grant Full Permissions on Group Creation"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Group Creator Key","bound_ips":"0.0.0.0/0","can_create_groups":true}'
+check "200" "create a key with can_create_groups=true"
+GROUP_CREATOR_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+
+log "Explicit creation via POST /api/groups..."
+api_call POST "/api/groups" "$GROUP_CREATOR_KEY" '{"name":"explicit-creator-group"}'
+check "200" "the can_create_groups key creates a new group via POST /api/groups"
+EXPLICIT_CREATOR_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call GET "/api/auth/me" "$GROUP_CREATOR_KEY"
+check "200" "fetch the creator key's own profile to inspect its granted permissions"
+check_true "[.group_permissions[] | select(.group_id == \"$EXPLICIT_CREATOR_GROUP_ID\")] | length == 1" \
+    "the creator has exactly one permission record on the group it just created"
+check_true "[.group_permissions[] | select(.group_id == \"$EXPLICIT_CREATOR_GROUP_ID\")][0] | .can_read and .can_write and .can_delete" \
+    "that permission record grants full can_read/can_write/can_delete"
+
+log "Implicit creation via POST /api/ban (auto-create-on-first-use)..."
+api_call POST "/api/ban" "$GROUP_CREATOR_KEY" '{"target_address":"198.51.100.240","group_name":"implicit-creator-group","cause":"testing implicit auto-grant"}'
+check "200" "the can_create_groups key implicitly creates a new group via POST /api/ban"
+
+api_call GET "/api/groups" "$MASTER_KEY"
+IMPLICIT_CREATOR_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.[] | select(.name=="implicit-creator-group") | .id')
+
+api_call GET "/api/auth/me" "$GROUP_CREATOR_KEY"
+check "200" "fetch the creator key's profile again after implicit group creation"
+check_true "[.group_permissions[] | select(.group_id == \"$IMPLICIT_CREATOR_GROUP_ID\")][0] | .can_read and .can_write and .can_delete" \
+    "the implicitly-created group also grants full can_read/can_write/can_delete"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

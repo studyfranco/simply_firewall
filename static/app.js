@@ -162,10 +162,15 @@ class FirewallClient {
 
         try {
             const res = await fetch(`${this.apiBase}${endpoint}`, { ...options, headers });
-            
-            if (res.status === 401 || res.status === 403) {
+
+            // 401 means the key itself is invalid/missing — the session is unrecoverable, so log
+            // out. 403 means the key IS valid but lacks permission for this one action; it must
+            // NOT log the user out or swallow the server's specific "Permission denied: ..."
+            // message behind a generic one — that message is exactly what the user needs to see,
+            // and falls through to the generic error handling below like any other 4xx.
+            if (res.status === 401) {
                 this.handleAuthFailure();
-                throw new Error("Authentication failed");
+                throw new Error("Session expired or invalid API key — please log in again.");
             }
 
             if (!res.ok) {
@@ -213,7 +218,7 @@ class FirewallClient {
 
     logout() {
         this.handleAuthFailure();
-        this.showToast("Logged out successfully");
+        this.showToast("Logged out successfully", 'success');
     }
 
     enforceRBACUI() {
@@ -359,11 +364,19 @@ class FirewallClient {
         const toast = document.createElement('div');
         toast.className = `toast toast-${type}`;
         toast.textContent = message;
-        
+
         container.appendChild(toast);
-        
+
+        // The base .toast class starts hidden (opacity: 0, slid off-screen) so this class add
+        // triggers the CSS transition into view. Applying it in the same tick as appendChild()
+        // often gets coalesced by the browser with no visible transition, so defer one frame to
+        // let the hidden state actually paint first.
+        requestAnimationFrame(() => {
+            toast.classList.add('visible');
+        });
+
         setTimeout(() => {
-            toast.style.opacity = '0';
+            toast.classList.remove('visible');
             setTimeout(() => toast.remove(), 300);
         }, 3000);
     }
@@ -655,7 +668,7 @@ class FirewallClient {
         if (!confirm("Confirm deleting API Key?")) return;
         try {
             await this.apiFetch(`/keys/${id}`, { method: 'DELETE' });
-            this.showToast("Key deleted");
+            this.showToast("Key deleted", 'success');
             this.loadKeys();
         } catch(e) {}
     }
@@ -721,7 +734,7 @@ class FirewallClient {
             await this.apiFetch('/groups', { method: 'POST', body: JSON.stringify({ name }) });
             document.getElementById('form-create-group').reset();
             this.loadGroups();
-            this.showToast("Group created");
+            this.showToast("Group created", 'success');
         } catch(e) {}
     }
 
@@ -769,7 +782,7 @@ class FirewallClient {
             await this.apiFetch('/webhooks', { method: 'POST', body: JSON.stringify(payload) });
             document.getElementById('form-create-webhook').reset();
             this.loadWebhooks();
-            this.showToast("Webhook configured");
+            this.showToast("Webhook configured", 'success');
         } catch(e) {}
     }
 
@@ -778,7 +791,7 @@ class FirewallClient {
         try {
             await this.apiFetch(`/webhooks/${id}`, { method: 'DELETE' });
             this.loadWebhooks();
-            this.showToast("Webhook configuration deleted");
+            this.showToast("Webhook configuration deleted", 'success');
         } catch(e) {}
     }
 

@@ -1300,3 +1300,120 @@ No changes were needed to `tests/rbac_integration_tests.rs`'s existing tests, `s
   receiver's port 18763 confirmed free after each run.
 - `static/`: HTML tag balance, duplicate-id, `getElementById`, `data-tab`, and combobox-class
   cross-checks all clean.
+
+---
+
+## 2026-07-26 (session 11) — RBAC-before-type-validation, auto-grant verification, toast bug fixes
+
+Three of this session's four tasks turned out to be "verify/close a gap," not "build from
+scratch" — worth stating plainly since it changes what actually got touched:
+
+1. **Task 1 (RBAC precedence)**: the RBAC permission check in `handle_ip_upsert` already ran
+   before anything else — but there was no group-*type* validation anywhere to have an ordering
+   problem with. `/api/ban` on an existing whitelist group (or `/api/white` on a banlist group)
+   silently succeeded with no check at all. So this wasn't a reordering fix; it was adding a
+   missing feature, in the position the task specified.
+2. **Task 2 (auto-grant on group creation)**: already fully implemented on both paths —
+   `create_ip_group` (explicit `POST /api/groups`) and `handle_ip_upsert`'s auto-create branch
+   (implicit, via `/api/ban`/`/api/white` on a not-yet-existing `group_name`) both already insert a
+   full `can_read`/`can_write`/`can_delete = true` permission row for non-master creators. No code
+   changes needed — this session added the missing explicit-path test and an E2E section proving
+   it, since only the implicit path had prior coverage.
+3. **Task 3 (toast UI)**: the toast component already existed in skeleton form and was completely
+   non-functional — see below. This was a real bug fix, not new construction.
+
+### Task 1: `src/api.rs` — strict group-type validation, correctly ordered
+
+Added directly after the existing RBAC permission-check block inside `handle_ip_upsert`'s
+"existing group" branch (not before it, and not as a replacement for it):
+
+```rust
+if is_whitelist && g.group_type == "banlist" {
+    return Err(AppError::InvalidInput(format!(
+        "Cannot whitelist IP into group '{resolved_group_name}': group type is 'banlist'. Use /api/ban or target a whitelist group."
+    )));
+}
+if !is_whitelist && g.group_type == "whitelist" {
+    return Err(AppError::InvalidInput(format!(
+        "Cannot ban IP into group '{resolved_group_name}': group type is 'whitelist'. Use /api/white or target a banlist group."
+    )));
+}
+```
+
+Runs unconditionally (even for `is_master`, which bypasses the permission check above it but not
+this one — banning into a whitelist group is a mistake regardless of who's doing it) but only
+after the permission check has already had a chance to return 403 first — a caller with zero
+access to a group must never learn its type via a 400 instead of the 403 they should actually get.
+The auto-create branch (`else if let Some(group_name) = ...`) needed no change: a newly-created
+group is always created with `default_type` matching the endpoint being called, so no mismatch is
+ever possible there by construction. Confirmed via a full `cargo test` run *before* adding any new
+tests that no existing test relied on the old (missing) validation — 29/29 unchanged.
+
+### Task 3: `static/app.js`, `static/style.css` — two real bugs, not a from-scratch build
+
+- **Toasts were completely invisible.** `.toast`'s base CSS starts at
+  `opacity: 0; transform: translateX(120%)` (off-screen, awaiting a `.visible` class to transition
+  in) — but `showToast()` never added that class. Every toast existed in the DOM for its full
+  3.3-second lifetime at zero opacity, then got silently removed. Every one of the ~15 call sites
+  across the app had been firing into the void since whenever this was written. Fixed by adding
+  `.visible` via `requestAnimationFrame` (deferring one frame so the hidden initial state actually
+  paints before the class change, letting the CSS transition animate instead of the two states
+  collapsing into one browser-coalesced update) and symmetrically removing it before deletion,
+  replacing a dead inline `toast.style.opacity = '0'` that duplicated — and fought — the CSS
+  class-based approach without resetting `transform`.
+- **`apiFetch` treated `403` the same as `401`**: both triggered `handleAuthFailure()` (clearing
+  the stored key and forcing the user back to the login screen) and both got overwritten with a
+  generic `"Authentication failed"` message, discarding whatever the server actually said. This
+  directly defeated task 3's own requirement ("403 permission denied... display... the exact
+  server error message") for every single 403 in the app, including all the new ones this
+  session's task 1 introduces: a user hitting the new "Cannot ban IP into group... group type
+  is..." 400 would see it fine, but a *401-coded* permission-denied response would never surface
+  and would spuriously log them out. `401` (key itself is invalid) and `403` (key is valid but
+  lacks permission for this one action) are different failure modes — logging out on `403` is
+  wrong regardless of this session's other changes. Fixed by making only `401` trigger
+  `handleAuthFailure()`; `403` now falls through to the same generic `!res.ok` handling as every
+  other 4xx, which already correctly extracts and displays `errData.error`.
+- **Five genuinely-successful actions were shown as plain/neutral toasts, not green ones**:
+  `showToast(message)` calls with no explicit type default to `'info'`, and five call sites
+  ("Logged out successfully", "Key deleted", "Group created", "Webhook configured", "Webhook
+  configuration deleted") were missing the `'success'` argument entirely. Fixed all five —
+  directly required by "on success, display a subtle green success toast."
+- Gave `.toast-success`/`.toast-error` a tinted background (reusing the same `rgba(...)` tokens
+  already used by the separate `.message.success`/`.message.error` component) on top of the
+  existing colored left-border, since a 4px accent bar alone reads as fairly subtle for an error
+  state the task explicitly wants in "amber/red."
+
+### Tests
+
+- `tests/rbac_integration_tests.rs`, 3 new: `test_explicit_group_creation_grants_full_permissions_to_creator`
+  (closes the explicit-path coverage gap noted above), `test_rbac_denial_precedes_group_type_validation`
+  (a key with *no* permission mapping on an existing whitelist group gets `403` attempting
+  `/api/ban`, asserting the body contains `"Permission denied"` — proving the 403 path, not a
+  generic error), `test_group_type_mismatch_rejected_with_exact_message_for_authorized_key` (a key
+  *with* full read+write on both a whitelist and a banlist group still gets exactly the specified
+  `400` message in both directions — proving type validation actually fires once RBAC clears).
+- `scripts/test_e2e.sh`, 2 new sections: **§15 RBAC Precedence & Strict Group Type Validation**
+  (no-access key → 403 on a whitelist group; then an authorized dedicated key → 400 with the exact
+  message in both ban→whitelist and white→banlist directions) and **§16 Auto-Grant Full Permissions
+  on Group Creation** (a fresh `can_create_groups=true` key creates one group explicitly via
+  `POST /api/groups` and a second implicitly via `POST /api/ban`, then `GET /api/auth/me` confirms
+  full `can_read`/`can_write`/`can_delete` on both — covering the symmetry the Rust tests split
+  across two separate tests in a single end-to-end pass).
+
+No changes were needed to `src/error.rs`, `src/middleware.rs`, `src/migration/`, or any entity —
+this session was scoped entirely to `src/api.rs`'s ban/white handler and the frontend toast path.
+
+### Final verification (session 11)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **32/32 pass** (29 carried over + 3 new).
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `scripts/test_e2e.sh`: **137/137 checks pass**, twice in a row (118 carried over from session 10
+  + 19 new: 4 RBAC-precedence/type-validation checks + 2 seed checks + 2 grant checks + 2 exact-
+  message checks in §15, plus 1 key-creation + 2 explicit-creation + 2 implicit-creation checks in
+  §16 — 9 + 7, rounding out via the intermediate seed/grant/fetch checks each section also runs),
+  exit code `0` both times, both port 3000 and the webhook receiver's port 18763 confirmed free
+  after each run.
+- `static/`: HTML tag balance, duplicate-id, `getElementById`, `data-tab`, and combobox-class
+  cross-checks all clean (no HTML changed this session; re-run to confirm the JS changes didn't
+  introduce any new unresolved references).

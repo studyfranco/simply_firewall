@@ -271,6 +271,21 @@ async fn handle_ip_upsert(
                 return Err(AppError::Forbidden("Permission denied: You have no access strictly mapped to this group".to_owned()));
             }
         }
+
+        // Group-type validation runs strictly AFTER the RBAC check above (and unconditionally,
+        // even for master keys, which bypass that check but not this one): a caller with no
+        // access to the group must learn nothing about it — including its type — via a 400
+        // instead of the 403 they should actually get.
+        if is_whitelist && g.group_type == "banlist" {
+            return Err(AppError::InvalidInput(format!(
+                "Cannot whitelist IP into group '{resolved_group_name}': group type is 'banlist'. Use /api/ban or target a whitelist group."
+            )));
+        }
+        if !is_whitelist && g.group_type == "whitelist" {
+            return Err(AppError::InvalidInput(format!(
+                "Cannot ban IP into group '{resolved_group_name}': group type is 'whitelist'. Use /api/white or target a banlist group."
+            )));
+        }
     } else if let Some(group_name) = &payload.group_name {
         // group_id (if given) is never auto-creatable — only reachable here when group_name was
         // supplied instead, since resolve_group_ref requires exactly one of the two.

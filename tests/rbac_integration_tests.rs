@@ -191,6 +191,169 @@ async fn test_auto_provisioning_on_group_creation() {
     assert!(perms[0].can_delete);
 }
 
+/// Same auto-provisioning guarantee as `test_auto_provisioning_on_group_creation`, but exercised
+/// via the EXPLICIT `POST /api/groups` endpoint rather than an implicit ban/white auto-create —
+/// AGENT.MD's rule ("When an API Key creates a new IpGroup...") applies to both paths, and only
+/// the implicit one had coverage before this test.
+#[tokio::test]
+async fn test_explicit_group_creation_grants_full_permissions_to_creator() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (key_id, plaintext) = insert_key(&db, "Group Creator", false, false, false, true).await;
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/groups")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "name": "explicitly-created-group" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let group_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
+
+    let perm = simply_firewall::entities::api_key_group_permission::Entity::find()
+        .filter(simply_firewall::entities::api_key_group_permission::Column::ApiKeyId.eq(key_id))
+        .filter(simply_firewall::entities::api_key_group_permission::Column::GroupId.eq(group_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("creator should have an auto-granted permission row on the group it just created");
+
+    assert!(perm.can_read);
+    assert!(perm.can_write);
+    assert!(perm.can_delete);
+}
+
+/// RBAC must be checked BEFORE group-type validation: a key with no permission mapping at all on
+/// an existing (whitelist-typed) group must get 403, never 400 — a caller with no access to a
+/// group shouldn't learn anything about it, including its type, and should get the same denial
+/// it would get for any other group it can't touch.
+#[tokio::test]
+async fn test_rbac_denial_precedes_group_type_validation() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (_key_b_id, key_b) = insert_key(&db, "No-Access Key", false, false, false, false).await;
+
+    // Master creates a whitelist-typed group.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/white")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "203.0.113.9", "group_name": "precedence-whitelist" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // key_b has NO permission mapping at all on this group — must get 403, not 400, even though
+    // the group is also the "wrong" type for a ban.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &key_b)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "198.51.100.5", "group_name": "precedence-whitelist" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(json["error"].as_str().unwrap().contains("Permission denied"));
+}
+
+/// Once RBAC clears a key for write access, group-type mismatches are still rejected — in both
+/// directions — with the exact, actionable message naming the group and pointing at the correct
+/// endpoint/group type.
+#[tokio::test]
+async fn test_group_type_mismatch_rejected_with_exact_message_for_authorized_key() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (key_b_id, key_b) = insert_key(&db, "Key_B", false, false, false, false).await;
+
+    // Master creates a whitelist group and a banlist group, each seeded with an address.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/white")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "203.0.113.10", "group_name": "type-check-whitelist" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "203.0.113.11", "group_name": "type-check-banlist" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Grant Key_B full read+write on BOTH groups.
+    for group_name in ["type-check-whitelist", "type-check-banlist"] {
+        let req = inject_connect_info(Request::builder()
+            .method("POST")
+            .uri(format!("/api/keys/{key_b_id}/groups"))
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json"))
+            .body(Body::from(json!({
+                "group_name": group_name,
+                "can_read": true,
+                "can_write": true,
+                "can_delete": false
+            }).to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    // Banning into the whitelist group is rejected with the exact specified message.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &key_b)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "198.51.100.20", "group_name": "type-check-whitelist" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["error"],
+        "Cannot ban IP into group 'type-check-whitelist': group type is 'whitelist'. Use /api/white or target a banlist group."
+    );
+
+    // Whitelisting into the banlist group is rejected with the exact specified (reverse) message.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/white")
+        .header("X-API-Key", &key_b)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "198.51.100.21", "group_name": "type-check-banlist" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        json["error"],
+        "Cannot whitelist IP into group 'type-check-banlist': group type is 'banlist'. Use /api/ban or target a whitelist group."
+    );
+}
+
 #[tokio::test]
 async fn test_explicit_key_group_manipulation() {
     let db = setup_test_db().await;

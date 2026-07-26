@@ -809,10 +809,13 @@ body {
 
 .toast-success {
     border-left-color: var(--success);
+    background-color: rgba(28, 220, 154, 0.1);
 }
 
 .toast-error {
     border-left-color: var(--danger);
+    background-color: rgba(231, 76, 60, 0.12);
+    color: #ffd9d3;
 }
 
 /* ─── Utility Classes ───────────────────────────────────── */
