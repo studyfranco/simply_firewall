@@ -1186,3 +1186,365 @@ async fn test_webhook_dispatch_does_not_block_api_response() {
         "expected POST /api/ban to return in under 50ms regardless of webhook speed, took {elapsed:?}"
     );
 }
+
+// ─────────────────────────────────────────────────────────────
+// Unified group identification, flexible DELETE, key rotation/update,
+// permission revocation, and audit log querying
+// ─────────────────────────────────────────────────────────────
+
+/// `DELETE /api/ips` must accept `target_address`/`group_name` from the URL query string (the
+/// original, documented shape) as well as from a JSON request body (previously a guaranteed
+/// deserialization failure, since `Query<DeleteIpQuery>` only ever looked at the URL).
+#[tokio::test]
+async fn test_delete_ip_accepts_query_or_json_body() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    for addr in ["55.55.55.1", "55.55.55.2"] {
+        let req = inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/ban")
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json"))
+            .body(Body::from(json!({ "target_address": addr, "group_name": "delete-shape-group" }).to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    // Delete via URL query string.
+    let req = inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri("/api/ips?target_address=55.55.55.1&group_name=delete-shape-group")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    // Delete via JSON body instead — previously this failed before the handler even ran.
+    let req = inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri("/api/ips")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "55.55.55.2", "group_name": "delete-shape-group" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=delete-shape-group")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert!(items.is_empty(), "both records should be gone: {items:?}");
+}
+
+/// A group granted/looked-up by `group_id` and one looked up by `group_name` must be the same
+/// group and behave identically. Also covers the required-exactly-one-of validation and that an
+/// unknown `group_id` 404s rather than silently auto-creating (unlike an unknown `group_name`).
+#[tokio::test]
+async fn test_group_identification_by_id_and_name_are_interchangeable() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (key_c_id, key_c) = insert_key(&db, "Key_C", false, false, false, false).await;
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "77.1.1.1", "group_name": "interop-group" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let group_id = simply_firewall::entities::ip_group::Entity::find()
+        .filter(simply_firewall::entities::ip_group::Column::Name.eq("interop-group"))
+        .one(&db).await.unwrap().unwrap().id;
+
+    // Grant Key_C rights on the group BY ID.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{key_c_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "group_id": group_id, "can_read": true, "can_write": true, "can_delete": false }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Key_C bans an address identifying the group BY NAME...
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &key_c)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "77.1.1.2", "group_name": "interop-group" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // ...and another identifying it BY ID.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &key_c)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "77.1.1.3", "group_id": group_id }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Supplying both is rejected.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &key_c)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "77.1.1.4", "group_id": group_id, "group_name": "interop-group" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+    // Supplying neither is rejected.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &key_c)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "77.1.1.5" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
+
+    // An unknown group_id is 404 — unlike group_name, an ID is never auto-creatable.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "77.1.1.6", "group_id": Uuid::new_v4() }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+}
+
+/// `POST /api/keys/{id}/rotate` must generate a new secret and immediately invalidate the old one.
+#[tokio::test]
+async fn test_key_rotation_invalidates_old_secret() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (rotate_id, old_secret) = insert_key(&db, "Rotate_Me", false, false, false, false).await;
+
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &old_secret))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{rotate_id}/rotate"))
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let new_secret = parsed["plaintext_key"].as_str().unwrap().to_owned();
+    assert_ne!(new_secret, old_secret);
+
+    // Old secret immediately stops working.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &old_secret))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // New secret works.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &new_secret))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // A non-privileged key cannot rotate someone else's key.
+    let (other_id, _) = insert_key(&db, "Other", false, false, false, false).await;
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{other_id}/rotate"))
+        .header("X-API-Key", &new_secret))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+}
+
+/// `PUT /api/keys/{id}` updates name/bound_ips/global scopes in place, and the change is visible
+/// on the next request using that key (permission enforcement isn't cached).
+#[tokio::test]
+async fn test_update_api_key_changes_take_effect_immediately() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (target_id, target_key) = insert_key(&db, "Before", false, false, false, false).await;
+
+    // Not yet allowed to manage webhooks.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/webhooks")
+        .header("X-API-Key", &target_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    let req = inject_connect_info(Request::builder()
+        .method("PUT")
+        .uri(format!("/api/keys/{target_id}"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "name": "After",
+            "bound_ips": "0.0.0.0/0",
+            "can_manage_webhooks": true
+        }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let updated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(updated["name"], "After");
+    assert_eq!(updated["bound_ips"], "0.0.0.0/0");
+    assert_eq!(updated["can_manage_webhooks"], true);
+
+    // Now allowed, immediately, with the same (unrotated) secret.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/webhooks")
+        .header("X-API-Key", &target_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+}
+
+/// `DELETE /api/keys/{id}/permissions/{group_identifier}` removes exactly the targeted grant,
+/// accepts either a group name or a group ID as the identifier, and 404s on a second attempt.
+#[tokio::test]
+async fn test_revoke_group_permission_by_name_and_by_id() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (key_id, key_plain) = insert_key(&db, "Key_D", false, false, false, false).await;
+
+    for group_name in ["revoke-by-name-group", "revoke-by-id-group"] {
+        let req = inject_connect_info(Request::builder()
+            .method("POST")
+            .uri(format!("/api/keys/{key_id}/permissions"))
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json"))
+            .body(Body::from(json!({ "group_name": group_name, "can_read": true, "can_write": true, "can_delete": true }).to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    let group_id_2 = simply_firewall::entities::ip_group::Entity::find()
+        .filter(simply_firewall::entities::ip_group::Column::Name.eq("revoke-by-id-group"))
+        .one(&db).await.unwrap().unwrap().id;
+
+    // Revoke the first by name.
+    let req = inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri("/api/keys/".to_owned() + &key_id.to_string() + "/permissions/revoke-by-name-group")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    // Revoke the second by ID.
+    let req = inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{key_id}/permissions/{group_id_2}"))
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    // Revoking again is 404 — the grant is already gone.
+    let req = inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri("/api/keys/".to_owned() + &key_id.to_string() + "/permissions/revoke-by-name-group")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    // The key can no longer read either group.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=revoke-by-name-group,revoke-by-id-group")
+        .header("X-API-Key", &key_plain))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert!(items.is_empty());
+}
+
+/// `GET /api/audit-logs` is master-only and returns populated entries after mutations, filterable
+/// by action.
+#[tokio::test]
+async fn test_audit_log_query_returns_entries_after_mutations() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (_sub_id, sub_key) = insert_key(&db, "Sub", false, false, false, false).await;
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "88.1.1.1", "group_name": "audit-check-group" }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Non-master keys cannot view audit logs, even with other broad global scopes.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/audit-logs")
+        .header("X-API-Key", &sub_key))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/audit-logs?action=IP_ADD")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["action"], "IP_ADD");
+    assert_eq!(items[0]["target_address"], "88.1.1.1");
+    assert_eq!(items[0]["group_names"], "audit-check-group");
+}

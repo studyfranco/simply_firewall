@@ -47,6 +47,7 @@
         <nav class="tab-nav" role="tablist">
             <button class="tab-btn active" data-tab="firewall" role="tab" aria-selected="true">Firewall Rules</button>
             <button class="tab-btn" data-tab="admin" role="tab" aria-selected="false">Administration</button>
+            <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
 
         <!-- ═══════════════════════════════════════════════ -->
@@ -215,8 +216,10 @@
                                     </select>
                                 </div>
                                 <div class="form-group">
-                                    <label for="manage-rights-group">Group Name <span>*</span></label>
-                                    <input type="text" id="manage-rights-group" placeholder="e.g. backend-servers" required class="input-field">
+                                    <label for="manage-rights-group">Group <span>*</span></label>
+                                    <select id="manage-rights-group" class="input-field select-field" required>
+                                        <option value="">-- Select Group --</option>
+                                    </select>
                                 </div>
                             </div>
                             <div class="permissions-grid mt-2 mb-4">
@@ -308,7 +311,89 @@
                 </section>
             </div>
         </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: Audit Logs                                 -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-audit" class="tab-panel">
+            <section class="card">
+                <h2>Audit Logs</h2>
+                <p class="subtitle">Recent mutating actions across the system. Visible to Master keys only.</p>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>Action</th>
+                                <th>Target</th>
+                                <th>Groups</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody id="audit-logs-table-body">
+                            <tr>
+                                <td colspan="5" class="text-center text-muted">Loading data...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination">
+                    <button id="audit-btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
+                    <span id="audit-page-indicator">Page 1</span>
+                    <button id="audit-btn-next" class="btn btn-icon">Next &raquo;</button>
+                </div>
+            </section>
+        </main>
     </div>
+
+    <!-- Edit API Key Modal -->
+    <div id="edit-key-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3>Edit API Key</h3>
+            <form id="form-edit-key">
+                <input type="hidden" id="edit-key-id">
+                <div class="form-group">
+                    <label for="edit-key-name">Key Name <span>*</span></label>
+                    <input type="text" id="edit-key-name" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-key-bound-ips">Bound IPs (CIDR)</label>
+                    <textarea id="edit-key-bound-ips" class="input-field" rows="2"></textarea>
+                </div>
+                <div class="permissions-grid mt-2 mb-4">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="edit-key-can-manage-keys">
+                        <span class="checkmark"></span> Manage Keys
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="edit-key-can-manage-webhooks">
+                        <span class="checkmark"></span> Manage Webhooks
+                    </label>
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="edit-key-can-create-groups">
+                        <span class="checkmark"></span> Can Create Groups
+                    </label>
+                </div>
+                <div class="form-actions">
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                    <button type="button" id="edit-key-cancel" class="btn btn-secondary">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <!-- Secret Reveal Modal (used after key rotation) -->
+    <div id="secret-reveal-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3>New Secret Generated</h3>
+            <p class="subtitle">Copy this key now — it will not be shown again.</p>
+            <code id="secret-reveal-value" class="key-reveal-value"></code>
+            <div class="form-actions mt-4">
+                <button type="button" id="secret-reveal-close" class="btn btn-primary">Done</button>
+            </div>
+        </div>
+    </div>
+
     <div id="toast-container" class="toast-container"></div>
     <script src="app.js"></script>
 </body>

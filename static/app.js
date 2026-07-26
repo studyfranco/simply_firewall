@@ -11,7 +11,9 @@ class FirewallClient {
             apiKeys: [],
             groups: [],
             webhooks: [],
-            pagination: { limit: 15, offset: 0, hasMore: true }
+            auditLogs: [],
+            pagination: { limit: 15, offset: 0, hasMore: true },
+            auditPagination: { limit: 15, offset: 0, hasMore: true }
         };
         this.init();
     }
@@ -96,6 +98,7 @@ class FirewallClient {
         const p = this.state.profile;
         const manageIpEl = document.getElementById('manage-ip-section');
         const adminTab = document.querySelector('button[data-tab="admin"]');
+        const auditTab = document.getElementById('audit-tab-btn');
         const keysSection = document.getElementById('apikey-section');
         const webhooksSection = document.getElementById('webhooks-section');
         const groupsSection = document.getElementById('groups-section');
@@ -109,7 +112,7 @@ class FirewallClient {
 
         // Admin Tab
         let showAdminInfo = p.is_master || p.can_manage_keys || p.can_manage_webhooks;
-        
+
         if (showAdminInfo) {
             adminTab.style.display = 'inline-block';
             keysSection.style.display = (p.is_master || p.can_manage_keys) ? 'block' : 'none';
@@ -118,6 +121,10 @@ class FirewallClient {
         } else {
             adminTab.style.display = 'none';
         }
+
+        // Audit Logs Tab — the backend restricts GET /audit-logs to master keys, so hide the tab
+        // entirely rather than show it and let every request 403.
+        auditTab.style.display = p.is_master ? 'inline-block' : 'none';
     }
 
     // ───────────────────────────────────────────────────────
@@ -132,6 +139,10 @@ class FirewallClient {
         }
         if (this.state.profile.is_master || this.state.profile.can_manage_webhooks) {
             await this.loadWebhooks();
+        }
+        if (this.state.profile.is_master) {
+            this.state.auditPagination.offset = 0;
+            await this.loadAuditLogs();
         }
     }
 
@@ -173,6 +184,7 @@ class FirewallClient {
         try {
             this.state.groups = await this.apiFetch('/groups');
             this.renderGroupsTable();
+            this.updateGroupSelector();
         } catch(e) {}
     }
 
@@ -180,6 +192,19 @@ class FirewallClient {
         try {
             this.state.webhooks = await this.apiFetch('/webhooks');
             this.renderWebhooksTable();
+        } catch(e) {}
+    }
+
+    async loadAuditLogs() {
+        if (!this.state.profile?.is_master) return;
+        const { limit, offset } = this.state.auditPagination;
+        const params = new URLSearchParams({ limit, offset });
+        try {
+            const data = await this.apiFetch(`/audit-logs?${params.toString()}`);
+            this.state.auditLogs = data;
+            this.state.auditPagination.hasMore = data.length === limit;
+            this.renderAuditLogsTable();
+            this.updateAuditPaginationUI();
         } catch(e) {}
     }
 
@@ -277,14 +302,19 @@ class FirewallClient {
                 <td class="font-mono">${escapeHtml(k.bound_ips || '-')}</td>
                 <td>${this.renderKeyScopes(k)}</td>
                 <td>
-                    <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>
+                    <div class="flex gap-2">
+                        <button class="btn btn-sm btn-secondary" onclick="window.app.openEditKeyModal('${k.id}')">Edit</button>
+                        <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateKeySecret('${k.id}')">Regenerate</button>
+                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>
+                    </div>
                 </td>
             </tr>
         `).join('');
     }
 
     // Renders global scope badges (Master / Manage Keys / Manage Webhooks / Create Groups)
-    // plus per-group read/write/delete permission badges for an API key row.
+    // plus per-group read/write/delete permission badges for an API key row. Each group badge
+    // carries a "×" button to revoke that specific group permission.
     renderKeyScopes(k) {
         const scopes = [];
         if (k.is_master) scopes.push('<span class="badge badge-scope badge-scope-master">Master</span>');
@@ -295,7 +325,9 @@ class FirewallClient {
         const groupBadges = (k.group_permissions || []).map(p => {
             const rights = [p.can_read ? 'R' : '', p.can_write ? 'W' : '', p.can_delete ? 'D' : '']
                 .filter(Boolean).join('') || 'none';
-            return `<span class="badge badge-group" title="${escapeHtml(p.group_name)}: ${rights}">${escapeHtml(p.group_name)}: ${rights}</span>`;
+            return `<span class="badge badge-group" title="${escapeHtml(p.group_name)}: ${rights}">${escapeHtml(p.group_name)}: ${rights}
+                <button type="button" class="badge-revoke" title="Revoke this group permission" onclick="window.app.revokeGroupPermission('${k.id}', '${p.group_id}')">&times;</button>
+            </span>`;
         });
 
         const badges = [...scopes, ...groupBadges];
@@ -308,12 +340,26 @@ class FirewallClient {
     updateRightsSelector() {
         const sel = document.getElementById('manage-rights-key');
         if (!sel) return;
-        
+
         sel.innerHTML = '<option value="">-- Select API Key --</option>' + this.state.apiKeys.map(k => {
             // Master keys do not require scoping
             if (k.is_master) return '';
             return `<option value="${k.id}">${escapeHtml(k.name)}</option>`;
         }).join('');
+    }
+
+    // Populates the "Manage Group Rights" group dropdown from currently known groups, replacing
+    // the old free-text group name input (which allowed unnoticed typos to silently auto-create a
+    // brand-new, wrong group instead of granting rights on the intended one).
+    updateGroupSelector() {
+        const sel = document.getElementById('manage-rights-group');
+        if (!sel) return;
+
+        const previousValue = sel.value;
+        sel.innerHTML = '<option value="">-- Select Group --</option>' + this.state.groups.map(g =>
+            `<option value="${escapeHtml(g.name)}">${escapeHtml(g.name)}</option>`
+        ).join('');
+        if (previousValue) sel.value = previousValue;
     }
 
     renderGroupsTable() {
@@ -357,10 +403,38 @@ class FirewallClient {
         const pr = document.getElementById('btn-prev');
         const nt = document.getElementById('btn-next');
         const ind = document.getElementById('page-indicator');
-        
+
         pr.disabled = this.state.pagination.offset === 0;
         nt.disabled = !this.state.pagination.hasMore;
         ind.textContent = `Page ${Math.floor(this.state.pagination.offset / this.state.pagination.limit) + 1}`;
+    }
+
+    renderAuditLogsTable() {
+        const tbody = document.getElementById('audit-logs-table-body');
+        if (this.state.auditLogs.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No audit log entries.</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = this.state.auditLogs.map(log => `
+            <tr>
+                <td class="text-sm">${new Date(log.timestamp).toLocaleString()}</td>
+                <td><span class="badge badge-scope">${escapeHtml(log.action)}</span></td>
+                <td class="font-mono text-sm">${escapeHtml(log.target_address || '-')}</td>
+                <td class="text-sm">${escapeHtml(log.group_names || '-')}</td>
+                <td class="text-sm">${escapeHtml(log.details || '-')}</td>
+            </tr>
+        `).join('');
+    }
+
+    updateAuditPaginationUI() {
+        const pr = document.getElementById('audit-btn-prev');
+        const nt = document.getElementById('audit-btn-next');
+        const ind = document.getElementById('audit-page-indicator');
+
+        pr.disabled = this.state.auditPagination.offset === 0;
+        nt.disabled = !this.state.auditPagination.hasMore;
+        ind.textContent = `Page ${Math.floor(this.state.auditPagination.offset / this.state.auditPagination.limit) + 1}`;
     }
 
     // ───────────────────────────────────────────────────────
@@ -444,6 +518,60 @@ class FirewallClient {
         try {
             await this.apiFetch(`/keys/${id}`, { method: 'DELETE' });
             this.showToast("Key deleted");
+            this.loadKeys();
+        } catch(e) {}
+    }
+
+    openEditKeyModal(id) {
+        const k = this.state.apiKeys.find(k => k.id === id);
+        if (!k) return;
+        document.getElementById('edit-key-id').value = k.id;
+        document.getElementById('edit-key-name').value = k.name;
+        document.getElementById('edit-key-bound-ips').value = k.bound_ips || '';
+        document.getElementById('edit-key-can-manage-keys').checked = k.can_manage_keys;
+        document.getElementById('edit-key-can-manage-webhooks').checked = k.can_manage_webhooks;
+        document.getElementById('edit-key-can-create-groups').checked = k.can_create_groups;
+        document.getElementById('edit-key-modal').classList.remove('hidden');
+    }
+
+    closeEditKeyModal() {
+        document.getElementById('edit-key-modal').classList.add('hidden');
+    }
+
+    async submitEditKey(e) {
+        e.preventDefault();
+        const id = document.getElementById('edit-key-id').value;
+        const payload = {
+            name: document.getElementById('edit-key-name').value,
+            bound_ips: document.getElementById('edit-key-bound-ips').value,
+            can_manage_keys: document.getElementById('edit-key-can-manage-keys').checked,
+            can_manage_webhooks: document.getElementById('edit-key-can-manage-webhooks').checked,
+            can_create_groups: document.getElementById('edit-key-can-create-groups').checked
+        };
+
+        try {
+            await this.apiFetch(`/keys/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+            this.showToast("Key updated", 'success');
+            this.closeEditKeyModal();
+            this.loadKeys();
+        } catch(e) {}
+    }
+
+    async regenerateKeySecret(id) {
+        if (!confirm("Regenerate this key's secret? The old secret will stop working immediately.")) return;
+        try {
+            const res = await this.apiFetch(`/keys/${id}/rotate`, { method: 'POST' });
+            document.getElementById('secret-reveal-value').textContent = res.plaintext_key;
+            document.getElementById('secret-reveal-modal').classList.remove('hidden');
+            this.showToast("Secret rotated", 'success');
+        } catch(e) {}
+    }
+
+    async revokeGroupPermission(keyId, groupIdentifier) {
+        if (!confirm("Revoke this key's permission on this group?")) return;
+        try {
+            await this.apiFetch(`/keys/${keyId}/permissions/${groupIdentifier}`, { method: 'DELETE' });
+            this.showToast("Permission revoked", 'success');
             this.loadKeys();
         } catch(e) {}
     }
@@ -559,6 +687,29 @@ class FirewallClient {
         document.getElementById('form-manage-rights').addEventListener('submit', (e) => this.manageKeyRights(e));
         document.getElementById('form-create-group').addEventListener('submit', (e) => this.createGroup(e));
         document.getElementById('form-create-webhook').addEventListener('submit', (e) => this.createWebhook(e));
+
+        // Edit Key modal
+        document.getElementById('form-edit-key').addEventListener('submit', (e) => this.submitEditKey(e));
+        document.getElementById('edit-key-cancel').addEventListener('click', () => this.closeEditKeyModal());
+
+        // Secret reveal modal (used after key rotation)
+        document.getElementById('secret-reveal-close').addEventListener('click', () => {
+            document.getElementById('secret-reveal-modal').classList.add('hidden');
+        });
+
+        // Audit log pagination
+        document.getElementById('audit-btn-prev').addEventListener('click', () => {
+            if (this.state.auditPagination.offset > 0) {
+                this.state.auditPagination.offset -= this.state.auditPagination.limit;
+                this.loadAuditLogs();
+            }
+        });
+        document.getElementById('audit-btn-next').addEventListener('click', () => {
+            if (this.state.auditPagination.hasMore) {
+                this.state.auditPagination.offset += this.state.auditPagination.limit;
+                this.loadAuditLogs();
+            }
+        });
     }
 }
 

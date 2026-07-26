@@ -1,5 +1,6 @@
 //! The `ip_records` table: banned or whitelisted IP addresses and CIDR subnets. A record is
-//! shared across every group it belongs to via [`ip_record_group_membership`](super::ip_record_group_membership).
+//! shared across every group it belongs to via
+//! [`ip_record_group_membership`](crate::entities::ip_record_group_membership).
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};

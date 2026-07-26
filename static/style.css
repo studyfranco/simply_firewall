@@ -995,3 +995,68 @@ body {
     border: 1px solid var(--border);
     border-radius: var(--radius);
 }
+
+/* ─── Modals ────────────────────────────────────────────── */
+
+.modal-overlay {
+    position: fixed;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    background-color: rgba(0, 0, 0, 0.55);
+    z-index: 20000;
+    padding: 1.5rem;
+    transition: opacity var(--transition-slow), visibility var(--transition-slow);
+}
+
+.modal-overlay.hidden {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+    display: flex !important;
+}
+
+.modal-card {
+    width: 100%;
+    max-width: 460px;
+    box-shadow: var(--shadow-lg);
+    animation: fadeIn var(--transition-slow);
+}
+
+.modal-card h3 {
+    font-size: 1.1rem;
+    font-weight: 600;
+    margin-bottom: 0.75rem;
+}
+
+.modal-card .key-reveal-value {
+    margin-top: 0.5rem;
+}
+
+/* ─── Permission Badge Revoke Button ───────────────────────── */
+
+.badge-group {
+    gap: 0.4rem;
+}
+
+.badge-revoke {
+    background: transparent;
+    border: none;
+    color: inherit;
+    font-size: 0.95em;
+    line-height: 1;
+    padding: 0;
+    margin: 0;
+    cursor: pointer;
+    opacity: 0.6;
+    transition: opacity var(--transition-fast), color var(--transition-fast);
+}
+
+.badge-revoke:hover {
+    opacity: 1;
+    color: var(--danger);
+}

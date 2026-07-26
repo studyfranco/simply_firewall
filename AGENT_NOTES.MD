@@ -598,3 +598,150 @@ the standing recommendation from session 2 still applies and now has two additio
 any `find-then-insert` or `on_conflict(...)` in this codebase needs to be checked against genuine
 concurrent execution, not just sequential re-invocation — a bug can be (and twice was) invisible to
 a test that awaits each request one at a time.
+
+---
+
+## 2026-07-26 (session 5) — Unified group identification, key lifecycle, audit log UI
+
+Driven by live cURL/UI review findings: `DELETE /api/ips` rejected JSON bodies, group permission
+mapping only accepted `group_name`, audit logs had no UI or endpoint at all, and the dashboard had
+no way to edit a key, rotate its secret, or revoke a single group permission.
+
+### New module/route structure (`src/api.rs`, `src/lib.rs`)
+
+- `resolve_group_ref(db, group_id, group_name)` — shared resolver requiring exactly one of the
+  two; `group_id` never auto-creates (an ID isn't something a client can legitimately invent), only
+  `group_name` can. Used by `handle_ip_upsert` (`/ban`, `/white`) and
+  `update_key_group_permissions`.
+- `resolve_group_by_identifier(db, &str)` — resolves a single path segment that may be a UUID or a
+  literal name; tries UUID first, falls back to name. Used by the new revoke route, where REST path
+  conventions only allow one placeholder.
+- `BanWhitePayload`, `GroupPermInput`: `group_name: String` → `group_id: Option<Uuid>` +
+  `group_name: Option<String>`. Purely additive — every existing test/call site that only ever sent
+  `group_name` keeps working unchanged (confirmed: all pre-existing tests still pass with zero
+  modification to their payloads).
+- `QueryFilters` (`GET /api/ips`): added `group_id: Option<Uuid>`, OR'd together with the existing
+  name-based `groups`/`group_name` matches.
+- `DeleteIpQuery`: every field became `Option<...>`; `delete_ip` now takes `Query<DeleteIpQuery>`
+  *and* raw `axum::body::Bytes`, parses the body as the same shape if non-empty, and merges
+  (query wins on overlap) before validating that a `target_address` and exactly one group
+  identifier were supplied from *either* source.
+- `PUT /api/keys/{id}` (`update_api_key`) — updates `name`/`bound_ips`/global scope flags only;
+  deliberately excludes `is_master` (promotion/demotion isn't exposed through a generic update).
+- `POST /api/keys/{id}/rotate` (`rotate_api_key`) — new `key_hash`/`prefix`, returns the plaintext
+  once. The old hash is overwritten, not retained, so the old secret is invalid the instant the
+  response is sent.
+- `DELETE /api/keys/{id}/permissions/{group_identifier}` (`revoke_key_group_permission`) — new.
+- `POST /api/keys/{id}/permissions` — added as an alias for the existing
+  `update_key_group_permissions` handler. The task text referred to the assignment endpoint as
+  living at `/permissions`, but it has always been `/keys/{id}/groups`; renaming outright would
+  break every existing caller (frontend + all prior tests), so `/groups` keeps working and
+  `/permissions` was added alongside it, giving the new `DELETE .../permissions/{id}` route a
+  natural, matching collection to sit under.
+- `GET /api/audit-logs` (`list_audit_logs`) — master-only (not just `can_manage_keys` or similar:
+  audit entries span every key/group in the system, so anything less than master would be an RBAC
+  leak), supports `action`/`limit`/`offset`.
+- `build_api_key_summary()` — extracted from `list_api_keys` so `update_api_key` returns the exact
+  same shape.
+
+### Security finding along the way: `GET /api/webhooks` leaked `secret_token`
+
+Same shape of bug as the `api_keys.key_hash` leak fixed in an earlier session, found while touching
+this exact code for the audit-log work: `list_webhooks` serialized the raw `webhook_config::Model`,
+which includes `secret_token` in plaintext. Unlike `key_hash` (a hash of a 256-bit *generated*
+value, so a leak isn't practically exploitable), `secret_token` is the actual, caller-chosen HMAC
+signing secret — leaking it lets any reader with `can_manage_webhooks` forge valid
+`X-Signature-256` signatures for that webhook. Fixed with a new `WebhookSummary` DTO (mirrors
+`ApiKeySummary`'s pattern) that omits it; `list_webhooks` now maps through it. Verified live: created
+a webhook with a real secret, confirmed `GET /webhooks` response has no `secret_token` key at all.
+
+### Also found and fixed: broken rustdoc intra-link (latent since session 1)
+
+`cargo check`/`cargo clippy` don't run rustdoc's link checker, so this had never surfaced:
+`src/entities/ip_record.rs`'s module doc linked
+`` [`ip_record_group_membership`](super::ip_record_group_membership) ``, which `cargo doc` reports
+as unresolvable. Fixed by switching to an unambiguous `crate::entities::ip_record_group_membership`
+path. Worth normalizing: `cargo doc --no-deps` isn't in this project's usual validation loop
+(`check`/`test`/`clippy`) and should probably be added, since it caught something the other three
+didn't.
+
+### Frontend (`static/`)
+
+- **Dynamic group dropdown**: `#manage-rights-group` changed from a free-text input to a `<select>`
+  populated by a new `updateGroupSelector()`, called after every `loadGroups()`. Closes a real
+  papercut, not just a nicety — a typo in the old text field would silently auto-create a brand-new
+  group (if the caller had `can_create_groups`) instead of erroring, and the mistake wouldn't be
+  obvious until someone asked "why doesn't my key have access?".
+- **Audit Logs tab**: new nav button + panel, hidden entirely for non-master keys in
+  `enforceRBACUI()` (matches the backend's master-only restriction — no point showing a tab that
+  will just 403). Own pagination state (`auditPagination`), loaded as part of `loadInitialData()`
+  when the profile is master.
+- **Edit Key modal** (`openEditKeyModal`/`closeEditKeyModal`/`submitEditKey`): plain-CSS overlay
+  (`.modal-overlay`/`.modal-card`, same fixed-overlay pattern as the existing login screen, just
+  layered above it at a higher `z-index`), pre-filled from `this.state.apiKeys`, `PUT`s on submit.
+- **Regenerate Secret** (`regenerateKeySecret`): confirms, calls the rotate endpoint, shows the new
+  plaintext in a small reused reveal modal (`#secret-reveal-modal`) rather than inline in the table
+  row (there's no good inline spot once the row already has three action buttons).
+- **Group permission revoke**: each group badge in `renderKeyScopes()` now embeds a small `×`
+  button (`.badge-revoke`) calling `revokeGroupPermission(keyId, groupId)` — passes the group's
+  UUID rather than its name specifically to avoid breaking the inline `onclick` attribute if a group
+  name ever contains a quote character.
+- Verified structurally: every `getElementById(...)` string in the new/changed `app.js` code has a
+  matching `id="..."` in `index.html` (scripted diff of both ID sets — zero mismatches).
+
+### Tests added (`tests/rbac_integration_tests.rs`)
+
+- `test_delete_ip_accepts_query_or_json_body`
+- `test_group_identification_by_id_and_name_are_interchangeable` (also covers both-supplied and
+  neither-supplied validation, and that an unknown `group_id` 404s instead of auto-creating)
+- `test_key_rotation_invalidates_old_secret`
+- `test_update_api_key_changes_take_effect_immediately`
+- `test_revoke_group_permission_by_name_and_by_id`
+- `test_audit_log_query_returns_entries_after_mutations`
+
+One self-inflicted test bug caught before finalizing: `test_update_api_key_changes_take_effect_immediately`
+originally set the target key's `bound_ips` to `192.0.2.0/24` as part of the update payload, which
+doesn't cover the test harness's simulated client address (`127.0.0.1`) — the *next* request
+correctly got `403` from the CIDR check, not from the scope check the test meant to exercise.
+Fixed by using `0.0.0.0/0` instead, which still proves the field persists (asserted against the
+response) without accidentally locking the test out of its own key.
+
+### Live manual verification
+
+Hit a real environment snag worth recording: the first server start for manual testing bound
+successfully enough to print the bootstrap banner and generate a master key in its own fresh
+database, but then failed with `Error: Os { code: 98, kind: AddrInUse, ... }` on the actual
+`TcpListener::bind` — a *different*, already-running `simply_firewall` process from earlier in this
+session had never been stopped and was still holding port 3000. `ps aux`/`fuser` briefly showed a
+PID that appeared to belong to the new (crashed) process, which was really just PID-reuse
+coincidence pointing at the old one. Lesson applied: after seeing `AddrInUse` (or any unexplained
+auth mismatch against a freshly-generated key), check `fuser 3000/tcp` / confirm the log has no
+bind error *before* trusting `ps aux` — don't assume the most recently launched process is the one
+actually serving. Once the stale process was force-killed and a genuinely fresh one started (log
+verified clean, no `AddrInUse`), every new endpoint was exercised directly and matched the
+automated tests: `group_id`/`group_name` interchangeable on `/ban`, `DELETE /ips` via query string
+and via JSON body, `PUT`/`rotate`/permission-grant/permission-revoke on a real sub-key, master-only
+`/audit-logs` showing the real action history in order, and `GET /webhooks` confirmed to omit
+`secret_token` after creating one with a real secret.
+
+### Final verification (session 5)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **21/21 pass** (15 carried over from sessions 1–4 + 6 new this
+  session).
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- `cargo doc --no-deps`: clean (after the intra-link fix above).
+- `grep -rn -E "\.unwrap\(\)|\.expect\(" src/`: no matches.
+- Live server: every new/changed endpoint exercised manually via `curl` against a real (non-test)
+  SQLite database, see above.
+
+### Production readiness note
+
+All five `<task>` items are done: unified group identification, flexible `DELETE /api/ips`, key
+rotation, key update, and permission revocation are implemented, routed, tested, and manually
+verified; the audit log endpoint and its UI panel exist and are master-gated; the dashboard gained
+an edit-key modal, a regenerate-secret flow, a dynamic group dropdown, and per-badge permission
+revocation. Two items beyond the literal ask were fixed because they were directly adjacent to the
+work and represent real, live security/documentation gaps: the `secret_token` leak on
+`GET /webhooks`, and the broken rustdoc link. Neither required expanding scope beyond files already
+being edited for the requested work.

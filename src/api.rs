@@ -10,7 +10,7 @@ use ipnetwork::IpNetwork;
 use rand::RngExt;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter,
-    sea_query::OnConflict, Condition, QuerySelect, ActiveModelTrait, SqlErr,
+    sea_query::OnConflict, Condition, QuerySelect, QueryOrder, ActiveModelTrait, SqlErr,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -94,6 +94,48 @@ async fn get_or_create_group(
         .ok_or(AppError::Internal)
 }
 
+/// Resolves a group given an optional `group_id` and/or `group_name`; exactly one must be
+/// supplied. Returns `Ok(None)` if the identifier doesn't match any existing group — the caller
+/// decides whether that means "404" (for `group_id`, which is never client-inventable) or
+/// "auto-create it" (for `group_name`, the only identifier a client can pick with permission).
+async fn resolve_group_ref(
+    db: &sea_orm::DatabaseConnection,
+    group_id: Option<Uuid>,
+    group_name: Option<&str>,
+) -> Result<Option<ip_group::Model>, AppError> {
+    match (group_id, group_name) {
+        (Some(_), Some(_)) => Err(AppError::InvalidInput(
+            "Provide either group_id or group_name, not both".to_owned(),
+        )),
+        (None, None) => Err(AppError::InvalidInput(
+            "Either group_id or group_name is required".to_owned(),
+        )),
+        (Some(gid), None) => Ok(ip_group::Entity::find_by_id(gid).one(db).await?),
+        (None, Some(name)) => Ok(ip_group::Entity::find()
+            .filter(ip_group::Column::Name.eq(name))
+            .one(db)
+            .await?),
+    }
+}
+
+/// Resolves a group from a single path segment that may be either a UUID or a literal name —
+/// used for the `DELETE .../permissions/{group_identifier}` route, where REST path conventions
+/// only allow one placeholder rather than separate `group_id`/`group_name` fields.
+async fn resolve_group_by_identifier(
+    db: &sea_orm::DatabaseConnection,
+    identifier: &str,
+) -> Result<Option<ip_group::Model>, AppError> {
+    if let Ok(id) = Uuid::parse_str(identifier)
+        && let Some(g) = ip_group::Entity::find_by_id(id).one(db).await?
+    {
+        return Ok(Some(g));
+    }
+    Ok(ip_group::Entity::find()
+        .filter(ip_group::Column::Name.eq(identifier))
+        .one(db)
+        .await?)
+}
+
 // ─────────────────────────────────────────────────────────────
 // IP Ban / Whitelist
 // ─────────────────────────────────────────────────────────────
@@ -103,8 +145,11 @@ async fn get_or_create_group(
 pub struct BanWhitePayload {
     /// The target IP address or CIDR range
     pub target_address: String,
-    /// The group name to associate the IP with
-    pub group_name: String,
+    /// The group to associate the IP with, by ID. Provide this or `group_name`, not both.
+    pub group_id: Option<Uuid>,
+    /// The group to associate the IP with, by name. Provide this or `group_id`, not both. Unlike
+    /// `group_id`, a name that doesn't exist yet may be auto-created (permission allowing).
+    pub group_name: Option<String>,
     /// The reason for the ban or whitelist
     pub cause: Option<String>,
 }
@@ -158,15 +203,14 @@ async fn handle_ip_upsert(
     }
 
     let target_group_id: Uuid;
-    
-    let existing_group = ip_group::Entity::find()
-        .filter(ip_group::Column::Name.eq(&payload.group_name))
-        .one(&state.db)
-        .await?;
+    let resolved_group_name: String;
+
+    let existing_group = resolve_group_ref(&state.db, payload.group_id, payload.group_name.as_deref()).await?;
 
     if let Some(g) = existing_group {
         target_group_id = g.id;
-        
+        resolved_group_name = g.name;
+
         if !key.is_master {
             let perm = api_key_group_permission::Entity::find()
                 .filter(
@@ -176,7 +220,7 @@ async fn handle_ip_upsert(
                 )
                 .one(&state.db)
                 .await?;
-            
+
             if let Some(p) = perm {
                 if !p.can_write {
                     return Err(AppError::Forbidden("Permission denied: You do not have write access to this group".to_owned()));
@@ -185,14 +229,17 @@ async fn handle_ip_upsert(
                 return Err(AppError::Forbidden("Permission denied: You have no access strictly mapped to this group".to_owned()));
             }
         }
-    } else {
+    } else if let Some(group_name) = &payload.group_name {
+        // group_id (if given) is never auto-creatable — only reachable here when group_name was
+        // supplied instead, since resolve_group_ref requires exactly one of the two.
         if !key.is_master && !key.can_create_groups {
             return Err(AppError::Forbidden("Permission denied: Target group does not exist and you cannot create groups".to_owned()));
         }
 
         let default_type = if is_whitelist { "whitelist" } else { "banlist" };
-        let group = get_or_create_group(&state.db, &payload.group_name, default_type).await?;
+        let group = get_or_create_group(&state.db, group_name, default_type).await?;
         target_group_id = group.id;
+        resolved_group_name = group.name;
 
         if !key.is_master {
             let now = Utc::now().naive_utc();
@@ -216,6 +263,10 @@ async fn handle_ip_upsert(
                 .exec_without_returning(&state.db)
                 .await?;
         }
+    } else {
+        // group_id was supplied but doesn't match any existing group. Unlike group_name, an ID
+        // is never something a client can legitimately invent, so there's nothing to create.
+        return Err(AppError::NotFound);
     }
 
     let now = Utc::now().naive_utc();
@@ -291,11 +342,11 @@ async fn handle_ip_upsert(
         .await?;
 
     create_audit_log(
-        &state.db, 
-        Some(key.id), 
-        "IP_ADD", 
-        Some(payload.target_address.clone()), 
-        Some(payload.group_name.clone()), 
+        &state.db,
+        Some(key.id),
+        "IP_ADD",
+        Some(payload.target_address.clone()),
+        Some(resolved_group_name),
         Some(format!("Added IP to group. Whitelist: {}", is_whitelist))
     ).await?;
 
@@ -322,6 +373,8 @@ pub struct QueryFilters {
     pub groups: Option<String>,
     /// Filter by a single group name (in addition to `groups`)
     pub group_name: Option<String>,
+    /// Filter by a single group ID (in addition to `groups`/`group_name`)
+    pub group_id: Option<Uuid>,
     /// Filter by a substring of the target address
     pub ip: Option<String>,
     /// Filter by a substring of the cause
@@ -405,14 +458,26 @@ pub async fn list_ips(
             group_names.push(trimmed.to_owned());
         }
     }
+    // `group_id` narrows the same way, just by ID instead of by name; combined with any
+    // name-based matches above using OR semantics (both are just ways to pick "these groups").
+    let mut gids: Vec<Uuid> = Vec::new();
+    let mut group_filter_requested = false;
     if !group_names.is_empty() {
-        let gids: Vec<Uuid> = ip_group::Entity::find()
-            .filter(ip_group::Column::Name.is_in(group_names))
-            .all(&state.db)
-            .await?
-            .into_iter()
-            .map(|g| g.id)
-            .collect();
+        group_filter_requested = true;
+        gids.extend(
+            ip_group::Entity::find()
+                .filter(ip_group::Column::Name.is_in(group_names))
+                .all(&state.db)
+                .await?
+                .into_iter()
+                .map(|g| g.id),
+        );
+    }
+    if let Some(gid) = filters.group_id {
+        group_filter_requested = true;
+        gids.push(gid);
+    }
+    if group_filter_requested {
         query = query.filter(ip_record_group_membership::Column::GroupId.is_in(gids));
     }
 
@@ -490,25 +555,54 @@ pub async fn list_ips(
     Ok(Json(items))
 }
 
-/// Parameters for deleting an IP record from a group
-#[derive(Deserialize)]
+/// Parameters for deleting an IP record from a group. Every field is optional here because this
+/// same shape is used to parse both the URL query string and an optional JSON body — the handler
+/// merges the two and only then checks that the required combination was actually supplied.
+#[derive(Deserialize, Default)]
 pub struct DeleteIpQuery {
     /// IP to delete
-    pub target_address: String,
-    /// Group to delete from
-    pub group_name: String,
+    pub target_address: Option<String>,
+    /// Group to delete from, by ID. Provide this or `group_name`, not both.
+    pub group_id: Option<Uuid>,
+    /// Group to delete from, by name. Provide this or `group_id`, not both.
+    pub group_name: Option<String>,
 }
 
-/// Handles DELETE /api/v1/ips?target_address=...&group_name=...
+impl DeleteIpQuery {
+    /// Fills in any field left `None` by `self` with the corresponding field from `other`.
+    fn merge(self, other: DeleteIpQuery) -> DeleteIpQuery {
+        DeleteIpQuery {
+            target_address: self.target_address.or(other.target_address),
+            group_id: self.group_id.or(other.group_id),
+            group_name: self.group_name.or(other.group_name),
+        }
+    }
+}
+
+/// Handles DELETE /api/v1/ips. Accepts `target_address` and `group_id`/`group_name` from the URL
+/// query string, a JSON request body, or a mix of both (query values win on overlap) — some HTTP
+/// clients refuse to attach a body to `DELETE`, others prefer a body over query-string params, so
+/// this endpoint accommodates either without producing a deserialization error for either shape.
 pub async fn delete_ip(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Query(query): Query<DeleteIpQuery>,
+    Query(query_params): Query<DeleteIpQuery>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
+    let body_params: DeleteIpQuery = if body.is_empty() {
+        DeleteIpQuery::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::InvalidInput(format!("Invalid JSON body: {e}")))?
+    };
+    let params = query_params.merge(body_params);
 
-    let group = ip_group::Entity::find()
-        .filter(ip_group::Column::Name.eq(&query.group_name))
-        .one(&state.db)
+    let target_address = params
+        .target_address
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::InvalidInput("target_address is required (query or JSON body)".to_owned()))?;
+
+    let group = resolve_group_ref(&state.db, params.group_id, params.group_name.as_deref())
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -521,7 +615,7 @@ pub async fn delete_ip(
             )
             .one(&state.db)
             .await?;
-        
+
         if let Some(p) = perm {
             if !p.can_delete {
                 return Err(AppError::Forbidden("Permission denied: You do not have delete permissions over this group".to_owned()));
@@ -532,7 +626,7 @@ pub async fn delete_ip(
     }
 
     let record = ip_record::Entity::find()
-        .filter(ip_record::Column::TargetAddress.eq(&query.target_address))
+        .filter(ip_record::Column::TargetAddress.eq(&target_address))
         .one(&state.db)
         .await?
         .ok_or(AppError::NotFound)?;
@@ -550,11 +644,11 @@ pub async fn delete_ip(
     }
 
     create_audit_log(
-        &state.db, 
-        Some(key.id), 
-        "IP_DELETE", 
-        Some(query.target_address.clone()), 
-        Some(query.group_name.clone()), 
+        &state.db,
+        Some(key.id),
+        "IP_DELETE",
+        Some(target_address),
+        Some(group.name.clone()),
         None
     ).await?;
 
@@ -654,8 +748,11 @@ pub async fn get_me(
 /// Input to update group permissions
 #[derive(Deserialize)]
 pub struct GroupPermInput {
-    /// Target group
-    pub group_name: String,
+    /// Target group, by ID. Provide this or `group_name`, not both.
+    pub group_id: Option<Uuid>,
+    /// Target group, by name. Provide this or `group_id`, not both. A name that doesn't exist
+    /// yet may be auto-created (permission allowing); an unknown `group_id` is a `404` instead.
+    pub group_name: Option<String>,
     /// Can read
     pub can_read: bool,
     /// Can write
@@ -769,6 +866,45 @@ pub struct ApiKeySummary {
     pub group_permissions: Vec<MePermission>,
 }
 
+/// Builds the public-safe summary (including per-group permissions) for a single key. Shared by
+/// every endpoint that returns key details, so the shape stays consistent everywhere.
+async fn build_api_key_summary(
+    db: &sea_orm::DatabaseConnection,
+    k: api_key::Model,
+) -> Result<ApiKeySummary, AppError> {
+    let perms = api_key_group_permission::Entity::find()
+        .filter(api_key_group_permission::Column::ApiKeyId.eq(k.id))
+        .find_also_related(ip_group::Entity)
+        .all(db)
+        .await?;
+
+    let group_permissions = perms
+        .into_iter()
+        .filter_map(|(p, g)| {
+            g.map(|group| MePermission {
+                group_id: p.group_id,
+                group_name: group.name,
+                can_read: p.can_read,
+                can_write: p.can_write,
+                can_delete: p.can_delete,
+            })
+        })
+        .collect();
+
+    Ok(ApiKeySummary {
+        id: k.id,
+        name: k.name,
+        prefix: k.prefix,
+        bound_ips: k.bound_ips,
+        is_master: k.is_master,
+        can_manage_keys: k.can_manage_keys,
+        can_manage_webhooks: k.can_manage_webhooks,
+        can_create_groups: k.can_create_groups,
+        created_at: k.created_at,
+        group_permissions,
+    })
+}
+
 /// Handles GET /api/v1/keys
 pub async fn list_api_keys(
     State(state): State<AppState>,
@@ -780,39 +916,8 @@ pub async fn list_api_keys(
 
     let keys = ApiKey::find().all(&state.db).await?;
     let mut summaries = Vec::with_capacity(keys.len());
-
     for k in keys {
-        let perms = api_key_group_permission::Entity::find()
-            .filter(api_key_group_permission::Column::ApiKeyId.eq(k.id))
-            .find_also_related(ip_group::Entity)
-            .all(&state.db)
-            .await?;
-
-        let group_permissions = perms
-            .into_iter()
-            .filter_map(|(p, g)| {
-                g.map(|group| MePermission {
-                    group_id: p.group_id,
-                    group_name: group.name,
-                    can_read: p.can_read,
-                    can_write: p.can_write,
-                    can_delete: p.can_delete,
-                })
-            })
-            .collect();
-
-        summaries.push(ApiKeySummary {
-            id: k.id,
-            name: k.name,
-            prefix: k.prefix,
-            bound_ips: k.bound_ips,
-            is_master: k.is_master,
-            can_manage_keys: k.can_manage_keys,
-            can_manage_webhooks: k.can_manage_webhooks,
-            can_create_groups: k.can_create_groups,
-            created_at: k.created_at,
-            group_permissions,
-        });
+        summaries.push(build_api_key_summary(&state.db, k).await?);
     }
 
     Ok(Json(summaries))
@@ -842,6 +947,105 @@ pub async fn delete_api_key(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// Payload for updating an existing API key's name, `bound_ips`, and global scope flags. Does not
+/// include `is_master`: promoting/demoting master status is deliberately not exposed through this
+/// generic update endpoint.
+#[derive(Deserialize)]
+pub struct UpdateApiKeyPayload {
+    /// New name, if changing it
+    pub name: Option<String>,
+    /// New bound CIDRs, if changing them
+    pub bound_ips: Option<String>,
+    /// New value for the "manage keys" global scope, if changing it
+    pub can_manage_keys: Option<bool>,
+    /// New value for the "manage webhooks" global scope, if changing it
+    pub can_manage_webhooks: Option<bool>,
+    /// New value for the "create groups" global scope, if changing it
+    pub can_create_groups: Option<bool>,
+}
+
+/// Handles PUT /api/v1/keys/:id — updates name, `bound_ips`, and global scope flags in place.
+pub async fn update_api_key(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<UpdateApiKeyPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+
+    if let Some(bips) = &payload.bound_ips {
+        for cidr in bips.split(',') {
+            let _: IpNetwork = cidr.trim().parse()
+                .map_err(|_| AppError::InvalidInput(format!("Invalid CIDR: {cidr}")))?;
+        }
+    }
+
+    let mut active: api_key::ActiveModel = target.into();
+    if let Some(name) = payload.name {
+        active.name = Set(name);
+    }
+    if let Some(bips) = payload.bound_ips {
+        active.bound_ips = Set(Some(bips));
+    }
+    if let Some(v) = payload.can_manage_keys {
+        active.can_manage_keys = Set(v);
+    }
+    if let Some(v) = payload.can_manage_webhooks {
+        active.can_manage_webhooks = Set(v);
+    }
+    if let Some(v) = payload.can_create_groups {
+        active.can_create_groups = Set(v);
+    }
+    active.updated_at = Set(Utc::now().naive_utc());
+    let updated = active.update(&state.db).await?;
+
+    create_audit_log(&state.db, Some(key.id), "KEY_UPDATE", None, None, Some(id.to_string())).await?;
+
+    Ok(Json(build_api_key_summary(&state.db, updated).await?))
+}
+
+/// Response after rotating an API key's secret
+#[derive(Serialize)]
+pub struct RotateKeyResponse {
+    /// Key ID
+    pub id: Uuid,
+    /// The new plaintext key. Shown only once — only its hash is stored.
+    pub plaintext_key: String,
+}
+
+/// Handles POST /api/v1/keys/:id/rotate — generates a new secret for an existing key, returning
+/// the plaintext once while immediately invalidating the previous secret (the old `key_hash` is
+/// overwritten, not kept around).
+pub async fn rotate_api_key(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+
+    let plaintext_key = generate_random_key();
+    let key_hash = hash_key(&plaintext_key);
+    let prefix = plaintext_key.chars().take(8).collect::<String>();
+
+    let mut active: api_key::ActiveModel = target.into();
+    active.key_hash = Set(key_hash);
+    active.prefix = Set(prefix);
+    active.updated_at = Set(Utc::now().naive_utc());
+    active.update(&state.db).await?;
+
+    create_audit_log(&state.db, Some(key.id), "KEY_ROTATE", None, None, Some(id.to_string())).await?;
+
+    Ok(Json(RotateKeyResponse { id, plaintext_key }))
+}
+
 /// Handles POST /api/v1/keys/:id/groups
 pub async fn update_key_group_permissions(
     State(state): State<AppState>,
@@ -861,20 +1065,22 @@ pub async fn update_key_group_permissions(
     }
 
     let target_group_id: Uuid;
-    let existing_group = ip_group::Entity::find()
-        .filter(ip_group::Column::Name.eq(&payload.group_name))
-        .one(&state.db)
-        .await?;
+    let resolved_group_name: String;
+    let existing_group = resolve_group_ref(&state.db, payload.group_id, payload.group_name.as_deref()).await?;
 
     if let Some(g) = existing_group {
         target_group_id = g.id;
-    } else {
+        resolved_group_name = g.name;
+    } else if let Some(group_name) = &payload.group_name {
         if !key.is_master && !key.can_create_groups {
             return Err(AppError::Forbidden("Permission denied: Target group does not exist and you cannot create groups".to_owned()));
         }
 
-        let group = get_or_create_group(&state.db, &payload.group_name, "banlist").await?;
+        let group = get_or_create_group(&state.db, group_name, "banlist").await?;
         target_group_id = group.id;
+        resolved_group_name = group.name;
+    } else {
+        return Err(AppError::NotFound);
     }
 
     let now = Utc::now().naive_utc();
@@ -900,10 +1106,43 @@ pub async fn update_key_group_permissions(
         )
         .exec(&state.db)
         .await?;
-        
-    create_audit_log(&state.db, Some(key.id), "KEY_PERM_UPDATE", None, Some(payload.group_name.clone()), Some(id.to_string())).await?;
+
+    create_audit_log(&state.db, Some(key.id), "KEY_PERM_UPDATE", None, Some(resolved_group_name), Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::OK)
+}
+
+/// Handles DELETE /api/v1/keys/:id/permissions/:group_identifier — removes a key's permission
+/// mapping for a specific group. `group_identifier` may be either the group's UUID or its name.
+pub async fn revoke_key_group_permission(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Path((id, group_identifier)): Path<(Uuid, String)>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let group = resolve_group_by_identifier(&state.db, &group_identifier)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    let result = api_key_group_permission::Entity::delete_many()
+        .filter(
+            Condition::all()
+                .add(api_key_group_permission::Column::ApiKeyId.eq(id))
+                .add(api_key_group_permission::Column::GroupId.eq(group.id))
+        )
+        .exec(&state.db)
+        .await?;
+
+    if result.rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    create_audit_log(&state.db, Some(key.id), "KEY_PERM_REVOKE", None, Some(group.name), Some(id.to_string())).await?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1065,6 +1304,45 @@ pub async fn create_webhook(
     Ok(Json(serde_json::json!({ "id": id, "target_url": payload.target_url })))
 }
 
+/// Public-safe summary of a webhook configuration. Deliberately omits `secret_token`: unlike
+/// `api_key.key_hash` (a hash of a high-entropy generated value), a webhook's `secret_token` is a
+/// caller-supplied plaintext HMAC key — leaking it would let any reader with `can_manage_webhooks`
+/// forge valid `X-Signature-256` signatures for that webhook.
+#[derive(Serialize)]
+pub struct WebhookSummary {
+    /// Webhook ID
+    pub id: Uuid,
+    /// Webhook name
+    pub name: String,
+    /// Target URL
+    pub target_url: String,
+    /// Custom headers (JSON-encoded)
+    pub headers_json: Option<String>,
+    /// Payload template
+    pub payload_template: String,
+    /// Target IP group
+    pub group_id: Uuid,
+    /// Whether dispatching is currently enabled
+    pub is_active: bool,
+    /// Creation timestamp
+    pub created_at: chrono::NaiveDateTime,
+}
+
+impl From<webhook_config::Model> for WebhookSummary {
+    fn from(w: webhook_config::Model) -> Self {
+        WebhookSummary {
+            id: w.id,
+            name: w.name,
+            target_url: w.target_url,
+            headers_json: w.headers_json,
+            payload_template: w.payload_template,
+            group_id: w.group_id,
+            is_active: w.is_active,
+            created_at: w.created_at,
+        }
+    }
+}
+
 /// Handles GET /api/v1/webhooks
 pub async fn list_webhooks(
     State(state): State<AppState>,
@@ -1075,7 +1353,8 @@ pub async fn list_webhooks(
     }
 
     let webhooks = WebhookConfig::find().all(&state.db).await?;
-    Ok(Json(webhooks))
+    let summaries: Vec<WebhookSummary> = webhooks.into_iter().map(WebhookSummary::from).collect();
+    Ok(Json(summaries))
 }
 
 /// Handles DELETE /api/v1/webhooks/:id
@@ -1096,4 +1375,45 @@ pub async fn delete_webhook(
     create_audit_log(&state.db, Some(key.id), "WEBHOOK_DELETE", None, None, Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+// ─────────────────────────────────────────────────────────────
+// Audit Logs
+// ─────────────────────────────────────────────────────────────
+
+/// Query parameters for audit log listing
+#[derive(Deserialize)]
+pub struct AuditLogQuery {
+    /// Filter by exact action type (e.g. `IP_ADD`)
+    pub action: Option<String>,
+    /// Pagination limit
+    pub limit: Option<u64>,
+    /// Pagination offset
+    pub offset: Option<u64>,
+}
+
+/// Handles GET /api/v1/audit-logs. Restricted to master keys: audit entries span every key and
+/// group in the system, so a scoped key seeing them would be an RBAC leak regardless of its
+/// per-group grants.
+pub async fn list_audit_logs(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Query(query): Query<AuditLogQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master {
+        return Err(AppError::Forbidden("Only master keys can view audit logs".to_owned()));
+    }
+
+    let mut q = audit_log::Entity::find().order_by_desc(audit_log::Column::Timestamp);
+    if let Some(action) = &query.action
+        && !action.is_empty()
+    {
+        q = q.filter(audit_log::Column::Action.eq(action));
+    }
+
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+    let logs = q.limit(limit).offset(offset).all(&state.db).await?;
+
+    Ok(Json(logs))
 }

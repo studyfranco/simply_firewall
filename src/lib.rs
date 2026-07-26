@@ -3,7 +3,7 @@
 //! This module provides the core API router, state, and webhook logic.
 
 use axum::{
-    routing::{delete, get, post},
+    routing::{delete, get, post, put},
     Router,
 };
 use tower_http::services::ServeDir;
@@ -33,14 +33,21 @@ pub fn create_app(state: AppState) -> Router {
         // Admin endpoints
         .route("/keys", post(api::create_api_key))
         .route("/keys", get(api::list_api_keys))
+        .route("/keys/{id}", put(api::update_api_key))
         .route("/keys/{id}", delete(api::delete_api_key))
+        .route("/keys/{id}/rotate", post(api::rotate_api_key))
         .route("/keys/{id}/groups", post(api::update_key_group_permissions))
+        // `/permissions` is the same assignment handler as `/groups` under a name that matches
+        // the new revoke route below; `/groups` is kept working for backward compatibility.
+        .route("/keys/{id}/permissions", post(api::update_key_group_permissions))
+        .route("/keys/{id}/permissions/{group_identifier}", delete(api::revoke_key_group_permission))
         .route("/groups", post(api::create_ip_group))
         .route("/groups", get(api::list_ip_groups))
         .route("/groups/{id}", delete(api::delete_ip_group))
         .route("/webhooks", post(api::create_webhook))
         .route("/webhooks", get(api::list_webhooks))
         .route("/webhooks/{id}", delete(api::delete_webhook))
+        .route("/audit-logs", get(api::list_audit_logs))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::auth_middleware,
