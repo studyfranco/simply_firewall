@@ -135,4 +135,16 @@ For every route registered under `/api`, tests MUST assert three distinct outcom
   - **Audit Trail (`GET /api/audit-logs`):**
     - Verify mutating actions write audit entries and read access is restricted to `is_master` keys.
 
+### 3. API Contract Flexibility & Lifecycle Validation
+  - **Query & Group Identification:**
+    Endpoints manipulating group permissions (`/api/keys/{id}/permissions`) or records (`/api/ips`, `/api/ban`, `/api/white`) MUST accept both `group_id` (UUID) and `group_name` (string) seamlessly.
+  - **Flexible Body / Query Deserialization (`DELETE /api/ips`):**
+    `DELETE /api/ips` MUST accept parameters both via URL Query strings (`?target_address=...&group_name=...`) and via JSON request body (`{"target_address": "...", "group_name": "..."}`).
+  - **Key Rotation & Editing:**
+    `POST /api/keys/{id}/rotate` MUST generate a new secret while keeping key ID/name intact and invalidating the old secret. `PUT /api/keys/{id}` MUST allow updating key name, bound IPs, and global scopes.
+  - **Revoking Group Permissions:**
+    `DELETE /api/keys/{id}/permissions/{group_identifier}` MUST remove specific group permission mappings from a key.
+  - **Audit Log Interface & Endpoint:**
+    All mutating actions MUST write audit logs, accessible via `GET /api/audit-logs` for Master keys and rendered in a dedicated UI panel.
+
 *End of directives. Write safe, panic-free (`no .unwrap()`), and elegant Rust code.*
