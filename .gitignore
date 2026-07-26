@@ -2,3 +2,4 @@ target/*
 *.db
 *.db-journal
 Cargo.lock
+.claude/*

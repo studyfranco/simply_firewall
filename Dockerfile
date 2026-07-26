@@ -47,6 +47,7 @@ EXPOSE 3000
 # Default environment configuration
 ENV DATABASE_URL=sqlite://data/firewall.db?mode=rwc
 ENV RUST_LOG=info
+ENV ALLOW_PRIVATE_WEBHOOKS=false
 
 # Define command
 CMD ["simply_firewall"]
