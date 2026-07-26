@@ -45,6 +45,14 @@ async fn shutdown_signal() {
 /// Checks specifically for the absence of a key with `is_master = true` (not merely "any key
 /// exists"): if every master key were ever deleted while lower-privilege sub-keys remained,
 /// administrators could otherwise be permanently locked out.
+///
+/// If the `INITIAL_MASTER_KEY` environment variable is set, its exact value is used as the
+/// plaintext secret instead of generating a random one. This exists purely for deterministic
+/// test/CI bootstrap (e.g. `scripts/test_e2e.sh`), where a caller needs to know the master key
+/// up front rather than scraping it back out of stdout — it is deliberately **not** documented as
+/// a normal deployment option, since a human-chosen, low-entropy secret defeats the point of
+/// generating a random 256-bit key. A warning is logged whenever it's used so it can't be enabled
+/// by accident in a real deployment without someone noticing in the logs.
 async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
     use entities::{api_key, prelude::ApiKey};
 
@@ -56,7 +64,17 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
         return Ok(());
     }
 
-    let plaintext_key = api::generate_random_key();
+    let plaintext_key = match std::env::var("INITIAL_MASTER_KEY") {
+        Ok(fixed_key) if !fixed_key.is_empty() => {
+            tracing::warn!(
+                "INITIAL_MASTER_KEY is set: using the provided value as the master key instead \
+                 of generating a random one. This is intended for deterministic test/CI bootstrap \
+                 only — do not set this in a real deployment."
+            );
+            fixed_key
+        }
+        _ => api::generate_random_key(),
+    };
     let key_hash = api::hash_key(&plaintext_key);
     let bound_ip = std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0".to_owned());
 
@@ -88,6 +106,14 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
          ╚══════════════════════════════════════════════════════════════╝",
         plaintext_key, bound_ip
     );
+
+    // tracing's fmt subscriber buffers writes; a reader tailing/polling the redirected log file
+    // right after this point (as scripts/test_e2e.sh used to, before it switched to
+    // INITIAL_MASTER_KEY) could otherwise see a truncated or missing banner for a short window.
+    // Flushing explicitly makes the banner's appearance in the log deterministic.
+    use std::io::Write;
+    std::io::stdout().flush().ok();
+    std::io::stderr().flush().ok();
 
     Ok(())
 }

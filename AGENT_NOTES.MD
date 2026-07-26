@@ -861,3 +861,92 @@ this session, like session 5, found a stale `simply_firewall` process still hold
 earlier manual testing before either the script or a fresh manual run could bind it. The E2E
 script itself now checks for this up front and exits with a clear message instead of limping along
 against a leftover instance the way manual testing did in session 5.
+
+---
+
+## 2026-07-26 (session 7) — Deterministic bootstrap, verbose E2E logging, 4 more test scenarios
+
+Root cause of the reported "I/O buffering timeout": `scripts/test_e2e.sh` extracted the bootstrap
+master key by `grep`-ing the server's redirected log file (`grep -oE '(Key:    )[a-f0-9]{64}'
+"$SERVER_LOG"`). `tracing-subscriber`'s fmt writer doesn't flush after every event the way a
+line-buffered TTY would, so a reader polling that log file immediately after the readiness `curl`
+succeeds can race a banner that's already been *printed* by the process but not yet flushed to the
+actual file on disk. The fix in this session removes the race at its source rather than papering
+over it with a longer timeout.
+
+### `src/main.rs`: `INITIAL_MASTER_KEY` + explicit flush
+
+`bootstrap_master_key` now checks `INITIAL_MASTER_KEY` before falling back to
+`api::generate_random_key()`. Deliberately scoped as a test/CI-only affordance, not a documented
+deployment option: it logs a `tracing::warn!` every time it's used, precisely so a fixed,
+attacker-guessable secret can't end up in a real deployment without someone noticing it in the
+logs. Also added the explicit `std::io::stdout().flush()` / `std::io::stderr().flush()` the task
+specified, right after the bootstrap banner — belt-and-suspenders alongside the `INITIAL_MASTER_KEY`
+fix, since some other future reader of this log might still want to tail it for the banner. Smoke
+tested directly (not just through the E2E script): started the real binary with
+`INITIAL_MASTER_KEY=e2e_master_secret_key_for_testing_123456789`, confirmed the warning appears,
+confirmed `GET /api/auth/me` authenticates with that exact literal string, confirmed
+`is_master: true`.
+
+### `scripts/test_e2e.sh`: rebuilt around the deterministic key, verbose per-call logging, port default
+
+- Removed the log-grep entirely. The script now sets `INITIAL_MASTER_KEY` when launching the
+  server and uses that same literal value directly — zero dependency on log content or timing for
+  the single piece of state the whole rest of the script depends on.
+  - `BASE_URL` default changed from `http://localhost:3000` to `http://127.0.0.1:3000` (avoids an
+    IPv6 `::1`-first resolution attempt against a server that only binds the IPv4 wildcard
+    address) — readiness polling already used `curl`, not log content; it just needed the more
+    precise host literal the task specified.
+- `api_call` now prints the jq-pretty-printed response body (dimmed, indented under the status
+  line) after **every** call, not just on failures — moved this out of `check`/`check_jq`'s
+  failure branches (which were the only places a body used to get printed) since printing it
+  unconditionally in one place made the redundant per-assertion copy pointless. Falls back to
+  printing the raw body verbatim if it isn't valid JSON (e.g. a `204 No Content` body), and prints
+  `(empty body)` for a genuinely empty one.
+- Found and fixed one remaining call that bypassed the `api_call` wrapper (a raw `curl` to resolve
+  `fail2ban_nginx`'s group id) while auditing the script for "format every single HTTP call" —
+  routed it through `api_call` like everything else so it gets the same timestamp/status/body
+  treatment.
+- Added `check_true` (wraps `jq -e`) for boolean-expression assertions, used by the new conflict-
+  detection section to check `[.[].group_type] | sort == ["banlist","whitelist"]` in one line
+  instead of several separate scalar `check_jq` calls.
+- Added new sections: **§4 Multi-Group Overlap / Conflict Detection** (same address into a
+  banlist and a whitelist group, asserts `GET /api/ips` returns 2 rows with the two different
+  `group_type`s), a dedicated **bound-IP strict-rejection** case inside §6 (`bound_ips=127.0.0.1/32`
+  key, `X-Forwarded-For: 203.0.113.50`, asserts exactly `403` + `"error": "Client IP not allowed"`),
+  **§7 audit log pagination** (6 `GROUP_CREATE` actions, `limit=3&offset=0` vs `limit=3&offset=3`,
+  asserts each page has exactly 3 entries and the two pages don't overlap), and a
+  **group_name-vs-group_id interop** case in §8 using a realistic `fail2ban_nginx` group name
+  granted to one key while a second key gets the same group by UUID.
+- Two full runs back-to-back: **78/78 checks pass both times**, clean shutdown, port 3000 free
+  after each.
+
+### `tests/rbac_integration_tests.rs`: 4 new tests (28 total, all passing)
+
+- `test_multi_group_overlap_exposes_both_memberships_for_conflict_detection` — same address into
+  a banlist and a whitelist group; asserts `GET /api/ips` returns exactly 2 rows (not deduplicated
+  into 1), with `group_type`s `["banlist","whitelist"]` after sorting.
+- `test_group_permission_assignment_via_group_name_alongside_uuid` — a realistic
+  `fail2ban_nginx`-named group, one key granted access via `group_name`, a second key granted
+  access to the *same* group via its UUID; asserts both keys can read it and both grants resolved
+  to the identical `group_id`.
+- `test_audit_log_pagination` — 6 `GROUP_CREATE` actions, asserts `limit=3&offset=0` and
+  `limit=3&offset=3` each return exactly 3 entries whose ID sets are disjoint and whose union is
+  all 6 (via `HashSet::is_disjoint`/`union`, not just eyeballing individual entries).
+- `test_bound_ip_strictly_rejects_out_of_cidr_forwarded_address` — the exact scenario named in the
+  task (`bound_ips=127.0.0.1/32`, `X-Forwarded-For: 203.0.113.50`), asserting the precise error
+  body (`{"error": "Client IP not allowed"}`), plus a sanity check that the same key from
+  `127.0.0.1` itself is let through.
+
+No existing test needed modification.
+
+### Final verification (session 7)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **28/28 pass** (24 carried over from sessions 1–6 + 4 new this
+  session).
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- `cargo doc --no-deps`: clean.
+- `grep -rn -E "\.unwrap\(\)|\.expect\(" src/`: no matches.
+- `scripts/test_e2e.sh`: **78/78 checks pass**, twice in a row, against a real running instance
+  with verbose per-call JSON logging throughout.

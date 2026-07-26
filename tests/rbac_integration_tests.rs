@@ -1710,3 +1710,238 @@ async fn test_group_permission_write_or_delete_requires_read() {
         .unwrap();
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
+
+// ─────────────────────────────────────────────────────────────
+// Conflict detection, group_name assignment, audit log pagination,
+// and a dedicated strict bound-IP rejection scenario
+// ─────────────────────────────────────────────────────────────
+
+/// The same address can legitimately belong to a `banlist` group and a `whitelist` group at
+/// once; `GET /api/ips` must expose both memberships as separate rows (one per group), each
+/// carrying its own `group_type`, so the dashboard's client-side conflict indicator
+/// (`findConflictingAddresses` in `static/app.js`) has the data it needs to flag it. A response
+/// that deduplicated/merged the two memberships into one row would silently break that feature.
+#[tokio::test]
+async fn test_multi_group_overlap_exposes_both_memberships_for_conflict_detection() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "target_address": "192.0.2.200",
+            "group_name": "conflict-banlist",
+            "cause": "flagged as hostile"
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/white")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "target_address": "192.0.2.200",
+            "group_name": "conflict-whitelist",
+            "cause": "also a trusted partner"
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?ip=192.0.2.200")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(items.len(), 2, "both memberships must be exposed as separate rows: {items:?}");
+    assert!(items.iter().all(|i| i["target_address"] == "192.0.2.200"));
+    let mut group_types: Vec<&str> = items.iter().map(|i| i["group_type"].as_str().unwrap()).collect();
+    group_types.sort_unstable();
+    assert_eq!(group_types, vec!["banlist", "whitelist"]);
+}
+
+/// Assigning group rights via a literal `group_name` (e.g. a realistic fail2ban jail name) must
+/// work exactly as well as via `group_id`, including when both are used to grant different keys
+/// access to the very same group in the same test.
+#[tokio::test]
+async fn test_group_permission_assignment_via_group_name_alongside_uuid() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (name_key_id, name_key) = insert_key(&db, "fail2ban-nginx-name-grant", false, false, false, false).await;
+    let (uuid_key_id, uuid_key) = insert_key(&db, "fail2ban-nginx-uuid-grant", false, false, false, false).await;
+
+    // Seed the group into existence via a normal ban, using a realistic fail2ban-style name.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "target_address": "198.51.100.77",
+            "group_name": "fail2ban_nginx",
+            "cause": "nginx probing"
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/groups")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let groups: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    let group_id = groups.iter().find(|g| g["name"] == "fail2ban_nginx").unwrap()["id"].as_str().unwrap().to_owned();
+
+    // Grant via the literal group_name field.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{name_key_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_name": "fail2ban_nginx",
+            "can_read": true,
+            "can_write": true,
+            "can_delete": false
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Grant a DIFFERENT key on the SAME group via its UUID, seamlessly alongside the name grant.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{uuid_key_id}/groups"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "group_id": group_id,
+            "can_read": true,
+            "can_write": false,
+            "can_delete": false
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Both keys can now read the group, and both grants reference the identical group id.
+    for key in [&name_key, &uuid_key] {
+        let req = inject_connect_info(Request::builder()
+            .uri("/api/ips?group_name=fail2ban_nginx")
+            .header("X-API-Key", key))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+        assert_eq!(items.len(), 1);
+    }
+
+    let perms = simply_firewall::entities::api_key_group_permission::Entity::find().all(&db).await.unwrap();
+    let group_ids: std::collections::HashSet<String> = perms.iter().map(|p| p.group_id.to_string()).collect();
+    assert_eq!(group_ids.len(), 1, "the name-grant and the uuid-grant must reference the same group");
+    assert_eq!(group_ids.into_iter().next().unwrap(), group_id);
+}
+
+/// `GET /api/audit-logs` pagination (`limit`/`offset`) must actually advance the window: two
+/// consecutive pages of the same filtered query must return disjoint sets of entries.
+#[tokio::test]
+async fn test_audit_log_pagination() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    // Six distinct GROUP_CREATE audit entries, so two limit=3 pages fully partition them.
+    for i in 0..6 {
+        let req = inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/groups")
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json"))
+            .body(Body::from(json!({ "name": format!("pagination-group-{i}") }).to_string()))
+            .unwrap();
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    let fetch_page = |offset: u64| {
+        let app = app.clone();
+        let master_key = master_key.clone();
+        async move {
+            let req = inject_connect_info(Request::builder()
+                .uri(format!("/api/audit-logs?action=GROUP_CREATE&limit=3&offset={offset}"))
+                .header("X-API-Key", &master_key))
+                .body(Body::empty())
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            serde_json::from_slice::<Vec<serde_json::Value>>(&body).unwrap()
+        }
+    };
+
+    let page1 = fetch_page(0).await;
+    let page2 = fetch_page(3).await;
+
+    assert_eq!(page1.len(), 3, "page 1 (offset=0) must have exactly `limit` entries: {page1:?}");
+    assert_eq!(page2.len(), 3, "page 2 (offset=3) must have exactly `limit` entries: {page2:?}");
+
+    let page1_ids: std::collections::HashSet<&str> = page1.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    let page2_ids: std::collections::HashSet<&str> = page2.iter().map(|e| e["id"].as_str().unwrap()).collect();
+    assert!(page1_ids.is_disjoint(&page2_ids), "page 1 and page 2 must not overlap: {page1_ids:?} vs {page2_ids:?}");
+    assert_eq!(page1_ids.union(&page2_ids).count(), 6, "together the two pages cover all 6 entries exactly once");
+}
+
+/// Dedicated strict scenario: a key bound to `127.0.0.1/32` must be rejected — with exactly the
+/// `403 Client IP not allowed` the middleware documents — when the (proxy-supplied) client
+/// address is `203.0.113.50`, nowhere near the bound range.
+#[tokio::test]
+async fn test_bound_ip_strictly_rejects_out_of_cidr_forwarded_address() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, restricted_key) = insert_key_with_bound_ips(&db, "loopback-only", "127.0.0.1/32").await;
+
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &restricted_key)
+        .header("X-Forwarded-For", "203.0.113.50"))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["error"], "Client IP not allowed");
+
+    // Sanity check: the same key from the bound address itself is let through.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &restricted_key)
+        .header("X-Forwarded-For", "127.0.0.1"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+}
