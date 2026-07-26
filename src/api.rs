@@ -10,7 +10,7 @@ use ipnetwork::IpNetwork;
 use rand::RngExt;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter,
-    sea_query::OnConflict, Condition, QuerySelect, ActiveModelTrait,
+    sea_query::OnConflict, Condition, QuerySelect, ActiveModelTrait, SqlErr,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -60,6 +60,38 @@ async fn create_audit_log(
     };
     audit_log::Entity::insert(log).exec(db).await?;
     Ok(())
+}
+
+/// Fetches an `IpGroup` by name, creating it with `default_group_type` if it doesn't exist yet.
+///
+/// Concurrency-safe: naively doing a `find` followed by a plain `insert` races when two requests
+/// both observe the group as missing and both try to create it — `ip_groups.name` is unique, so
+/// the loser gets a raw constraint-violation `500` instead of just using the winner's row. This
+/// uses `on_conflict(...).do_nothing()` for the insert and always re-reads by name afterwards, so
+/// either outcome (we created it, or a concurrent request beat us to it) converges on the same
+/// canonical row.
+async fn get_or_create_group(
+    db: &sea_orm::DatabaseConnection,
+    name: &str,
+    default_group_type: &str,
+) -> Result<ip_group::Model, AppError> {
+    let new_group = ip_group::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        name: Set(name.to_owned()),
+        group_type: Set(default_group_type.to_owned()),
+        description: Set(None),
+        created_at: Set(Utc::now().naive_utc()),
+    };
+    ip_group::Entity::insert(new_group)
+        .on_conflict(OnConflict::column(ip_group::Column::Name).do_nothing().to_owned())
+        .exec_without_returning(db)
+        .await?;
+
+    ip_group::Entity::find()
+        .filter(ip_group::Column::Name.eq(name))
+        .one(db)
+        .await?
+        .ok_or(AppError::Internal)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -158,19 +190,12 @@ async fn handle_ip_upsert(
             return Err(AppError::Forbidden("Permission denied: Target group does not exist and you cannot create groups".to_owned()));
         }
 
-        let new_id = Uuid::new_v4();
-        let now = chrono::Utc::now().naive_utc();
-        let new_group = ip_group::ActiveModel {
-            id: Set(new_id),
-            name: Set(payload.group_name.clone()),
-            group_type: Set(if is_whitelist { "whitelist".to_owned() } else { "banlist".to_owned() }),
-            description: Set(None),
-            created_at: Set(now),
-        };
-        ip_group::Entity::insert(new_group).exec(&state.db).await?;
-        target_group_id = new_id;
+        let default_type = if is_whitelist { "whitelist" } else { "banlist" };
+        let group = get_or_create_group(&state.db, &payload.group_name, default_type).await?;
+        target_group_id = group.id;
 
         if !key.is_master {
+            let now = Utc::now().naive_utc();
             let perm = api_key_group_permission::ActiveModel {
                 id: Set(Uuid::new_v4()),
                 api_key_id: Set(key.id),
@@ -180,35 +205,55 @@ async fn handle_ip_upsert(
                 can_delete: Set(true),
                 created_at: Set(now),
             };
-            api_key_group_permission::Entity::insert(perm).exec(&state.db).await?;
+            // on_conflict do_nothing: a concurrent burst from this same key racing to create the
+            // same new group would otherwise hit the (api_key_id, group_id) unique index here too.
+            api_key_group_permission::Entity::insert(perm)
+                .on_conflict(
+                    OnConflict::columns([api_key_group_permission::Column::ApiKeyId, api_key_group_permission::Column::GroupId])
+                        .do_nothing()
+                        .to_owned()
+                )
+                .exec_without_returning(&state.db)
+                .await?;
         }
     }
-
-    let existing_record = ip_record::Entity::find()
-        .filter(ip_record::Column::TargetAddress.eq(payload.target_address.clone()))
-        .one(&state.db)
-        .await?;
 
     let now = Utc::now().naive_utc();
     let record_id: Uuid;
 
-    if let Some(record) = existing_record {
-        if record.is_locked {
-            return Err(AppError::Forbidden("This IP is protected and cannot be modified".to_owned()));
+    // find-then-insert races under true concurrency: two requests can both see no existing
+    // record and both attempt to insert the same (unique) target_address. Rather than trying to
+    // cram the is_locked check and "only overwrite cause if provided" semantics into a single
+    // atomic ON CONFLICT DO UPDATE, retry as a normal update on the one specific, portably
+    // detectable failure mode that means "a concurrent request just won this race": a unique
+    // constraint violation on the insert. At most one retry is possible — by the time it fires,
+    // the winning request's row is already committed (SeaORM/sqlx pool this DB to a single
+    // connection for SQLite, so operations are fully serialized).
+    loop {
+        let existing_record = ip_record::Entity::find()
+            .filter(ip_record::Column::TargetAddress.eq(payload.target_address.clone()))
+            .one(&state.db)
+            .await?;
+
+        if let Some(record) = existing_record {
+            if record.is_locked {
+                return Err(AppError::Forbidden("This IP is protected and cannot be modified".to_owned()));
+            }
+
+            let mut active_rec: ip_record::ActiveModel = record.into();
+            active_rec.last_seen_at = Set(now);
+            active_rec.updated_at = Set(now);
+            if let Some(c) = &payload.cause {
+                active_rec.cause = Set(Some(c.clone()));
+            }
+            let updated = active_rec.update(&state.db).await?;
+            record_id = updated.id;
+            break;
         }
-        
-        let mut active_rec: ip_record::ActiveModel = record.into();
-        active_rec.last_seen_at = Set(now);
-        active_rec.updated_at = Set(now);
-        if let Some(c) = &payload.cause {
-            active_rec.cause = Set(Some(c.clone()));
-        }
-        let updated = active_rec.update(&state.db).await?;
-        record_id = updated.id;
-    } else {
-        record_id = Uuid::new_v4();
+
+        let new_id = Uuid::new_v4();
         let model = ip_record::ActiveModel {
-            id: Set(record_id),
+            id: Set(new_id),
             target_address: Set(payload.target_address.clone()),
             cause: Set(payload.cause.clone()),
             is_locked: Set(false),
@@ -216,7 +261,16 @@ async fn handle_ip_upsert(
             updated_at: Set(now),
             last_seen_at: Set(now),
         };
-        ip_record::Entity::insert(model).exec(&state.db).await?;
+        match ip_record::Entity::insert(model).exec(&state.db).await {
+            Ok(_) => {
+                record_id = new_id;
+                break;
+            }
+            Err(err) if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) => {
+                continue;
+            }
+            Err(err) => return Err(err.into()),
+        }
     }
 
     let mem = ip_record_group_membership::ActiveModel {
@@ -819,17 +873,8 @@ pub async fn update_key_group_permissions(
             return Err(AppError::Forbidden("Permission denied: Target group does not exist and you cannot create groups".to_owned()));
         }
 
-        let new_id = Uuid::new_v4();
-        let now = chrono::Utc::now().naive_utc();
-        let new_group = ip_group::ActiveModel {
-            id: Set(new_id),
-            name: Set(payload.group_name.clone()),
-            group_type: Set("banlist".to_owned()),
-            description: Set(None),
-            created_at: Set(now),
-        };
-        ip_group::Entity::insert(new_group).exec(&state.db).await?;
-        target_group_id = new_id;
+        let group = get_or_create_group(&state.db, &payload.group_name, "banlist").await?;
+        target_group_id = group.id;
     }
 
     let now = Utc::now().naive_utc();

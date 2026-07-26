@@ -477,3 +477,124 @@ as the title (as requested), with a body listing this commit's actual contents (
 fix, new tests) plus a note that it builds on the already-pushed `c4c0bd6` for the bulk of the
 Rust-2024/bug-fix/UI work the title refers to — kept the title the user asked for while keeping the
 body honest about which changes are actually in this diff. Not pushed — no push was requested.
+
+---
+
+## 2026-07-26 (session 4) — Concurrency tests uncover two more real races; module cleanup verified
+
+### Tasks 1 & 2 (rand fix, dead code) — already satisfied, re-verified
+
+`use rand::RngExt;` / `rand::rng().random()` in `src/api.rs` and the `Cargo.toml` `rand = "0.10"`
+bump were both already done (session 1). Re-ran a full repo file listing plus a check that every
+file under `static/` is actually referenced from `index.html` — no dead files, no orphans,
+`src/lib_tmp.rs` (deleted session 1) has not reappeared. `cargo check --all-targets` is clean.
+
+### Task 3 — four new tests added, two of them found real, previously-unknown production bugs
+
+Added to `tests/rbac_integration_tests.rs`:
+
+- `test_concurrent_burst_ban_requests` — 10 concurrent `tokio::spawn` tasks POST the same
+  address+group. **This test failed on first run: 9 of 10 requests got `500`, not `200`.**
+- `test_reverse_proxy_xff_extracts_rightmost_trusted_hop` — asserts a key bound to the *rightmost*
+  `X-Forwarded-For` hop is let through, and a key bound to the *leftmost* (client-forgeable) claim
+  in the same header is rejected. Passed immediately — this is exactly what session 1's middleware
+  fix already implements (`.split(',').next_back()`), just not previously exercised by an explicit
+  security-focused test.
+- `test_cidr_and_ipv6_boundary_validation` — `256.0.0.1/32`, `10.0.0.1/35`, and free-form garbage
+  all correctly `400`; `2001:db8::/32` correctly parses and is accepted. Passed immediately;
+  verified by hand-checking the IPv6 private/link-local bitmask logic in `handle_ip_upsert` against
+  `2001:db8::`'s first segment (`0x2001`) before trusting the assertion.
+- `test_webhook_dispatch_does_not_block_api_response` — registers a webhook pointing at a mock
+  endpoint that sleeps 3 seconds before responding, then asserts `POST /api/ban` still returns
+  `200` in under 50ms. Passed immediately: `handle_ip_upsert` only ever does
+  `state.webhook_tx.send(event).await` (a bounded mpsc channel, capacity 100, never full in this
+  test) — the slow HTTP dispatch happens later, in the separate `run_webhook_worker` task.
+
+Needed a `static ENV_MUTATION_LOCK: LazyLock<tokio::sync::Mutex<()>>` shared between this new test
+and the existing `test_webhook_hmac_signature_and_delivery` (session 2): both mutate the
+process-wide `ALLOW_PRIVATE_WEBHOOKS` env var, which is `unsafe` in this Rust version specifically
+because concurrent `set_var`/`var` calls from different threads race — and libtest runs different
+`#[tokio::test]`s on different threads by default. Both tests now hold this lock for the full
+duration they depend on that env var, so they can never interleave.
+
+Before writing the concurrency test, checked whether SeaORM's SQLite driver would even make "10
+truly concurrent connections to `sqlite::memory:`" mean anything sane: by default, sqlx pools up to
+10 connections, and *without* `cache=shared` in the DSN, each connection to `:memory:` is a fully
+separate, isolated database. Checked the vendored source
+(`sea-orm-2.0.0/src/driver/sqlx_sqlite.rs:91-92`) and confirmed SeaORM's SQLite driver
+unconditionally forces `max_connections(1)` whenever the caller hasn't set one explicitly — so
+`Database::connect("sqlite::memory:")` (used by every test's `setup_test_db()`) was already safe
+for this without any changes.
+
+### Bug #1 (found by `test_concurrent_burst_ban_requests`): `ip_groups.name` auto-creation race
+
+`handle_ip_upsert` and `update_key_group_permissions` both do `find group by name` → if `None`,
+`insert` a new group. Two concurrent requests for a group name neither has seen yet both take the
+`insert` branch; `ip_groups.name` is unique, so the loser gets a raw `UNIQUE constraint failed`
+`DbErr` → `500`. Fixed by adding `get_or_create_group(db, name, default_type)` (new helper in
+`src/api.rs`'s Helpers section): the insert uses `.on_conflict(OnConflict::column(Name)
+.do_nothing()).exec_without_returning(...)`, then always re-reads the row by name afterwards —
+whichever request's insert actually won, everyone converges on the same canonical row instead of
+erroring. Replaced both call sites. Also made the *auto-provisioned permission grant* insert in
+`handle_ip_upsert`'s new-group branch conflict-safe the same way (`on_conflict(...).do_nothing()
+.exec_without_returning(...)` on the `(api_key_id, group_id)` pair) — a burst of new-group-creating
+requests from the *same* non-master key would otherwise hit that unique index next, even after the
+group-name race was fixed.
+
+### Bug #2 (the actual reason the test still failed after fixing bug #1): `ip_records.target_address` upsert race
+
+This is the more important one — it's the core "re-register an IP" path AGENT.MD explicitly
+mandates must not fail. Same shape of bug as #1, in `handle_ip_upsert`'s record resolution: `find
+by target_address` → if `None`, `insert`. Confirmed via `RUST_LOG=error` with a temporary
+`tracing_subscriber` init in the test (removed afterward) that the real error was `UNIQUE
+constraint failed: ip_records.target_address` on 9 of 10 concurrent inserts — session 2's
+`exec_without_returning` fix only covered the *membership* insert, not this one, and the existing
+sequential regression test (`test_reban_into_same_group_does_not_500`) couldn't catch it because
+awaiting each ban one at a time means the second one always finds the first one's already-committed
+row.
+
+This one *can't* use the same `on_conflict().do_nothing()` trick directly, because the update path
+has real conditional business logic a blind "insert-or-overwrite" would lose: preserve the existing
+`cause` when the caller doesn't supply one, and refuse to touch a record with `is_locked = true`.
+Instead, wrapped the existing find-or-insert logic in a `loop`, and on the insert attempt, used
+SeaORM 2.0's built-in, portable `DbErr::sql_err() -> Option<SqlErr>` classifier (documented in
+`sea-orm-2.0.0/src/error.rs` as the correct cross-backend way to detect this, rather than matching
+SQLite's numeric error codes directly, which would violate AGENT.MD's SQL-agnosticism constraint)
+to detect specifically `SqlErr::UniqueConstraintViolation` and retry — at that point the concurrent
+winner's row is guaranteed already committed (SQLite here is pooled to exactly one connection, so
+there's no interleaving left to race against), so the retry's `find` succeeds and takes the normal
+update branch, `is_locked` check and conditional `cause` preservation fully intact. At most one
+retry is ever possible.
+
+Diagnosis process, for the record: the client-facing error is intentionally generic ("Internal
+database error"), so getting the real DB error required temporarily adding
+`tracing_subscriber::fmt().with_test_writer().try_init()` plus `eprintln!`-ing each task's real
+status/body inside the test itself, running with `RUST_LOG=error --nocapture`, then removing all of
+that instrumentation once the actual `DbErr` message was captured. The final committed test has
+none of that — it's a plain, clean assertion.
+
+Re-ran the concurrency test 5 times in isolation and the full suite 3 times after both fixes — 100%
+stable, no flakes.
+
+### Final verification (session 4)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **15/15 pass** (11 carried over from sessions 1–3 + 4 new this
+  session), stable across repeated runs.
+- `cargo clippy --all-targets --all-features -- -D warnings`: clean.
+- `grep -rn -E "\.unwrap\(\)|\.expect\(" src/`: no matches.
+- Full repo file sweep: no dead/orphaned files; every `static/` asset is referenced from
+  `index.html`.
+
+### Updated production-readiness note
+
+Three sessions in, the pattern holding true is: **every previously-undiscovered bug in this
+codebase has been a SeaORM `on_conflict`/upsert pitfall, and every one of them was found by
+actually exercising a code path, not by reading the code or by static analysis.** Session 2 found
+one such bug (membership insert) via manual sequential `curl` testing. This session's *purpose-built
+concurrency test* found two more in the same family, including one that a sequential test
+structurally cannot detect. If more concurrent/multi-writer paths are added later (or reviewed),
+the standing recommendation from session 2 still applies and now has two additional data points:
+any `find-then-insert` or `on_conflict(...)` in this codebase needs to be checked against genuine
+concurrent execution, not just sequential re-invocation — a bug can be (and twice was) invisible to
+a test that awaits each request one at a time.

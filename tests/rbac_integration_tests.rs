@@ -20,6 +20,12 @@ fn inject_connect_info(req: axum::http::request::Builder) -> axum::http::request
     req.extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))))
 }
 
+/// `ALLOW_PRIVATE_WEBHOOKS` is process-wide global state. Any test that mutates it must hold this
+/// lock for the duration, so two such tests running on different libtest threads can never
+/// interleave their `set_var` calls (which is itself a data race, hence why `set_var` is `unsafe`).
+static ENV_MUTATION_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 #[tokio::test]
 async fn test_auth_and_cidr_rejection() {
     let db = setup_test_db().await;
@@ -383,6 +389,8 @@ async fn test_webhook_hmac_signature_and_delivery() {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
     use std::sync::{Arc, Mutex};
+
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
 
     #[derive(Default)]
     struct Captured {
@@ -916,4 +924,265 @@ async fn test_key_deletion_revokes_access_and_cascades_permissions() {
         .await
         .unwrap();
     assert!(perms_after.is_empty());
+}
+
+// ─────────────────────────────────────────────────────────────
+// Concurrency, reverse-proxy security, and CIDR boundary tests
+// ─────────────────────────────────────────────────────────────
+
+async fn insert_key_with_bound_ips(db: &DatabaseConnection, name: &str, bound_ips: &str) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let plaintext = simply_firewall::api::generate_random_key();
+    let hash = simply_firewall::api::hash_key(&plaintext);
+    simply_firewall::entities::api_key::ActiveModel {
+        id: Set(id),
+        key_hash: Set(hash),
+        name: Set(name.to_owned()),
+        bound_ips: Set(Some(bound_ips.to_owned())),
+        is_master: Set(false),
+        can_manage_keys: Set(false),
+        can_manage_webhooks: Set(false),
+        can_create_groups: Set(false),
+        prefix: Set("dummy123".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    (id, plaintext)
+}
+
+/// Fail2ban-style simulation: 10 concurrent tasks re-ban the exact same address into the exact
+/// same group at once. SeaORM's SQLite driver forces a single-connection pool by default (there is
+/// no `cache=shared` in play here — without that forced serialization, concurrent connections to
+/// `sqlite::memory:` would each see their own empty database), so this also doubles as a
+/// concurrency-level regression test for the `exec_without_returning` fix: under real contention,
+/// several of these requests *will* hit the `ON CONFLICT DO NOTHING` branch for the membership
+/// insert at the same moment.
+#[tokio::test]
+async fn test_concurrent_burst_ban_requests() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let mut handles = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let app = app.clone();
+        let master_key = master_key.clone();
+        handles.push(tokio::spawn(async move {
+            let req = inject_connect_info(Request::builder()
+                .method("POST")
+                .uri("/api/ban")
+                .header("X-API-Key", &master_key)
+                .header("Content-Type", "application/json"))
+                .body(Body::from(json!({
+                    "target_address": "44.44.44.44",
+                    "group_name": "burst-group",
+                    "cause": "fail2ban burst"
+                }).to_string()))
+                .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        }));
+    }
+
+    let mut ok_count = 0;
+    for handle in handles {
+        // A per-task timeout turns a hang/deadlock into a clear test failure instead of an
+        // indefinitely stuck `cargo test` run.
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), handle)
+            .await
+            .expect("task did not complete in time (possible deadlock)")
+            .unwrap();
+        if status == StatusCode::OK {
+            ok_count += 1;
+        }
+    }
+    assert_eq!(ok_count, 10, "all 10 concurrent re-bans of the same address/group must return 200 OK");
+
+    // Exactly one record must exist in exactly one membership row — no duplicates, no partial
+    // failures, despite 10 simultaneous writers targeting the same (address, group) pair.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=burst-group")
+        .header("X-API-Key", &master_key))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["target_address"], "44.44.44.44");
+
+    // last_seen_at must reflect one of the concurrent requests, not be stale/missing.
+    let last_seen: chrono::NaiveDateTime = serde_json::from_value(items[0]["last_seen_at"].clone()).unwrap();
+    let age = chrono::Utc::now().naive_utc() - last_seen;
+    assert!(age < chrono::Duration::seconds(30), "last_seen_at should have just been updated, age was {age}");
+}
+
+/// Security regression test: a forged `X-Forwarded-For` prefix must not bypass `bound_ips`. Only
+/// the rightmost hop (the one *your own* reverse proxy appended) is trustworthy — anything to its
+/// left is attacker-supplied and must be ignored, per AGENT.MD's "Resilient IP Extraction" rule.
+#[tokio::test]
+async fn test_reverse_proxy_xff_extracts_rightmost_trusted_hop() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    const FORGED_CLAIM: &str = "8.8.8.8";
+    const TRUSTED_HOP: &str = "10.0.0.1";
+    let xff_header = format!("{FORGED_CLAIM}, {TRUSTED_HOP}");
+
+    // A key bound to the rightmost (trusted-proxy-appended) address must be let through.
+    let (_id, key_trusted) = insert_key_with_bound_ips(&db, "trusted-hop", "10.0.0.1/32").await;
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &key_trusted)
+        .header("X-Forwarded-For", &xff_header))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // A key bound to the leftmost, client-forgeable claim must NOT be let through: if it were,
+    // any client could bypass CIDR restriction just by prepending an allowed address to the
+    // header.
+    let (_id2, key_forged) = insert_key_with_bound_ips(&db, "forged-claim", "8.8.8.8/32").await;
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &key_forged)
+        .header("X-Forwarded-For", &xff_header))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+}
+
+/// `POST /api/ban` must reject malformed CIDRs with `400` and accept valid IPv6 CIDRs cleanly.
+#[tokio::test]
+async fn test_cidr_and_ipv6_boundary_validation() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let ban = |addr: &str| {
+        inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/ban")
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json"))
+            .body(Body::from(json!({ "target_address": addr, "group_name": "cidr-boundary-group" }).to_string()))
+            .unwrap()
+    };
+
+    // Octet out of range (> 255).
+    let res = app.clone().oneshot(ban("256.0.0.1/32")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Prefix length out of range for an IPv4 address (max is /32).
+    let res = app.clone().oneshot(ban("10.0.0.1/35")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Free-form garbage.
+    let res = app.clone().oneshot(ban("definitely-not-an-ip")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // A valid, non-private IPv6 CIDR must parse and be accepted.
+    let res = app.clone().oneshot(ban("2001:db8::/32")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+}
+
+/// Proves webhook dispatch is genuinely non-blocking: `POST /api/ban` must return almost
+/// immediately even when the only registered webhook for that group targets an endpoint that
+/// takes several seconds to respond. The handler only ever hands the event off over an mpsc
+/// channel (`state.webhook_tx.send(event).await`, capacity 100, effectively never full here) — the
+/// slow HTTP dispatch itself happens later, in the separate `run_webhook_worker` background task.
+#[tokio::test]
+async fn test_webhook_dispatch_does_not_block_api_response() {
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+
+    let slow_app = axum::Router::new().route(
+        "/slow-hook",
+        axum::routing::post(|| async {
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            StatusCode::OK
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let slow_addr = listener.local_addr().unwrap();
+    let _slow_server = tokio::spawn(async move {
+        axum::serve(listener, slow_app).await.unwrap();
+    });
+
+    // The slow mock above lives on loopback, which SSRF protection blocks unless explicitly
+    // allowed; opt in so the dispatch genuinely reaches (and hangs on) the slow endpoint rather
+    // than being short-circuited immediately.
+    unsafe {
+        std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true");
+    }
+
+    let db = setup_test_db().await;
+    let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
+    let db_for_worker = db.clone();
+    let _worker_handle = tokio::spawn(async move {
+        simply_firewall::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+    });
+
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let group_id = Uuid::new_v4();
+    simply_firewall::entities::ip_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("slow-hook-group".to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "name": "Slow Hook",
+            "target_url": format!("http://{slow_addr}/slow-hook"),
+            "secret_token": "s",
+            "payload_template": "{}",
+            "group_id": group_id.to_string(),
+        }).to_string()))
+        .unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let start = std::time::Instant::now();
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "66.66.66.66", "group_name": "slow-hook-group" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    let elapsed = start.elapsed();
+
+    unsafe {
+        std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "false");
+    }
+
+    assert_eq!(res.status(), StatusCode::OK);
+    assert!(
+        elapsed < std::time::Duration::from_millis(50),
+        "expected POST /api/ban to return in under 50ms regardless of webhook speed, took {elapsed:?}"
+    );
 }
