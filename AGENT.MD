@@ -109,4 +109,30 @@ To test endpoints manually during development, use `curl`:
 - **Delete IP:**
   `curl -X DELETE -H "X-API-Key: <KEY>" "http://localhost:3000/api/ips?target_address=192.168.1.100/32&group_name=fail2ban"`
 
+### 1. Mandatory Test Matrix per Endpoint
+For every route registered under `/api`, tests MUST assert three distinct outcomes:
+  1. **Positive Assertion (200/201 OK):** Valid payload with sufficient permissions returns expected JSON structure and persists changes in DB.
+  2. **Authentication Check (401 Unauthorized):** Missing, invalid, or revoked `X-API-Key` header immediately rejects the request.
+  3. **Authorization Boundary (403 Forbidden):** Valid API key lacking explicit scope or group permission is denied access.
+  4. **Validation Check (400 Bad Request):** Malformed CIDR blocks, bad URLs, or invalid JSON payloads are rejected before processing.
+
+### 2. Required Endpoint Test Coverage
+
+  - **Authentication Profile (`GET /api/auth/me`):**
+    - Verify returned global scopes and group permissions match the database state.
+  - **IP Records (`POST /api/ban`, `POST /api/white`, `GET /api/ips`, `DELETE /api/ips`):**
+    - Verify IP insertion and `last_seen_at` updates on duplicate records.
+    - Test filtering via `?groups=g1,g2` and temporal filtering via `?max_age=3600`.
+    - Assert non-authorized keys cannot write to groups where `can_write = false`.
+  - **API Keys Management (`GET /api/keys`, `POST /api/keys`, `DELETE /api/keys/{id}`, `POST /api/keys/{id}/permissions`):**
+    - Test master-only access for key generation and revocation.
+    - Verify cascading deletion cleans `api_key_group_permissions` without orphan records.
+  - **Group Management (`GET /api/groups`, `POST /api/groups`, `DELETE /api/groups/{id}`):**
+    - Test auto-provisioning of permissions when a key creates a new group.
+  - **Webhooks (`GET /api/webhooks`, `POST /api/webhooks`, `DELETE /api/webhooks/{id}`):**
+    - Verify URL validation (HTTP/HTTPS required, private IPs blocked).
+    - Test HMAC SHA-256 signature header (`X-Signature-256`) generation.
+  - **Audit Trail (`GET /api/audit-logs`):**
+    - Verify mutating actions write audit entries and read access is restricted to `is_master` keys.
+
 *End of directives. Write safe, panic-free (`no .unwrap()`), and elegant Rust code.*
