@@ -60,11 +60,17 @@ async fn is_url_safe(url_str: &str, allow_private: bool) -> bool {
 
 /// Runs the background webhook worker, processing events and dispatching HTTP requests
 pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<WebhookEvent>) {
-    let client = Client::builder()
+    let client = match Client::builder()
         .timeout(WEBHOOK_TIMEOUT)
         .user_agent("SimplyFirewall/2.0")
         .build()
-        .expect("Failed to build reqwest client");
+    {
+        Ok(c) => c,
+        Err(e) => {
+            error!("Failed to build webhook HTTP client, worker will not start: {}", e);
+            return;
+        }
+    };
 
     let mut join_set = JoinSet::new();
     let allow_private_webhooks = std::env::var("ALLOW_PRIVATE_WEBHOOKS").unwrap_or_else(|_| "false".to_owned()) == "true";
@@ -106,12 +112,12 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
             let mut headers = HeaderMap::new();
             headers.insert("Content-Type", HeaderValue::from_static("application/json"));
             
-            if let Some(hjson) = &config.headers_json {
-                if let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(hjson) {
-                    for (k, v) in map {
-                        if let (Ok(h_name), Ok(h_val)) = (HeaderName::from_str(&k), HeaderValue::from_str(&v)) {
-                            headers.insert(h_name, h_val);
-                        }
+            if let Some(hjson) = &config.headers_json
+                && let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(hjson)
+            {
+                for (k, v) in map {
+                    if let (Ok(h_name), Ok(h_val)) = (HeaderName::from_str(&k), HeaderValue::from_str(&v)) {
+                        headers.insert(h_name, h_val);
                     }
                 }
             }
@@ -124,7 +130,6 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
                     continue;
                 }
             };
-            // Safe: KeyInit::new_from_slice is infallible for HMAC with variable-size keys
             mac.update(payload.as_bytes());
             let result = mac.finalize();
             let hex_sig = hex::encode(result.into_bytes());

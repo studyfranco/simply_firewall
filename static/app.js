@@ -210,6 +210,26 @@ class FirewallClient {
         }, 3000);
     }
 
+    // Addresses present in this loaded data set that belong to both a banlist AND a
+    // whitelist group at once — a conflicting/ambiguous firewall state worth flagging.
+    findConflictingAddresses() {
+        const typesByAddress = new Map();
+        for (const ip of this.state.ips) {
+            if (!typesByAddress.has(ip.target_address)) {
+                typesByAddress.set(ip.target_address, new Set());
+            }
+            typesByAddress.get(ip.target_address).add(ip.group_type);
+        }
+
+        const conflicts = new Set();
+        for (const [address, types] of typesByAddress) {
+            if (types.has('banlist') && types.has('whitelist')) {
+                conflicts.add(address);
+            }
+        }
+        return conflicts;
+    }
+
     renderIpTable() {
         const tbody = document.getElementById('ip-table-body');
         if (this.state.ips.length === 0) {
@@ -217,14 +237,22 @@ class FirewallClient {
             return;
         }
 
-        tbody.innerHTML = this.state.ips.map(ip => `
+        const conflicts = this.findConflictingAddresses();
+
+        tbody.innerHTML = this.state.ips.map(ip => {
+            const isConflicting = conflicts.has(ip.target_address);
+            const statusBadge = ip.group_type === 'whitelist'
+                ? '<span class="badge badge-white">Whitelisted</span>'
+                : '<span class="badge badge-ban">Banned</span>';
+
+            return `
             <tr>
-                <td class="font-mono">${escapeHtml(ip.target_address)} ${ip.is_locked ? '<span title="Locked" class="badge">🔒 Locked</span>' : ''}</td>
-                <td>
-                    <span class="badge ${ip.cause ? 'badge-danger' : 'badge-success'}">
-                        Active
-                    </span>
+                <td class="font-mono">
+                    ${escapeHtml(ip.target_address)}
+                    ${ip.is_locked ? '<span title="Locked" class="badge">🔒 Locked</span>' : ''}
+                    ${isConflicting ? '<span title="This address is in both a banlist and a whitelist group" class="badge badge-conflict">⚠ Conflict</span>' : ''}
                 </td>
+                <td>${statusBadge}</td>
                 <td>${escapeHtml(ip.cause || '-')}</td>
                 <td><span class="badge badge-group">${escapeHtml(ip.group_name || 'Global')}</span></td>
                 <td>${new Date(ip.last_seen_at).toLocaleString()}</td>
@@ -232,25 +260,49 @@ class FirewallClient {
                     <button class="btn btn-sm btn-danger" onclick="window.app.deleteIp('${escapeHtml(ip.target_address)}', '${escapeHtml(ip.group_name)}')" ${ip.is_locked ? 'disabled' : ''}>Delete</button>
                 </td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
     }
 
     renderKeysTable() {
         const tbody = document.getElementById('apikeys-table-body');
         if (this.state.apiKeys.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="3" class="text-center text-muted">No API keys.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No API keys.</td></tr>';
             return;
         }
 
         tbody.innerHTML = this.state.apiKeys.map(k => `
             <tr>
                 <td><strong>${escapeHtml(k.name)}</strong></td>
-                <td class="font-mono">${escapeHtml(k.bound_ips)}</td>
+                <td class="font-mono">${escapeHtml(k.bound_ips || '-')}</td>
+                <td>${this.renderKeyScopes(k)}</td>
                 <td>
                     <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>
                 </td>
             </tr>
         `).join('');
+    }
+
+    // Renders global scope badges (Master / Manage Keys / Manage Webhooks / Create Groups)
+    // plus per-group read/write/delete permission badges for an API key row.
+    renderKeyScopes(k) {
+        const scopes = [];
+        if (k.is_master) scopes.push('<span class="badge badge-scope badge-scope-master">Master</span>');
+        if (k.can_manage_keys) scopes.push('<span class="badge badge-scope">Manage Keys</span>');
+        if (k.can_manage_webhooks) scopes.push('<span class="badge badge-scope">Manage Webhooks</span>');
+        if (k.can_create_groups) scopes.push('<span class="badge badge-scope">Create Groups</span>');
+
+        const groupBadges = (k.group_permissions || []).map(p => {
+            const rights = [p.can_read ? 'R' : '', p.can_write ? 'W' : '', p.can_delete ? 'D' : '']
+                .filter(Boolean).join('') || 'none';
+            return `<span class="badge badge-group" title="${escapeHtml(p.group_name)}: ${rights}">${escapeHtml(p.group_name)}: ${rights}</span>`;
+        });
+
+        const badges = [...scopes, ...groupBadges];
+        if (badges.length === 0) {
+            return '<span class="text-muted text-sm">None</span>';
+        }
+        return `<div class="scope-badges">${badges.join('')}</div>`;
     }
 
     updateRightsSelector() {

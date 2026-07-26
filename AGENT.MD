@@ -54,8 +54,12 @@ To keep this context clean and modular, responsibilities are split across three 
 - **Multi-Group Membership:** An IP can belong to multiple `IpGroup`s simultaneously.
 - **Group Tagging:** A group can be tag as whitelist or banlist. By default it is a banlist.
 - **Flexible Fetching (`GET /api/v1/ips`):**
-  - Parameter `groups=fail2ban,sshd`: Filters IPs belonging to specified groups. If omitted, returns all IPs accessible to the API Key.
-  - Parameter `max_age=3600` or `since=<timestamp>`: Temporal filtering based on `last_seen_at`. (No automatic TTL deletion worker exists; filtering is strictly query-driven).
+  - Parameter `groups=fail2ban,sshd` (or singular `group_name=fail2ban`): Filters IPs belonging to specified groups. If omitted, returns all IPs accessible to the API Key.
+  - Parameter `max_age=3600` or `since=<unix_timestamp>`: Temporal filtering based on `last_seen_at`, applied at the query level (before pagination). (No automatic TTL deletion worker exists; filtering is strictly query-driven).
+  - Parameter `ip=<substring>`: Filters by a substring of `target_address`.
+  - Parameter `cause=<substring>`: Filters by a substring of `cause`.
+  - Parameter `status=ban|white`: Filters to only the group type (`banlist`/`whitelist`) matching the associated IP group.
+  - Each result row includes the associated `group_type`, so a single address in both a `banlist` and a `whitelist` group is distinguishable per-row (used by the dashboard's conflict-highlighting badge).
 
 ### 4. Advanced & Secure Webhooks
 

@@ -20,7 +20,7 @@ sha2 = "0.11"
 hmac = "0.13"
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 hex = "0.4"
-rand = "0.9"
+rand = "0.10"
 thiserror = "2"
 dotenvy = "0.15"
 log = "0.4"

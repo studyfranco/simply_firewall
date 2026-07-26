@@ -180,9 +180,9 @@ async fn test_auto_provisioning_on_group_creation() {
     
     assert_eq!(perms.len(), 1);
     assert_eq!(perms[0].api_key_id, key_id);
-    assert_eq!(perms[0].can_read, true);
-    assert_eq!(perms[0].can_write, true);
-    assert_eq!(perms[0].can_delete, true);
+    assert!(perms[0].can_read);
+    assert!(perms[0].can_write);
+    assert!(perms[0].can_delete);
 }
 
 #[tokio::test]
@@ -233,7 +233,7 @@ async fn test_explicit_key_group_manipulation() {
 
     let req = inject_connect_info(Request::builder()
         .method("POST")
-        .uri(&format!("/api/keys/{}/groups", target_id))
+        .uri(format!("/api/keys/{}/groups", target_id))
         .header("X-API-Key", &master_plaintext)
         .header("Content-Type", "application/json"))
         .body(Body::from(json!({
@@ -254,6 +254,413 @@ async fn test_explicit_key_group_manipulation() {
 
     assert_eq!(perms.len(), 1);
     assert_eq!(perms[0].api_key_id, target_id);
-    assert_eq!(perms[0].can_read, true);
-    assert_eq!(perms[0].can_write, false);
+    assert!(perms[0].can_read);
+    assert!(!perms[0].can_write);
+}
+
+/// AGENT.MD mandates verifying multi-group and temporal (`max_age`/`since`) query filtering on
+/// `GET /api/v1/ips`.
+#[tokio::test]
+async fn test_multi_group_and_temporal_filtering() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let key_id = Uuid::new_v4();
+    let plaintext = simply_firewall::api::generate_random_key();
+    let hash = simply_firewall::api::hash_key(&plaintext);
+    simply_firewall::entities::api_key::ActiveModel {
+        id: Set(key_id),
+        key_hash: Set(hash),
+        name: Set("Master".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(true),
+        can_manage_keys: Set(true),
+        can_manage_webhooks: Set(true),
+        can_create_groups: Set(true),
+        prefix: Set("dummy123".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    // A fresh record, created "now" through the API, in "group-fresh".
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "9.9.9.9", "group_name": "group-fresh" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // A stale record inserted directly with an old `last_seen_at`, in "group-old".
+    let old_group_id = Uuid::new_v4();
+    simply_firewall::entities::ip_group::ActiveModel {
+        id: Set(old_group_id),
+        name: Set("group-old".to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let old_record_id = Uuid::new_v4();
+    let old_time = chrono::Utc::now().naive_utc() - chrono::Duration::hours(2);
+    simply_firewall::entities::ip_record::ActiveModel {
+        id: Set(old_record_id),
+        target_address: Set("8.8.4.4".to_owned()),
+        cause: Set(None),
+        is_locked: Set(false),
+        created_at: Set(old_time),
+        updated_at: Set(old_time),
+        last_seen_at: Set(old_time),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    simply_firewall::entities::ip_record_group_membership::ActiveModel {
+        ip_record_id: Set(old_record_id),
+        group_id: Set(old_group_id),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    // `groups` filter: only the fresh record's group should be returned.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=group-fresh")
+        .header("X-API-Key", &plaintext))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["target_address"], "9.9.9.9");
+
+    // `max_age` filter: a 60-second window must exclude the 2-hour-old record but keep the
+    // fresh one, and the exclusion must happen in the query (not just be truncated by paging).
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?max_age=60")
+        .header("X-API-Key", &plaintext))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert!(items.iter().any(|i| i["target_address"] == "9.9.9.9"));
+    assert!(items.iter().all(|i| i["target_address"] != "8.8.4.4"));
+
+    // `since` filter: a very recent Unix timestamp must also exclude the stale record.
+    let since_ts = (chrono::Utc::now() - chrono::Duration::minutes(5)).timestamp();
+    let req = inject_connect_info(Request::builder()
+        .uri(format!("/api/ips?since={since_ts}"))
+        .header("X-API-Key", &plaintext))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert!(items.iter().any(|i| i["target_address"] == "9.9.9.9"));
+    assert!(items.iter().all(|i| i["target_address"] != "8.8.4.4"));
+}
+
+/// AGENT.MD mandates verifying webhook payload delivery and HMAC `X-Signature-256` validity via
+/// a mock HTTP endpoint.
+#[tokio::test]
+async fn test_webhook_hmac_signature_and_delivery() {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Captured {
+        body: Option<String>,
+        signature: Option<String>,
+    }
+
+    let captured: Arc<Mutex<Captured>> = Arc::new(Mutex::new(Captured::default()));
+    let captured_for_handler = captured.clone();
+
+    let hook_app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let captured = captured_for_handler.clone();
+            async move {
+                let sig = headers
+                    .get("X-Signature-256")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.to_owned());
+                let mut c = captured.lock().unwrap();
+                c.body = Some(body);
+                c.signature = sig;
+                StatusCode::OK
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hook_addr = listener.local_addr().unwrap();
+    let _hook_server = tokio::spawn(async move {
+        axum::serve(listener, hook_app).await.unwrap();
+    });
+
+    // The mock hook above lives on loopback, which SSRF protection blocks by default; this test
+    // explicitly opts in to private targets to exercise the signing/delivery path.
+    unsafe {
+        std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true");
+    }
+
+    let db = setup_test_db().await;
+    let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
+    let db_for_worker = db.clone();
+    let _worker_handle = tokio::spawn(async move {
+        simply_firewall::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+    });
+
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let key_id = Uuid::new_v4();
+    let plaintext = simply_firewall::api::generate_random_key();
+    let hash = simply_firewall::api::hash_key(&plaintext);
+    simply_firewall::entities::api_key::ActiveModel {
+        id: Set(key_id),
+        key_hash: Set(hash),
+        name: Set("Webhook Tester".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(true),
+        can_manage_keys: Set(true),
+        can_manage_webhooks: Set(true),
+        can_create_groups: Set(true),
+        prefix: Set("dummy123".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let group_id = Uuid::new_v4();
+    simply_firewall::entities::ip_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("hook-group".to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let secret = "top-secret-webhook-key";
+    let hook_url = format!("http://{hook_addr}/hook");
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({
+            "name": "Test Hook",
+            "target_url": hook_url,
+            "secret_token": secret,
+            "payload_template": "{\"ip\":\"$target_address\"}",
+            "group_id": group_id.to_string(),
+        }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(json!({ "target_address": "5.5.5.5", "group_name": "hook-group" }).to_string()))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Dispatch is async (channel + background worker + spawned HTTP task); poll for delivery.
+    let mut delivered = None;
+    for _ in 0..40 {
+        {
+            let c = captured.lock().unwrap();
+            if c.body.is_some() {
+                delivered = Some((c.body.clone().unwrap(), c.signature.clone()));
+            }
+        }
+        if delivered.is_some() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    unsafe {
+        std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "false");
+    }
+
+    let (body, signature) = delivered.expect("webhook was not delivered within timeout");
+    let signature = signature.expect("missing X-Signature-256 header");
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(body.as_bytes());
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    assert_eq!(signature, expected);
+    assert!(body.contains("5.5.5.5"));
+}
+
+/// Regression test for a bug found by manual exploratory testing: re-banning an address into a
+/// group it already belongs to used `Entity::insert(..).on_conflict(..).do_nothing().exec(db)`
+/// for the membership row, which raises `DbErr::RecordNotInserted` ("None of the records are
+/// inserted") whenever the `DO NOTHING` branch actually fires, turning AGENT.MD's mandatory
+/// "re-registering an existing IP updates `last_seen_at` rather than failing" behavior into a
+/// 500 on the single most common real-world firewall operation. The fix uses
+/// `exec_without_returning`, which doesn't require a row back.
+#[tokio::test]
+async fn test_reban_into_same_group_does_not_500() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let key_id = Uuid::new_v4();
+    let plaintext = simply_firewall::api::generate_random_key();
+    let hash = simply_firewall::api::hash_key(&plaintext);
+    simply_firewall::entities::api_key::ActiveModel {
+        id: Set(key_id),
+        key_hash: Set(hash),
+        name: Set("Master".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(true),
+        can_manage_keys: Set(true),
+        can_manage_webhooks: Set(true),
+        can_create_groups: Set(true),
+        prefix: Set("dummy123".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let ban = |cause: &'static str| {
+        json!({ "target_address": "77.77.77.77", "group_name": "reban-group", "cause": cause }).to_string()
+    };
+
+    // First ban: creates the record and the membership row (no conflict).
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(ban("first offense")))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Second ban into the SAME group: the membership insert hits the conflict path. Must still
+    // return 200, not 500.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json"))
+        .body(Body::from(ban("second offense")))
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Exactly one record and one membership row must exist, with the cause updated.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=reban-group")
+        .header("X-API-Key", &plaintext))
+        .body(Body::empty())
+        .unwrap();
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["cause"], "second offense");
+}
+
+/// Regression test for a bug found by manual exploratory testing: `POST /api/webhooks` accepted
+/// any string as `target_url`, including "not a url", creating a webhook that could never
+/// possibly be delivered with no feedback to the caller (it would only ever fail silently, once
+/// per matching event, at dispatch time). `create_webhook` now validates the URL eagerly.
+#[tokio::test]
+async fn test_create_webhook_rejects_invalid_url() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let key_id = Uuid::new_v4();
+    let plaintext = simply_firewall::api::generate_random_key();
+    let hash = simply_firewall::api::hash_key(&plaintext);
+    simply_firewall::entities::api_key::ActiveModel {
+        id: Set(key_id),
+        key_hash: Set(hash),
+        name: Set("Master".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(true),
+        can_manage_keys: Set(true),
+        can_manage_webhooks: Set(true),
+        can_create_groups: Set(true),
+        prefix: Set("dummy123".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let group_id = Uuid::new_v4();
+    simply_firewall::entities::ip_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("webhook-validation-group".to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let make_req = |url: &str| {
+        inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/webhooks")
+            .header("X-API-Key", &plaintext)
+            .header("Content-Type", "application/json"))
+            .body(Body::from(json!({
+                "name": "Test",
+                "target_url": url,
+                "secret_token": "s",
+                "payload_template": "{}",
+                "group_id": group_id.to_string(),
+            }).to_string()))
+            .unwrap()
+    };
+
+    let res = app.clone().oneshot(make_req("not a url")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let res = app.clone().oneshot(make_req("ftp://example.com/hook")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    let res = app.clone().oneshot(make_req("https://example.com/hook")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
 }

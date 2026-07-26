@@ -1,21 +1,34 @@
+//! The `api_key_group_permissions` M:N junction table: fine-grained read/write/delete rights
+//! that a given API key holds over a given IP group.
+
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
 
+/// A single (API key, IP group) permission grant.
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "api_key_group_permissions")]
 pub struct Model {
+    /// Unique identifier for the permission grant.
     #[sea_orm(primary_key, auto_increment = false)]
     pub id: Uuid,
+    /// The API key this grant applies to.
     pub api_key_id: Uuid,
+    /// The IP group this grant applies to.
     pub group_id: Uuid,
+    /// Permission to view IPs within this group.
     pub can_read: bool,
+    /// Permission to add/update IPs in this group. Implies `can_read`.
     pub can_write: bool,
+    /// Permission to remove IPs from this group. Implies `can_read`.
     pub can_delete: bool,
+    /// Assignment timestamp.
     pub created_at: DateTime,
 }
 
+/// Relations from `api_key_group_permissions` to the entities it joins.
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
 pub enum Relation {
+    /// The API key holding this grant.
     #[sea_orm(
         belongs_to = "super::api_key::Entity",
         from = "Column::ApiKeyId",
@@ -24,6 +37,7 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     ApiKey,
+    /// The IP group this grant covers.
     #[sea_orm(
         belongs_to = "super::ip_group::Entity",
         from = "Column::GroupId",

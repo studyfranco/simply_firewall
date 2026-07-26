@@ -102,9 +102,11 @@ Stores banned or whitelisted IP addresses and CIDR subnets.
 | Field | Type | Attributes | Description |
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique record identifier |
-| `target_address` | `String` | Not Null, Indexed | Valid IPv4/IPv6 address or CIDR range (e.g. `192.168.1.50/32`, `2001:db8::/32`) |
+| `target_address` | `String` | Not Null, Unique, Indexed | Valid IPv4/IPv6 address or CIDR range (e.g. `192.168.1.50/32`, `2001:db8::/32`), stored exactly as submitted. Unique so re-registration updates the existing row instead of creating a duplicate |
 | `cause` | `Text` | Nullable | Reason for adding the IP record |
+| `is_locked` | `Boolean` | Default: `false` | When `true`, the record cannot be modified or deleted through the API regardless of caller permissions. No endpoint currently sets this; it is a manual/administrative safeguard |
 | `created_at` | `DateTimeUtc` | Not Null | Initial insertion timestamp |
+| `updated_at` | `DateTimeUtc` | Not Null | Timestamp of the last field update (cause change or re-registration) |
 | `last_seen_at` | `DateTimeUtc` | Not Null, Indexed | Timestamp of last re-registration or recorded activity |
 
 ---
@@ -146,7 +148,7 @@ Security audit trail tracking mutating operations across the application.
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique audit log entry ID |
 | `api_key_id` | `UUID` | Nullable, FK -> `api_keys.id` (SET NULL) | Performing API key ID (Null if triggered by system auto-gen) |
-| `action` | `String` | Not Null, Indexed | Operation type (`IP_ADD`, `IP_DELETE`, `KEY_CREATE`, `KEY_DELETE`, `GROUP_CREATE`, `WEBHOOK_CREATE`) |
+| `action` | `String` | Not Null, Indexed | Operation type, e.g. `IP_ADD`, `IP_DELETE`, `KEY_CREATE`, `KEY_DELETE`, `KEY_PERM_UPDATE`, `GROUP_CREATE`, `GROUP_DELETE`, `WEBHOOK_CREATE`, `WEBHOOK_DELETE` (non-exhaustive — any mutating action may log its own type) |
 | `target_address` | `String` | Nullable | Target IP or CIDR range affected |
 | `group_names` | `String` | Nullable | Comma-separated list of group names involved |
 | `details` | `Text` | Nullable | Additional context or raw payload overview |

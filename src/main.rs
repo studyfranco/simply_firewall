@@ -1,23 +1,33 @@
 use std::net::SocketAddr;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ConnectOptions, Database, DatabaseConnection, EntityTrait};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter};
 use sea_orm_migration::MigratorTrait;
 use tokio::net::TcpListener;
 use uuid::Uuid;
 use simply_firewall::{create_app, setup_state, api, migration, entities};
 
+/// Waits for a Ctrl+C or (on Unix) SIGTERM signal so `axum::serve` can shut down gracefully.
+///
+/// If signal registration itself fails, that branch is left pending forever instead of firing
+/// immediately: an unregisterable signal should never be treated as "shutdown requested now".
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to install Ctrl+C handler");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!("Failed to listen for Ctrl+C: {}", e);
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-            .expect("failed to install signal handler")
-            .recv()
-            .await;
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => {
+                tracing::error!("Failed to install SIGTERM handler: {}", e);
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]
@@ -30,11 +40,19 @@ async fn shutdown_signal() {
     tracing::info!("Received shutdown signal.");
 }
 
+/// Generates a default Master API Key if the database does not already contain one.
+///
+/// Checks specifically for the absence of a key with `is_master = true` (not merely "any key
+/// exists"): if every master key were ever deleted while lower-privilege sub-keys remained,
+/// administrators could otherwise be permanently locked out.
 async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
     use entities::{api_key, prelude::ApiKey};
 
-    let existing = ApiKey::find().one(db).await?;
-    if existing.is_some() {
+    let existing_master = ApiKey::find()
+        .filter(api_key::Column::IsMaster.eq(true))
+        .one(db)
+        .await?;
+    if existing_master.is_some() {
         return Ok(());
     }
 

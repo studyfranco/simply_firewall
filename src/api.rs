@@ -7,7 +7,7 @@ use axum::{
 };
 use chrono::Utc;
 use ipnetwork::IpNetwork;
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{
     ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter,
     sea_query::OnConflict, Condition, QuerySelect, ActiveModelTrait,
@@ -223,13 +223,17 @@ async fn handle_ip_upsert(
         ip_record_id: Set(record_id),
         group_id: Set(target_group_id),
     };
+    // `exec_without_returning` is required here (not `exec`): when `DO NOTHING` actually
+    // suppresses the insert because the membership already exists, there is no row to return,
+    // and SeaORM's `exec` treats that as `DbErr::RecordNotInserted` ("None of the records are
+    // inserted") instead of the no-op success it actually is.
     ip_record_group_membership::Entity::insert(mem)
         .on_conflict(
             OnConflict::columns([ip_record_group_membership::Column::IpRecordId, ip_record_group_membership::Column::GroupId])
                 .do_nothing()
                 .to_owned()
         )
-        .exec(&state.db)
+        .exec_without_returning(&state.db)
         .await?;
 
     create_audit_log(
@@ -260,10 +264,20 @@ async fn handle_ip_upsert(
 /// Query parameters for IP listing
 #[derive(Deserialize)]
 pub struct QueryFilters {
-    /// Filter by groups (comma-separated)
+    /// Filter by groups (comma-separated group names)
     pub groups: Option<String>,
-    /// Maximum age in seconds
+    /// Filter by a single group name (in addition to `groups`)
+    pub group_name: Option<String>,
+    /// Filter by a substring of the target address
+    pub ip: Option<String>,
+    /// Filter by a substring of the cause
+    pub cause: Option<String>,
+    /// Filter by group type: `ban`/`banlist` or `white`/`whitelist`
+    pub status: Option<String>,
+    /// Maximum age in seconds, based on `last_seen_at`
     pub max_age: Option<i64>,
+    /// Only return records last seen at or after this Unix timestamp (seconds)
+    pub since: Option<i64>,
     /// Pagination limit
     pub limit: Option<u64>,
     /// Pagination offset
@@ -279,6 +293,8 @@ pub struct IpRecordResponse {
     pub target_address: String,
     /// Associated group name
     pub group_name: String,
+    /// Associated group type (`banlist` or `whitelist`)
+    pub group_type: String,
     /// Cause for addition
     pub cause: Option<String>,
     /// Lock status
@@ -297,7 +313,7 @@ pub async fn list_ips(
     Extension(key): Extension<api_key::Model>,
     Query(filters): Query<QueryFilters>,
 ) -> Result<impl IntoResponse, AppError> {
-    
+
     // Manual join fetching because of M:N
     let mut query = ip_record_group_membership::Entity::find()
         .find_also_related(ip_record::Entity);
@@ -322,10 +338,20 @@ pub async fn list_ips(
         query = query.filter(ip_record_group_membership::Column::GroupId.is_in(accessible_groups));
     }
 
+    // `groups` (comma-separated) and `group_name` (single) both narrow by group name.
+    let mut group_names: Vec<String> = Vec::new();
     if let Some(groups) = &filters.groups
         && !groups.is_empty()
     {
-        let group_names: Vec<&str> = groups.split(',').map(|s| s.trim()).collect();
+        group_names.extend(groups.split(',').map(|s| s.trim().to_owned()).filter(|s| !s.is_empty()));
+    }
+    if let Some(name) = &filters.group_name {
+        let trimmed = name.trim();
+        if !trimmed.is_empty() {
+            group_names.push(trimmed.to_owned());
+        }
+    }
+    if !group_names.is_empty() {
         let gids: Vec<Uuid> = ip_group::Entity::find()
             .filter(ip_group::Column::Name.is_in(group_names))
             .all(&state.db)
@@ -336,6 +362,48 @@ pub async fn list_ips(
         query = query.filter(ip_record_group_membership::Column::GroupId.is_in(gids));
     }
 
+    if let Some(status) = &filters.status
+        && !status.is_empty()
+    {
+        let group_type = match status.as_str() {
+            "ban" | "banlist" => "banlist",
+            "white" | "whitelist" => "whitelist",
+            other => return Err(AppError::InvalidInput(format!("Invalid status filter: {other}"))),
+        };
+        let gids: Vec<Uuid> = ip_group::Entity::find()
+            .filter(ip_group::Column::GroupType.eq(group_type))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|g| g.id)
+            .collect();
+        query = query.filter(ip_record_group_membership::Column::GroupId.is_in(gids));
+    }
+
+    if let Some(ip) = &filters.ip
+        && !ip.is_empty()
+    {
+        query = query.filter(ip_record::Column::TargetAddress.contains(ip.trim()));
+    }
+
+    if let Some(cause) = &filters.cause
+        && !cause.is_empty()
+    {
+        query = query.filter(ip_record::Column::Cause.contains(cause.trim()));
+    }
+
+    if let Some(age) = filters.max_age {
+        let threshold = Utc::now().naive_utc() - chrono::Duration::seconds(age);
+        query = query.filter(ip_record::Column::LastSeenAt.gte(threshold));
+    }
+
+    if let Some(since) = filters.since {
+        let threshold = chrono::DateTime::from_timestamp(since, 0)
+            .ok_or_else(|| AppError::InvalidInput("Invalid `since` timestamp".to_owned()))?
+            .naive_utc();
+        query = query.filter(ip_record::Column::LastSeenAt.gte(threshold));
+    }
+
     let limit = filters.limit.unwrap_or(50);
     let offset = filters.offset.unwrap_or(0);
 
@@ -344,32 +412,27 @@ pub async fn list_ips(
         .offset(offset)
         .all(&state.db)
         .await?;
-    
-    let mut items = Vec::new();
+
+    let mut items = Vec::with_capacity(memberships.len());
     for (mem, record_opt) in memberships {
-        if let Some(record) = record_opt {
-            if let Some(age) = filters.max_age {
-                let threshold = Utc::now().naive_utc() - chrono::Duration::seconds(age);
-                if record.last_seen_at < threshold {
-                    continue;
-                }
-            }
+        let Some(record) = record_opt else { continue };
+        let Some(group) = ip_group::Entity::find_by_id(mem.group_id).one(&state.db).await? else {
+            continue;
+        };
 
-            let group = ip_group::Entity::find_by_id(mem.group_id).one(&state.db).await?.unwrap();
-
-            items.push(IpRecordResponse {
-                id: record.id,
-                target_address: record.target_address,
-                group_name: group.name,
-                cause: record.cause,
-                is_locked: record.is_locked,
-                created_at: record.created_at,
-                updated_at: record.updated_at,
-                last_seen_at: record.last_seen_at,
-            });
-        }
+        items.push(IpRecordResponse {
+            id: record.id,
+            target_address: record.target_address,
+            group_name: group.name,
+            group_type: group.group_type,
+            cause: record.cause,
+            is_locked: record.is_locked,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+            last_seen_at: record.last_seen_at,
+        });
     }
-    
+
     Ok(Json(items))
 }
 
@@ -626,6 +689,32 @@ pub async fn create_api_key(
     }))
 }
 
+/// Public-safe summary of an API key for admin listings. Deliberately omits `key_hash`: the
+/// hash of the live secret has no reason to ever leave the server, even to trusted admin UIs.
+#[derive(Serialize)]
+pub struct ApiKeySummary {
+    /// Key ID
+    pub id: Uuid,
+    /// Key name
+    pub name: String,
+    /// First 8 characters of the plaintext key, for display/identification only
+    pub prefix: String,
+    /// Bound CIDRs
+    pub bound_ips: Option<String>,
+    /// Master flag
+    pub is_master: bool,
+    /// Global key management scope
+    pub can_manage_keys: bool,
+    /// Global webhook management scope
+    pub can_manage_webhooks: bool,
+    /// Global group creation scope
+    pub can_create_groups: bool,
+    /// Key creation timestamp
+    pub created_at: chrono::NaiveDateTime,
+    /// Per-group permissions granted to this key
+    pub group_permissions: Vec<MePermission>,
+}
+
 /// Handles GET /api/v1/keys
 pub async fn list_api_keys(
     State(state): State<AppState>,
@@ -636,7 +725,43 @@ pub async fn list_api_keys(
     }
 
     let keys = ApiKey::find().all(&state.db).await?;
-    Ok(Json(keys))
+    let mut summaries = Vec::with_capacity(keys.len());
+
+    for k in keys {
+        let perms = api_key_group_permission::Entity::find()
+            .filter(api_key_group_permission::Column::ApiKeyId.eq(k.id))
+            .find_also_related(ip_group::Entity)
+            .all(&state.db)
+            .await?;
+
+        let group_permissions = perms
+            .into_iter()
+            .filter_map(|(p, g)| {
+                g.map(|group| MePermission {
+                    group_id: p.group_id,
+                    group_name: group.name,
+                    can_read: p.can_read,
+                    can_write: p.can_write,
+                    can_delete: p.can_delete,
+                })
+            })
+            .collect();
+
+        summaries.push(ApiKeySummary {
+            id: k.id,
+            name: k.name,
+            prefix: k.prefix,
+            bound_ips: k.bound_ips,
+            is_master: k.is_master,
+            can_manage_keys: k.can_manage_keys,
+            can_manage_webhooks: k.can_manage_webhooks,
+            can_create_groups: k.can_create_groups,
+            created_at: k.created_at,
+            group_permissions,
+        });
+    }
+
+    Ok(Json(summaries))
 }
 
 /// Handles DELETE /api/v1/keys/:id
@@ -864,6 +989,15 @@ pub async fn create_webhook(
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_webhooks {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let parsed_url = reqwest::Url::parse(&payload.target_url)
+        .map_err(|_| AppError::InvalidInput("Invalid target_url: must be a well-formed URL".to_owned()))?;
+    if parsed_url.scheme() != "http" && parsed_url.scheme() != "https" {
+        return Err(AppError::InvalidInput("Invalid target_url: scheme must be http or https".to_owned()));
+    }
+    if parsed_url.host_str().is_none() {
+        return Err(AppError::InvalidInput("Invalid target_url: missing host".to_owned()));
     }
 
     let id = Uuid::new_v4();
