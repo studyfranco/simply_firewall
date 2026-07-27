@@ -84,11 +84,9 @@ class SearchableSelect {
         this.search.value = opt.label;
         if (this.valueInput !== this.search) {
             this.valueInput.value = opt.value;
-        } else {
-            // Programmatic .value assignment doesn't fire 'input' on its own; dispatch one so
-            // the pre-existing debounced filter listener on this element still reacts to it.
-            this.search.dispatchEvent(new Event('input', { bubbles: true }));
         }
+        // onSelect is the single mechanism external code reacts to a selection through, in both
+        // modes — e.g. the IP Group filter's combobox wires this straight to an explicit search.
         this.onSelect(opt.value);
         this.closeMenu();
     }
@@ -102,30 +100,129 @@ class SearchableSelect {
     }
 }
 
+// Client-side cache for a paginated list endpoint: fetches large chunks from the server
+// (chunkSize, e.g. 100 items) but paginates locally in small pages (pageSize, e.g. 15) — most
+// "Next"/"Prev" clicks are then a pure client-side slice with no network round-trip at all.
+// Background-prefetches the next server chunk as soon as the user reaches the second-to-last
+// local page of whatever's currently cached, so by the time they'd actually need it, it's
+// typically already there.
+class PagedCache {
+    constructor({ chunkSize = 100, pageSize = 15, fetchChunk }) {
+        this.chunkSize = chunkSize;
+        this.pageSize = pageSize;
+        this.fetchChunk = fetchChunk; // async (serverOffset, chunkSize) => Array<item>
+        this.reset();
+    }
+
+    reset() {
+        this.items = [];
+        this.serverOffset = 0;
+        this.hasMoreOnServer = true;
+        this.localPage = 0;
+        this.prefetching = null; // in-flight prefetch promise, if any
+    }
+
+    get totalLocalPages() {
+        return Math.max(1, Math.ceil(this.items.length / this.pageSize));
+    }
+
+    get currentPageItems() {
+        const start = this.localPage * this.pageSize;
+        return this.items.slice(start, start + this.pageSize);
+    }
+
+    get hasNextPage() {
+        const nextPageStart = (this.localPage + 1) * this.pageSize;
+        return nextPageStart < this.items.length || this.hasMoreOnServer;
+    }
+
+    get hasPrevPage() {
+        return this.localPage > 0;
+    }
+
+    // Discards everything cached and fetches a fresh first chunk — used on initial load and
+    // whenever the active filters/search change (a different query is a different dataset, not
+    // more pages of the old one).
+    async loadFirstChunk() {
+        this.reset();
+        const chunk = await this.fetchChunk(0, this.chunkSize);
+        this.items = chunk;
+        this.serverOffset = chunk.length;
+        this.hasMoreOnServer = chunk.length === this.chunkSize;
+        this._maybePrefetch();
+    }
+
+    async fetchNextChunk() {
+        if (!this.hasMoreOnServer) return;
+        if (this.prefetching) return this.prefetching;
+        this.prefetching = (async () => {
+            const chunk = await this.fetchChunk(this.serverOffset, this.chunkSize);
+            this.items = [...this.items, ...chunk];
+            this.serverOffset += chunk.length;
+            this.hasMoreOnServer = chunk.length === this.chunkSize;
+            this.prefetching = null;
+        })();
+        return this.prefetching;
+    }
+
+    // Advances one local page. If the next page isn't cached yet but the server might still have
+    // more, fetches synchronously first (the one case where "Next" still has to wait on the
+    // network — normally avoided by the background prefetch below already having run ahead).
+    async nextPage() {
+        const nextPageStart = (this.localPage + 1) * this.pageSize;
+        if (nextPageStart >= this.items.length && this.hasMoreOnServer) {
+            await this.fetchNextChunk();
+        }
+        if (nextPageStart < this.items.length) {
+            this.localPage++;
+        }
+        this._maybePrefetch();
+    }
+
+    prevPage() {
+        if (this.localPage > 0) this.localPage--;
+    }
+
+    // Fires a background fetch the moment the user lands on the second-to-last page of the
+    // currently cached chunk — re-evaluated dynamically off the live item count, so it correctly
+    // fires again after each new chunk arrives, not just once.
+    _maybePrefetch() {
+        if (!this.hasMoreOnServer || this.prefetching) return;
+        if (this.localPage === this.totalLocalPages - 2) {
+            this.fetchNextChunk();
+        }
+    }
+}
+
 class FirewallClient {
     constructor() {
         this.apiKey = localStorage.getItem('simply_firewall_key') || '';
         this.apiBase = '/api';
         this.state = {
             profile: null,
-            ips: [],
             apiKeys: [],
             groups: [],
             webhooks: [],
-            auditLogs: [],
-            pagination: { limit: 15, offset: 0, hasMore: true },
-            auditPagination: { limit: 15, offset: 0, hasMore: true },
             showConflictsOnly: false
         };
+
+        // IP records and audit logs are both large, append-only lists — fetched from the server
+        // 100 at a time and paginated locally 15 at a time via PagedCache, instead of one small
+        // network round-trip per page.
+        this.ipCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchIpsChunk(offset, limit) });
+        this.auditCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchAuditLogsChunk(offset, limit) });
 
         // Searchable group comboboxes — populated from this.state.groups by loadGroups() via
         // setOptions() on each. The IP-group filter is free-text (its value IS the substring
         // filter sent to the API); the other two require picking an actual existing group.
+        // Explicitly selecting a suggestion is a deliberate action (not a keystroke), so it's
+        // exempt from the "search fires on Enter/button only" rule and searches immediately.
         this.groupFilterCombobox = new SearchableSelect({
             rootId: 'group-filter-combobox',
             searchId: 'group-filter',
             valueId: 'group-filter',
-            allowFreeText: true
+            allowFreeText: true,
+            onSelect: () => this.triggerIpSearch()
         });
         this.rightsGroupCombobox = new SearchableSelect({
             rootId: 'manage-rights-group-combobox',
@@ -238,10 +335,10 @@ class FirewallClient {
         // Enforce RBAC logic
         const p = this.state.profile;
         const manageIpEl = document.getElementById('manage-ip-section');
+        const groupsTab = document.getElementById('groups-tab-btn');
         const keysTab = document.getElementById('keys-tab-btn');
         const webhooksTab = document.getElementById('webhooks-tab-btn');
         const auditTab = document.getElementById('audit-tab-btn');
-        const groupsSection = document.getElementById('groups-section');
 
         // Manage IPs
         if (!p.is_master && p.group_permissions.length === 0 && !p.can_create_groups) {
@@ -250,11 +347,10 @@ class FirewallClient {
             manageIpEl.style.display = 'block';
         }
 
-        // IP Groups card lives on the IPs & Groups tab; kept visible under the same condition
-        // that used to gate the whole shared "Administration" tab, since either scope previously
-        // implied seeing it.
+        // IP Groups tab — kept visible under the same condition that used to gate the whole
+        // shared "Administration" tab, since either scope previously implied seeing it.
         const showAdminInfo = p.is_master || p.can_manage_keys || p.can_manage_webhooks;
-        groupsSection.style.display = showAdminInfo ? 'block' : 'none';
+        groupsTab.style.display = showAdminInfo ? 'inline-block' : 'none';
 
         // API Keys & Permissions tab
         keysTab.style.display = (p.is_master || p.can_manage_keys) ? 'inline-block' : 'none';
@@ -271,7 +367,6 @@ class FirewallClient {
     // Data Loading
     // ───────────────────────────────────────────────────────
     async loadInitialData() {
-        this.state.pagination.offset = 0;
         await this.loadIps();
         if (this.state.profile.is_master || this.state.profile.can_manage_keys) {
             await this.loadKeys();
@@ -285,13 +380,15 @@ class FirewallClient {
             await this.loadWebhooks();
         }
         if (this.state.profile.is_master) {
-            this.state.auditPagination.offset = 0;
             await this.loadAuditLogs();
         }
     }
 
-    async loadIps() {
-        const { limit, offset } = this.state.pagination;
+    // Fetches one chunk (up to 100 records) from the server for the current filter values —
+    // called by PagedCache, both for the initial page and for background prefetches. Filter
+    // values are read fresh on every call (not captured once) so a prefetch mid-typing session
+    // still reflects whatever was actually searched, not stale values from page load.
+    async fetchIpsChunk(offset, limit) {
         const ipQ = document.getElementById('ip-filter').value;
         const groupQ = document.getElementById('group-filter').value;
         const causeQ = document.getElementById('cause-filter').value;
@@ -303,17 +400,22 @@ class FirewallClient {
         if (causeQ) params.append('cause', causeQ);
         if (statQ) params.append('status', statQ);
 
+        return await this.apiFetch(`/ips?${params.toString()}`);
+    }
+
+    async loadIps() {
         try {
-            const data = await this.apiFetch(`/ips?${params.toString()}`);
-            if (offset === 0) {
-                this.state.ips = data;
-            } else {
-                this.state.ips = [...this.state.ips, ...data];
-            }
-            this.state.pagination.hasMore = data.length === limit;
+            await this.ipCache.loadFirstChunk();
             this.renderIpTable();
             this.updatePaginationUI();
         } catch(e) {}
+    }
+
+    // Discards the current IP cache and fetches fresh from the server with whatever's currently
+    // in the filter inputs — the explicit "search" action (button click / Enter / combobox pick),
+    // never fired on every keystroke.
+    triggerIpSearch() {
+        this.loadIps();
     }
 
     async loadKeys() {
@@ -346,14 +448,15 @@ class FirewallClient {
         } catch(e) {}
     }
 
+    async fetchAuditLogsChunk(offset, limit) {
+        const params = new URLSearchParams({ limit, offset });
+        return await this.apiFetch(`/audit-logs?${params.toString()}`);
+    }
+
     async loadAuditLogs() {
         if (!this.state.profile?.is_master) return;
-        const { limit, offset } = this.state.auditPagination;
-        const params = new URLSearchParams({ limit, offset });
         try {
-            const data = await this.apiFetch(`/audit-logs?${params.toString()}`);
-            this.state.auditLogs = data;
-            this.state.auditPagination.hasMore = data.length === limit;
+            await this.auditCache.loadFirstChunk();
             this.renderAuditLogsTable();
             this.updateAuditPaginationUI();
         } catch(e) {}
@@ -394,11 +497,14 @@ class FirewallClient {
         }, 3000);
     }
 
-    // Addresses present in this loaded data set that belong to both a banlist AND a
-    // whitelist group at once — a conflicting/ambiguous firewall state worth flagging.
-    findConflictingAddresses() {
+    // Addresses in the given data set that belong to both a banlist AND a whitelist group at
+    // once — a conflicting/ambiguous firewall state worth flagging. Scans the caller-supplied
+    // array (the full cached chunk, up to 100 records) rather than just the visible 15-row page,
+    // so a conflict is far less likely to be missed just because its two rows landed on
+    // different local pages of the same chunk.
+    findConflictingAddresses(items) {
         const typesByAddress = new Map();
-        for (const ip of this.state.ips) {
+        for (const ip of items) {
             if (!typesByAddress.has(ip.target_address)) {
                 typesByAddress.set(ip.target_address, new Set());
             }
@@ -416,13 +522,15 @@ class FirewallClient {
 
     renderIpTable() {
         const tbody = document.getElementById('ip-table-body');
-        const conflicts = this.findConflictingAddresses();
+        const cached = this.ipCache.items;
+        const conflicts = this.findConflictingAddresses(cached);
 
-        // Client-side only: conflicts (and this filter) can only ever be detected among rows
-        // already present in the currently loaded page, same as the conflict badge itself.
+        // "Conflicted IPs Only" shows every match across the whole cached chunk at once (usually
+        // a short list — conflicts are the exception, not the rule) rather than being paginated
+        // like the normal view; the normal view stays a clean 15-row local page.
         const rows = this.state.showConflictsOnly
-            ? this.state.ips.filter(ip => conflicts.has(ip.target_address))
-            : this.state.ips;
+            ? cached.filter(ip => conflicts.has(ip.target_address))
+            : this.ipCache.currentPageItems;
 
         if (rows.length === 0) {
             const msg = this.state.showConflictsOnly
@@ -450,7 +558,9 @@ class FirewallClient {
                 <td><span class="badge badge-group">${escapeHtml(ip.group_name || 'Global')}</span></td>
                 <td>${new Date(ip.last_seen_at).toLocaleString()}</td>
                 <td>
-                    <button class="btn btn-sm btn-danger" onclick="window.app.deleteIp('${escapeHtml(ip.target_address)}', '${escapeHtml(ip.group_name)}')" ${ip.is_locked ? 'disabled' : ''}>Delete</button>
+                    <div class="flex gap-2">
+                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteIp('${escapeHtml(ip.target_address)}', '${escapeHtml(ip.group_name)}')" ${ip.is_locked ? 'disabled' : ''}>Delete</button>
+                    </div>
                 </td>
             </tr>
         `;
@@ -533,7 +643,9 @@ class FirewallClient {
                 <td><strong>${escapeHtml(g.name)}</strong></td>
                 <td>${typeBadge}</td>
                 <td>
-                    <button class="btn btn-sm btn-danger" onclick="window.app.deleteGroup('${g.id}')">Delete</button>
+                    <div class="flex gap-2">
+                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteGroup('${g.id}')">Delete</button>
+                    </div>
                 </td>
             </tr>
         `;
@@ -553,7 +665,9 @@ class FirewallClient {
                 <td><strong>${escapeHtml(w.name)}</strong></td>
                 <td class="font-mono text-sm">${escapeHtml(w.target_url)}</td>
                 <td>
-                    <button class="btn btn-sm btn-danger" onclick="window.app.deleteWebhook('${w.id}')">Delete</button>
+                    <div class="flex gap-2">
+                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteWebhook('${w.id}')">Delete</button>
+                    </div>
                 </td>
             </tr>
         `).join('');
@@ -564,19 +678,20 @@ class FirewallClient {
         const nt = document.getElementById('btn-next');
         const ind = document.getElementById('page-indicator');
 
-        pr.disabled = this.state.pagination.offset === 0;
-        nt.disabled = !this.state.pagination.hasMore;
-        ind.textContent = `Page ${Math.floor(this.state.pagination.offset / this.state.pagination.limit) + 1}`;
+        pr.disabled = !this.ipCache.hasPrevPage;
+        nt.disabled = !this.ipCache.hasNextPage;
+        ind.textContent = `Page ${this.ipCache.localPage + 1}`;
     }
 
     renderAuditLogsTable() {
         const tbody = document.getElementById('audit-logs-table-body');
-        if (this.state.auditLogs.length === 0) {
+        const rows = this.auditCache.currentPageItems;
+        if (rows.length === 0) {
             tbody.innerHTML = '<tr><td colspan="7" class="text-center text-muted">No audit log entries.</td></tr>';
             return;
         }
 
-        tbody.innerHTML = this.state.auditLogs.map(log => {
+        tbody.innerHTML = rows.map(log => {
             const keyDisplay = log.api_key_name
                 ? `${escapeHtml(log.api_key_name)}${log.api_key_prefix ? ` <span class="text-muted text-sm">(${escapeHtml(log.api_key_prefix)}...)</span>` : ''}`
                 : '<span class="text-muted">System</span>';
@@ -599,9 +714,9 @@ class FirewallClient {
         const nt = document.getElementById('audit-btn-next');
         const ind = document.getElementById('audit-page-indicator');
 
-        pr.disabled = this.state.auditPagination.offset === 0;
-        nt.disabled = !this.state.auditPagination.hasMore;
-        ind.textContent = `Page ${Math.floor(this.state.auditPagination.offset / this.state.auditPagination.limit) + 1}`;
+        pr.disabled = !this.auditCache.hasPrevPage;
+        nt.disabled = !this.auditCache.hasNextPage;
+        ind.textContent = `Page ${this.auditCache.localPage + 1}`;
     }
 
     // ───────────────────────────────────────────────────────
@@ -827,14 +942,21 @@ class FirewallClient {
         document.getElementById('logout-btn').addEventListener('click', () => this.logout());
         document.getElementById('refresh-btn').addEventListener('click', () => this.loadInitialData());
 
-        // Tabs
+        // Tabs. Each panel is fully re-rendered from cached/fetched state on every switch (see
+        // the render* methods) rather than mutated in place, so repeatedly switching tabs can
+        // never accumulate stale rows — every render starts from tbody.innerHTML = ..., a full
+        // replace, never an append.
         document.querySelectorAll('.tab-btn').forEach(btn => {
             btn.addEventListener('click', (e) => {
-                document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active', 'aria-selected'));
+                document.querySelectorAll('.tab-btn').forEach(b => {
+                    b.classList.remove('active');
+                    b.setAttribute('aria-selected', 'false');
+                });
                 document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
-                
+
                 const trg = e.target;
-                trg.classList.add('active', 'aria-selected');
+                trg.classList.add('active');
+                trg.setAttribute('aria-selected', 'true');
                 document.getElementById(`tab-${trg.dataset.tab}`).classList.add('active');
             });
         });
@@ -844,37 +966,44 @@ class FirewallClient {
         document.getElementById('btn-ban').addEventListener('click', () => this.upsertIp(false));
         document.getElementById('btn-white').addEventListener('click', () => this.upsertIp(true));
 
-        // Filters
-        const loadDebounced = debounce(() => {
-            this.state.pagination.offset = 0;
-            this.loadIps();
-        }, 500);
-        
-        document.getElementById('ip-filter').addEventListener('input', loadDebounced);
-        document.getElementById('group-filter').addEventListener('input', loadDebounced);
-        document.getElementById('cause-filter').addEventListener('input', loadDebounced);
-        document.getElementById('status-filter').addEventListener('change', () => {
-            this.state.pagination.offset = 0;
-            this.loadIps();
+        // Filters — explicit search only: the search button, Enter in a text filter, or the
+        // status dropdown's own change event. Typing alone no longer fires a request.
+        document.getElementById('ip-search-btn').addEventListener('click', () => this.triggerIpSearch());
+        document.getElementById('ip-filter').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); this.triggerIpSearch(); }
         });
+        document.getElementById('cause-filter').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); this.triggerIpSearch(); }
+        });
+        document.getElementById('group-filter').addEventListener('keydown', (e) => {
+            // If the combobox's suggestion menu is open, let its own Enter handler pick the
+            // highlighted option first (which itself triggers a search via onSelect above) —
+            // otherwise this would double-fire. Only handle Enter directly when the menu is
+            // closed (nothing to select, e.g. no matches or not focused).
+            if (e.key === 'Enter' && this.groupFilterCombobox.menu.classList.contains('hidden')) {
+                e.preventDefault();
+                this.triggerIpSearch();
+            }
+        });
+        document.getElementById('status-filter').addEventListener('change', () => this.triggerIpSearch());
         document.getElementById('conflict-filter-btn').addEventListener('click', (e) => {
             this.state.showConflictsOnly = !this.state.showConflictsOnly;
             e.currentTarget.classList.toggle('active', this.state.showConflictsOnly);
             this.renderIpTable();
         });
 
-        // Pagination
+        // Pagination — most clicks are a pure client-side slice of the cached chunk; nextPage()
+        // only actually awaits a network request on the rare occasion the background prefetch
+        // hasn't resolved yet by the time the user gets there.
         document.getElementById('btn-prev').addEventListener('click', () => {
-            if (this.state.pagination.offset > 0) {
-                this.state.pagination.offset -= this.state.pagination.limit;
-                this.loadIps();
-            }
+            this.ipCache.prevPage();
+            this.renderIpTable();
+            this.updatePaginationUI();
         });
-        document.getElementById('btn-next').addEventListener('click', () => {
-            if (this.state.pagination.hasMore) {
-                this.state.pagination.offset += this.state.pagination.limit;
-                this.loadIps();
-            }
+        document.getElementById('btn-next').addEventListener('click', async () => {
+            await this.ipCache.nextPage();
+            this.renderIpTable();
+            this.updatePaginationUI();
         });
 
         // Admin Forms
@@ -892,18 +1021,16 @@ class FirewallClient {
             document.getElementById('secret-reveal-modal').classList.add('hidden');
         });
 
-        // Audit log pagination
+        // Audit log pagination — same client-side-slice-first model as the IP table above.
         document.getElementById('audit-btn-prev').addEventListener('click', () => {
-            if (this.state.auditPagination.offset > 0) {
-                this.state.auditPagination.offset -= this.state.auditPagination.limit;
-                this.loadAuditLogs();
-            }
+            this.auditCache.prevPage();
+            this.renderAuditLogsTable();
+            this.updateAuditPaginationUI();
         });
-        document.getElementById('audit-btn-next').addEventListener('click', () => {
-            if (this.state.auditPagination.hasMore) {
-                this.state.auditPagination.offset += this.state.auditPagination.limit;
-                this.loadAuditLogs();
-            }
+        document.getElementById('audit-btn-next').addEventListener('click', async () => {
+            await this.auditCache.nextPage();
+            this.renderAuditLogsTable();
+            this.updateAuditPaginationUI();
         });
     }
 }
@@ -918,14 +1045,6 @@ function escapeHtml(unsafe) {
          .replace(/>/g, "&gt;")
          .replace(/"/g, "&quot;")
          .replace(/'/g, "&#039;");
-}
-
-function debounce(func, timeout = 300) {
-    let timer;
-    return (...args) => {
-        clearTimeout(timer);
-        timer = setTimeout(() => { func.apply(this, args); }, timeout);
-    };
 }
 
 // Bootstrap

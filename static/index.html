@@ -45,14 +45,15 @@
 
         <!-- Tab Navigation -->
         <nav class="tab-nav" role="tablist">
-            <button class="tab-btn active" data-tab="firewall" role="tab" aria-selected="true">IPs &amp; Groups</button>
+            <button class="tab-btn active" data-tab="firewall" role="tab" aria-selected="true">IP Records</button>
+            <button class="tab-btn" data-tab="groups" id="groups-tab-btn" role="tab" aria-selected="false">IP Groups</button>
             <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
             <button class="tab-btn" data-tab="webhooks" id="webhooks-tab-btn" role="tab" aria-selected="false">Webhooks</button>
             <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
 
         <!-- ═══════════════════════════════════════════════ -->
-        <!-- TAB: IPs & Groups                               -->
+        <!-- TAB: IP Records                                 -->
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-firewall" class="tab-panel active">
             <div class="grid-layout">
@@ -96,6 +97,7 @@
                                 <div class="combobox-menu hidden"></div>
                             </div>
                             <input type="text" id="cause-filter" placeholder="Filter by cause..." class="input-field">
+                            <button type="button" id="ip-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
                             <select id="status-filter" class="input-field select-field">
                                 <option value="">All Statuses</option>
                                 <option value="ban">Banned</option>
@@ -132,8 +134,13 @@
                     </div>
                 </section>
             </div>
+        </main>
 
-            <div class="admin-grid mt-4">
+        <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: IP Groups                                  -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-groups" class="tab-panel">
+            <div class="admin-grid">
                 <!-- IP Groups -->
                 <section class="card admin-section" id="groups-section">
                     <h2>IP Groups</h2>

@@ -1539,3 +1539,125 @@ No changes were needed to `src/error.rs`, `src/middleware.rs`, `src/state.rs`,
   both times, both port 3000 and the webhook receiver's port 18763 confirmed free after each run.
 - `static/`: HTML tag balance, duplicate-id, `getElementById`, `data-tab`, and combobox-class
   cross-checks all clean.
+
+---
+
+## 2026-07-27 (session 13) — Client caching/prefetch, explicit search, dedicated Groups tab, iplist endpoint, readable audit logs
+
+Seven task areas this session; two turned out to already be satisfied by prior sessions' work
+(checkbox theming, `.table-container` responsive wrapping) and needed verification rather than
+new code — noted below rather than making unnecessary changes.
+
+### Backend (`src/api.rs`)
+
+- **`GET /api/ips` ordering**: added `.order_by_desc(ip_record::Column::UpdatedAt)` to the query
+  builder before `.limit()/.offset()`. `GET /api/audit-logs` already had `.order_by_desc(Timestamp)`
+  from an earlier session — verified, not re-added. Confirmed via a full `cargo test` run *before*
+  adding new tests that no existing test relied on the previous unspecified order — 34/34 unchanged.
+- **`format=iplist` / `mode=iplist`**: both accepted as synonyms (`QueryFilters` gained `format`
+  and `mode: Option<String>`). Branches *before* the per-row `ip_group` lookup, skipping it
+  entirely for this path — not needed for a flat address list — and returns
+  `{"ip_list": [...]}`, sorted and de-duplicated (an address matched via two different group
+  memberships in the same query would otherwise appear twice). Hit an `impl IntoResponse` type
+  inference snag: with two different concrete response types now returned from the same handler
+  (`Json<Vec<IpRecordResponse>>` vs `Json<serde_json::Value>`), the opaque return type no longer
+  resolved to a single concrete type; fixed by calling `.into_response()` at every return site
+  (including the pre-existing early-return for an empty `accessible_groups` list) so all paths
+  agree on `axum::response::Response`.
+- **Readable audit log `details`**: added `fn format_key_reference(name: &str, id: Uuid) -> String`
+  (`"'name' (xxxxxxxx...)"`) and applied it at all 5 call sites that previously logged a bare
+  `id.to_string()` as `details` — `KEY_DELETE`, `KEY_UPDATE`, `KEY_ROTATE`, `KEY_PERM_UPDATE`,
+  `KEY_PERM_REVOKE`. Two of the five (`delete_api_key`, `revoke_key_group_permission`) previously
+  never fetched the target key at all; added a `find_by_id` lookup in each — for `delete_api_key`
+  specifically, this has to happen *before* the delete, since the row (and its name) is gone
+  afterward. `update_api_key` uses the *post*-update name (if the call itself renamed the key, the
+  log should say what it's called now, not what it used to be called) — the other four use the
+  name as it already was, since none of them can change it.
+
+### Frontend (`static/app.js`, `static/index.html`, `static/style.css`)
+
+- **`PagedCache` class**: fetches 100 items per server request, paginates 15 at a time locally —
+  most "Next"/"Prev" clicks are now a pure in-memory slice, zero network round-trip. Prefetches the
+  next 100-item chunk in the background the moment the user's local page index hits
+  `totalLocalPages - 2` (exactly "second-to-last page of the currently cached dataset," re-derived
+  dynamically off the live item count on every page change, so it correctly re-fires after each
+  new chunk arrives rather than only once). One shared class backs both `this.ipCache` and
+  `this.auditCache` rather than duplicating the same fetch/cache/paginate logic twice.
+  - Bonus, low-risk side effect: the conflict-detection scan (`findConflictingAddresses`) now
+    scans the whole cached 100-item chunk instead of just the visible 15-row page, so a
+    banlist/whitelist conflict split across two local pages is far less likely to be missed.
+- **Root cause of the "infinite table append" bug**: every `render*Table()` already used
+  `tbody.innerHTML = ...` (a full replace) — there was no literal DOM-append bug. The actual bug
+  was `loadIps()`'s old pagination: `this.state.ips = [...this.state.ips, ...data]` on every
+  "Next" click, then rendering that *entire* ever-growing accumulated array each time — clicking
+  Next repeatedly did produce a monotonically longer rendered table, just via data accumulation
+  feeding a full re-render, not via literal `appendChild`. `PagedCache.currentPageItems` always
+  renders a fixed-size slice, which eliminates this by construction. Also found and fixed a real,
+  separate accessibility bug in the same tab-switching code this touches:
+  `classList.add('active', 'aria-selected')` was adding a CSS class literally *named*
+  `aria-selected` (which does nothing — no such selector exists) instead of updating the actual
+  `aria-selected` *attribute* via `setAttribute`, so screen readers never saw which tab was
+  actually selected after the first switch. Fixed alongside the tab-click handler rewrite this
+  session already needed for the new Groups tab.
+- **Explicit search (no auto-search-on-keystroke)**: removed the debounced `input`-event listeners
+  on `ip-filter`/`group-filter`/`cause-filter` entirely (and the now-fully-unused `debounce()`
+  utility with them). Added a 🔍 `ip-search-btn` plus `keydown`→Enter handlers on each text filter;
+  `status-filter`'s own `change` event is unaffected (a dropdown has no "keystrokes" to suppress).
+  The group-filter combobox's `SearchableSelect` already had its own Enter handler (selects the
+  highlighted suggestion); wired its `onSelect` callback to fire the search directly, and made the
+  new field-level Enter handler only fire when the combobox menu is *closed*, so picking a
+  suggestion via Enter doesn't double-fire the search once through selection and again through the
+  raw keydown.
+- **Dedicated IP Groups tab**: split out of the "IPs & Groups" tab (renamed to "IP Records") into
+  its own `data-tab="groups"` / `#tab-groups`, gated by the same `groups-tab-btn` visibility rule
+  the shared section used before (`is_master || can_manage_keys || can_manage_webhooks`).
+- **Verified, not changed** (task described as needed; already true from earlier sessions):
+  *Checkbox theming* — all 13 checkboxes in `index.html` already use the dark-themed
+  `.checkbox-container`/`.checkmark` component (grepped for every `type="checkbox"` to confirm no
+  raw unstyled ones exist). *Responsive tables* — every table was already wrapped in
+  `.table-container { overflow-x: auto }`. Did add one small, genuine improvement here:
+  `.data-table { min-width: 640px }`, so a wide table (the 7-column Audit Logs) scrolls cleanly
+  instead of the browser silently squeezing every column illegibly thin first.
+- **Action button consistency**: `renderKeysTable()` already wrapped its (3) action buttons in
+  `<div class="flex gap-2">`; the single-button cases (`renderIpTable`, `renderGroupsTable`,
+  `renderWebhooksTable`) didn't. Wrapped all three the same way for one consistent DOM shape
+  across every table's Actions column, even though a single button doesn't strictly need the
+  wrapper.
+
+### Tests
+
+- `tests/rbac_integration_tests.rs`, 2 new (Rust-side scope was explicitly iplist-format +
+  DESC-ordering per the task list; per-task-6 audit-log-readability coverage went into the E2E
+  script instead, matching how the task itself only listed those two for backend tests):
+  `test_list_ips_iplist_format_returns_deduplicated_address_list` (same address banned into two
+  groups appears exactly once; asserts the response is *only* `{"ip_list": [...]}`, nothing else
+  leaks in; checks both the `format=` and `mode=` query keys) and
+  `test_list_ips_orders_by_updated_at_descending` (three addresses banned in sequence come back
+  newest-first; re-registering the oldest jumps it back to the front).
+- `scripts/test_e2e.sh`, 2 new sections: **§19 Latest-Activity-First Ordering & Lightweight iplist
+  Format** (same ordering/re-registration proof as the Rust test, driven over real HTTP, plus both
+  `format=iplist` and `mode=iplist`) and **§20 Readable Audit Log Details** (rotates a key's
+  secret, grants it a permission, then deletes it — asserts each of the three resulting audit
+  entries' `details` names the key by name, and that the `KEY_PERM_UPDATE` message exactly matches
+  the task's own example format character-for-character).
+
+No changes were needed to `src/error.rs`, `src/middleware.rs`, `src/state.rs`, `src/webhooks.rs`,
+`src/migration/`, or any entity this session.
+
+### Final verification (session 13)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **36/36 pass** (34 carried over + 2 new).
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `scripts/test_e2e.sh`: **181/181 checks pass**, twice in a row (157 carried over from session 12
+  + 24 new: 3 sequential-ban + 2 ordering + 1 re-registration + 5 iplist-format checks in §19,
+  plus 1 key-creation + 2 rotate + 2 grant + 2 delete checks in §20, plus the intermediate
+  fetch/list checks each section also runs), exit code `0` both times, both port 3000 and the
+  webhook receiver's port 18763 confirmed free after each run.
+- `static/`: HTML tag balance, duplicate-id, `getElementById`, `data-tab` (now 5 tabs: audit,
+  firewall, groups, keys, webhooks), and combobox-class cross-checks all clean.
+- Headless Chromium remains unable to launch in this container (unchanged from prior sessions);
+  the frontend rewrite this session — including the new `PagedCache` pagination/prefetch logic —
+  was verified via the static structural checks above plus careful manual trace-through of every
+  state transition, not a live rendered screenshot. Flagging this explicitly again since this was
+  the largest pure-frontend logic change of any session so far.

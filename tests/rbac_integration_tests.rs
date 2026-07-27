@@ -2361,3 +2361,105 @@ async fn test_bound_ip_strictly_rejects_out_of_cidr_forwarded_address() {
         .unwrap();
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
+
+/// `GET /api/ips?format=iplist` (and its `mode=iplist` synonym) returns `{"ip_list": [...]}` —
+/// just the addresses, de-duplicated, not full records. The same address banned into two
+/// different groups must appear exactly once in the list, even though it matches two separate
+/// `ip_record_group_membership` rows.
+#[tokio::test]
+async fn test_list_ips_iplist_format_returns_deduplicated_address_list() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let ban = |addr: &'static str, group: &'static str| {
+        inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/ban")
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json"))
+            .body(Body::from(json!({ "target_address": addr, "group_name": group }).to_string()))
+            .unwrap()
+    };
+
+    assert_eq!(app.clone().oneshot(ban("198.51.100.1", "iplist-group-a")).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(app.clone().oneshot(ban("198.51.100.2", "iplist-group-a")).await.unwrap().status(), StatusCode::OK);
+    // Same address as the first, but in a SECOND group — must still only appear once in ip_list.
+    assert_eq!(app.clone().oneshot(ban("198.51.100.1", "iplist-group-b")).await.unwrap().status(), StatusCode::OK);
+
+    for query in ["format=iplist", "mode=iplist"] {
+        let req = inject_connect_info(Request::builder()
+            .uri(format!("/api/ips?groups=iplist-group-a,iplist-group-b&{query}"))
+            .header("X-API-Key", &master_key))
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "query string was `{query}`");
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let ip_list = parsed["ip_list"].as_array().expect("ip_list must be an array");
+        let addresses: Vec<&str> = ip_list.iter().map(|v| v.as_str().unwrap()).collect();
+        assert_eq!(addresses.len(), 2, "query string was `{query}`: expected exactly 2 unique addresses, got {addresses:?}");
+        assert!(addresses.contains(&"198.51.100.1"));
+        assert!(addresses.contains(&"198.51.100.2"));
+        // No other fields (id, cause, group_name, ...) leak into the lightweight response.
+        assert!(parsed.get("id").is_none() && parsed.as_object().unwrap().len() == 1);
+    }
+}
+
+/// `GET /api/ips` must order results by `updated_at DESC` — the most recently added or
+/// re-registered record always sorts first, regardless of insertion order.
+#[tokio::test]
+async fn test_list_ips_orders_by_updated_at_descending() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let ban = |addr: &'static str| {
+        inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/ban")
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json"))
+            .body(Body::from(json!({ "target_address": addr, "group_name": "ordering-group" }).to_string()))
+            .unwrap()
+    };
+
+    // Created in order A, B, C — freshly created, so C (most recent) should sort first.
+    for addr in ["203.0.113.101", "203.0.113.102", "203.0.113.103"] {
+        assert_eq!(app.clone().oneshot(ban(addr)).await.unwrap().status(), StatusCode::OK);
+    }
+
+    let list = |app: &axum::Router, master_key: &str| {
+        let app = app.clone();
+        let master_key = master_key.to_owned();
+        async move {
+            let req = inject_connect_info(Request::builder()
+                .uri("/api/ips?groups=ordering-group")
+                .header("X-API-Key", &master_key))
+                .body(Body::empty())
+                .unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
+            items.into_iter().map(|i| i["target_address"].as_str().unwrap().to_owned()).collect::<Vec<_>>()
+        }
+    };
+
+    let addresses = list(&app, &master_key).await;
+    assert_eq!(addresses, vec!["203.0.113.103", "203.0.113.102", "203.0.113.101"], "most recently created sorts first");
+
+    // Re-register the OLDEST one (.101) — it must now jump to the front, since its updated_at is
+    // now the most recent of the three.
+    assert_eq!(app.clone().oneshot(ban("203.0.113.101")).await.unwrap().status(), StatusCode::OK);
+
+    let addresses = list(&app, &master_key).await;
+    assert_eq!(addresses, vec!["203.0.113.101", "203.0.113.103", "203.0.113.102"], "re-registered record jumps to the front");
+}

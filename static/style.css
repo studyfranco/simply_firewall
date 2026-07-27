@@ -573,6 +573,10 @@ body {
 
 .data-table {
     width: 100%;
+    /* Gives columns room to breathe before the .table-container wrapper's overflow-x: auto
+       kicks in, rather than the browser silently squeezing every column illegibly thin on a
+       narrow viewport — a wide table (e.g. the 7-column Audit Logs) scrolls cleanly instead. */
+    min-width: 640px;
     border-collapse: collapse;
     font-size: 0.88rem;
 }

@@ -73,6 +73,15 @@ pub fn normalize_ip_or_cidr(input: &str) -> String {
     }
 }
 
+/// Formats a target API key for a human-readable audit log `details` string, e.g.
+/// `"'worker_bot' (65cf11ce...)"` — pairs the name (what an operator actually recognizes) with a
+/// truncated id (for unambiguous cross-referencing against a `GET /api/keys` listing) instead of
+/// a bare UUID, which was cryptic on its own.
+fn format_key_reference(name: &str, id: Uuid) -> String {
+    let id_str = id.to_string();
+    format!("'{name}' ({}...)", &id_str[..8])
+}
+
 /// Helper to insert an audit log entry. `key` denormalizes the acting key's name/prefix into the
 /// row so the audit trail stays legible even after that key is later deleted (its `api_key_id` FK
 /// is `ON DELETE SET NULL`, per `SCHEMA.MD`, but the name/prefix survive as a point-in-time
@@ -490,6 +499,11 @@ pub struct QueryFilters {
     pub limit: Option<u64>,
     /// Pagination offset
     pub offset: Option<u64>,
+    /// When set to `"iplist"` (accepted under either query key), returns a lightweight
+    /// `{"ip_list": [...]}` payload of just the matched addresses instead of full records.
+    pub format: Option<String>,
+    /// Synonym for `format` — `format=iplist` and `mode=iplist` are both accepted.
+    pub mode: Option<String>,
 }
 
 /// Response payload for a single IP record
@@ -540,7 +554,7 @@ pub async fn list_ips(
             .collect();
 
         if accessible_groups.is_empty() {
-            return Ok(Json(Vec::<IpRecordResponse>::new()));
+            return Ok(Json(Vec::<IpRecordResponse>::new()).into_response());
         }
 
         query = query.filter(ip_record_group_membership::Column::GroupId.is_in(accessible_groups));
@@ -631,11 +645,29 @@ pub async fn list_ips(
     let limit = filters.limit.unwrap_or(50);
     let offset = filters.offset.unwrap_or(0);
 
+    // Latest activity first: whichever record was most recently added or re-registered (a ban
+    // "renewed" by a fresh match) sorts to the top, matching AGENT.MD's ordering requirement.
     let memberships = query
+        .order_by_desc(ip_record::Column::UpdatedAt)
         .limit(limit)
         .offset(offset)
         .all(&state.db)
         .await?;
+
+    let format_iplist = matches!(filters.format.as_deref(), Some("iplist"))
+        || matches!(filters.mode.as_deref(), Some("iplist"));
+    if format_iplist {
+        // Lightweight path: skip the per-row group lookup below entirely (not needed for a flat
+        // address list), and de-duplicate — an address matched via multiple group memberships in
+        // the same query would otherwise appear once per membership.
+        let mut ip_list: Vec<String> = memberships
+            .into_iter()
+            .filter_map(|(_, record_opt)| record_opt.map(|r| r.target_address))
+            .collect();
+        ip_list.sort();
+        ip_list.dedup();
+        return Ok(Json(serde_json::json!({ "ip_list": ip_list })).into_response());
+    }
 
     let mut items = Vec::with_capacity(memberships.len());
     for (mem, record_opt) in memberships {
@@ -657,7 +689,7 @@ pub async fn list_ips(
         });
     }
 
-    Ok(Json(items))
+    Ok(Json(items).into_response())
 }
 
 /// Parameters for deleting an IP record from a group. Every field is optional here because this
@@ -1052,12 +1084,17 @@ pub async fn delete_api_key(
         return Err(AppError::Forbidden("Cannot delete yourself".to_owned()));
     }
 
+    // Fetched before deleting (not just relied on rows_affected) so its name is still available
+    // for the audit log below — once deleted, there's nothing left to look the name up from.
+    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target_ref = format_key_reference(&target.name, id);
+
     let result = ApiKey::delete_by_id(id).exec(&state.db).await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
-    
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_DELETE", None, None, Some(id.to_string())).await?;
+
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_DELETE", None, None, Some(format!("Deleted key {target_ref}"))).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -1118,8 +1155,11 @@ pub async fn update_api_key(
     }
     active.updated_at = Set(Utc::now().naive_utc());
     let updated = active.update(&state.db).await?;
+    // Uses the post-update name (not the pre-update one) — if this call renamed the key, the
+    // resulting name is what a reader will actually recognize it by later.
+    let target_ref = format_key_reference(&updated.name, id);
 
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_UPDATE", None, None, Some(id.to_string())).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_UPDATE", None, None, Some(format!("Updated key {target_ref}"))).await?;
 
     Ok(Json(build_api_key_summary(&state.db, updated).await?))
 }
@@ -1147,6 +1187,7 @@ pub async fn rotate_api_key(
     }
 
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target_ref = format_key_reference(&target.name, id);
 
     let plaintext_key = generate_random_key();
     let key_hash = hash_key(&plaintext_key);
@@ -1158,7 +1199,7 @@ pub async fn rotate_api_key(
     active.updated_at = Set(Utc::now().naive_utc());
     active.update(&state.db).await?;
 
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_ROTATE", None, None, Some(id.to_string())).await?;
+    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_ROTATE", None, None, Some(format!("Rotated secret for key {target_ref}"))).await?;
 
     Ok(Json(RotateKeyResponse { id, plaintext_key }))
 }
@@ -1231,7 +1272,15 @@ pub async fn update_key_group_permissions(
         .exec(&state.db)
         .await?;
 
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_PERM_UPDATE", None, Some(resolved_group_name), Some(id.to_string())).await?;
+    create_audit_log(
+        &state.db,
+        Some(&key),
+        Some(client_ip.0),
+        "KEY_PERM_UPDATE",
+        None,
+        Some(resolved_group_name),
+        Some(format!("Updated permissions for key {}", format_key_reference(&target_key.name, id)))
+    ).await?;
 
     Ok(axum::http::StatusCode::OK)
 }
@@ -1265,7 +1314,16 @@ pub async fn revoke_key_group_permission(
         return Err(AppError::NotFound);
     }
 
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_PERM_REVOKE", None, Some(group.name), Some(id.to_string())).await?;
+    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    create_audit_log(
+        &state.db,
+        Some(&key),
+        Some(client_ip.0),
+        "KEY_PERM_REVOKE",
+        None,
+        Some(group.name),
+        Some(format!("Revoked permissions for key {}", format_key_reference(&target.name, id)))
+    ).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

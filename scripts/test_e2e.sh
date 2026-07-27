@@ -14,7 +14,9 @@
 # permissions on both explicit (POST /api/groups) and implicit (ban/white auto-create) group
 # creation, explicit group_type selection on group creation (with a lenient default-to-banlist
 # fallback for an omitted/invalid value), IP/CIDR canonicalization (a bare address and its /32 or
-# /128 form are the same stored record, while genuine subnets keep their notation), and the
+# /128 form are the same stored record, while genuine subnets keep their notation), latest-
+# activity-first ordering on GET /api/ips, a lightweight format=iplist/mode=iplist response mode,
+# human-readable target-key names in audit log details (instead of a bare UUID), and the
 # group-identification bug fixes (duplicate-name 409, flexible group_id/group_name). Every request
 # is logged with a timestamp, method, full URL, color-coded status, and jq-formatted body.
 #
@@ -887,6 +889,70 @@ api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.0/24","grou
 check "200" "ban a /24 subnet"
 api_call GET "/api/ips?groups=canon-e2e-group" "$MASTER_KEY"
 check_jq ".[0].target_address" "203.0.113.0/24" "a /24 is stored with its CIDR notation intact, not stripped like /32"
+
+# ── 19. Latest-activity-first ordering & lightweight iplist format ──────────
+
+log_section "19. Latest-Activity-First Ordering & Lightweight iplist Format"
+
+log "Banning 3 addresses in sequence — GET /api/ips must return them most-recent-first..."
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"ordering-e2e-group"}'
+check "200" "ban address 1"
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.202","group_name":"ordering-e2e-group"}'
+check "200" "ban address 2"
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.203","group_name":"ordering-e2e-group"}'
+check "200" "ban address 3"
+
+api_call GET "/api/ips?groups=ordering-e2e-group" "$MASTER_KEY"
+check "200" "list the ordering test group"
+check_jq ".[0].target_address" "198.51.100.203" "the most recently created record sorts first"
+check_jq ".[2].target_address" "198.51.100.201" "the oldest record sorts last"
+
+log "Re-banning the oldest address must move it back to the front..."
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"ordering-e2e-group","cause":"renewed"}'
+check "200" "re-ban address 1"
+api_call GET "/api/ips?groups=ordering-e2e-group" "$MASTER_KEY"
+check_jq ".[0].target_address" "198.51.100.201" "the re-registered record jumps back to the front"
+
+log "GET /api/ips?format=iplist returns a lightweight, deduplicated address list..."
+api_call GET "/api/ips?groups=ordering-e2e-group&format=iplist" "$MASTER_KEY"
+check "200" "iplist format request succeeds"
+check_true '(.ip_list | type) == "array"' "the response has an ip_list array"
+check_jq "(.ip_list | length)" "3" "all 3 addresses are present"
+check_true '.ip_list | contains(["198.51.100.201","198.51.100.202","198.51.100.203"])' "the exact addresses are present"
+
+log "mode=iplist is accepted as a synonym for format=iplist..."
+api_call GET "/api/ips?groups=ordering-e2e-group&mode=iplist" "$MASTER_KEY"
+check "200" "mode=iplist request succeeds"
+check_jq "(.ip_list | length)" "3" "same result via the mode= synonym"
+
+# ── 20. Readable audit log details (human-readable key names) ──────────────
+
+log_section "20. Readable Audit Log Details"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"readable_logs_key","bound_ips":"0.0.0.0/0"}'
+check "200" "create a dedicated key to exercise KEY_ROTATE/KEY_PERM_UPDATE/KEY_DELETE logging"
+READABLE_LOGS_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/keys/$READABLE_LOGS_KEY_ID/rotate" "$MASTER_KEY"
+check "200" "rotate its secret"
+api_call GET "/api/audit-logs?action=KEY_ROTATE&limit=1" "$MASTER_KEY"
+check "200" "fetch the most recent KEY_ROTATE entry"
+check_true '(.[0].details | contains("readable_logs_key")) and (.[0].details | contains("Rotated secret for key"))' \
+    "the details string names the key by name, not just its raw UUID"
+
+api_call POST "/api/keys/$READABLE_LOGS_KEY_ID/groups" "$MASTER_KEY" \
+    '{"group_name":"readable-logs-group","can_read":true,"can_write":false,"can_delete":false}'
+check "200" "grant it a group permission"
+api_call GET "/api/audit-logs?action=KEY_PERM_UPDATE&limit=1" "$MASTER_KEY"
+check "200" "fetch the most recent KEY_PERM_UPDATE entry"
+check_jq ".[0].details" "Updated permissions for key 'readable_logs_key' (${READABLE_LOGS_KEY_ID:0:8}...)" \
+    "the details string exactly matches the spec's example format"
+
+api_call DELETE "/api/keys/$READABLE_LOGS_KEY_ID" "$MASTER_KEY"
+check "204" "delete the key"
+api_call GET "/api/audit-logs?action=KEY_DELETE&limit=1" "$MASTER_KEY"
+check "200" "fetch the most recent KEY_DELETE entry"
+check_true '.[0].details | contains("readable_logs_key")' "the delete log also names the key by name, even though it no longer exists"
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
