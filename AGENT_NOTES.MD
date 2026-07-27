@@ -1772,3 +1772,77 @@ markup/JS), so it was run twice purely as a regression check.
   hand for balanced braces/parens and correct control flow. Headless Chromium remains unable to
   launch here (unchanged from every prior session) — verified via the static checks above plus
   manual trace-through, not a live rendered screenshot.
+
+## 2026-07-27 (session 15) — IP Records layout breakpoint & batch-delete button contrast
+
+Small, targeted CSS-mostly fix for two visual issues on the "IP Records" tab found after session
+14's batch-delete work landed: the two-column grid stayed side-by-side too long as the viewport
+narrowed, and the new "Delete Selected" buttons were nearly unreadable. `static/app.js` needed no
+changes — both fixes are pure CSS/markup, and the button's disabled/enabled toggling logic added
+in session 14 (`wireRowSelection`) already drives the native `:disabled` state the new CSS keys
+off of. `test_simply_firewall.sh` still doesn't exist in the repo; left untouched regardless.
+
+### Layout responsiveness (task 1)
+
+- `.grid-layout`'s existing stack breakpoint (`static/style.css`) moved from `max-width: 900px` to
+  `max-width: 1100px`, per the task's explicit ask. At the old 900px threshold, the fixed 380px
+  "Manage Access" column left as little as ~500–630px for the "Recent IP Records" side (filters,
+  badges, and the 7-column table with its `min-width: 640px`) before stacking — genuinely tight.
+  Moving the trigger to 1100px stacks the two panels a full viewport-width earlier, well before
+  that squeeze. Added `.grid-layout > * { width: 100%; }` alongside it so the stacked
+  "Manage Access" and "Recent IP Records" panels each take the full row width rather than
+  retaining any intrinsic/content-based sizing once they're no longer sharing a grid track.
+- `.table-container` already had `overflow-x: auto` (so a table wider than its column scrolls
+  cleanly instead of squeezing) — added the missing explicit `max-width: 100%` alongside the
+  existing `width: 100%` so it can never be forced wider than its parent card regardless of the
+  table's own `min-width: 640px`.
+- `.filters` (the IP/group/cause text filters + status dropdown + search/conflict buttons above
+  the IP table) already had `flex-wrap: wrap` and `gap: 0.5rem` (8px) from an earlier session —
+  confirmed still correct and left as-is; the actual crush was the outer grid column staying at
+  a fixed 380px split too long, not the filter bar itself.
+
+### Batch-delete button contrast (task 2)
+
+- The three "Delete Selected" buttons (`#delete-selected-ips` / `-groups` / `-keys`, added in
+  session 14) used `.btn-danger-outline`: transparent background + `var(--danger)` (#e74c3c) text.
+  On the dark card/table backdrop that's already low-contrast, and the generic `.btn:disabled`
+  rule's `opacity: 0.4` washed the already-dim red text out further for the common case (0 items
+  selected) — exactly the "completely unreadable" bug reported.
+  `.btn-danger-outline` had no other callers anywhere in the app (`grep` confirmed), so it was
+  replaced outright with a new `.btn-batch-delete` class (renamed since "outline" no longer
+  described it) rather than kept alongside a second, redundant style:
+  - Enabled: solid `#dc2626` background, white text, `font-weight: 600`, no border,
+    `padding: 6px 14px`, `border-radius: 6px`, `box-shadow: 0 2px 4px rgba(0,0,0,0.2)` — exactly
+    the palette specified.
+  - Hover: `#b91c1c`.
+  - Disabled: explicit `opacity: 1` (to cancel out `.btn:disabled`'s `opacity: 0.4`, which would
+    otherwise wash out these specific muted colors into something dimmer than intended — the two
+    rules have equal CSS specificity, so without the explicit override the generic one still wins
+    on `opacity` since `.btn-batch-delete:disabled` doesn't otherwise touch that property),
+    `#2a2f3d` background, `#6b7280` text, `cursor: not-allowed`.
+  - `static/index.html`'s 3 button elements updated from `class="btn btn-sm btn-danger-outline"`
+    to `class="btn btn-batch-delete"` (the new class defines its own padding/font-size directly
+    rather than relying on `.btn-sm`, since the task specified an exact `padding: 6px 14px`).
+
+### Tests
+
+No Rust files changed. `cargo check`/`test`/`clippy` run per the task's explicit instruction and
+confirmed unchanged/clean. No new `scripts/test_e2e.sh` sections — nothing in this fix is
+observable over the HTTP API — run twice purely as a regression check. One stale
+`target/debug/simply_firewall` process from an earlier interrupted run was found still bound to
+port 3000 before the first run this session; killed before proceeding (confirmed via `ss -ltnp`
+it was the app binary, not an unrelated process).
+
+### Final verification (session 15)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **36/36 pass** (unchanged — no Rust files touched).
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `scripts/test_e2e.sh`: **181/181 checks pass**, twice in a row (unchanged count — confirms zero
+  regression from the CSS/markup-only changes).
+- `static/index.html`: zero duplicate `id` attributes, `<div>` tags balanced (76/76), exactly 3
+  `btn-batch-delete` usages (the 3 batch-delete buttons, and only those).
+- `static/style.css`: brace count balanced (174/174).
+- Headless Chromium remains unable to launch in this container; verified via the static checks
+  above plus manual reasoning through the CSS cascade/specificity (particularly the
+  `:disabled`-opacity interaction) rather than a live rendered screenshot at each breakpoint.

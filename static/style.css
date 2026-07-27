@@ -179,9 +179,13 @@ body {
     align-items: start;
 }
 
-@media (max-width: 900px) {
+@media (max-width: 1100px) {
     .grid-layout {
         grid-template-columns: 1fr;
+    }
+
+    .grid-layout > * {
+        width: 100%;
     }
 }
 
@@ -379,22 +383,35 @@ body {
     font-size: 0.8rem;
 }
 
-.btn-danger-outline {
-    background: transparent;
-    color: var(--danger);
-    border: 1px solid var(--danger);
-    padding: 0.3rem 0.7rem;
-    font-size: 0.8rem;
-    border-radius: var(--radius);
-    cursor: pointer;
-    font-family: var(--font-sans);
+/* Solid, high-contrast style for the "Delete Selected" batch-action buttons — the previous
+   transparent/red-on-red outline style (further dimmed by .btn:disabled's opacity when there
+   was nothing selected) was effectively unreadable against the dark surface behind it. */
+.btn-batch-delete {
+    background-color: #dc2626;
+    color: #ffffff;
     font-weight: 600;
+    font-size: 0.8rem;
+    font-family: var(--font-sans);
+    border: none;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
     transition: all var(--transition-base);
 }
 
-.btn-danger-outline:hover {
-    background-color: var(--danger);
-    color: #fff;
+.btn-batch-delete:hover:not(:disabled) {
+    background-color: #b91c1c;
+}
+
+.btn-batch-delete:disabled {
+    /* Overrides .btn:disabled's opacity: 0.4, which would otherwise wash out these explicit
+       muted colors into an even harder-to-read state than intended. */
+    opacity: 1;
+    background-color: #2a2f3d;
+    color: #6b7280;
+    box-shadow: none;
+    cursor: not-allowed;
 }
 
 /* ─── Forms ─────────────────────────────────────────────── */
@@ -567,6 +584,7 @@ body {
 
 .table-container {
     width: 100%;
+    max-width: 100%;
     overflow-x: auto;
     border-radius: var(--radius);
 }
