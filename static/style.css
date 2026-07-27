@@ -1103,6 +1103,79 @@ body {
     margin-top: 0.5rem;
 }
 
+.modal-actions {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.75rem;
+}
+
+/* ─── Batch Selection Actions ──────────────────────────────── */
+
+.batch-actions {
+    display: flex;
+    justify-content: flex-start;
+    margin-bottom: 0.75rem;
+}
+
+/* ─── Universal Checkbox Theming ───────────────────────────── */
+/* Applies to any bare <input type="checkbox"> that isn't wrapped in a
+   .checkbox-container (e.g. table row-selection checkboxes). The rules above
+   for ".checkbox-container input" have higher specificity and keep winning for
+   the existing label-wrapped checkboxes, so the two styles coexist without
+   conflict. */
+
+input[type="checkbox"] {
+    appearance: none;
+    -webkit-appearance: none;
+    width: 18px;
+    height: 18px;
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    cursor: pointer;
+    position: relative;
+    flex-shrink: 0;
+    vertical-align: middle;
+    transition: all var(--transition-fast);
+}
+
+input[type="checkbox"]:hover {
+    border-color: var(--accent);
+}
+
+input[type="checkbox"]:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px rgba(28, 220, 154, 0.3);
+}
+
+input[type="checkbox"]:checked,
+input[type="checkbox"]:indeterminate {
+    background-color: var(--accent);
+    border-color: var(--accent);
+}
+
+input[type="checkbox"]:checked::after {
+    content: "";
+    position: absolute;
+    left: 5px;
+    top: 1px;
+    width: 5px;
+    height: 10px;
+    border: solid #1a1d20;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+}
+
+input[type="checkbox"]:indeterminate::after {
+    content: "";
+    position: absolute;
+    left: 3px;
+    top: 7px;
+    width: 10px;
+    height: 2px;
+    background-color: #1a1d20;
+}
+
 /* ─── Permission Badge Revoke Button ───────────────────────── */
 
 .badge-group {

@@ -107,10 +107,15 @@
                         </div>
                     </div>
 
+                    <div class="batch-actions">
+                        <button type="button" id="delete-selected-ips" class="btn btn-sm btn-danger-outline" disabled>Delete Selected</button>
+                    </div>
+
                     <div class="table-container">
                         <table id="ip-table" class="data-table">
                             <thead>
                                 <tr>
+                                    <th><input type="checkbox" id="select-all-ips" title="Select all"></th>
                                     <th>Address</th>
                                     <th>Status</th>
                                     <th>Cause</th>
@@ -121,7 +126,7 @@
                             </thead>
                             <tbody id="ip-table-body">
                                 <tr>
-                                    <td colspan="6" class="text-center text-muted">Loading data...</td>
+                                    <td colspan="7" class="text-center text-muted">Loading data...</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -164,9 +169,13 @@
                             </div>
                         </div>
                     </form>
+                    <div class="batch-actions">
+                        <button type="button" id="delete-selected-groups" class="btn btn-sm btn-danger-outline" disabled>Delete Selected</button>
+                    </div>
+
                     <div class="table-container mt-4">
                         <table class="data-table">
-                            <thead><tr><th>ID</th><th>Name</th><th>Type</th><th>Actions</th></tr></thead>
+                            <thead><tr><th><input type="checkbox" id="select-all-groups" title="Select all"></th><th>ID</th><th>Name</th><th>Type</th><th>Actions</th></tr></thead>
                             <tbody id="groups-table-body"></tbody>
                         </table>
                     </div>
@@ -230,10 +239,15 @@
                         <code id="apikey-plaintext" class="key-reveal-value"></code>
                     </div>
 
+                    <div class="batch-actions">
+                        <button type="button" id="delete-selected-keys" class="btn btn-sm btn-danger-outline" disabled>Delete Selected</button>
+                    </div>
+
                     <div class="table-container mt-4">
                         <table class="data-table">
                             <thead>
                                 <tr>
+                                    <th><input type="checkbox" id="select-all-keys" title="Select all"></th>
                                     <th>Name</th>
                                     <th>Bound IPs</th>
                                     <th>Global Permissions / Scopes</th>
@@ -242,7 +256,7 @@
                             </thead>
                             <tbody id="apikeys-table-body">
                                 <tr>
-                                    <td colspan="4" class="text-center text-muted">No API keys loaded.</td>
+                                    <td colspan="5" class="text-center text-muted">No API keys loaded.</td>
                                 </tr>
                             </tbody>
                         </table>
@@ -445,6 +459,18 @@
             <code id="secret-reveal-value" class="key-reveal-value"></code>
             <div class="form-actions mt-4">
                 <button type="button" id="secret-reveal-close" class="btn btn-primary">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Confirmation Modal (replaces native window.confirm()) -->
+    <div id="confirm-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3 id="confirm-modal-title">Are you sure?</h3>
+            <p id="confirm-modal-message" class="subtitle"></p>
+            <div class="modal-actions mt-4">
+                <button type="button" id="confirm-modal-cancel" class="btn btn-secondary">Cancel</button>
+                <button type="button" id="confirm-modal-confirm" class="btn btn-danger">Confirm</button>
             </div>
         </div>
     </div>

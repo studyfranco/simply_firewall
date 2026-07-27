@@ -203,7 +203,14 @@ class FirewallClient {
             apiKeys: [],
             groups: [],
             webhooks: [],
-            showConflictsOnly: false
+            showConflictsOnly: false,
+            // Row-selection state for the batch-delete checkboxes, keyed by each row's own
+            // stable id (IpRecordResponse.id, group.id, key.id) — never a synthesized composite
+            // key, since e.g. IPv6 addresses can themselves contain "::" and would corrupt any
+            // delimiter-based encoding of (address, group) pairs.
+            selectedIpIds: new Set(),
+            selectedGroupIds: new Set(),
+            selectedKeyIds: new Set()
         };
 
         // IP records and audit logs are both large, append-only lists — fetched from the server
@@ -405,6 +412,7 @@ class FirewallClient {
 
     async loadIps() {
         try {
+            this.state.selectedIpIds.clear();
             await this.ipCache.loadFirstChunk();
             this.renderIpTable();
             this.updatePaginationUI();
@@ -420,6 +428,7 @@ class FirewallClient {
 
     async loadKeys() {
         try {
+            this.state.selectedKeyIds.clear();
             this.state.apiKeys = await this.apiFetch('/keys');
             this.renderKeysTable();
             this.updateRightsSelector();
@@ -428,6 +437,7 @@ class FirewallClient {
 
     async loadGroups() {
         try {
+            this.state.selectedGroupIds.clear();
             this.state.groups = await this.apiFetch('/groups');
             this.renderGroupsTable();
             // manage-rights-group and the IP filter both operate on group NAME (the API's
@@ -497,6 +507,92 @@ class FirewallClient {
         }, 3000);
     }
 
+    // Custom dark-themed replacement for window.confirm(). Populates and shows #confirm-modal,
+    // then resolves true/false based on which button (or Escape/backdrop/Enter) the user picks.
+    // Every call re-binds its own listeners and tears them down on resolve, so concurrent calls
+    // never leak or stack duplicate handlers on the shared modal element.
+    showConfirmModal({ title = 'Are you sure?', message = '', confirmText = 'Confirm', cancelText = 'Cancel', danger = false } = {}) {
+        const modal = document.getElementById('confirm-modal');
+        const titleEl = document.getElementById('confirm-modal-title');
+        const messageEl = document.getElementById('confirm-modal-message');
+        const confirmBtn = document.getElementById('confirm-modal-confirm');
+        const cancelBtn = document.getElementById('confirm-modal-cancel');
+
+        titleEl.textContent = title;
+        messageEl.textContent = message;
+        confirmBtn.textContent = confirmText;
+        cancelBtn.textContent = cancelText;
+        confirmBtn.className = `btn ${danger ? 'btn-danger' : 'btn-primary'}`;
+
+        modal.classList.remove('hidden');
+
+        return new Promise((resolve) => {
+            const cleanup = (result) => {
+                modal.classList.add('hidden');
+                confirmBtn.removeEventListener('click', onConfirm);
+                cancelBtn.removeEventListener('click', onCancel);
+                modal.removeEventListener('click', onBackdropClick);
+                document.removeEventListener('keydown', onKeydown);
+                resolve(result);
+            };
+            const onConfirm = () => cleanup(true);
+            const onCancel = () => cleanup(false);
+            const onBackdropClick = (e) => { if (e.target === modal) cleanup(false); };
+            const onKeydown = (e) => {
+                if (e.key === 'Escape') cleanup(false);
+                if (e.key === 'Enter') cleanup(true);
+            };
+
+            confirmBtn.addEventListener('click', onConfirm);
+            cancelBtn.addEventListener('click', onCancel);
+            modal.addEventListener('click', onBackdropClick);
+            document.addEventListener('keydown', onKeydown);
+            confirmBtn.focus();
+        });
+    }
+
+    // Wires a table's "select all" header checkbox and its .row-select body checkboxes to a
+    // shared Set of selected row ids, keeping the header checkbox's checked/indeterminate state
+    // and the "Delete Selected" button's enabled state + label in sync. Called at the end of
+    // every render*Table() — row checkboxes are recreated each time (tbody.innerHTML replace),
+    // so they get fresh listeners each call; the header checkbox and delete button are static
+    // elements outside the tbody, so their handlers are (re)assigned via .onchange/.onclick
+    // rather than addEventListener to avoid stacking duplicate handlers across renders.
+    wireRowSelection({ tbodySelector, selectAllId, deleteBtnId, deleteBtnLabel, selectedSet, onDeleteSelected }) {
+        const selectAllEl = document.getElementById(selectAllId);
+        const deleteBtn = document.getElementById(deleteBtnId);
+        const rowCheckboxes = () => [...document.querySelectorAll(`${tbodySelector} .row-select`)];
+
+        const updateControls = () => {
+            const boxes = rowCheckboxes();
+            const checkedCount = boxes.filter(cb => cb.checked).length;
+            selectAllEl.checked = boxes.length > 0 && checkedCount === boxes.length;
+            selectAllEl.indeterminate = checkedCount > 0 && checkedCount < boxes.length;
+            deleteBtn.disabled = selectedSet.size === 0;
+            deleteBtn.textContent = selectedSet.size > 0 ? `${deleteBtnLabel} (${selectedSet.size})` : deleteBtnLabel;
+        };
+
+        rowCheckboxes().forEach(cb => {
+            cb.checked = selectedSet.has(cb.dataset.id);
+            cb.addEventListener('change', () => {
+                if (cb.checked) selectedSet.add(cb.dataset.id); else selectedSet.delete(cb.dataset.id);
+                updateControls();
+            });
+        });
+
+        selectAllEl.onchange = () => {
+            rowCheckboxes().forEach(cb => {
+                cb.checked = selectAllEl.checked;
+                if (cb.checked) selectedSet.add(cb.dataset.id); else selectedSet.delete(cb.dataset.id);
+            });
+            updateControls();
+        };
+
+        deleteBtn.onclick = () => onDeleteSelected();
+
+        updateControls();
+    }
+
     // Addresses in the given data set that belong to both a banlist AND a whitelist group at
     // once — a conflicting/ambiguous firewall state worth flagging. Scans the caller-supplied
     // array (the full cached chunk, up to 100 records) rather than just the visible 15-row page,
@@ -536,7 +632,12 @@ class FirewallClient {
             const msg = this.state.showConflictsOnly
                 ? 'No conflicting records in the current view.'
                 : 'No records found.';
-            tbody.innerHTML = `<tr><td colspan="6" class="text-center text-muted">${msg}</td></tr>`;
+            tbody.innerHTML = `<tr><td colspan="7" class="text-center text-muted">${msg}</td></tr>`;
+            this.wireRowSelection({
+                tbodySelector: '#ip-table-body', selectAllId: 'select-all-ips', deleteBtnId: 'delete-selected-ips',
+                deleteBtnLabel: 'Delete Selected', selectedSet: this.state.selectedIpIds,
+                onDeleteSelected: () => this.batchDeleteIps()
+            });
             return;
         }
 
@@ -548,6 +649,7 @@ class FirewallClient {
 
             return `
             <tr>
+                <td>${ip.is_locked ? '' : `<input type="checkbox" class="row-select" data-id="${ip.id}">`}</td>
                 <td class="font-mono">
                     ${escapeHtml(ip.target_address)}
                     ${ip.is_locked ? '<span title="Locked" class="badge">🔒 Locked</span>' : ''}
@@ -565,17 +667,29 @@ class FirewallClient {
             </tr>
         `;
         }).join('');
+
+        this.wireRowSelection({
+            tbodySelector: '#ip-table-body', selectAllId: 'select-all-ips', deleteBtnId: 'delete-selected-ips',
+            deleteBtnLabel: 'Delete Selected', selectedSet: this.state.selectedIpIds,
+            onDeleteSelected: () => this.batchDeleteIps()
+        });
     }
 
     renderKeysTable() {
         const tbody = document.getElementById('apikeys-table-body');
         if (this.state.apiKeys.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No API keys.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No API keys.</td></tr>';
+            this.wireRowSelection({
+                tbodySelector: '#apikeys-table-body', selectAllId: 'select-all-keys', deleteBtnId: 'delete-selected-keys',
+                deleteBtnLabel: 'Delete Selected', selectedSet: this.state.selectedKeyIds,
+                onDeleteSelected: () => this.batchDeleteKeys()
+            });
             return;
         }
 
         tbody.innerHTML = this.state.apiKeys.map(k => `
             <tr>
+                <td><input type="checkbox" class="row-select" data-id="${k.id}"></td>
                 <td><strong>${escapeHtml(k.name)}</strong></td>
                 <td class="font-mono">${escapeHtml(k.bound_ips || '-')}</td>
                 <td>${this.renderKeyScopes(k)}</td>
@@ -588,6 +702,12 @@ class FirewallClient {
                 </td>
             </tr>
         `).join('');
+
+        this.wireRowSelection({
+            tbodySelector: '#apikeys-table-body', selectAllId: 'select-all-keys', deleteBtnId: 'delete-selected-keys',
+            deleteBtnLabel: 'Delete Selected', selectedSet: this.state.selectedKeyIds,
+            onDeleteSelected: () => this.batchDeleteKeys()
+        });
     }
 
     // Renders global scope badges (Master / Manage Keys / Manage Webhooks / Create Groups)
@@ -629,7 +749,12 @@ class FirewallClient {
     renderGroupsTable() {
         const tbody = document.getElementById('groups-table-body');
         if (this.state.groups.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No groups.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No groups.</td></tr>';
+            this.wireRowSelection({
+                tbodySelector: '#groups-table-body', selectAllId: 'select-all-groups', deleteBtnId: 'delete-selected-groups',
+                deleteBtnLabel: 'Delete Selected', selectedSet: this.state.selectedGroupIds,
+                onDeleteSelected: () => this.batchDeleteGroups()
+            });
             return;
         }
 
@@ -639,6 +764,7 @@ class FirewallClient {
                 : '<span class="badge badge-ban">Banlist</span>';
             return `
             <tr>
+                <td><input type="checkbox" class="row-select" data-id="${g.id}"></td>
                 <td class="font-mono text-sm">${g.id.substring(0, 8)}...</td>
                 <td><strong>${escapeHtml(g.name)}</strong></td>
                 <td>${typeBadge}</td>
@@ -650,6 +776,12 @@ class FirewallClient {
             </tr>
         `;
         }).join('');
+
+        this.wireRowSelection({
+            tbodySelector: '#groups-table-body', selectAllId: 'select-all-groups', deleteBtnId: 'delete-selected-groups',
+            deleteBtnLabel: 'Delete Selected', selectedSet: this.state.selectedGroupIds,
+            onDeleteSelected: () => this.batchDeleteGroups()
+        });
     }
 
     renderWebhooksTable() {
@@ -741,13 +873,44 @@ class FirewallClient {
     }
 
     async deleteIp(targetAddress, groupName) {
-        if (!confirm("Are you sure you want to delete this rule?")) return;
+        const ok = await this.showConfirmModal({
+            title: 'Delete IP Record',
+            message: `Delete the rule for ${targetAddress} in group "${groupName}"?`,
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
         try {
             const params = new URLSearchParams({ target_address: targetAddress, group_name: groupName });
             await this.apiFetch(`/ips?${params.toString()}`, { method: 'DELETE' });
             this.showToast("Record deleted", 'success');
             this.loadInitialData();
         } catch(e) {}
+    }
+
+    async batchDeleteIps() {
+        const count = this.state.selectedIpIds.size;
+        if (count === 0) return;
+        const ok = await this.showConfirmModal({
+            title: 'Delete Selected IP Records',
+            message: `Delete ${count} selected IP record${count === 1 ? '' : 's'}? This cannot be undone.`,
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
+
+        const targets = this.ipCache.items.filter(ip => this.state.selectedIpIds.has(ip.id));
+        const results = await Promise.allSettled(targets.map(ip => {
+            const params = new URLSearchParams({ target_address: ip.target_address, group_name: ip.group_name });
+            return this.apiFetch(`/ips?${params.toString()}`, { method: 'DELETE' });
+        }));
+
+        const failed = results.filter(r => r.status === 'rejected').length;
+        this.showToast(
+            failed === 0 ? `${count} record${count === 1 ? '' : 's'} deleted` : `${count - failed} of ${count} deleted; ${failed} failed`,
+            failed === 0 ? 'success' : 'error'
+        );
+        this.loadInitialData();
     }
 
     async createApiKey(e) {
@@ -799,12 +962,41 @@ class FirewallClient {
     }
 
     async deleteKey(id) {
-        if (!confirm("Confirm deleting API Key?")) return;
+        const key = this.state.apiKeys.find(k => k.id === id);
+        const ok = await this.showConfirmModal({
+            title: 'Delete API Key',
+            message: `Delete the API key "${key ? key.name : id}"? This immediately revokes its access and cannot be undone.`,
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
         try {
             await this.apiFetch(`/keys/${id}`, { method: 'DELETE' });
             this.showToast("Key deleted", 'success');
             this.loadKeys();
         } catch(e) {}
+    }
+
+    async batchDeleteKeys() {
+        const count = this.state.selectedKeyIds.size;
+        if (count === 0) return;
+        const ok = await this.showConfirmModal({
+            title: 'Delete Selected API Keys',
+            message: `Delete ${count} selected API key${count === 1 ? '' : 's'}? This immediately revokes their access and cannot be undone.`,
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
+
+        const ids = [...this.state.selectedKeyIds];
+        const results = await Promise.allSettled(ids.map(id => this.apiFetch(`/keys/${id}`, { method: 'DELETE' })));
+
+        const failed = results.filter(r => r.status === 'rejected').length;
+        this.showToast(
+            failed === 0 ? `${count} key${count === 1 ? '' : 's'} deleted` : `${count - failed} of ${count} deleted; ${failed} failed`,
+            failed === 0 ? 'success' : 'error'
+        );
+        this.loadKeys();
     }
 
     openEditKeyModal(id) {
@@ -843,7 +1035,13 @@ class FirewallClient {
     }
 
     async regenerateKeySecret(id) {
-        if (!confirm("Regenerate this key's secret? The old secret will stop working immediately.")) return;
+        const ok = await this.showConfirmModal({
+            title: 'Regenerate Secret',
+            message: "Regenerate this key's secret? The old secret will stop working immediately.",
+            confirmText: 'Regenerate',
+            danger: true
+        });
+        if (!ok) return;
         try {
             const res = await this.apiFetch(`/keys/${id}/rotate`, { method: 'POST' });
             document.getElementById('secret-reveal-value').textContent = res.plaintext_key;
@@ -853,7 +1051,13 @@ class FirewallClient {
     }
 
     async revokeGroupPermission(keyId, groupIdentifier) {
-        if (!confirm("Revoke this key's permission on this group?")) return;
+        const ok = await this.showConfirmModal({
+            title: 'Revoke Permission',
+            message: "Revoke this key's permission on this group?",
+            confirmText: 'Revoke',
+            danger: true
+        });
+        if (!ok) return;
         try {
             await this.apiFetch(`/keys/${keyId}/permissions/${groupIdentifier}`, { method: 'DELETE' });
             this.showToast("Permission revoked", 'success');
@@ -874,12 +1078,42 @@ class FirewallClient {
     }
 
     async deleteGroup(id) {
-        if (!confirm("Delete entire group? This operation cascade wipes resources.")) return;
+        const group = this.state.groups.find(g => g.id === id);
+        const ok = await this.showConfirmModal({
+            title: 'Delete Group',
+            message: `Delete the group "${group ? group.name : id}"? This operation cascades and wipes all associated resources.`,
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
         try {
             await this.apiFetch(`/groups/${id}`, { method: 'DELETE' });
             this.loadGroups();
             this.loadIps();
         } catch(e) {}
+    }
+
+    async batchDeleteGroups() {
+        const count = this.state.selectedGroupIds.size;
+        if (count === 0) return;
+        const ok = await this.showConfirmModal({
+            title: 'Delete Selected Groups',
+            message: `Delete ${count} selected group${count === 1 ? '' : 's'}? This cascades and wipes all associated resources.`,
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
+
+        const ids = [...this.state.selectedGroupIds];
+        const results = await Promise.allSettled(ids.map(id => this.apiFetch(`/groups/${id}`, { method: 'DELETE' })));
+
+        const failed = results.filter(r => r.status === 'rejected').length;
+        this.showToast(
+            failed === 0 ? `${count} group${count === 1 ? '' : 's'} deleted` : `${count - failed} of ${count} deleted; ${failed} failed`,
+            failed === 0 ? 'success' : 'error'
+        );
+        this.loadGroups();
+        this.loadIps();
     }
 
     async createWebhook(e) {
@@ -922,7 +1156,14 @@ class FirewallClient {
     }
 
     async deleteWebhook(id) {
-        if (!confirm("Delete this webhook?")) return;
+        const webhook = this.state.webhooks.find(w => w.id === id);
+        const ok = await this.showConfirmModal({
+            title: 'Delete Webhook',
+            message: `Delete the webhook "${webhook ? webhook.name : id}"?`,
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
         try {
             await this.apiFetch(`/webhooks/${id}`, { method: 'DELETE' });
             this.loadWebhooks();

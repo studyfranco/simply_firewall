@@ -1661,3 +1661,114 @@ No changes were needed to `src/error.rs`, `src/middleware.rs`, `src/state.rs`, `
   was verified via the static structural checks above plus careful manual trace-through of every
   state transition, not a live rendered screenshot. Flagging this explicitly again since this was
   the largest pure-frontend logic change of any session so far.
+
+## 2026-07-27 (session 14) — Custom dark confirmation modal, row checkboxes, batch delete
+
+Frontend-only task, purely `static/index.html` + `static/app.js` + `static/style.css`: replace
+every native `window.confirm()` with a themed modal, add row-selection checkboxes + "Delete
+Selected" batch actions to the IP/Groups/Keys tables, and give bare (unwrapped) checkboxes a dark
+custom style to match the app. `test_simply_firewall.sh` does not exist anywhere in the repo
+(confirmed via `find`), so the "do not modify" instruction had nothing to protect — noted and
+respected regardless. No Rust files touched.
+
+### Custom confirmation modal (task 1)
+
+- `grep` confirmed exactly 6 `confirm()` call sites and **zero** `alert()` usages in `app.js`
+  before this session — `alert()` needed no cleanup.
+- New `#confirm-modal` in `index.html`, reusing the *existing* `.modal-overlay` / `.modal-card
+  card` pattern already established by `#edit-key-modal` / `#secret-reveal-modal`, rather than
+  inventing a parallel `.modal-backdrop` class as the task's own example naming suggested — the
+  task said "e.g." for a reason, and duplicating a component the app already has would be pure
+  churn. New `.modal-actions` CSS class (`display: flex; justify-content: space-between`) gives
+  Cancel (left) / Confirm (right) the "aligned on the left/right" layout the task asked for,
+  distinct from the existing `.form-actions` (which keeps buttons adjacent, used by the other
+  modals — left untouched).
+- `showConfirmModal({ title, message, confirmText, cancelText, danger })` (new method on
+  `FirewallClient`) shows the modal, populates it, and returns a `Promise<boolean>`. Resolves
+  `true` on Confirm-click or Enter, `false` on Cancel-click, Escape, or a backdrop click. Every
+  call attaches its own listeners and tears them down via `removeEventListener` on resolve, so
+  back-to-back calls (e.g. a normal delete right after a batch delete) never leak or stack
+  duplicate handlers on the shared `#confirm-modal` element.
+- All 6 call sites converted to `const ok = await this.showConfirmModal({...}); if (!ok) return;`
+  — `deleteIp`, `deleteKey`, `regenerateKeySecret`, `revokeGroupPermission`, `deleteGroup`,
+  `deleteWebhook`. Each message was upgraded from the original generic confirm() text to name the
+  specific record where the data was already in hand (e.g. `deleteKey`/`deleteGroup`/
+  `deleteWebhook` now look up the target's name from `this.state.*` and interpolate it into the
+  message) — the modal has room for it where a native `confirm()` didn't invite it.
+
+### Row checkboxes & batch delete (task 2)
+
+- Checkbox column added to the IP table, Groups table, and Keys table only — exactly the three
+  the task named. The Webhooks table and Audit Logs table were deliberately left unchanged.
+- Selection state: `this.state.selectedIpIds` / `selectedGroupIds` / `selectedKeyIds`, each a
+  `Set` of the row's own **real id** (`IpRecordResponse.id`, `group.id`, `key.id`) — not a
+  synthesized composite key. IP records are logically identified by (address, group) but an
+  IPv6 address like `2001:db8::1` already contains the substring `::`, so any delimiter-joined
+  composite key risks corrupting on split; using the record's own UUID and looking the full row
+  back up from `this.ipCache.items` by id at delete time sidesteps that entirely.
+- New `wireRowSelection({ tbodySelector, selectAllId, deleteBtnId, deleteBtnLabel, selectedSet,
+  onDeleteSelected })` helper, called at the end of every `render{Ip,Keys,Groups}Table()` (both
+  the empty-state branch and the populated branch, so the button/select-all always reflect
+  what's actually on screen). It syncs `.row-select` checkboxes ↔ the Set, drives the header
+  `select-all` checkbox's `checked`/`indeterminate` state, and updates the "Delete Selected"
+  button's `disabled` state + `(N)` count label. Row checkboxes get a fresh `addEventListener`
+  every render (safe — the whole `tbody` is replaced via `innerHTML =`, so old elements are
+  discarded, not reused); the `select-all` checkbox and delete button live in static markup
+  *outside* the tbody and persist across renders, so their handlers are (re)assigned via
+  `.onchange` / `.onclick` property assignment instead of `addEventListener`, which would
+  otherwise stack a new duplicate listener on every single re-render.
+- Locked IP rows (`ip.is_locked`) get no checkbox at all (same rule the per-row Delete button
+  already followed) — nothing to select where the single-item action was already disabled.
+- Selection persists across `PagedCache` page flips within the same loaded chunk (ids matching
+  the same rows naturally stay checked) but is explicitly `.clear()`-ed at the top of
+  `loadIps()`/`loadKeys()`/`loadGroups()` — i.e. on every *fresh* reload/search, since ids from a
+  discarded dataset are meaningless once the new one lands.
+- Three new batch methods (`batchDeleteIps`, `batchDeleteKeys`, `batchDeleteGroups`): show the
+  confirm modal once for the whole batch (not once per item), then loop the *existing* single-item
+  DELETE endpoints via `Promise.allSettled` (no new backend endpoint — the task's file list never
+  mentioned `src/api.rs`, and a partial-failure-tolerant client-side loop covers it, e.g. a master
+  key that happens to include itself in a batch key-delete still gets the existing backend
+  self-delete guard's rejection surfaced as "N of M deleted" rather than aborting the whole batch).
+  Toast reports full success or a partial-failure count; the table is reloaded afterward either
+  way, which also naturally clears the (now-stale) selection.
+
+### Universal checkbox theming (task 3)
+
+- New `input[type="checkbox"] { appearance: none; ... }` block in `style.css`, styled with the
+  existing `--bg-input`/`--border`/`--accent` tokens plus a `::after` pseudo-element checkmark —
+  works on bare checkboxes that aren't wrapped in a `<label>`, which the new row-select/select-all
+  checkboxes are (they sit alone in a `<td>`/`<th>`, unlike every pre-existing checkbox in the
+  app). Also styles `:indeterminate` (a dash, for the select-all header checkbox when some but not
+  all visible rows are checked) and `:focus-visible`.
+- Deliberately did **not** touch or replace the pre-existing `.checkbox-container` / `.checkmark`
+  system (the label+span wrapper used by all 13 prior checkboxes — permission grids, webhook
+  event toggles, edit-key-modal). `.checkbox-container input` has higher CSS specificity (one
+  class + one element vs. the new rule's one attribute selector) and already fully hides the
+  native input via `opacity: 0; width: 0; height: 0`, so it keeps winning there unchanged; the new
+  universal rule only actually applies where nothing more specific claims the element — exactly
+  the new bare table checkboxes. Confirmed by reasoning through CSS specificity rather than a live
+  render (headless Chromium still unavailable in this container).
+
+### Tests
+
+No Rust files changed this session — `cargo check`/`test`/`clippy` were run per the task's
+explicit instruction and confirmed unchanged/clean rather than skipped. `scripts/test_e2e.sh`
+required no new sections (nothing in this task is observable over the HTTP API — it's pure DOM
+markup/JS), so it was run twice purely as a regression check.
+
+### Final verification (session 14)
+
+- `cargo check --all-targets`: clean.
+- `cargo test --all-targets`: **36/36 pass** (unchanged from session 13 — no Rust files touched).
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `scripts/test_e2e.sh`: **181/181 checks pass**, twice in a row (unchanged count — confirms zero
+  regression from the frontend-only changes).
+- `static/index.html`: zero duplicate `id` attributes, `<div>`/`<table>`/`<thead>`/`<tbody>` tags
+  balanced (76/76, 5/5, 5/5, 5/5).
+- `static/app.js`: brace/paren/bracket counts balanced (352/352, 812/812, 19/19); `grep` confirms
+  zero remaining `confirm(`/`alert(` calls outside of the `showConfirmModal` doc comment itself.
+- No `node`/`deno`/other JS engine is available in this container to run a real syntax check
+  (`node --check`), so every edited function was additionally read back in full and traced by
+  hand for balanced braces/parens and correct control flow. Headless Chromium remains unable to
+  launch here (unchanged from every prior session) — verified via the static checks above plus
+  manual trace-through, not a live rendered screenshot.
