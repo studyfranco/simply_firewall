@@ -1943,3 +1943,54 @@ Mechanical in nature but touched 15 files — `AGENT.MD`, `Cargo.toml`, `Dockerf
 - Repo-wide `grep -rniI "simply_firewall|simply-firewall|SIMPLY_FIREWALL"` (excluding `target/` and
   `.git/`) confirmed zero remaining matches anywhere except the intentionally-preserved
   `AGENT_NOTES.MD` historical entries described above.
+
+---
+
+## 2026-07-29 (session 17) — Post-rename health check & full E2E verification
+
+Verification-only session. No source, test, script, or config file was modified — every check
+passed on the first run, so there was nothing to fix, and per the "no breaking changes" directive
+nothing was touched speculatively.
+
+### Results
+
+| Check | Command | Result |
+| --- | --- | --- |
+| Compilation | `cargo check --all-targets` | ✅ clean, 0 warnings |
+| Static analysis | `cargo clippy --all-targets -- -D warnings` | ✅ clean, 0 warnings |
+| Rust test suite | `cargo test --all-targets` | ✅ **36/36 passed**, 0 failed, 0 ignored (1.27s) |
+| End-to-end suite | `./scripts/test_e2e.sh` | ✅ **181/181 checks passed**, 0 failed |
+
+Test-count breakdown for `cargo test`: `src/lib.rs` unittests 0, `src/main.rs` unittests 0, and
+`tests/rbac_integration_tests.rs` 36 — i.e. the entire Rust suite lives in the integration test
+binary, matching session 16's count exactly (the rename was behaviour-neutral, as claimed).
+
+The E2E script builds the binary itself (`cargo build --quiet`), boots
+`target/debug/simply_ip_vault` with a deterministic `INITIAL_MASTER_KEY`, spins up a local Python
+webhook receiver, and drives the live HTTP API — so it doubles as the "build and run the server
+binary" verification, exercising the real boot path (migrations, master-key bootstrap, static file
+serving, webhook dispatch) rather than the in-memory test harness.
+
+### Root-level verification script: still does not exist
+
+Task 2 asked to run a root-level verification script *if present*. Confirmed via
+`find . -name "*.sh" -not -path "./target/*" -not -path "./.git/*"` that `scripts/test_e2e.sh` is
+the **only** shell script in the repository — there is no root-level `test_simply_ip_vault.sh`,
+`verify.sh`, or equivalent, and no non-`.sh` executable at the root either. This matches the
+identical finding recorded in sessions 5–16 (for both the old and new project names). Nothing was
+authored to fill the gap: inventing a second entry-point script that duplicates
+`scripts/test_e2e.sh` was not asked for and would create a maintenance fork of the E2E suite.
+
+### Artifact cleanup
+
+No cleanup action was necessary — the suites leave nothing behind by design, verified after the run:
+
+- `scripts/test_e2e.sh` allocates its SQLite DB, server log, and webhook receiver log inside a
+  `mktemp -d "${TMPDIR:-/tmp}/simply_ip_vault_e2e.XXXXXX"` work dir removed by an
+  `EXIT INT TERM` trap. Post-run `ls -d /tmp/simply_ip_vault_e2e.*` → none remaining.
+- Integration tests use `sqlite::memory:` per `AGENT.MD`, so they never touch the filesystem.
+- `find` for `*.db` / `*.db-journal` / `*.sqlite*` outside `target/` → zero matches. Note the stray
+  root-level `firewall.db` mentioned in session 16 is no longer present; it was a gitignored local
+  dev artifact, not something this session created or removed.
+- `git status --porcelain` → empty. The working tree is byte-identical to commit `71767a4`.
+- No orphaned server or webhook-receiver processes left listening on ports 3000 / the receiver port.
