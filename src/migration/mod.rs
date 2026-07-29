@@ -1,9 +1,9 @@
-//! Database migration registry for `simply_firewall`. Migrations run automatically on startup.
+//! Database migration registry for `simply_ip_vault`. Migrations run automatically on startup.
 pub use sea_orm_migration::prelude::*;
 
 mod m20230101_000001_initial_schema;
 
-/// The ordered set of all schema migrations for `simply_firewall`.
+/// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
 
 #[async_trait::async_trait]

@@ -8,7 +8,7 @@ use serde_json::json;
 use tower::ServiceExt;
 use uuid::Uuid;
 
-use simply_firewall::{create_app, migration, state::AppState};
+use simply_ip_vault::{create_app, migration, state::AppState};
 
 async fn setup_test_db() -> DatabaseConnection {
     let db = Database::connect("sqlite::memory:").await.unwrap();
@@ -34,10 +34,10 @@ async fn test_auth_and_cidr_rejection() {
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
 
-    simply_firewall::entities::api_key::ActiveModel {
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
         name: Set("Test Key".to_owned()),
@@ -79,7 +79,7 @@ async fn test_tenant_isolation_mn_rbac() {
 
     // Create a group
     let group_a_id = Uuid::new_v4();
-    simply_firewall::entities::ip_group::ActiveModel {
+    simply_ip_vault::entities::ip_group::ActiveModel {
         id: Set(group_a_id),
         name: Set("Group A".to_owned()),
         group_type: Set("banlist".to_owned()),
@@ -88,10 +88,10 @@ async fn test_tenant_isolation_mn_rbac() {
     }.insert(&db).await.unwrap();
 
     let key_id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
 
-    simply_firewall::entities::api_key::ActiveModel {
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
         name: Set("Tenant Key".to_owned()),
@@ -120,7 +120,7 @@ async fn test_tenant_isolation_mn_rbac() {
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 
     // Assign M:N Read/Write permissions
-    simply_firewall::entities::api_key_group_permission::ActiveModel {
+    simply_ip_vault::entities::api_key_group_permission::ActiveModel {
         id: Set(Uuid::new_v4()),
         api_key_id: Set(key_id),
         group_id: Set(group_a_id),
@@ -151,10 +151,10 @@ async fn test_auto_provisioning_on_group_creation() {
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
 
-    simply_firewall::entities::api_key::ActiveModel {
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
         name: Set("Creator Key".to_owned()),
@@ -181,7 +181,7 @@ async fn test_auto_provisioning_on_group_creation() {
     assert_eq!(res.status(), StatusCode::OK);
 
     // Verify it automatically gave us 'can_delete' in the M:N binding
-    let perms = simply_firewall::entities::api_key_group_permission::Entity::find()
+    let perms = simply_ip_vault::entities::api_key_group_permission::Entity::find()
         .all(&db).await.unwrap();
     
     assert_eq!(perms.len(), 1);
@@ -217,9 +217,9 @@ async fn test_explicit_group_creation_grants_full_permissions_to_creator() {
     let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let group_id = Uuid::parse_str(created["id"].as_str().unwrap()).unwrap();
 
-    let perm = simply_firewall::entities::api_key_group_permission::Entity::find()
-        .filter(simply_firewall::entities::api_key_group_permission::Column::ApiKeyId.eq(key_id))
-        .filter(simply_firewall::entities::api_key_group_permission::Column::GroupId.eq(group_id))
+    let perm = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(key_id))
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::GroupId.eq(group_id))
         .one(&db)
         .await
         .unwrap()
@@ -362,10 +362,10 @@ async fn test_explicit_key_group_manipulation() {
     let app = create_app(state);
 
     let master_id = Uuid::new_v4();
-    let master_plaintext = simply_firewall::api::generate_random_key();
-    let master_hash = simply_firewall::api::hash_key(&master_plaintext);
+    let master_plaintext = simply_ip_vault::api::generate_random_key();
+    let master_hash = simply_ip_vault::api::hash_key(&master_plaintext);
 
-    simply_firewall::entities::api_key::ActiveModel {
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(master_id),
         key_hash: Set(master_hash),
         name: Set("System Master".to_owned()),
@@ -383,9 +383,9 @@ async fn test_explicit_key_group_manipulation() {
     .unwrap();
 
     let target_id = Uuid::new_v4();
-    simply_firewall::entities::api_key::ActiveModel {
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(target_id),
-        key_hash: Set(simply_firewall::api::hash_key("dummy")),
+        key_hash: Set(simply_ip_vault::api::hash_key("dummy")),
         name: Set("Target Sub-Key".to_owned()),
         bound_ips: Set(Some("192.168.1.1/32".to_owned())),
         is_master: Set(false),
@@ -416,7 +416,7 @@ async fn test_explicit_key_group_manipulation() {
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let perms = simply_firewall::entities::api_key_group_permission::Entity::find()
+    let perms = simply_ip_vault::entities::api_key_group_permission::Entity::find()
         .all(&db)
         .await
         .unwrap();
@@ -437,9 +437,9 @@ async fn test_multi_group_and_temporal_filtering() {
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
-    simply_firewall::entities::api_key::ActiveModel {
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
         name: Set("Master".to_owned()),
@@ -469,7 +469,7 @@ async fn test_multi_group_and_temporal_filtering() {
 
     // A stale record inserted directly with an old `last_seen_at`, in "group-old".
     let old_group_id = Uuid::new_v4();
-    simply_firewall::entities::ip_group::ActiveModel {
+    simply_ip_vault::entities::ip_group::ActiveModel {
         id: Set(old_group_id),
         name: Set("group-old".to_owned()),
         group_type: Set("banlist".to_owned()),
@@ -482,7 +482,7 @@ async fn test_multi_group_and_temporal_filtering() {
 
     let old_record_id = Uuid::new_v4();
     let old_time = chrono::Utc::now().naive_utc() - chrono::Duration::hours(2);
-    simply_firewall::entities::ip_record::ActiveModel {
+    simply_ip_vault::entities::ip_record::ActiveModel {
         id: Set(old_record_id),
         target_address: Set("8.8.4.4".to_owned()),
         cause: Set(None),
@@ -495,7 +495,7 @@ async fn test_multi_group_and_temporal_filtering() {
     .await
     .unwrap();
 
-    simply_firewall::entities::ip_record_group_membership::ActiveModel {
+    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
         ip_record_id: Set(old_record_id),
         group_id: Set(old_group_id),
     }
@@ -597,16 +597,16 @@ async fn test_webhook_hmac_signature_and_delivery() {
     let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
     let db_for_worker = db.clone();
     let _worker_handle = tokio::spawn(async move {
-        simply_firewall::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+        simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
     let state = AppState { db: db.clone(), webhook_tx };
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
-    simply_firewall::entities::api_key::ActiveModel {
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
         name: Set("Webhook Tester".to_owned()),
@@ -624,7 +624,7 @@ async fn test_webhook_hmac_signature_and_delivery() {
     .unwrap();
 
     let group_id = Uuid::new_v4();
-    simply_firewall::entities::ip_group::ActiveModel {
+    simply_ip_vault::entities::ip_group::ActiveModel {
         id: Set(group_id),
         name: Set("hook-group".to_owned()),
         group_type: Set("banlist".to_owned()),
@@ -732,16 +732,16 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
     let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
     let db_for_worker = db.clone();
     let _worker_handle = tokio::spawn(async move {
-        simply_firewall::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+        simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
     let state = AppState { db: db.clone(), webhook_tx };
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
-    simply_firewall::entities::api_key::ActiveModel {
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
         name: Set("Event Filter Tester".to_owned()),
@@ -759,7 +759,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
     .unwrap();
 
     let group_id = Uuid::new_v4();
-    simply_firewall::entities::ip_group::ActiveModel {
+    simply_ip_vault::entities::ip_group::ActiveModel {
         id: Set(group_id),
         name: Set("event-filter-group".to_owned()),
         group_type: Set("banlist".to_owned()),
@@ -859,9 +859,9 @@ async fn test_reban_into_same_group_does_not_500() {
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
-    simply_firewall::entities::api_key::ActiveModel {
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
         name: Set("Master".to_owned()),
@@ -931,9 +931,9 @@ async fn test_create_webhook_rejects_invalid_url() {
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
-    simply_firewall::entities::api_key::ActiveModel {
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
         name: Set("Master".to_owned()),
@@ -951,7 +951,7 @@ async fn test_create_webhook_rejects_invalid_url() {
     .unwrap();
 
     let group_id = Uuid::new_v4();
-    simply_firewall::entities::ip_group::ActiveModel {
+    simply_ip_vault::entities::ip_group::ActiveModel {
         id: Set(group_id),
         name: Set("webhook-validation-group".to_owned()),
         group_type: Set("banlist".to_owned()),
@@ -1001,9 +1001,9 @@ async fn insert_key(
     can_create_groups: bool,
 ) -> (Uuid, String) {
     let id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
-    simply_firewall::entities::api_key::ActiveModel {
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(id),
         key_hash: Set(hash),
         name: Set(name.to_owned()),
@@ -1055,7 +1055,7 @@ async fn test_key_creation_lifecycle() {
 
     // Confirm the persisted flags actually match what was requested (not just the create
     // response echoing the input back).
-    let stored = simply_firewall::entities::api_key::Entity::find_by_id(Uuid::parse_str(new_key_id).unwrap())
+    let stored = simply_ip_vault::entities::api_key::Entity::find_by_id(Uuid::parse_str(new_key_id).unwrap())
         .one(&db)
         .await
         .unwrap()
@@ -1201,8 +1201,8 @@ async fn test_key_deletion_revokes_access_and_cascades_permissions() {
         .unwrap();
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let perms_before = simply_firewall::entities::api_key_group_permission::Entity::find()
-        .filter(simply_firewall::entities::api_key_group_permission::Column::ApiKeyId.eq(key_b_id))
+    let perms_before = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(key_b_id))
         .all(&db)
         .await
         .unwrap();
@@ -1233,8 +1233,8 @@ async fn test_key_deletion_revokes_access_and_cascades_permissions() {
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 
     // No orphaned api_key_group_permissions rows survive the deleted key.
-    let perms_after = simply_firewall::entities::api_key_group_permission::Entity::find()
-        .filter(simply_firewall::entities::api_key_group_permission::Column::ApiKeyId.eq(key_b_id))
+    let perms_after = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(key_b_id))
         .all(&db)
         .await
         .unwrap();
@@ -1247,9 +1247,9 @@ async fn test_key_deletion_revokes_access_and_cascades_permissions() {
 
 async fn insert_key_with_bound_ips(db: &DatabaseConnection, name: &str, bound_ips: &str) -> (Uuid, String) {
     let id = Uuid::new_v4();
-    let plaintext = simply_firewall::api::generate_random_key();
-    let hash = simply_firewall::api::hash_key(&plaintext);
-    simply_firewall::entities::api_key::ActiveModel {
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let hash = simply_ip_vault::api::hash_key(&plaintext);
+    simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(id),
         key_hash: Set(hash),
         name: Set(name.to_owned()),
@@ -1418,7 +1418,7 @@ async fn test_cidr_and_ipv6_boundary_validation() {
 /// than erroring: it's a normalization helper, not a validator.
 #[tokio::test]
 async fn test_normalize_ip_or_cidr_strips_single_host_prefixes_only() {
-    use simply_firewall::api::normalize_ip_or_cidr;
+    use simply_ip_vault::api::normalize_ip_or_cidr;
 
     assert_eq!(normalize_ip_or_cidr("188.190.74.128/32"), "188.190.74.128");
     assert_eq!(normalize_ip_or_cidr("188.190.74.128"), "188.190.74.128");
@@ -1546,7 +1546,7 @@ async fn test_webhook_dispatch_does_not_block_api_response() {
     let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
     let db_for_worker = db.clone();
     let _worker_handle = tokio::spawn(async move {
-        simply_firewall::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+        simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
     let state = AppState { db: db.clone(), webhook_tx };
@@ -1555,7 +1555,7 @@ async fn test_webhook_dispatch_does_not_block_api_response() {
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
     let group_id = Uuid::new_v4();
-    simply_firewall::entities::ip_group::ActiveModel {
+    simply_ip_vault::entities::ip_group::ActiveModel {
         id: Set(group_id),
         name: Set("slow-hook-group".to_owned()),
         group_type: Set("banlist".to_owned()),
@@ -1683,8 +1683,8 @@ async fn test_group_identification_by_id_and_name_are_interchangeable() {
         .unwrap();
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let group_id = simply_firewall::entities::ip_group::Entity::find()
-        .filter(simply_firewall::entities::ip_group::Column::Name.eq("interop-group"))
+    let group_id = simply_ip_vault::entities::ip_group::Entity::find()
+        .filter(simply_ip_vault::entities::ip_group::Column::Name.eq("interop-group"))
         .one(&db).await.unwrap().unwrap().id;
 
     // Grant Key_C rights on the group BY ID.
@@ -1877,8 +1877,8 @@ async fn test_revoke_group_permission_by_name_and_by_id() {
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
-    let group_id_2 = simply_firewall::entities::ip_group::Entity::find()
-        .filter(simply_firewall::entities::ip_group::Column::Name.eq("revoke-by-id-group"))
+    let group_id_2 = simply_ip_vault::entities::ip_group::Entity::find()
+        .filter(simply_ip_vault::entities::ip_group::Column::Name.eq("revoke-by-id-group"))
         .one(&db).await.unwrap().unwrap().id;
 
     // Revoke the first by name.
@@ -1998,8 +1998,8 @@ async fn test_create_duplicate_group_returns_conflict_not_500() {
     assert_eq!(res.status(), StatusCode::CONFLICT, "duplicate group name must be 409, not 500");
 
     // Only one row actually exists — the failed second attempt didn't leave anything behind.
-    let count = simply_firewall::entities::ip_group::Entity::find()
-        .filter(simply_firewall::entities::ip_group::Column::Name.eq("duplicate-group-test"))
+    let count = simply_ip_vault::entities::ip_group::Entity::find()
+        .filter(simply_ip_vault::entities::ip_group::Column::Name.eq("duplicate-group-test"))
         .all(&db)
         .await
         .unwrap()
@@ -2065,7 +2065,7 @@ async fn test_group_permission_assignment_accepts_uuid_or_name_in_group_id_field
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Both grants landed on the exact same group.
-    let perms = simply_firewall::entities::api_key_group_permission::Entity::find().all(&db).await.unwrap();
+    let perms = simply_ip_vault::entities::api_key_group_permission::Entity::find().all(&db).await.unwrap();
     let group_ids: std::collections::HashSet<String> = perms.iter().map(|p| p.group_id.to_string()).collect();
     assert_eq!(group_ids.len(), 1);
     assert_eq!(group_ids.into_iter().next().unwrap(), group_uuid);
@@ -2271,7 +2271,7 @@ async fn test_group_permission_assignment_via_group_name_alongside_uuid() {
         assert_eq!(items.len(), 1);
     }
 
-    let perms = simply_firewall::entities::api_key_group_permission::Entity::find().all(&db).await.unwrap();
+    let perms = simply_ip_vault::entities::api_key_group_permission::Entity::find().all(&db).await.unwrap();
     let group_ids: std::collections::HashSet<String> = perms.iter().map(|p| p.group_id.to_string()).collect();
     assert_eq!(group_ids.len(), 1, "the name-grant and the uuid-grant must reference the same group");
     assert_eq!(group_ids.into_iter().next().unwrap(), group_id);

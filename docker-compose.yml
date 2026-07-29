@@ -1,13 +1,13 @@
 version: '3.8'
 
 services:
-  simply-firewall:
+  simply-ip-vault:
     build: .
-    container_name: simply_firewall
+    container_name: simply_ip_vault
     ports:
       - "3000:3000"
     environment:
-      - DATABASE_URL=sqlite://data/firewall.db?mode=rwc
+      - DATABASE_URL=sqlite://data/simply_ip_vault.db?mode=rwc
       - RUST_LOG=info
     volumes:
       - ./data:/app/data

@@ -1,6 +1,6 @@
-# Simply Firewall - AI Agent Context & Directives
+# Simply IP Vault - AI Agent Context & Directives
 
-Hello AI Agent! You are assisting with the development of `simply_firewall`. Read and strictly adhere to these guidelines before inspecting or writing any code.
+Hello AI Agent! You are assisting with the development of `simply_ip_vault`. Read and strictly adhere to these guidelines before inspecting or writing any code.
 
 ---
 
@@ -15,7 +15,7 @@ To keep this context clean and modular, responsibilities are split across three 
 
 ## 🎯 Project Overview
 
-`simply_firewall` is an enterprise-grade, central Firewall and ACL management API written in Rust. It acts as the single source of truth for IP banning/whitelisting and dispatches signed, templated webhook events to downstream systems or other `simply_firewall` instances. It features an integrated Vanilla JS dashboard governed by a granular multi-tenant Role-Based Access Control (RBAC) system.
+`simply_ip_vault` is an enterprise-grade, central Firewall and ACL management API written in Rust. It acts as the single source of truth for IP banning/whitelisting and dispatches signed, templated webhook events to downstream systems or other `simply_ip_vault` instances. It features an integrated Vanilla JS dashboard governed by a granular multi-tenant Role-Based Access Control (RBAC) system.
 
 ---
 
@@ -64,7 +64,7 @@ To keep this context clean and modular, responsibilities are split across three 
 ### 4. Advanced & Secure Webhooks
 
 - **Group Scoping:** Webhooks are bound to specific `IpGroup`s. Actions on IPs in those groups dispatch asynchronous HTTP POST requests via Tokio tasks.
-- **Templating & Headers:** Custom JSON payload templates (e.g., `{"ip": "$target_address", "group": "$group_name"}`) and custom HTTP headers (e.g., `X-API-Key` for chaining `simply_firewall` instances).
+- **Templating & Headers:** Custom JSON payload templates (e.g., `{"ip": "$target_address", "group": "$group_name"}`) and custom HTTP headers (e.g., `X-API-Key` for chaining `simply_ip_vault` instances).
 - **HMAC Signatures:** All webhook dispatches MUST include a signature header: `X-Signature-256: sha256=<hex_hmac>` calculated using the webhook's secret token.
 - **SSRF Prevention:** Validate target URLs. Reject private/loopback IP ranges (RFC 1918, RFC 4193, loopback) unless `ALLOW_PRIVATE_WEBHOOKS=true` is set in environment.
 

@@ -38,16 +38,16 @@ RUN set -x \
 WORKDIR /app
 
 # Copy the binary and static files
-COPY --from=builder /app/target/release/simply_firewall /usr/local/bin/simply_firewall
+COPY --from=builder /app/target/release/simply_ip_vault /usr/local/bin/simply_ip_vault
 COPY static /app/static
 
 # Expose API/Frontend port
 EXPOSE 3000
 
 # Default environment configuration
-ENV DATABASE_URL=sqlite://data/firewall.db?mode=rwc
+ENV DATABASE_URL=sqlite://data/simply_ip_vault.db?mode=rwc
 ENV RUST_LOG=info
 ENV ALLOW_PRIVATE_WEBHOOKS=false
 
 # Define command
-CMD ["simply_firewall"]
+CMD ["simply_ip_vault"]

@@ -3,7 +3,7 @@ use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, D
 use sea_orm_migration::MigratorTrait;
 use tokio::net::TcpListener;
 use uuid::Uuid;
-use simply_firewall::{create_app, setup_state, api, migration, entities};
+use simply_ip_vault::{create_app, setup_state, api, migration, entities};
 
 /// Waits for a Ctrl+C or (on Unix) SIGTERM signal so `axum::serve` can shut down gracefully.
 ///
@@ -130,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "sqlite://firewall.db?mode=rwc".to_owned());
+        .unwrap_or_else(|_| "sqlite://simply_ip_vault.db?mode=rwc".to_owned());
 
     tracing::info!("Connecting to database...");
     let mut opt = ConnectOptions::new(db_url);
@@ -147,7 +147,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = create_app(state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    tracing::info!("Simply Firewall API listening on {}", addr);
+    tracing::info!("Simply IP Vault API listening on {}", addr);
 
     let listener = TcpListener::bind(addr).await?;
     axum::serve(

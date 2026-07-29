@@ -1,5 +1,5 @@
 #![warn(missing_docs)]
-//! Simply Firewall Library
+//! Simply IP Vault Library
 //! This module provides the core API router, state, and webhook logic.
 
 use axum::{

@@ -1,10 +1,10 @@
-# simply_firewall
+# simply_ip_vault
 
 Simply efficient. A homelab firewall.
 
-`simply_firewall` is a small, self-hosted API and dashboard for centrally managing IP ban/whitelist
+`simply_ip_vault` is a small, self-hosted API and dashboard for centrally managing IP ban/whitelist
 rules across your infrastructure. It's the single source of truth for "is this address allowed?",
-and can notify other systems (or other `simply_firewall` instances) of changes via signed,
+and can notify other systems (or other `simply_ip_vault` instances) of changes via signed,
 templated webhooks.
 
 - **Backend:** Rust, Axum, SeaORM (SQLite by default, zero config).
@@ -42,7 +42,7 @@ templated webhooks.
 cargo run
 ```
 
-On first boot, `simply_firewall`:
+On first boot, `simply_ip_vault`:
 
 1. Connects to the database (creating the SQLite file if needed) and runs all pending migrations
    automatically.
@@ -74,10 +74,10 @@ automatically if present):
 
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
-| `DATABASE_URL` | `sqlite://firewall.db?mode=rwc` | SeaORM connection string. |
+| `DATABASE_URL` | `sqlite://simply_ip_vault.db?mode=rwc` | SeaORM connection string. |
 | `BOOTSTRAP_SUBNET` | `0.0.0.0/0` | `bound_ips` assigned to the auto-generated master key. |
 | `ALLOW_PRIVATE_WEBHOOKS` | `false` | Set to `true` to allow webhook targets on private/loopback/link-local addresses (useful for local testing; leave `false` in production to keep SSRF protection active). |
-| `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter, e.g. `debug`, `simply_firewall=debug`. |
+| `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter, e.g. `debug`, `simply_ip_vault=debug`. |
 
 The listen address is currently fixed at `0.0.0.0:3000`.
 

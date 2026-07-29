@@ -1,4 +1,4 @@
-// Simply Firewall SPA Client
+// Simply IP Vault SPA Client
 // No external dependencies (Vanilla JS)
 
 // Reusable searchable dropdown ("combobox"): a text input plus a live-filtered option list.
@@ -196,7 +196,7 @@ class PagedCache {
 
 class FirewallClient {
     constructor() {
-        this.apiKey = localStorage.getItem('simply_firewall_key') || '';
+        this.apiKey = localStorage.getItem('simply_ip_vault_key') || '';
         this.apiBase = '/api';
         this.state = {
             profile: null,
@@ -311,7 +311,7 @@ class FirewallClient {
     // ───────────────────────────────────────────────────────
     handleAuthFailure() {
         this.apiKey = '';
-        localStorage.removeItem('simply_firewall_key');
+        localStorage.removeItem('simply_ip_vault_key');
         this.showLogin();
     }
 
@@ -328,7 +328,7 @@ class FirewallClient {
 
     async login(key) {
         this.apiKey = key;
-        localStorage.setItem('simply_firewall_key', key);
+        localStorage.setItem('simply_ip_vault_key', key);
         document.getElementById('login-error').classList.add('hidden');
         await this.verifyAuth();
     }

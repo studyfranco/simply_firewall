@@ -1,6 +1,6 @@
-# Simply Firewall - Database Schema & Entity Specifications
+# Simply IP Vault - Database Schema & Entity Specifications
 
-This document defines the complete database schema for `simply_firewall`. All entities are managed through **SeaORM** (2.0+) and must remain strictly **SQL-agnostic** (compatible with SQLite, PostgreSQL, and MySQL).
+This document defines the complete database schema for `simply_ip_vault`. All entities are managed through **SeaORM** (2.0+) and must remain strictly **SQL-agnostic** (compatible with SQLite, PostgreSQL, and MySQL).
 
 ---
 

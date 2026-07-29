@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# End-to-end test suite for simply_firewall.
+# End-to-end test suite for simply_ip_vault.
 #
 # Builds the project, boots a fresh instance against a throwaway SQLite database with a
 # deterministic bootstrap master key (via INITIAL_MASTER_KEY — no log-scraping), and drives the
@@ -40,7 +40,7 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
 # Deterministic bootstrap secret: passed to the server as INITIAL_MASTER_KEY so this script never
 # needs to scrape the master key back out of the (buffered, redirected) server log.
 MASTER_KEY="e2e_master_secret_key_for_testing_123456789"
-WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/simply_firewall_e2e.XXXXXX")"
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/simply_ip_vault_e2e.XXXXXX")"
 DB_PATH="$WORK_DIR/e2e.db"
 SERVER_LOG="$WORK_DIR/server.log"
 RESP_BODY_FILE="$WORK_DIR/resp_body"
@@ -234,7 +234,7 @@ log "Using INITIAL_MASTER_KEY for deterministic bootstrap (no log-scraping neede
 # targets a real public host, so this doesn't loosen anything they depend on.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
     ALLOW_PRIVATE_WEBHOOKS=true \
-    "$PROJECT_ROOT/target/debug/simply_firewall" >"$SERVER_LOG" 2>&1 &
+    "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
 log "Waiting for the server to become ready (pid $SERVER_PID)..."

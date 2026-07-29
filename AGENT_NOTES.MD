@@ -1,6 +1,7 @@
 # AGENT NOTES
 
-> This file is the living worklog for the `simply_firewall` implementation & audit sweep.
+> This file is the living worklog for the `simply_ip_vault` (formerly `simply_firewall`)
+> implementation & audit sweep.
 > The version of this file found at the start of this session claimed the project was "fully
 > up-to-date and completed... Ready to hand over to the user." A fresh line-by-line audit against
 > `AGENT.MD` and `SCHEMA.MD` showed that claim was **not accurate** — the project did not even
@@ -1846,3 +1847,99 @@ it was the app binary, not an unrelated process).
 - Headless Chromium remains unable to launch in this container; verified via the static checks
   above plus manual reasoning through the CSS cascade/specificity (particularly the
   `:disabled`-opacity interaction) rather than a live rendered screenshot at each breakpoint.
+
+## 2026-07-29 (session 16) — Project rename: simply_firewall → simply_ip_vault
+
+Repo-wide rename of the crate/package/binary and all first-party branding from `simply_firewall`
+to `simply_ip_vault`, per the new "centralized IP address vault & management service" framing.
+Mechanical in nature but touched 15 files — `AGENT.MD`, `Cargo.toml`, `Dockerfile`,
+`docker-compose.yml`, `README.md`, `SCHEMA.MD`, `scripts/test_e2e.sh`, `src/lib.rs`,
+`src/main.rs`, `src/migration/mod.rs`, `static/app.js`, `static/index.html`, `static/style.css`,
+`tests/rbac_integration_tests.rs`, plus this file.
+
+### What changed
+
+- **`Cargo.toml`**: `name = "simply_firewall"` → `"simply_ip_vault"`. No `[[bin]]` target exists,
+  so the produced binary is renamed automatically along with the package (confirmed via
+  `cargo check`: `target/debug/simply_ip_vault` now builds; the old `target/debug/simply_firewall`
+  is just an orphaned stale artifact left in the gitignored `target/` dir, harmless). `Cargo.lock`
+  is itself gitignored/untracked in this repo (`git check-ignore` confirmed) so it's never part of
+  a commit, but it picked up the new package name automatically on the next `cargo check` (likely
+  rust-analyzer's background check reacting to the `Cargo.toml` edit) — verified, not manually
+  touched.
+- **`src/`**: `lib.rs`'s crate doc comment, `main.rs`'s `use simply_firewall::{...}` import, the
+  hardcoded default `DATABASE_URL` fallback (`sqlite://firewall.db` → `sqlite://simply_ip_vault.db`
+  — the task's own example assumed the old default was named `simply_firewall.db`, but it was
+  actually just `firewall.db`; renamed to the new project name regardless, matching the task's
+  intent), the startup log banner (`"Simply Firewall API listening on {}"` →
+  `"Simply IP Vault API listening on {}"`), and `migration/mod.rs`'s two doc comments.
+- **`tests/rbac_integration_tests.rs`**: 67 occurrences of the `simply_firewall::` crate path
+  prefix, mechanically replaced with `simply_ip_vault::` via a single `replace_all` edit (every
+  occurrence is an identical literal substring, so no per-call-site review was needed — verified
+  count matches exactly before/after and `cargo test` confirms all 36 tests still compile and pass
+  unchanged).
+- **`static/`**: `<title>`, meta description, and both `<h1>` branding occurrences in
+  `index.html`; the `style.css` and `app.js` header comments; and — a functional change, not just
+  branding — the `localStorage` key `app.js` uses to persist the logged-in API key,
+  `simply_firewall_key` → `simply_ip_vault_key` (all 3 call sites: `getItem`/`removeItem`/
+  `setItem`, kept consistent via `replace_all`). No dual-read backward-compat fallback for the old
+  key name was added — `AGENT.MD` has no such requirement for client-side storage (only the task's
+  own conditional env-var clause mentioned backward compat, and that clause turned out to be
+  inapplicable — see below), and this is pre-production tooling with no real deployed users to
+  preserve sessions for; anyone with an existing `simply_firewall_key` entry just needs to log in
+  again once, which is a one-time, low-cost effect of the rename.
+- **`Dockerfile`** / **`docker-compose.yml`**: binary path, `CMD`, default `DATABASE_URL` DB
+  filename, Compose service name (`simply-firewall` → `simply-ip-vault`) and `container_name`.
+- **`scripts/test_e2e.sh`**: header comment, the `mktemp` work-dir prefix
+  (`simply_firewall_e2e.XXXXXX` → `simply_ip_vault_e2e.XXXXXX`), and the built-binary path the
+  script execs (`target/debug/simply_firewall` → `target/debug/simply_ip_vault`) — this last one
+  is load-bearing, not cosmetic: without it the script would `cargo build` a binary that no longer
+  exists under the old path and fail at the "Boot" stage.
+- **`README.md`, `AGENT.MD`, `SCHEMA.MD`**: title headings and every literal `simply_firewall`
+  identifier/code-span reference, including the `RUST_LOG` example value
+  (`simply_firewall=debug` → `simply_ip_vault=debug`) and the `DATABASE_URL` default shown in the
+  config table. Left untouched: generic prose that merely uses the English word "firewall" as a
+  concept rather than the project's identifier (e.g. AGENT.MD's "central Firewall and ACL
+  management API", README's "Simply efficient. A homelab firewall." tagline) — the task asked for
+  an identifier rename, not a rewrite of the product's conceptual description, and those phrases
+  contain no literal `simply_firewall` string to begin with.
+- **`AGENT_NOTES.MD`**: only the file's living intro line (now "the `simply_ip_vault` (formerly
+  `simply_firewall`)..."). Deliberately did **not** rewrite the 7 other occurrences that live
+  inside already-dated, historical session entries (e.g. session 5's "Checking simply_firewall
+  v0.1.0" cargo output, mentions of a stale `simply_firewall` process holding a port, past
+  sessions' confirmations that `test_simply_firewall.sh` didn't exist at the time) — those are
+  accurate historical record of what was literally true *at the time each entry was written*,
+  analogous to not rewriting old git commit messages after a rename. Rewriting them would misrepresent
+  what those past sessions actually observed.
+
+### Not applicable
+
+- Task 2 asked to "align default environment variables if applicable (e.g. `SIMPLY_IP_VAULT_LOG`,
+  `SIMPLY_IP_VAULT_PORT`, etc.)". Checked every `std::env::var(...)` call site in `src/`
+  (`DATABASE_URL`, `RUST_LOG`, `INITIAL_MASTER_KEY`, `BOOTSTRAP_SUBNET`,
+  `ALLOW_PRIVATE_WEBHOOKS`) — none was ever prefixed with `SIMPLY_FIREWALL_` in the first place, so
+  there was nothing to rename here, and the listen port isn't configurable via env var at all (it's
+  hardcoded to `0.0.0.0:3000`, per `AGENT.MD` — unchanged, out of scope for a rename). No new env
+  vars were invented to satisfy the task's own example names, since doing so would be unrequested
+  scope creep beyond "if applicable."
+- `test_simply_ip_vault.sh` (task 5 asks to run it): confirmed via `find` that neither this file
+  nor its pre-rename equivalent `test_simply_firewall.sh` exists anywhere in the repo — consistent
+  with every prior session's identical finding for the old name. Nothing was created to satisfy
+  this, since task 3's explicit file list only calls for updating `scripts/test_e2e.sh`, not
+  authoring a new/duplicate test script.
+- The stray root-level `firewall.db` local SQLite file (gitignored, untracked, pre-existing dev
+  artifact) was left alone — renaming or deleting a local file outside the explicit task list and
+  outside version control isn't something this rename asked for.
+
+### Final verification (session 16)
+
+- `cargo check --all-targets`: clean, package reported as `simply_ip_vault v0.1.0`.
+- `cargo test --all-targets`: **36/36 pass** (unchanged test count — purely a rename, no behavior
+  changed), binary/doctest sections now report under `simply_ip_vault` instead of `simply_firewall`.
+- `cargo clippy --all-targets -- -D warnings`: clean.
+- `scripts/test_e2e.sh`: **181/181 checks pass**, twice in a row, confirming the renamed binary
+  path/work-dir prefix didn't break the build-and-boot sequence and there's zero behavioral
+  regression from the rename.
+- Repo-wide `grep -rniI "simply_firewall|simply-firewall|SIMPLY_FIREWALL"` (excluding `target/` and
+  `.git/`) confirmed zero remaining matches anywhere except the intentionally-preserved
+  `AGENT_NOTES.MD` historical entries described above.
