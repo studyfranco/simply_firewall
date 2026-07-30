@@ -2402,3 +2402,126 @@ that delivery occurred.
 
 The E2E mock receiver now also records `X-API-Key`. New §23 exercises the executor-shaped case end to
 end: post to `/proxied/path`, sign `/api/hooks/42/execute`, verify both.
+
+## 2026-07-30 (session 21) — Adversarial security review: SSRF bypasses fixed, regression suite added
+
+### Scope
+
+An attack-oriented review of `crypto.rs` and `webhooks.rs` — timing attacks, SSRF, template
+injection — followed by a dedicated regression suite (`tests/security_tests.rs`) that replays each
+attack and asserts it fails. No functional behaviour changed except the SSRF fixes below.
+
+### Timing attacks — no finding
+
+`crypto::verify_signature` is the only place a signature is compared, and it uses
+`Mac::verify_slice`, which is constant-time. Grepping the whole of `src/` for `==`, `!=`, `.eq(` and
+`.contains(` against any signature/HMAC-derived value returns nothing. There is no second comparison
+path to miss: the webhook dispatcher only ever *produces* signatures, never verifies them.
+
+Worth stating explicitly because it is easy to reintroduce: `verify_slice` takes the **expected tag
+bytes**, so the `hex::decode` of the caller's input happens first and a non-hex signature is rejected
+before the MAC is consulted. That early return is not a timing leak — it reveals only the encoding of
+the input the caller already knows, not any part of the true digest.
+
+### Template injection — no finding
+
+`resolve_hmac_template`'s single-pass design (session 20) holds up under the specific attack it was
+built for. The reasoning, restated as the property the tests now pin:
+
+Substituted values are appended to `out` and `rest` advances *past* the placeholder, so no byte of a
+substituted value is ever re-examined by the loop. `out` is never read back. Therefore for any body
+`B`, the resolved string under the default template is exactly `POST\n<path>\n<ts>\n` ++ `B` — `B`
+contributes no bytes to the first three fields regardless of its content. A receiver that splits into
+**exactly four** fields (`splitn(4, '\n')`) recovers the true method, path and timestamp for every
+`B`. The injected `\n` and `{path}` land wholly inside field four.
+
+The one caveat, which is a *receiver-side* contract rather than a defect here: a receiver that splits
+unbounded (`split('\n')`) and then indexes, or that validates a field count, will misparse a body
+containing newlines. That is why the four-field split is the documented contract.
+
+### SSRF — two real bypasses found and fixed, one documented as future work
+
+The existing `is_url_safe` check was sound in intent but had gaps that fully defeated it:
+
+**1. Redirects were followed without re-screening (fixed).** `Client::builder()` never set a redirect
+policy, so `reqwest`'s default of following up to 10 hops applied. `is_url_safe` screens only the
+*configured* `target_url`. A webhook pointed at an attacker-controlled public host that answers
+`302 Location: http://169.254.169.254/latest/meta-data/` would therefore have the SSRF filter pass on
+the public host and then follow the redirect to the metadata service — delivering the signed payload
+and `X-API-Key` there. This is the whole control bypassed with a single response header. Now
+`.redirect(Policy::none())`; a 3xx from a receiver surfaces as a failed delivery instead of being
+followed silently.
+
+**2. IPv4-mapped IPv6 was not normalized (fixed).** `Ipv6Addr::is_loopback()` is `false` for
+`::ffff:127.0.0.1`, and the v4 rules were never applied to the mapped form, so
+`http://[::ffff:127.0.0.1]/` walked straight through. `middleware.rs` already normalized inbound
+addresses this way (`normalize_ip`) — the two directions were inconsistent, which is what made this
+easy to miss. The blocklist is now a pure function, `is_blocked_address(IpAddr)`, that unwraps mapped
+addresses first, and is unit-tested against address literals with no DNS involved.
+
+Also tightened while in there: only the *first* resolved address was checked, so a hostname with two
+A records (one public, one `127.0.0.1`) could pass the gate on one record while the HTTP client
+independently picked the other — now every resolved address is screened and an empty resolution fails
+closed. Added the ranges the original check missed: 100.64.0.0/10 (CGNAT, common for internal service
+meshes), 0.0.0.0/8, 192.0.0.0/24, 198.18.0.0/15, broadcast and documentation ranges. Non-http(s)
+schemes are now rejected in `is_url_safe` rather than left to the HTTP client.
+
+**3. DNS rebinding remains open — deliberate, needs a connector (NOT fixed).** This is still a
+check-then-connect design: `is_url_safe` resolves the host, and `reqwest` resolves it again
+independently when it connects. A DNS server answering differently between those two lookups (short
+TTL, round-robin) defeats the check no matter how good the blocklist is. Closing it properly means
+resolving **once** and pinning the resulting socket address for the connection — i.e. a custom
+`reqwest` connector, or `resolve()` on the client builder with a per-request override. That is a
+larger change than this session's scope and is left as explicit future work.
+
+Until then the mitigations are: `ALLOW_PRIVATE_WEBHOOKS` defaults to `false`, redirects are refused,
+and webhook creation requires `can_manage_webhooks` — so the attacker must already be a privileged
+operator. **This is a real residual risk, not a theoretical one**, and should be the next thing done
+to `webhooks.rs`.
+
+### `tests/security_tests.rs`
+
+A separate binary from `rbac_integration_tests.rs`, with its own duplicated fixture setup. The
+duplication is intentional: a refactor of the functional harness must not be able to silently weaken
+the security assertions. Every test is named for the attack it replays, so a failure reads as "this
+vulnerability is open" rather than "a test broke".
+
+Two patterns worth keeping when extending it:
+
+- **Every attack probe carries an otherwise-valid request.** The timestamp tests send a
+  *cryptographically correct* signature over the stale timestamp, so only the freshness check can
+  reject them — a test that sent a bad signature would pass even with the anti-replay check deleted.
+  Each attack block also asserts a positive control first, so a broken fixture returning a blanket
+  401 fails loudly instead of passing everything.
+- **The signature forgery test keeps the mutated signature valid hex.** Mangling it into non-hex
+  would have it thrown out by `hex::decode` before `verify_slice` is ever reached, and the test would
+  pass without exercising the constant-time comparison at all. `flip_last_hex_digit` swaps `0`↔`1` for
+  exactly this reason. The suite also covers truncated and over-long signatures sharing a valid
+  prefix, which is what a length-agnostic or prefix-only comparison would accept.
+
+The injection test drives the *real* attacker path rather than calling the resolver directly:
+`cause` → `POST /api/ban` body → `$cause` substitution → dispatched payload → `{body}` field of the
+signed string. It asserts the injection reached the payload verbatim (otherwise the test proves
+nothing), that the signature covers the true path and timestamp, and — negatively — that the injected
+`POST /api/fake @123456` does *not* verify against the delivered signature.
+
+### Tests
+
+| Suite | Before | After |
+| :--- | :--- | :--- |
+| `cargo test` | 67 | 77 (15 unit + 54 RBAC + 8 security) |
+| `scripts/test_e2e.sh` | 261 | 271 |
+
+The 2 new unit tests are the SSRF blocklist and URL screening in `webhooks.rs`. The 10 new E2E checks
+cover omitting `X-Timestamp` in `CANONICAL_V1` mode (on both a signed POST-with-body and a signed
+GET, so the rejection cannot be attributed to body handling), an empty `X-Timestamp`, first/last
+character signature flips, truncated and over-long signatures, and the empty/lowercase/aliased
+`secret_token` preconditions on webhook creation.
+
+### Observation not acted on
+
+`secret_token` is checked with `.is_empty()` while `api_key` is `.trim()`-ed first, so a
+whitespace-only `secret_token` is accepted for `CANONICAL_V1`. It is a weak operator-chosen secret
+rather than an attacker-reachable flaw — and trimming would silently change the signing key of any
+existing webhook whose secret legitimately has surrounding whitespace. Left as-is; noted so the
+inconsistency is a decision rather than an oversight.

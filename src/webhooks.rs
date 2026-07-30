@@ -16,46 +16,95 @@ use sha2::Sha256;
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INFLIGHT: usize = 64;
 
+/// Whether a single resolved address is one this instance must never be induced to talk to.
+///
+/// Deliberately a pure function over an already-resolved [`IpAddr`], so it is unit-testable without
+/// any DNS: every interesting case (metadata service, loopback, RFC 1918, IPv4-mapped IPv6) is just
+/// an address literal.
+///
+/// The IPv4-mapped IPv6 normalization is load-bearing. `::ffff:127.0.0.1` is a perfectly ordinary
+/// way to write the loopback address, and `Ipv6Addr::is_loopback` is `false` for it — checking the
+/// v6 form alone would let `http://[::ffff:127.0.0.1]/` walk straight through. `crate::middleware`
+/// already normalizes inbound addresses the same way; this keeps the two directions consistent.
+fn is_blocked_address(ip: IpAddr) -> bool {
+    // Unwrap `::ffff:a.b.c.d` to `a.b.c.d` so the IPv4 rules below actually apply to it.
+    let ip = match ip {
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        v4 => v4,
+    };
+
+    match ip {
+        IpAddr::V4(v4) => {
+            // `is_link_local()` is what blocks 169.254.0.0/16, and therefore the cloud metadata
+            // endpoints (169.254.169.254 on AWS/GCP/Azure) that are the highest-value SSRF target
+            // on any hosted deployment.
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                // 100.64.0.0/10 — CGNAT space, routinely used for internal service meshes.
+                || (v4.octets()[0] == 100 && (64..128).contains(&v4.octets()[1]))
+                // 0.0.0.0/8 — "this network"; on Linux 0.x.y.z reaches the local host.
+                || v4.octets()[0] == 0
+                // 192.0.0.0/24 (IETF protocol assignments) and 198.18.0.0/15 (benchmarking).
+                || v4.octets()[..3] == [192, 0, 0]
+                || (v4.octets()[0] == 198 && (v4.octets()[1] & 0xfe) == 18)
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                // fc00::/7 unique-local and fe80::/10 link-local.
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+        }
+    }
+}
+
+/// Screens a webhook target URL against the SSRF blocklist before any connection is attempted.
+///
+/// **Every** address the host resolves to is checked, not just the first. A hostname with two A
+/// records — one public, one `127.0.0.1` — would otherwise pass this gate on the public record while
+/// the HTTP client independently re-resolves and picks the loopback one.
+///
+/// This remains a check-then-connect design, so it cannot stop a DNS rebinding attack where the
+/// second resolution (the client's own) returns a different answer than the one screened here.
+/// Closing that requires resolving once and pinning the socket address, i.e. a custom `reqwest`
+/// connector — see the SSRF entry in `AGENT_NOTES.MD`.
 async fn is_url_safe(url_str: &str, allow_private: bool) -> bool {
     if allow_private { return true; }
-    
+
     let url = match reqwest::Url::parse(url_str) {
         Ok(u) => u,
         Err(_) => return false,
     };
-    
+
+    // Only http/https can be dispatched at all; anything else fails closed rather than relying on
+    // the HTTP client to reject it later.
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return false;
+    }
+
     let host_str = match url.host_str() {
         Some(h) => h,
         None => return false,
     };
-    
+
     let port = url.port_or_known_default().unwrap_or(80);
-    
-    let addrs = match tokio::net::lookup_host((host_str, port)).await {
-        Ok(mut addrs) => {
-            if let Some(addr) = addrs.next() {
-                addr.ip()
-            } else {
-                return false;
-            }
-        },
+
+    let addrs: Vec<IpAddr> = match tokio::net::lookup_host((host_str, port)).await {
+        Ok(addrs) => addrs.map(|a| a.ip()).collect(),
         Err(_) => return false,
     };
-    
-    match addrs {
-        IpAddr::V4(v4) => {
-            if v4.is_private() || v4.is_loopback() || v4.is_link_local() || v4.is_unspecified() {
-                return false;
-            }
-        }
-        IpAddr::V6(v6) => {
-            if v6.is_loopback() || v6.is_unspecified() || (v6.segments()[0] & 0xfe00) == 0xfc00 || (v6.segments()[0] & 0xffc0) == 0xfe80 {
-                return false;
-            }
-        }
+
+    // A name that resolves to nothing is not dispatchable; fail closed rather than "no bad
+    // addresses found, therefore safe".
+    if addrs.is_empty() {
+        return false;
     }
-    
-    true
+
+    !addrs.into_iter().any(is_blocked_address)
 }
 
 /// Expands a `CANONICAL_V1` webhook's `hmac_template` into the exact bytes to be signed.
@@ -148,6 +197,13 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
     let client = match Client::builder()
         .timeout(WEBHOOK_TIMEOUT)
         .user_agent("SimplyFirewall/2.0")
+        // Redirects are refused, not followed. `is_url_safe` screens the *configured* target, and
+        // `reqwest`'s default policy would follow up to 10 hops afterwards without re-screening any
+        // of them — so a webhook pointed at an attacker-controlled public URL that answers `302
+        // Location: http://169.254.169.254/latest/meta-data/` would bypass the SSRF filter outright,
+        // and the signed payload plus `X-API-Key` would be delivered to the redirect target.
+        // A receiver that answers 3xx is now surfaced as a failed delivery instead.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
     {
         Ok(c) => c,
@@ -384,6 +440,63 @@ mod tests {
         let a = resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ban", "1700", "x");
         let b = resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ba", "n1700", "x");
         assert_ne!(a, b, "the \\n delimiter must keep adjacent fields unambiguous");
+    }
+
+    /// The SSRF blocklist, exercised as a pure function over resolved addresses.
+    ///
+    /// The cloud metadata endpoint is called out explicitly rather than left implicit in
+    /// "link-local": it is the single highest-value SSRF target on a hosted deployment, and a
+    /// refactor that dropped `is_link_local()` would otherwise silently reopen it.
+    #[test]
+    fn blocked_addresses_cover_metadata_loopback_and_rfc1918() {
+        for blocked in [
+            "169.254.169.254", // AWS/GCP/Azure instance metadata
+            "169.254.0.1",
+            "127.0.0.1",
+            "127.1.2.3",
+            "10.0.0.5",
+            "172.16.4.4",
+            "172.31.255.255",
+            "192.168.1.1",
+            "0.0.0.0",
+            "0.0.0.1",
+            "100.64.0.1",   // CGNAT
+            "100.127.0.1",  // CGNAT upper bound
+            "192.0.0.1",    // IETF protocol assignments
+            "198.18.0.1",   // benchmarking range
+            "255.255.255.255",
+            "::1",
+            "::",
+            "fd00::1",           // unique-local
+            "fe80::1",           // link-local
+            "::ffff:127.0.0.1",  // IPv4-mapped loopback — false for Ipv6Addr::is_loopback
+            "::ffff:169.254.169.254",
+            "::ffff:10.0.0.1",
+        ] {
+            let ip: IpAddr = blocked.parse().expect("test address literal parses");
+            assert!(is_blocked_address(ip), "{blocked} must be blocked as an SSRF target");
+        }
+
+        // Ordinary public addresses must still be dispatchable, or the feature is useless.
+        for allowed in ["1.1.1.1", "8.8.8.8", "93.184.216.34", "172.32.0.1", "100.63.255.255", "2606:4700::1111"] {
+            let ip: IpAddr = allowed.parse().expect("test address literal parses");
+            assert!(!is_blocked_address(ip), "{allowed} is public and must be allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn url_screening_rejects_literals_and_non_http_schemes() {
+        // Address literals need no DNS, so these assertions are hermetic.
+        assert!(!is_url_safe("http://127.0.0.1:8080/hook", false).await);
+        assert!(!is_url_safe("http://169.254.169.254/latest/meta-data/", false).await);
+        assert!(!is_url_safe("http://[::ffff:127.0.0.1]/hook", false).await);
+        assert!(!is_url_safe("http://10.0.0.1/hook", false).await);
+        assert!(!is_url_safe("file:///etc/passwd", false).await);
+        assert!(!is_url_safe("gopher://127.0.0.1:70/", false).await);
+        assert!(!is_url_safe("not a url", false).await);
+
+        // The documented development escape hatch still bypasses the whole check.
+        assert!(is_url_safe("http://127.0.0.1:8080/hook", true).await);
     }
 
     #[test]

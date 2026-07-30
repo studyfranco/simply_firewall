@@ -415,6 +415,52 @@ raw_call POST "/api/white" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $BIND_TS
     -H "X-Signature-256: $BIND_SIG" -H "Content-Type: application/json" -d "$BIND_BODY"
 check "401" "a /api/ban signature replayed onto /api/white is rejected"
 
+# ── CANONICAL_V1 adversarial probes ─────────────────────────────────────────
+# Each of these carries an otherwise *perfect* request — correct key, correct signature over the
+# exact bytes sent — and changes one thing. A 200 here means the corresponding control is not
+# actually being enforced. Mirrors tests/security_tests.rs at the HTTP boundary.
+
+# X-Timestamp must be mandatory, not merely validated when present. If a missing header skipped the
+# freshness check, every captured signature would stay replayable forever, since the signature
+# itself encodes no notion of time.
+STRIP_TS=$(date -u +%s)
+STRIP_BODY='{"target_address":"198.51.100.91","group_name":"Group-Sig","cause":"no-timestamp"}'
+STRIP_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/ban" "$STRIP_TS" "$STRIP_BODY")
+raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" \
+    -H "X-Signature-256: $STRIP_SIG" -H "Content-Type: application/json" -d "$STRIP_BODY"
+check "401" "CANONICAL_V1: omitting X-Timestamp on an otherwise valid signed request is rejected"
+
+# The same, on a GET with no body, so the rejection cannot be attributed to body handling.
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Signature-256: $VALID_SIG"
+check "401" "CANONICAL_V1: omitting X-Timestamp on a signed GET is rejected"
+
+# An empty X-Timestamp must not be treated as absent-and-therefore-skipped, nor parsed as 0.
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp;" -H "X-Signature-256: $VALID_SIG"
+check "401" "CANONICAL_V1: an empty X-Timestamp is rejected"
+
+# Signature forgery: flip only the final hex digit, keeping 64 valid hex characters so the request
+# reaches the constant-time MAC comparison instead of failing early in hex decoding.
+FORGED_SIG="${VALID_SIG%?}"
+case "${VALID_SIG: -1}" in
+    0) FORGED_SIG="${FORGED_SIG}1" ;;
+    *) FORGED_SIG="${FORGED_SIG}0" ;;
+esac
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: $FORGED_SIG"
+check "401" "a signature differing only in its last character is rejected"
+
+# ...and the first character, so no position of the digest goes uncompared.
+FIRST_FLIPPED="0${VALID_SIG:1}"
+[ "${VALID_SIG:0:1}" == "0" ] && FIRST_FLIPPED="1${VALID_SIG:1}"
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: $FIRST_FLIPPED"
+check "401" "a signature differing only in its first character is rejected"
+
+# A truncated signature sharing a valid prefix must not pass a length-agnostic comparison.
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: ${VALID_SIG:0:32}"
+check "401" "a truncated signature with a valid prefix is rejected"
+
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: ${VALID_SIG}00"
+check "401" "an over-long signature with a valid prefix is rejected"
+
 # The signing secret must never come back from a read endpoint.
 api_call GET "/api/keys" "$MASTER_KEY"
 check "200" "list keys"
@@ -1189,6 +1235,22 @@ check "400" "an unknown auth_mode is rejected"
 api_call POST "/api/webhooks" "$MASTER_KEY" \
     "{\"name\":\"no-secret\",\"target_url\":\"https://example.com/h\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\"}"
 check "400" "a signing auth_mode without a secret_token is rejected"
+
+# The explicitly-blank variant, which is what an untouched HTML form field actually posts — it must
+# not slip past a check that only looks for an absent field.
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"empty-secret\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\"}"
+check "400" "CANONICAL_V1 with an empty secret_token is rejected"
+
+# Case-insensitive mode parsing must not become a route around the precondition.
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"lowercase-mode\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"canonical_v1\"}"
+check "400" "a lowercase canonical_v1 with an empty secret_token is rejected"
+
+# ...nor may the deprecated alias reach a different validation path.
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"alias-mode\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"signature_mode\":\"CANONICAL_V1\"}"
+check "400" "the deprecated signature_mode alias enforces the same secret precondition"
 
 api_call POST "/api/webhooks" "$MASTER_KEY" \
     "{\"name\":\"no-key\",\"target_url\":\"https://example.com/h\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"API_KEY_ONLY\"}"
