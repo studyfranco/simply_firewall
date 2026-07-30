@@ -732,6 +732,9 @@ async fn test_webhook_hmac_signature_and_delivery() {
             "secret_token": secret,
             "payload_template": "{\"ip\":\"$target_address\"}",
             "group_id": group_id.to_string(),
+            // Explicit since `auth_mode` now defaults to CANONICAL_V1; this test asserts the
+            // GitHub-style `sha256=<hex over body>` shape specifically.
+            "auth_mode": "BODY_ONLY",
         }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -2728,41 +2731,47 @@ async fn test_signing_secret_is_encrypted_at_rest_when_vault_key_is_set() {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Webhook signature modes (BODY_ONLY / CANONICAL_V1)
+// Webhook auth modes (CANONICAL_V1 / BODY_ONLY / API_KEY_ONLY / NONE)
 // ─────────────────────────────────────────────────────────────
 
 /// What a mock webhook receiver captured from a single dispatch.
 #[derive(Default, Clone)]
 struct CapturedHook {
+    path: Option<String>,
     body: Option<String>,
     signature: Option<String>,
     timestamp: Option<String>,
+    api_key: Option<String>,
 }
 
 /// Spawns a loopback mock receiver on an ephemeral port, returning its base URL and the shared slot
-/// it records into. Used by the signature-mode tests below in place of the ad-hoc receiver that the
+/// it records into. Used by the auth-mode tests below in place of the ad-hoc receiver that the
 /// older webhook tests each built inline.
+///
+/// A `fallback` rather than a fixed route, so a test can point `target_url` at any path it likes and
+/// still be recorded — which is exactly what the custom-`hmac_template` cases need.
 async fn spawn_capturing_receiver() -> (String, std::sync::Arc<std::sync::Mutex<CapturedHook>>) {
     use std::sync::{Arc, Mutex};
 
     let captured: Arc<Mutex<CapturedHook>> = Arc::new(Mutex::new(CapturedHook::default()));
     let for_handler = captured.clone();
 
-    let hook_app = axum::Router::new().route(
-        "/hook",
-        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+    let hook_app = axum::Router::new().fallback(
+        move |uri: axum::http::Uri, headers: axum::http::HeaderMap, body: String| {
             let captured = for_handler.clone();
             async move {
                 let header = |name: &str| {
                     headers.get(name).and_then(|h| h.to_str().ok()).map(|s| s.to_owned())
                 };
                 let mut c = captured.lock().unwrap();
+                c.path = Some(uri.path().to_owned());
                 c.signature = header("X-Signature-256");
                 c.timestamp = header("X-Timestamp");
+                c.api_key = header("X-API-Key");
                 c.body = Some(body);
                 StatusCode::OK
             }
-        }),
+        },
     );
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -2846,13 +2855,13 @@ async fn test_canonical_v1_webhook_sends_timestamp_and_canonical_signature() {
             "secret_token": secret,
             "payload_template": "{\"ip\":\"$target_address\"}",
             "group_id": group_id.to_string(),
-            "signature_mode": "CANONICAL_V1",
+            "auth_mode": "CANONICAL_V1",
         }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(created["signature_mode"], "CANONICAL_V1", "creation echoes the stored mode");
+    assert_eq!(created["auth_mode"], "CANONICAL_V1", "creation echoes the stored mode");
 
     let req = signed(inject_connect_info(Request::builder()
         .method("POST")
@@ -2868,6 +2877,7 @@ async fn test_canonical_v1_webhook_sends_timestamp_and_canonical_signature() {
     let delivered_body = hit.body.expect("body");
     let signature = hit.signature.expect("CANONICAL_V1 dispatch must send X-Signature-256");
     let timestamp = hit.timestamp.expect("CANONICAL_V1 dispatch must send X-Timestamp");
+    assert!(hit.api_key.is_none(), "no api_key configured means no X-API-Key header at all");
 
     // The timestamp must be a plausible current epoch, not a placeholder — a receiver's anti-replay
     // window would reject anything else.
@@ -2891,10 +2901,10 @@ async fn test_canonical_v1_webhook_sends_timestamp_and_canonical_signature() {
     ));
 }
 
-/// Omitting `signature_mode` must keep the legacy behaviour exactly: body-only HMAC, `sha256=`
-/// prefix, and **no** `X-Timestamp` header. Guards third-party receivers against a silent change.
+/// `BODY_ONLY` must keep the legacy behaviour exactly: body-only HMAC, `sha256=` prefix, and **no**
+/// `X-Timestamp` or `X-API-Key` header. Guards third-party receivers against a silent change.
 #[tokio::test]
-async fn test_body_only_is_the_default_and_sends_no_timestamp() {
+async fn test_body_only_signs_the_payload_alone_and_sends_no_timestamp() {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
@@ -2915,13 +2925,15 @@ async fn test_body_only_is_the_default_and_sends_no_timestamp() {
             "secret_token": secret,
             "payload_template": "{\"ip\":\"$target_address\"}",
             "group_id": group_id.to_string(),
-            // signature_mode deliberately omitted
+            // Spelled with the deprecated `signature_mode` alias on purpose: callers written
+            // against the previous field must keep working unchanged.
+            "signature_mode": "BODY_ONLY",
         }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(created["signature_mode"], "BODY_ONLY", "omitted mode defaults to BODY_ONLY");
+    assert_eq!(created["auth_mode"], "BODY_ONLY", "the deprecated alias still selects the mode");
 
     let req = signed(inject_connect_info(Request::builder()
         .method("POST")
@@ -2937,16 +2949,17 @@ async fn test_body_only_is_the_default_and_sends_no_timestamp() {
     let delivered_body = hit.body.expect("body");
     let signature = hit.signature.expect("missing X-Signature-256");
     assert!(hit.timestamp.is_none(), "BODY_ONLY must not send X-Timestamp");
+    assert!(hit.api_key.is_none(), "BODY_ONLY must not send X-API-Key");
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(delivered_body.as_bytes());
     assert_eq!(signature, format!("sha256={}", hex::encode(mac.finalize().into_bytes())));
 }
 
-/// `signature_mode` is validated at the API boundary rather than silently defaulted, and the stored
+/// `auth_mode` is validated at the API boundary rather than silently defaulted, and the stored
 /// value is surfaced by `GET /api/webhooks` so the UI can display it.
 #[tokio::test]
-async fn test_signature_mode_is_validated_and_exposed_in_listings() {
+async fn test_auth_mode_is_validated_and_exposed_in_listings() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
     let state = AppState { db: db.clone(), webhook_tx };
@@ -2972,7 +2985,7 @@ async fn test_signature_mode_is_validated_and_exposed_in_listings() {
             "group_id": group_id.to_string(),
         });
         if !mode.is_null() {
-            payload["signature_mode"] = mode;
+            payload["auth_mode"] = mode;
         }
         signed(inject_connect_info(Request::builder()
             .method("POST")
@@ -2994,6 +3007,10 @@ async fn test_signature_mode_is_validated_and_exposed_in_listings() {
     let res = app.clone().oneshot(make(json!("BODY_ONLY"), "explicit-legacy")).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
+    // An omitted mode is the new default rather than an error — but it is CANONICAL_V1 now.
+    let res = app.clone().oneshot(make(json!(null), "defaulted")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
     let req = signed(inject_connect_info(Request::builder()
         .uri("/api/webhooks")
         .header("X-API-Key", &plaintext)), "");
@@ -3002,17 +3019,248 @@ async fn test_signature_mode_is_validated_and_exposed_in_listings() {
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
 
-    let mode_of = |name: &str| -> String {
+    let row = |name: &str| -> serde_json::Value {
         listed.as_array().unwrap().iter()
-            .find(|w| w["name"] == name).unwrap()["signature_mode"]
-            .as_str().unwrap().to_owned()
+            .find(|w| w["name"] == name).unwrap().clone()
     };
-    assert_eq!(mode_of("lowercase"), "CANONICAL_V1", "casing is normalized on the way in");
-    assert_eq!(mode_of("explicit-legacy"), "BODY_ONLY");
+    assert_eq!(row("lowercase")["auth_mode"], "CANONICAL_V1", "casing is normalized on the way in");
+    assert_eq!(row("explicit-legacy")["auth_mode"], "BODY_ONLY");
+    assert_eq!(row("defaulted")["auth_mode"], "CANONICAL_V1", "omitted mode defaults to CANONICAL_V1");
+
+    // An unset hmac_template reports the effective default, not null — the dashboard renders this
+    // straight into an input, and a literal "null" there would be signed on the next save.
+    assert_eq!(
+        row("defaulted")["hmac_template"],
+        r"{method}\n{path}\n{timestamp}\n{body}"
+    );
+    assert_eq!(row("defaulted")["has_api_key"], false);
 
     // The listing must still never leak the HMAC key itself.
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(!text.contains("s3cret"), "GET /api/webhooks leaked secret_token");
+}
+
+/// The new modes' per-mode preconditions are enforced when the webhook is *configured*, not left to
+/// fail silently inside the background worker on every future dispatch.
+#[tokio::test]
+async fn test_auth_mode_preconditions_are_enforced_at_creation() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_key_id, plaintext) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let group_id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("precondition-group".to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }.insert(&db).await.unwrap();
+
+    let post = |mut payload: serde_json::Value, name: &str| {
+        payload["name"] = json!(name);
+        payload["target_url"] = json!("https://example.com/hook");
+        payload["payload_template"] = json!("{}");
+        payload["group_id"] = json!(group_id.to_string());
+        signed(inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/webhooks")
+            .header("X-API-Key", &plaintext)
+            .header("Content-Type", "application/json")), payload.to_string())
+    };
+    let status = |req: Request<Body>| async { app.clone().oneshot(req).await.unwrap().status() };
+
+    // A signing mode with no key to sign with would produce an HMAC over the empty secret — a
+    // signature anyone can forge, which is worse than none because it looks authenticated.
+    assert_eq!(status(post(json!({ "auth_mode": "CANONICAL_V1" }), "no-secret")).await, StatusCode::BAD_REQUEST);
+    assert_eq!(status(post(json!({ "auth_mode": "BODY_ONLY", "secret_token": "" }), "blank-secret")).await, StatusCode::BAD_REQUEST);
+
+    // API_KEY_ONLY without a key sends no credential at all — i.e. silently becomes NONE.
+    assert_eq!(status(post(json!({ "auth_mode": "API_KEY_ONLY" }), "no-key")).await, StatusCode::BAD_REQUEST);
+    assert_eq!(status(post(json!({ "auth_mode": "API_KEY_ONLY", "api_key": "   " }), "blank-key")).await, StatusCode::BAD_REQUEST);
+
+    // A template that never interpolates the body signs a constant: replayable against any payload.
+    assert_eq!(
+        status(post(json!({
+            "auth_mode": "CANONICAL_V1",
+            "secret_token": "s",
+            "hmac_template": r"{method}\n{path}\n{timestamp}",
+        }), "bodyless-template")).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // The unsigned modes legitimately need no secret at all.
+    assert_eq!(status(post(json!({ "auth_mode": "NONE" }), "none-mode")).await, StatusCode::OK);
+    assert_eq!(status(post(json!({ "auth_mode": "API_KEY_ONLY", "api_key": "remote-key" }), "key-mode")).await, StatusCode::OK);
+
+    // ...and the key they carry is never handed back out.
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!text.contains("remote-key"), "GET /api/webhooks leaked the webhook's api_key");
+    let listed: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let key_row = listed.as_array().unwrap().iter().find(|w| w["name"] == "key-mode").unwrap();
+    assert_eq!(key_row["has_api_key"], true, "presence is reported even though the value is not");
+}
+
+/// The `auth_mode` migration replaces `signature_mode` rather than adding beside it, so it must
+/// carry existing rows across without rewriting them to the new `CANONICAL_V1` default — that would
+/// silently re-sign live third-party webhooks under a scheme their receivers reject.
+///
+/// Raw SQL is deliberate here and confined to this test: the point is to inspect the *physical*
+/// columns before and after, which the entity (fixed to the post-migration shape) cannot see. The
+/// statements are plain ANSI, so the SQL-agnosticism rule in `AGENT.MD` still holds.
+#[tokio::test]
+async fn test_auth_mode_migration_preserves_existing_rows_and_reverses_cleanly() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let db = setup_test_db().await;
+    let backend = db.get_database_backend();
+    let exec = |sql: &str| db.execute_raw(Statement::from_string(backend, sql.to_owned()));
+
+    exec("INSERT INTO ip_groups (id, name, group_type, created_at) \
+          VALUES ('g', 'migration-group', 'banlist', '2026-01-01 00:00:00')").await.unwrap();
+    exec("INSERT INTO webhook_configs \
+          (id, name, target_url, secret_token, auth_mode, payload_template, group_id, is_active, created_at) \
+          VALUES ('w', 'legacy', 'https://example.com/hook', 's', 'BODY_ONLY', '{}', 'g', 1, '2026-01-01 00:00:00')")
+        .await.unwrap();
+
+    // Reverse the auth-mode migration: the row must reappear under the old column, still BODY_ONLY.
+    migration::Migrator::down(&db, Some(1)).await.unwrap();
+    let row = db.query_one_raw(Statement::from_string(backend,
+        "SELECT signature_mode FROM webhook_configs WHERE id = 'w'".to_owned())).await.unwrap().unwrap();
+    assert_eq!(row.try_get::<String>("", "signature_mode").unwrap(), "BODY_ONLY");
+
+    // Re-apply it: the backfill — not the column default — decides what the existing row gets.
+    migration::Migrator::up(&db, None).await.unwrap();
+    let row = db.query_one_raw(Statement::from_string(backend,
+        "SELECT auth_mode, api_key, hmac_template FROM webhook_configs WHERE id = 'w'".to_owned()))
+        .await.unwrap().unwrap();
+    assert_eq!(
+        row.try_get::<String>("", "auth_mode").unwrap(), "BODY_ONLY",
+        "an existing webhook must keep its mode, not inherit the new CANONICAL_V1 default"
+    );
+    assert_eq!(row.try_get::<Option<String>>("", "api_key").unwrap(), None);
+    assert_eq!(
+        row.try_get::<Option<String>>("", "hmac_template").unwrap().as_deref(),
+        Some(r"{method}\n{path}\n{timestamp}\n{body}")
+    );
+}
+
+/// `CANONICAL_V1` with a custom template: a literal path baked into the template must override the
+/// one derived from `target_url`, and `api_key` must ride along as `X-API-Key`.
+///
+/// This is the reverse-proxy case — the vault posts to `https://proxy/hooks/42` while the receiver
+/// behind it sees, and signs over, `/api/hooks/42/execute`.
+#[tokio::test]
+async fn test_canonical_v1_custom_template_overrides_path_and_sends_api_key() {
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
+
+    let (base_url, captured) = spawn_capturing_receiver().await;
+    let (app, _db, plaintext, group_id) = setup_webhook_fixture("templated-hook-group").await;
+
+    let secret = "templated-webhook-secret";
+    let template = r"{method}\n/api/hooks/42/execute\n{timestamp}\n{body}";
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")), json!({
+            "name": "Templated Hook",
+            "target_url": format!("{base_url}/proxied/path"),
+            "secret_token": secret,
+            "payload_template": "{\"ip\":\"$target_address\"}",
+            "group_id": group_id.to_string(),
+            "auth_mode": "CANONICAL_V1",
+            "api_key": "downstream-key",
+            "hmac_template": template,
+        }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")),
+        json!({ "target_address": "7.7.7.7", "group_name": "templated-hook-group" }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let hit = await_dispatch(&captured).await.expect("webhook was not delivered within timeout");
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "false") };
+
+    let delivered_body = hit.body.expect("body");
+    let signature = hit.signature.expect("CANONICAL_V1 dispatch must send X-Signature-256");
+    let timestamp = hit.timestamp.expect("CANONICAL_V1 dispatch must send X-Timestamp");
+
+    assert_eq!(hit.api_key.as_deref(), Some("downstream-key"), "api_key must be sent as X-API-Key");
+    assert_eq!(hit.path.as_deref(), Some("/proxied/path"), "the request still goes to target_url");
+
+    // Signed over the hardcoded path, NOT /proxied/path.
+    let expected = simply_ip_vault::crypto::compute_signature(
+        secret, "POST", "/api/hooks/42/execute", &timestamp, delivered_body.as_bytes(),
+    ).unwrap();
+    assert_eq!(signature, expected, "the literal path in the template must win over target_url's");
+
+    // And the URL-derived path must NOT produce a matching signature, or the assertion above would
+    // pass for the wrong reason.
+    let from_url = simply_ip_vault::crypto::compute_signature(
+        secret, "POST", "/proxied/path", &timestamp, delivered_body.as_bytes(),
+    ).unwrap();
+    assert_ne!(signature, from_url);
+}
+
+/// `API_KEY_ONLY` sends the key and nothing else; `NONE` sends no auth headers at all. Both still
+/// deliver the templated payload.
+#[tokio::test]
+async fn test_api_key_only_and_none_modes_send_the_expected_headers() {
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
+
+    for (mode, group, address, expected_key) in [
+        ("API_KEY_ONLY", "keyonly-hook-group", "8.8.8.8", Some("downstream-key")),
+        ("NONE", "nomode-hook-group", "9.9.9.9", None),
+    ] {
+        let (base_url, captured) = spawn_capturing_receiver().await;
+        let (app, _db, plaintext, group_id) = setup_webhook_fixture(group).await;
+
+        let req = signed(inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/webhooks")
+            .header("X-API-Key", &plaintext)
+            .header("Content-Type", "application/json")), json!({
+                "name": format!("{mode} Hook"),
+                "target_url": format!("{base_url}/hook"),
+                "payload_template": "{\"ip\":\"$target_address\"}",
+                "group_id": group_id.to_string(),
+                "auth_mode": mode,
+                // Set in both cases on purpose: NONE must ignore it rather than send it.
+                "api_key": "downstream-key",
+            }).to_string());
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK, "creating {mode} hook");
+
+        let req = signed(inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/ban")
+            .header("X-API-Key", &plaintext)
+            .header("Content-Type", "application/json")),
+            json!({ "target_address": address, "group_name": group }).to_string());
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+        let hit = await_dispatch(&captured).await.unwrap_or_else(|| panic!("{mode} webhook was not delivered"));
+        assert_eq!(hit.api_key.as_deref(), expected_key, "{mode} X-API-Key header");
+        assert!(hit.signature.is_none(), "{mode} must not send X-Signature-256");
+        assert!(hit.timestamp.is_none(), "{mode} must not send X-Timestamp");
+        assert!(hit.body.expect("body").contains(address), "{mode} must still deliver the payload");
+    }
+
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "false") };
 }
 
 // ─────────────────────────────────────────────────────────────

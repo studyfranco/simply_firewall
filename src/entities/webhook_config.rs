@@ -17,16 +17,32 @@ pub struct Model {
     /// targets are rejected at dispatch time) unless `ALLOW_PRIVATE_WEBHOOKS=true`.
     pub target_url: String,
     /// Shared secret used to generate the HMAC SHA-256 signature (`X-Signature-256`) on every
-    /// dispatched request.
+    /// dispatched request. Empty for the unsigned modes (`API_KEY_ONLY`, `NONE`), which have no
+    /// HMAC to key.
     pub secret_token: String,
-    /// How outbound dispatches are signed — `"BODY_ONLY"` or `"CANONICAL_V1"`. See
-    /// [`SignatureMode`], which is the parsed form; this column stores its string representation.
+    /// How outbound dispatches authenticate — one of `"CANONICAL_V1"`, `"BODY_ONLY"`,
+    /// `"API_KEY_ONLY"`, `"NONE"`. See [`AuthMode`], which is the parsed form; this column stores
+    /// its string representation.
     ///
     /// Stored as a plain `String` rather than a SeaORM enum column to stay SQL-agnostic per
     /// `AGENT.MD` (a native `ENUM` type is PostgreSQL/MySQL-specific and has no SQLite equivalent).
-    /// Values are validated at the API boundary, and [`SignatureMode::from_stored`] fails safe on
+    /// Values are validated at the API boundary, and [`AuthMode::from_stored`] fails safe on
     /// anything unrecognized.
-    pub signature_mode: String,
+    pub auth_mode: String,
+    /// Value sent as the `X-API-Key` header, for receivers that identify the caller by key on top
+    /// of (or instead of) a signature. Used by `CANONICAL_V1` and `API_KEY_ONLY`; ignored by
+    /// `BODY_ONLY` and `NONE`.
+    ///
+    /// A plaintext credential for a *remote* system, not one of this instance's own keys — there is
+    /// nothing to hash it against here, so it is stored and sent verbatim, and never returned by
+    /// any read endpoint.
+    pub api_key: Option<String>,
+    /// The canonical string signed in `CANONICAL_V1` mode, with `{method}`, `{path}`,
+    /// `{timestamp}` and `{body}` placeholders. `None` means [`DEFAULT_HMAC_TEMPLATE`].
+    ///
+    /// See [`resolve_hmac_template`](crate::webhooks::resolve_hmac_template) for the substitution
+    /// and escape rules.
+    pub hmac_template: Option<String>,
     /// Custom JSON key-value object of HTTP headers to inject into requests.
     pub headers_json: Option<String>,
     /// Template string with dynamic variables (e.g.
@@ -43,40 +59,69 @@ pub struct Model {
     pub created_at: DateTime,
 }
 
-/// How an outbound webhook dispatch computes its `X-Signature-256`.
+/// The `hmac_template` used when a `CANONICAL_V1` webhook leaves the column `NULL`.
+///
+/// The `\n` are **two-character escape sequences**, not real newlines, because this value round-trips
+/// through a single-line HTML text input in the dashboard where a literal newline cannot be typed.
+/// [`resolve_hmac_template`](crate::webhooks::resolve_hmac_template) expands them, so the bytes
+/// actually signed are the same `METHOD\nPATH\nTIMESTAMP\nBODY` the inbound API verifies.
+pub const DEFAULT_HMAC_TEMPLATE: &str = r"{method}\n{path}\n{timestamp}\n{body}";
+
+/// How an outbound webhook dispatch authenticates itself to its receiver.
 ///
 /// Kept as a real type rather than stringly-typed comparisons scattered through the dispatcher, so
 /// adding a future mode is a compiler-enforced exhaustive match instead of a hunt for `==` checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum SignatureMode {
+pub enum AuthMode {
+    /// HMAC-SHA256 over the webhook's resolved `hmac_template`, sent as bare hex in
+    /// `X-Signature-256` alongside `X-Timestamp` and (when set) `X-API-Key`.
+    ///
+    /// With the default template this is byte-for-byte the construction the inbound API middleware
+    /// verifies, which is what lets one `simply_ip_vault` instance dispatch directly into another's
+    /// authenticated API (and what `simply_hook_executor` expects). A custom template covers
+    /// receivers that sit behind a path-rewriting reverse proxy, or that canonicalize differently.
+    CanonicalV1,
     /// HMAC-SHA256 over the raw request body only, sent as `X-Signature-256: sha256=<hex>`.
     ///
-    /// The original behaviour and the default, kept for generic third-party receivers (GitHub-style
-    /// webhook consumers) that expect exactly this and would reject anything else.
+    /// The original behaviour, kept for generic third-party receivers (GitHub-style webhook
+    /// consumers) that expect exactly this and would reject anything else.
     BodyOnly,
-    /// HMAC-SHA256 over `POST\n<path>\n<timestamp>\n<raw_body>`, sent as bare hex alongside an
-    /// `X-Timestamp` header.
+    /// Sends `X-API-Key` and no signature at all — for APIs whose only credential is a bearer-style
+    /// key. Requires `api_key` to be set.
+    ApiKeyOnly,
+    /// Sends the payload with no authentication headers whatsoever.
     ///
-    /// Byte-for-byte the same construction the inbound API middleware verifies, which is what lets
-    /// one `simply_ip_vault` instance dispatch directly into another's authenticated API (and what
-    /// `simply_hook_executor` expects).
-    CanonicalV1,
+    /// Legitimate for a receiver that authenticates by network position (a private listener reachable
+    /// only from this host) or by something already inside `headers_json`; a deliberate,
+    /// explicitly-chosen opt-out rather than a default anyone can drift into.
+    None,
 }
 
-impl SignatureMode {
-    /// The string written to `webhook_configs.signature_mode`.
-    pub const BODY_ONLY: &'static str = "BODY_ONLY";
-    /// The string written to `webhook_configs.signature_mode` for canonical signing.
+impl AuthMode {
+    /// The string written to `webhook_configs.auth_mode` for canonical signing.
     pub const CANONICAL_V1: &'static str = "CANONICAL_V1";
+    /// The string written to `webhook_configs.auth_mode` for body-only signing.
+    pub const BODY_ONLY: &'static str = "BODY_ONLY";
+    /// The string written to `webhook_configs.auth_mode` for key-only authentication.
+    pub const API_KEY_ONLY: &'static str = "API_KEY_ONLY";
+    /// The string written to `webhook_configs.auth_mode` for unauthenticated dispatches.
+    pub const NONE: &'static str = "NONE";
 
     /// Every accepted value, for API validation and error messages.
-    pub const ALL: [&'static str; 2] = [Self::BODY_ONLY, Self::CANONICAL_V1];
+    pub const ALL: [&'static str; 4] = [
+        Self::CANONICAL_V1,
+        Self::BODY_ONLY,
+        Self::API_KEY_ONLY,
+        Self::NONE,
+    ];
 
     /// Parses a caller-supplied value, accepting any casing. `None` if unrecognized.
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_uppercase().as_str() {
-            Self::BODY_ONLY => Some(Self::BodyOnly),
             Self::CANONICAL_V1 => Some(Self::CanonicalV1),
+            Self::BODY_ONLY => Some(Self::BodyOnly),
+            Self::API_KEY_ONLY => Some(Self::ApiKeyOnly),
+            Self::NONE => Some(Self::None),
             _ => None,
         }
     }
@@ -85,11 +130,13 @@ impl SignatureMode {
     ///
     /// Fails *safe* rather than erroring: a row with an unrecognized mode (hand-edited SQL, or a
     /// downgrade after a future mode is added) still dispatches under the conservative legacy
-    /// scheme instead of silently dropping the event or panicking inside the worker.
+    /// scheme instead of silently dropping the event or panicking inside the worker. Note the
+    /// fallback is `BODY_ONLY`, not the column default `CANONICAL_V1` — an unreadable mode must
+    /// resolve to *more* signing, never less, and never to [`Self::None`].
     pub fn from_stored(value: &str) -> Self {
         Self::parse(value).unwrap_or_else(|| {
             tracing::warn!(
-                "Unrecognized webhook signature_mode {:?} in database; falling back to {}",
+                "Unrecognized webhook auth_mode {:?} in database; falling back to {}",
                 value,
                 Self::BODY_ONLY
             );
@@ -100,9 +147,23 @@ impl SignatureMode {
     /// The canonical string representation, for storage and API responses.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::BodyOnly => Self::BODY_ONLY,
             Self::CanonicalV1 => Self::CANONICAL_V1,
+            Self::BodyOnly => Self::BODY_ONLY,
+            Self::ApiKeyOnly => Self::API_KEY_ONLY,
+            Self::None => Self::NONE,
         }
+    }
+
+    /// Whether this mode computes an HMAC, and therefore requires a non-empty `secret_token`.
+    pub fn requires_secret(self) -> bool {
+        matches!(self, Self::CanonicalV1 | Self::BodyOnly)
+    }
+
+    /// Whether this mode sends `X-API-Key`. Only `API_KEY_ONLY` *requires* a value; `CANONICAL_V1`
+    /// sends one when configured and omits the header otherwise, since a plain HMAC receiver has no
+    /// use for it.
+    pub fn sends_api_key(self) -> bool {
+        matches!(self, Self::CanonicalV1 | Self::ApiKeyOnly)
     }
 }
 

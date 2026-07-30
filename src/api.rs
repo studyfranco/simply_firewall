@@ -1537,8 +1537,9 @@ pub struct CreateWebhookPayload {
     pub name: String,
     /// Target URL
     pub target_url: String,
-    /// Shared secret
-    pub secret_token: String,
+    /// Shared secret keying the HMAC. Required by `CANONICAL_V1` and `BODY_ONLY`; may be omitted
+    /// (and is stored as an empty string) by the modes that compute no signature.
+    pub secret_token: Option<String>,
     /// Custom headers
     pub headers_json: Option<String>,
     /// Payload Template
@@ -1550,9 +1551,18 @@ pub struct CreateWebhookPayload {
     /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` to trigger on. `None` (the
     /// default if omitted) means all events — the historical, pre-filtering behavior.
     pub events: Option<String>,
-    /// How dispatches are signed: `"BODY_ONLY"` (default) or `"CANONICAL_V1"`. Omitting it keeps
-    /// the legacy body-only signature, so existing integrations are unaffected.
+    /// How dispatches authenticate: `"CANONICAL_V1"` (default), `"BODY_ONLY"`, `"API_KEY_ONLY"`, or
+    /// `"NONE"`.
+    pub auth_mode: Option<String>,
+    /// Deprecated alias for [`Self::auth_mode`], accepted so callers written against the
+    /// short-lived `signature_mode` field keep working. Ignored when `auth_mode` is also present.
     pub signature_mode: Option<String>,
+    /// Value to send as `X-API-Key` on each dispatch. Required by `API_KEY_ONLY`; optional for
+    /// `CANONICAL_V1`; ignored by the other modes.
+    pub api_key: Option<String>,
+    /// Canonical string template for `CANONICAL_V1`, with `{method}`/`{path}`/`{timestamp}`/`{body}`
+    /// placeholders. Omitted or empty means the default `{method}\n{path}\n{timestamp}\n{body}`.
+    pub hmac_template: Option<String>,
 }
 
 /// Handles POST /api/v1/webhooks
@@ -1586,17 +1596,46 @@ pub async fn create_webhook(
         }
     }
 
-    // Rejected rather than silently defaulted: a caller who asks for a signing mode and gets a
+    // Rejected rather than silently defaulted: a caller who asks for an auth mode and gets a
     // different one would ship a receiver that rejects every dispatch, with nothing to point at.
-    let signature_mode = match payload.signature_mode.as_deref() {
-        None => webhook_config::SignatureMode::BodyOnly,
-        Some(raw) => webhook_config::SignatureMode::parse(raw).ok_or_else(|| {
+    let requested_mode = payload.auth_mode.as_deref().or(payload.signature_mode.as_deref());
+    let auth_mode = match requested_mode {
+        None => webhook_config::AuthMode::CanonicalV1,
+        Some(raw) => webhook_config::AuthMode::parse(raw).ok_or_else(|| {
             AppError::InvalidInput(format!(
-                "Invalid signature_mode '{raw}': must be one of {}",
-                webhook_config::SignatureMode::ALL.join(", ")
+                "Invalid auth_mode '{raw}': must be one of {}",
+                webhook_config::AuthMode::ALL.join(", ")
             ))
         })?,
     };
+
+    // Empty strings are normalized to `None` up front, so "field present but blank" (what an
+    // untouched HTML input posts) and "field absent" mean the same thing everywhere downstream.
+    let api_key = payload.api_key.as_deref().map(str::trim).filter(|v| !v.is_empty()).map(str::to_owned);
+    let hmac_template = payload.hmac_template.as_deref().filter(|v| !v.is_empty()).map(str::to_owned);
+    let secret_token = payload.secret_token.clone().unwrap_or_default();
+
+    // Each mode's own preconditions. Catching these here turns a webhook that would have failed
+    // silently on every future dispatch — in a background worker, where the operator sees only a
+    // log line — into an error on the request that configured it.
+    if auth_mode.requires_secret() && secret_token.is_empty() {
+        return Err(AppError::InvalidInput(format!(
+            "auth_mode '{}' computes an HMAC and requires a non-empty secret_token",
+            auth_mode.as_str()
+        )));
+    }
+    if auth_mode == webhook_config::AuthMode::ApiKeyOnly && api_key.is_none() {
+        return Err(AppError::InvalidInput(
+            "auth_mode 'API_KEY_ONLY' requires a non-empty api_key".to_owned(),
+        ));
+    }
+    if let Some(template) = &hmac_template
+        && !template.contains("{body}")
+    {
+        return Err(AppError::InvalidInput(
+            "hmac_template must contain {body}: a signature that does not cover the payload authenticates nothing".to_owned(),
+        ));
+    }
 
     let id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
@@ -1604,8 +1643,10 @@ pub async fn create_webhook(
         id: Set(id),
         name: Set(payload.name.clone()),
         target_url: Set(payload.target_url.clone()),
-        secret_token: Set(payload.secret_token.clone()),
-        signature_mode: Set(signature_mode.as_str().to_owned()),
+        secret_token: Set(secret_token),
+        auth_mode: Set(auth_mode.as_str().to_owned()),
+        api_key: Set(api_key),
+        hmac_template: Set(hmac_template),
         headers_json: Set(payload.headers_json.clone()),
         payload_template: Set(payload.payload_template.clone()),
         group_id: Set(payload.group_id),
@@ -1620,14 +1661,15 @@ pub async fn create_webhook(
     Ok(Json(serde_json::json!({
         "id": id,
         "target_url": payload.target_url,
-        "signature_mode": signature_mode.as_str(),
+        "auth_mode": auth_mode.as_str(),
     })))
 }
 
-/// Public-safe summary of a webhook configuration. Deliberately omits `secret_token`: unlike
-/// `api_key.key_hash` (a hash of a high-entropy generated value), a webhook's `secret_token` is a
-/// caller-supplied plaintext HMAC key — leaking it would let any reader with `can_manage_webhooks`
-/// forge valid `X-Signature-256` signatures for that webhook.
+/// Public-safe summary of a webhook configuration. Deliberately omits `secret_token` **and**
+/// `api_key`: unlike `api_keys.key_hash` (a hash of a high-entropy generated value), both are
+/// caller-supplied plaintext credentials for a remote system — leaking `secret_token` would let any
+/// reader with `can_manage_webhooks` forge valid `X-Signature-256` signatures, and leaking `api_key`
+/// would hand them a working credential on the receiving system outright.
 #[derive(Serialize)]
 pub struct WebhookSummary {
     /// Webhook ID
@@ -1647,9 +1689,16 @@ pub struct WebhookSummary {
     /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook fires for; `None`
     /// means all events.
     pub events: Option<String>,
-    /// How dispatches are signed: `"BODY_ONLY"` or `"CANONICAL_V1"`. Safe to expose — it describes
-    /// the signing *scheme*, not the `secret_token` that keys it.
-    pub signature_mode: String,
+    /// How dispatches authenticate: `"CANONICAL_V1"`, `"BODY_ONLY"`, `"API_KEY_ONLY"` or `"NONE"`.
+    /// Safe to expose — it describes the *scheme*, not the `secret_token` or `api_key` behind it.
+    pub auth_mode: String,
+    /// The canonical string template used in `CANONICAL_V1` mode, resolved to the effective value
+    /// (the default when the column is unset) so the dashboard shows what is actually signed.
+    /// Contains only placeholders and literal structure, never secret material.
+    pub hmac_template: String,
+    /// Whether an `X-API-Key` is configured, without disclosing it. The dashboard needs to render
+    /// the field as populated; nothing needs its value back.
+    pub has_api_key: bool,
     /// Creation timestamp
     pub created_at: chrono::NaiveDateTime,
 }
@@ -1658,7 +1707,7 @@ impl From<webhook_config::Model> for WebhookSummary {
     fn from(w: webhook_config::Model) -> Self {
         // Normalized through the enum so a hand-edited or legacy row is reported as the mode it
         // will actually be dispatched with, rather than as whatever string happens to be stored.
-        let signature_mode = webhook_config::SignatureMode::from_stored(&w.signature_mode);
+        let auth_mode = webhook_config::AuthMode::from_stored(&w.auth_mode);
         WebhookSummary {
             id: w.id,
             name: w.name,
@@ -1668,7 +1717,11 @@ impl From<webhook_config::Model> for WebhookSummary {
             group_id: w.group_id,
             is_active: w.is_active,
             events: w.events,
-            signature_mode: signature_mode.as_str().to_owned(),
+            auth_mode: auth_mode.as_str().to_owned(),
+            hmac_template: w
+                .hmac_template
+                .unwrap_or_else(|| webhook_config::DEFAULT_HMAC_TEMPLATE.to_owned()),
+            has_api_key: w.api_key.is_some_and(|k| !k.is_empty()),
             created_at: w.created_at,
         }
     }

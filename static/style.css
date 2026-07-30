@@ -776,9 +776,11 @@ body {
     border: 1px solid var(--border);
 }
 
-/* Webhook signature mode. CANONICAL_V1 gets the same bluish-slate accent as the modal Cancel
-   button, marking it as the "speaks our own protocol" option; BODY_ONLY stays deliberately neutral
-   since it is the legacy default and carries no special meaning. */
+/* Webhook auth mode. CANONICAL_V1 gets the same bluish-slate accent as the modal Cancel button,
+   marking it as the "speaks our own protocol" option; BODY_ONLY stays deliberately neutral since it
+   carries no special meaning. The two unsigned modes are coloured by how much protection they drop:
+   API_KEY_ONLY warns, NONE reads as an error even though it is a legitimate choice — an
+   unauthenticated dispatch should never look ordinary in a list of otherwise-signed ones. */
 .badge-canonical {
     background-color: rgba(37, 99, 235, 0.15);
     color: #60a5fa;
@@ -789,6 +791,18 @@ body {
     background-color: rgba(189, 195, 199, 0.1);
     color: var(--text-muted);
     border: 1px solid var(--border);
+}
+
+.badge-api-key {
+    background-color: rgba(243, 156, 18, 0.15);
+    color: var(--warning);
+    border: 1px solid rgba(243, 156, 18, 0.35);
+}
+
+.badge-no-auth {
+    background-color: rgba(231, 76, 60, 0.15);
+    color: var(--danger);
+    border: 1px solid rgba(231, 76, 60, 0.35);
 }
 
 .badge-conflict {

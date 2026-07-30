@@ -29,6 +29,16 @@
                     <input type="password" id="login-secret" placeholder="Enter HMAC signing secret..." required class="input-field">
                     <small class="field-hint">Used locally to sign every request (HMAC-SHA256). Never transmitted.</small>
                 </div>
+                <div class="form-group">
+                    <label for="login-api-base">API Base Path Override</label>
+                    <input type="text" id="login-api-base" placeholder="/api" class="input-field" autocomplete="off">
+                    <small class="field-hint">
+                        Leave blank unless a reverse proxy rewrites the path. Signatures must cover the path the
+                        <em>server</em> sees: if the proxy strips a prefix (<code>/vault/api/ips</code> →
+                        <code>/api/ips</code>), keep <code>/api</code>; if it forwards the prefix untouched, set
+                        <code>/vault/api</code>. Requests themselves are always sent relative to this page.
+                    </small>
+                </div>
                 <button type="submit" id="login-submit" class="btn btn-primary">Unlock Dashboard</button>
             </form>
             <div id="login-error" class="message error hidden"></div>
@@ -336,7 +346,7 @@
                                 <label for="webhook-name">Webhook Name <span>*</span></label>
                                 <input type="text" id="webhook-name" placeholder="My Alert Hook" required class="input-field">
                             </div>
-                            <div class="form-group">
+                            <div class="form-group" id="webhook-secret-group">
                                 <label for="webhook-secret">HMAC Secret <span>*</span></label>
                                 <input type="password" id="webhook-secret" placeholder="Shared Secret" required class="input-field">
                             </div>
@@ -349,16 +359,38 @@
                                 </div>
                             </div>
                             <div class="form-group">
-                                <label for="webhook-signature-mode">Signature Mode <span>*</span></label>
-                                <select id="webhook-signature-mode" class="input-field select-field">
-                                    <option value="BODY_ONLY" selected>BODY_ONLY (generic receivers)</option>
-                                    <option value="CANONICAL_V1">CANONICAL_V1 (Simply IP Vault / hook executor)</option>
+                                <label for="webhook-auth-mode">Auth Mode <span>*</span></label>
+                                <select id="webhook-auth-mode" class="input-field select-field">
+                                    <option value="CANONICAL_V1" selected>CANONICAL_V1 (Simply IP Vault / hook executor)</option>
+                                    <option value="BODY_ONLY">BODY_ONLY (generic receivers)</option>
+                                    <option value="API_KEY_ONLY">API_KEY_ONLY (key header, no signature)</option>
+                                    <option value="NONE">NONE (no auth headers)</option>
                                 </select>
                                 <small class="field-hint">
-                                    <strong>BODY_ONLY</strong> signs the payload alone as <code>sha256=&lt;hex&gt;</code> — what
-                                    GitHub-style consumers expect. <strong>CANONICAL_V1</strong> signs
-                                    <code>POST\npath\ntimestamp\nbody</code> and adds an <code>X-Timestamp</code> header, so the
-                                    dispatch can authenticate directly against another Simply IP Vault instance.
+                                    <strong>CANONICAL_V1</strong> signs the template below and adds <code>X-Timestamp</code>
+                                    (plus <code>X-API-Key</code> when set), so the dispatch can authenticate directly against
+                                    another Simply IP Vault instance. <strong>BODY_ONLY</strong> signs the payload alone as
+                                    <code>sha256=&lt;hex&gt;</code> — what GitHub-style consumers expect.
+                                    <strong>API_KEY_ONLY</strong> sends just <code>X-API-Key</code>.
+                                    <strong>NONE</strong> sends no auth headers at all.
+                                </small>
+                            </div>
+                            <div class="form-group" id="webhook-api-key-group">
+                                <label for="webhook-api-key">API Key</label>
+                                <input type="password" id="webhook-api-key" placeholder="Sent as X-API-Key" class="input-field" autocomplete="off">
+                                <small class="field-hint">A credential for the <em>receiving</em> system. Stored as given and never shown again.</small>
+                            </div>
+                            <div class="form-group col-span-2" id="webhook-hmac-template-group">
+                                <label for="webhook-hmac-template">HMAC Signature Template <span>*</span></label>
+                                <input type="text" id="webhook-hmac-template" class="input-field font-mono"
+                                       value="{method}\n{path}\n{timestamp}\n{body}" spellcheck="false" autocomplete="off">
+                                <small class="field-hint">
+                                    The exact string that gets signed. <code>\n</code> is a real newline;
+                                    <code>{method}</code>, <code>{path}</code>, <code>{timestamp}</code> and
+                                    <code>{body}</code> are substituted (<code>{path}</code> comes from the target URL).
+                                    Behind a path-rewriting proxy, hardcode the path the receiver actually sees —
+                                    e.g. <code>{method}\n/api/hooks/42/execute\n{timestamp}\n{body}</code>.
+                                    <code>{body}</code> is mandatory.
                                 </small>
                             </div>
                             <div class="form-group col-span-2">
@@ -393,7 +425,7 @@
                     </form>
                     <div class="table-container mt-4">
                         <table class="data-table">
-                            <thead><tr><th>ID</th><th>Name</th><th>URL</th><th>Signing</th><th>Actions</th></tr></thead>
+                            <thead><tr><th>ID</th><th>Name</th><th>URL</th><th>Auth Mode</th><th>Actions</th></tr></thead>
                             <tbody id="webhooks-table-body"></tbody>
                         </table>
                     </div>

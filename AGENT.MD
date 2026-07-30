@@ -79,18 +79,25 @@ To keep this context clean and modular, responsibilities are split across three 
 ### 4. Advanced & Secure Webhooks
 
 - **Group Scoping:** Webhooks are bound to specific `IpGroup`s. Actions on IPs in those groups dispatch asynchronous HTTP POST requests via Tokio tasks.
-- **Templating & Headers:** Custom JSON payload templates (e.g., `{"ip": "$target_address", "group": "$group_name"}`) and custom HTTP headers (e.g., `X-API-Key` for chaining `simply_ip_vault` instances).
-- **Signature Modes (`webhook_configs.signature_mode`):** each webhook picks how its `X-Signature-256` is computed. The column defaults to `BODY_ONLY`, so existing webhooks are unaffected; the API validates the value and rejects anything unrecognized with `400` rather than silently downgrading.
+- **Templating & Headers:** Custom JSON payload templates (e.g., `{"ip": "$target_address", "group": "$group_name"}`) and custom HTTP headers via `headers_json`.
+- **Auth Modes (`webhook_configs.auth_mode`):** each webhook picks how it authenticates to its receiver. The column defaults to `CANONICAL_V1`; the API validates the value and rejects anything unrecognized with `400` rather than silently downgrading.
 
   | Mode | Signed message | Headers sent |
   | :--- | :--- | :--- |
-  | `BODY_ONLY` *(default)* | `RAW_BODY` only | `X-Signature-256: sha256=<hex>` |
-  | `CANONICAL_V1` | `POST\n<path>\n<timestamp>\n<raw_body>` — `<path>` from `target_url` | `X-Signature-256: <bare hex>` **and** `X-Timestamp` |
+  | `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: <bare hex>`, `X-Timestamp`, plus `X-API-Key` when `api_key` is set |
+  | `BODY_ONLY` | `RAW_BODY` only | `X-Signature-256: sha256=<hex>` |
+  | `API_KEY_ONLY` | *(none)* | `X-API-Key` |
+  | `NONE` | *(none)* | *(none)* |
 
+  - `CANONICAL_V1` with the default template is byte-identical to the inbound API scheme above, which is what makes **instance chaining** work: set `api_key` to a key on the receiving instance, set `secret_token` to *that key's* `signing_secret`, point `target_url` at its `/api/ban`, and the dispatch authenticates as a normal signed API request (including the receiver's own anti-replay check, hence the `X-Timestamp`). This is also the mode `simply_hook_executor` consumes.
   - `BODY_ONLY` is the legacy/generic scheme, matching what GitHub-style third-party receivers expect. Never change an existing webhook's mode without coordinating with its receiver — it changes both the signed bytes and the header set.
-  - `CANONICAL_V1` is byte-identical to the inbound API scheme above, which is what makes **instance chaining** work: set `X-API-Key` in `headers_json` to a key on the receiving instance, set `secret_token` to *that key's* `signing_secret`, point `target_url` at its `/api/ban`, and the dispatch authenticates as a normal signed API request (including the receiver's own anti-replay check, hence the `X-Timestamp`). This is also the mode `simply_hook_executor` consumes.
-  - An unrecognized value already in the database falls back to `BODY_ONLY` with a warning rather than erroring — a webhook worker must not be taken down by one bad row.
-- **HMAC Signatures:** All webhook dispatches MUST include a signature header: `X-Signature-256: sha256=<hex_hmac>` calculated using the webhook's secret token.
+  - `API_KEY_ONLY` and `NONE` compute no signature. They are legitimate (an API whose only credential is a bearer-style key; a receiver authenticated by network position) but must stay *explicitly chosen* — never a fallback anyone can drift into.
+  - An unrecognized value already in the database falls back to `BODY_ONLY` with a warning rather than erroring — a webhook worker must not be taken down by one bad row. The fallback is deliberately **not** the column default and never `NONE`: an unreadable mode must resolve to *more* authentication, not less.
+  - **Per-mode preconditions are enforced at creation, not at dispatch** (`400`): a signing mode needs a non-empty `secret_token` (an HMAC keyed with the empty secret is forgeable while *looking* authenticated), `API_KEY_ONLY` needs an `api_key` (without one it silently becomes `NONE`), and an `hmac_template` must contain `{body}` (a signature that does not cover the payload is replayable across payloads). Deferring these to the background worker would surface them only as a log line, on every future event.
+- **Dynamic HMAC templates (`webhook_configs.hmac_template`, `CANONICAL_V1` only):** the exact string to sign, with `{method}`/`{path}`/`{timestamp}`/`{body}` placeholders and `\n`/`\r`/`\t`/`\\` escapes. See `SCHEMA.MD` §6 for the full substitution rules. Two invariants matter:
+  1. **Single-pass resolution.** Escapes and placeholders are expanded in one left-to-right scan (`webhooks::resolve_hmac_template`), so substituted values are never rescanned. A two-phase implementation would let a request body containing `{path}` or `\n` — reachable through an IP record's `cause` field — forge field boundaries inside the signed string. Do not "simplify" this into chained `.replace()` calls.
+  2. **A literal path overrides `{path}`.** Writing `{method}\n/api/hooks/42/execute\n{timestamp}\n{body}` makes the dispatch sign the path the receiver sees behind a rewriting reverse proxy, while still POSTing to `target_url`. This is the whole mechanism — no proxy-awareness in the dispatcher, no extra column.
+- **Credential exposure:** neither `secret_token` nor `api_key` is ever returned by a read endpoint. `GET /api/webhooks` reports `has_api_key: bool` instead; `hmac_template` *is* returned (resolved to its effective value) because it contains only structure, never key material.
 - **SSRF Prevention:** Validate target URLs. Reject private/loopback IP ranges (RFC 1918, RFC 4193, loopback) unless `ALLOW_PRIVATE_WEBHOOKS=true` is set in environment.
 
 ### 5. Frontend Integration & Dynamic UI
@@ -99,6 +106,10 @@ To keep this context clean and modular, responsibilities are split across three 
 - Single Page Application served from `static/`.
 - **Credentials:** the login screen prompts for **both** the API key and its **signing secret**, stored as `simply_ip_vault_key` and `simply_ip_vault_signing_secret`. Both are required; either alone is useless.
 - **Request signing:** the global `fetch` wrapper injects `X-API-Key`, computes `X-Timestamp`, and signs every call with `X-Signature-256` over the CANONICAL_V1 string. The secret is used as its raw **UTF-8 bytes** (not hex-decoded), matching the server's `secret.as_bytes()`.
+- **Proxy-aware paths — two bases, deliberately separate:**
+  - `requestBase` — where requests are **sent**. Derived from the directory this page is served from, so a dashboard mounted at `/vault/` fetches `/vault/api/ips` with no configuration. Served at `/` it yields `/api`, identical to the previous hardcoded value.
+  - `signingBase` — what gets **signed**. The path the vault process itself sees *after* the proxy has rewritten the URL, which the browser cannot discover. Set via the login screen's **API Base Path Override** (`localStorage['simply_ip_vault_api_base']`, default `/api`).
+  - Never collapse these into one, and never sign `window.location.pathname`: with a prefix-stripping proxy the server verifies `/api/ips` against a signature computed over `/vault/api/ips`, and every request 401s.
 - **Two crypto backends, automatically selected:**
   1. **Web Crypto** (`crypto.subtle.importKey` + `crypto.subtle.sign`, HMAC/SHA-256) whenever available — constant-time and fast. The imported `CryptoKey` is memoized per session.
   2. A **self-contained pure-JS HMAC-SHA256** (`sha256Bytes` / `hmacSha256Bytes` at the top of `app.js`) as fallback. `crypto.subtle` exists *only* in a secure context (HTTPS or `http://localhost`), so a homelab instance reached over plain HTTP at a LAN address — the normal way this tool is used — has no Web Crypto at all. Without the fallback the dashboard simply cannot authenticate there.
@@ -125,7 +136,7 @@ To keep this context clean and modular, responsibilities are split across three 
 - **Coverage Mandatory Requirements:**
   1. **Positive RBAC:** Authorized keys successfully read/write allowed groups.
   2. **Negative RBAC:** Unauthorized attempts MUST return HTTP `403 Forbidden`.
-  3. **Webhook Signatures:** Mock HTTP endpoints (e.g., via Tokio task) verifying payload delivery and HMAC `X-Signature-256` validity.
+  3. **Webhook Signatures:** Mock HTTP endpoints (e.g., via Tokio task) verifying payload delivery and HMAC `X-Signature-256` validity — for **every** `auth_mode`: `CANONICAL_V1` (bare hex + `X-Timestamp`), `BODY_ONLY` (`sha256=` prefix, no timestamp), `API_KEY_ONLY` and `NONE` (asserting the *absence* of signature headers, not merely delivery). A custom `hmac_template` with a hardcoded path must be verified positively (the template's path validates) **and** negatively (the `target_url`-derived path does not), or the assertion passes for the wrong reason.
   4. **Multi-Group & Temporal Querying:** Validate `GET /api/ips` with group filters and `max_age`/`since` constraints.
   5. **Request Authentication (HMAC):** each of the three auth headers is individually mandatory (`401` when any is dropped — in particular the pre-HMAC "key + timestamp only" shape); the anti-replay window is enforced symmetrically at ±300s using *correctly signed* stale/future timestamps, so the rejection provably comes from the freshness check and not the HMAC; and the signature binds method, path, and body (replaying an authentic signature over a tampered body, or onto a different route, MUST fail).
   6. **Signing Secret Handling:** a `NULL` `signing_secret` fails closed; `signing_secret` never appears in any read endpoint's response; and with `VAULT_ENCRYPTION_KEY` set, the stored value is ciphertext yet still authenticates (round trip through the real request path).
@@ -188,6 +199,7 @@ For every route registered under `/api`, tests MUST assert three distinct outcom
   - **Webhooks (`GET /api/webhooks`, `POST /api/webhooks`, `DELETE /api/webhooks/{id}`):**
     - Verify URL validation (HTTP/HTTPS required, private IPs blocked).
     - Test HMAC SHA-256 signature header (`X-Signature-256`) generation.
+    - Test `auth_mode` validation and each mode's preconditions (`400`), and that `secret_token`/`api_key` never appear in a listing.
   - **Audit Trail (`GET /api/audit-logs`):**
     - Verify mutating actions write audit entries and read access is restricted to `is_master` keys.
 

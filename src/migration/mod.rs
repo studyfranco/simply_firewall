@@ -4,6 +4,7 @@ pub use sea_orm_migration::prelude::*;
 mod m20230101_000001_initial_schema;
 mod m20260729_000002_add_api_key_signing_secret;
 mod m20260730_000003_add_webhook_signature_mode;
+mod m20260730_000004_add_webhook_auth_modes;
 
 /// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
@@ -15,6 +16,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20230101_000001_initial_schema::Migration),
             Box::new(m20260729_000002_add_api_key_signing_secret::Migration),
             Box::new(m20260730_000003_add_webhook_signature_mode::Migration),
+            Box::new(m20260730_000004_add_webhook_auth_modes::Migration),
         ]
     }
 }

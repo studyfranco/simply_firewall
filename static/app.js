@@ -325,7 +325,22 @@ class FirewallClient {
     constructor() {
         this.apiKey = localStorage.getItem('simply_ip_vault_key') || '';
         this.signingSecret = localStorage.getItem('simply_ip_vault_signing_secret') || '';
-        this.apiBase = '/api';
+
+        // Two distinct bases, because behind a reverse proxy they are genuinely different paths:
+        //
+        //   requestBase — where to SEND. Derived from where this page is served, so a dashboard
+        //                 mounted at /vault/ fetches /vault/api/ips without any configuration.
+        //   signingBase — what to SIGN. The path the vault process itself sees after the proxy is
+        //                 done rewriting, which no amount of introspection in the browser can
+        //                 discover — hence the override. Defaults to '/api', the direct-access case
+        //                 where the two are identical.
+        //
+        // Signing the browser's own URL instead would break the moment a proxy strips a prefix:
+        // the vault would verify '/api/ips' against a signature computed over '/vault/api/ips'.
+        this.requestBase = FirewallClient.deriveRequestBase();
+        this.signingBase = FirewallClient.normalizeBasePath(
+            localStorage.getItem('simply_ip_vault_api_base') || ''
+        );
         // Cached CryptoKey for HMAC signing, so the secret is imported once per session rather than
         // on every request. Invalidated (alongside the cached secret it was derived from) whenever
         // the credentials change — see setCredentials().
@@ -385,6 +400,51 @@ class FirewallClient {
             await this.verifyAuth();
         } else {
             this.showLogin();
+        }
+    }
+
+    // ───────────────────────────────────────────────────────
+    // Proxy-aware base paths
+    // ───────────────────────────────────────────────────────
+
+    /**
+     * Cleans up a user-typed base path: trims it, guarantees exactly one leading slash, drops any
+     * trailing one, and falls back to '/api' when blank. Idempotent, so re-normalizing a stored
+     * value is harmless.
+     */
+    static normalizeBasePath(raw) {
+        const trimmed = (raw || '').trim();
+        if (!trimmed) return '/api';
+        return `/${trimmed.replace(/^\/+/, '').replace(/\/+$/, '')}`;
+    }
+
+    /**
+     * The prefix every request is sent to, derived from the directory this page is served from.
+     *
+     * Served at `/` this yields `/api` — byte-identical to the previous hardcoded value, so direct
+     * (non-proxied) deployments behave exactly as before. Served at `/vault/` it yields
+     * `/vault/api`, which is what makes a sub-path mount work with no configuration at all.
+     */
+    static deriveRequestBase() {
+        const path = window.location.pathname;
+        // Everything up to and including the last '/': '/vault/index.html' → '/vault/', '/' → '/'.
+        const dir = path.slice(0, path.lastIndexOf('/') + 1) || '/';
+        return `${dir}api`.replace(/\/{2,}/g, '/');
+    }
+
+    /**
+     * Persists the API base path override and applies it to this session.
+     *
+     * Only signing is affected — where requests are *sent* stays derived from the page location.
+     * The two are independent precisely because a prefix-stripping proxy makes them differ.
+     */
+    setApiBaseOverride(raw) {
+        const normalized = FirewallClient.normalizeBasePath(raw);
+        this.signingBase = normalized;
+        if (normalized === '/api') {
+            localStorage.removeItem('simply_ip_vault_api_base');
+        } else {
+            localStorage.setItem('simply_ip_vault_api_base', normalized);
         }
     }
 
@@ -468,13 +528,13 @@ class FirewallClient {
                 headers['X-Timestamp'] = timestamp;
                 headers['X-Signature-256'] = await this.signRequest(
                     method,
-                    `${this.apiBase}${pathOnly}`,
+                    `${this.signingBase}${pathOnly}`,
                     timestamp,
                     rawBody
                 );
             }
 
-            const res = await fetch(`${this.apiBase}${endpoint}`, { ...options, headers });
+            const res = await fetch(`${this.requestBase}${endpoint}`, { ...options, headers });
 
             // 401 means the key itself is invalid/missing — the session is unrecoverable, so log
             // out. 403 means the key IS valid but lacks permission for this one action; it must
@@ -1026,17 +1086,34 @@ class FirewallClient {
             return;
         }
 
+        const badgeClasses = {
+            CANONICAL_V1: 'badge-canonical',
+            BODY_ONLY: 'badge-body-only',
+            API_KEY_ONLY: 'badge-api-key',
+            NONE: 'badge-no-auth'
+        };
+
         tbody.innerHTML = this.state.webhooks.map(w => {
-            // Older rows (and any response from a pre-signature-mode server) carry no field at all;
+            // Older rows (and any response from a pre-auth-mode server) carry no field at all;
             // treat that as the legacy default rather than rendering "undefined".
-            const mode = w.signature_mode || 'BODY_ONLY';
-            const badgeClass = mode === 'CANONICAL_V1' ? 'badge-canonical' : 'badge-body-only';
+            const mode = w.auth_mode || w.signature_mode || 'BODY_ONLY';
+            const badgeClass = badgeClasses[mode] || 'badge-body-only';
+            // A non-default template changes what is actually signed, so it belongs next to the
+            // mode rather than buried — this is the field most likely to explain a rejected
+            // dispatch. The API returns the resolved value, so `default` here means literally that.
+            const customTemplate = mode === 'CANONICAL_V1'
+                && w.hmac_template
+                && w.hmac_template !== '{method}\\n{path}\\n{timestamp}\\n{body}';
+            const keyBadge = w.has_api_key ? ' <span class="badge badge-scope">key</span>' : '';
+            const templateBadge = customTemplate
+                ? ` <span class="badge badge-scope" title="${escapeHtml(w.hmac_template)}">custom template</span>`
+                : '';
             return `
             <tr>
                 <td class="font-mono text-sm">${w.id.split('-')[0]}...</td>
                 <td><strong>${escapeHtml(w.name)}</strong></td>
                 <td class="font-mono text-sm">${escapeHtml(w.target_url)}</td>
-                <td><span class="badge ${badgeClass}">${escapeHtml(mode)}</span></td>
+                <td><span class="badge ${badgeClass}">${escapeHtml(mode)}</span>${keyBadge}${templateBadge}</td>
                 <td>
                     <div class="flex gap-2">
                         <button class="btn btn-sm btn-danger" onclick="window.app.deleteWebhook('${w.id}')">Delete</button>
@@ -1409,6 +1486,33 @@ class FirewallClient {
         this.loadIps();
     }
 
+    /**
+     * Shows only the fields the selected auth mode actually uses, and keeps `required` in step with
+     * visibility.
+     *
+     * The two must move together: a hidden input that is still `required` makes the browser refuse
+     * to submit while reporting the problem on an element nobody can see, which reads as a dead
+     * button. Hidden fields are also excluded from the payload in createWebhook(), so a value left
+     * over from a previous mode can't be silently persisted.
+     */
+    syncWebhookAuthFields() {
+        const mode = document.getElementById('webhook-auth-mode').value;
+        const needsSecret = mode === 'CANONICAL_V1' || mode === 'BODY_ONLY';
+        const needsApiKey = mode === 'CANONICAL_V1' || mode === 'API_KEY_ONLY';
+        const needsTemplate = mode === 'CANONICAL_V1';
+
+        const toggle = (groupId, inputId, visible, required) => {
+            document.getElementById(groupId).classList.toggle('hidden', !visible);
+            document.getElementById(inputId).required = visible && required;
+        };
+
+        toggle('webhook-secret-group', 'webhook-secret', needsSecret, true);
+        // Optional for CANONICAL_V1 (a plain HMAC receiver has no use for a key), mandatory for
+        // API_KEY_ONLY where it is the entire credential — matching the server's own validation.
+        toggle('webhook-api-key-group', 'webhook-api-key', needsApiKey, mode === 'API_KEY_ONLY');
+        toggle('webhook-hmac-template-group', 'webhook-hmac-template', needsTemplate, true);
+    }
+
     async createWebhook(e) {
         e.preventDefault();
 
@@ -1430,20 +1534,35 @@ class FirewallClient {
         // default for an omitted `events` field — rather than a redundant explicit list.
         const events = checkedEvents.length === Object.keys(eventKeys).length ? null : checkedEvents.join(',');
 
+        const authMode = document.getElementById('webhook-auth-mode').value;
         const payload = {
             name: document.getElementById('webhook-name').value,
             target_url: document.getElementById('webhook-url').value,
-            secret_token: document.getElementById('webhook-secret').value,
             group_id: groupId,
             headers_json: document.getElementById('webhook-headers').value || null,
             payload_template: document.getElementById('webhook-template').value,
-            signature_mode: document.getElementById('webhook-signature-mode').value,
+            auth_mode: authMode,
             events
         };
+
+        // Only the fields this mode uses are sent. Anything the user typed under a previously
+        // selected mode and then hid stays out of the request rather than being persisted invisibly.
+        if (authMode === 'CANONICAL_V1' || authMode === 'BODY_ONLY') {
+            payload.secret_token = document.getElementById('webhook-secret').value;
+        }
+        if (authMode === 'CANONICAL_V1' || authMode === 'API_KEY_ONLY') {
+            payload.api_key = document.getElementById('webhook-api-key').value || null;
+        }
+        if (authMode === 'CANONICAL_V1') {
+            payload.hmac_template = document.getElementById('webhook-hmac-template').value;
+        }
 
         try {
             await this.apiFetch('/webhooks', { method: 'POST', body: JSON.stringify(payload) });
             document.getElementById('form-create-webhook').reset();
+            // reset() restores the select's default (CANONICAL_V1); re-sync so the fields on screen
+            // match it again.
+            this.syncWebhookAuthFields();
             this.loadWebhooks();
             this.showToast("Webhook configured", 'success');
         } catch(e) {}
@@ -1469,13 +1588,24 @@ class FirewallClient {
     // Event Binding
     // ───────────────────────────────────────────────────────
     bindEvents() {
+        // Prefill the override from storage so a proxied deployment doesn't ask for it again on
+        // every logout.
+        document.getElementById('login-api-base').value =
+            localStorage.getItem('simply_ip_vault_api_base') || '';
+
         document.getElementById('login-form').addEventListener('submit', (e) => {
             e.preventDefault();
+            // Applied before login(), since verifyAuth()'s very first request is already signed.
+            this.setApiBaseOverride(document.getElementById('login-api-base').value);
             this.login(
                 document.getElementById('login-key').value.trim(),
                 document.getElementById('login-secret').value.trim()
             );
         });
+
+        const authModeSelect = document.getElementById('webhook-auth-mode');
+        authModeSelect.addEventListener('change', () => this.syncWebhookAuthFields());
+        this.syncWebhookAuthFields();
 
         document.getElementById('logout-btn').addEventListener('click', () => this.logout());
         document.getElementById('refresh-btn').addEventListener('click', () => this.loadInitialData());

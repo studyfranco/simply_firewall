@@ -144,14 +144,41 @@ Defines HTTP endpoints to notify when IP events occur within a specific group.
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique webhook configuration ID |
 | `name` | `String` | Not Null | Human-readable name for the webhook |
 | `target_url` | `String` | Not Null | HTTP/HTTPS target endpoint URL |
-| `secret_token` | `String` | Not Null | Shared secret used to generate the HMAC SHA-256 signature (`X-Signature-256`). Never returned by `GET /api/webhooks` |
-| `signature_mode` | `Text` | Not Null, Default: `'BODY_ONLY'` | How dispatches are signed. `'BODY_ONLY'` → HMAC over `RAW_BODY`, sent as `sha256=<hex>` (legacy/generic receivers). `'CANONICAL_V1'` → HMAC over `POST\n<path>\n<timestamp>\n<raw_body>`, sent as bare hex plus an `X-Timestamp` header (Simply IP Vault instance chaining, `simply_hook_executor`). Unrecognized stored values fall back to `'BODY_ONLY'` |
+| `secret_token` | `String` | Not Null | Shared secret used to generate the HMAC SHA-256 signature (`X-Signature-256`). Empty string in the modes that compute no signature. Never returned by `GET /api/webhooks` |
+| `auth_mode` | `Text` | Not Null, Default: `'CANONICAL_V1'` | How dispatches authenticate — one of `'CANONICAL_V1'`, `'BODY_ONLY'`, `'API_KEY_ONLY'`, `'NONE'` (see the table below). Unrecognized stored values fall back to `'BODY_ONLY'`, never to `'NONE'` |
+| `api_key` | `Text` | Nullable | Value sent as the `X-API-Key` header by `'CANONICAL_V1'` and `'API_KEY_ONLY'`. A plaintext credential for the *receiving* system, so it is stored verbatim (there is nothing here to verify it against) and never returned by `GET /api/webhooks` — the listing reports only `has_api_key` |
+| `hmac_template` | `Text` | Nullable, Default: `'{method}\n{path}\n{timestamp}\n{body}'` | The string signed in `'CANONICAL_V1'` mode. `NULL` means the default. Only meaningful for `'CANONICAL_V1'` |
 | `headers_json` | `Text` | Nullable | Custom JSON key-value object of HTTP headers to inject into requests |
 | `payload_template` | `Text` | Not Null | Template string with dynamic variables (e.g. `{"ip":"$target_address","group":"$group_name"}`) |
 | `group_id` | `UUID` | FK -> `ip_groups.id` (CASCADE) | Monitored IP Group |
 | `is_active` | `Boolean` | Default: `true` | Toggle to enable/disable webhook dispatching |
 | `events` | `String` | Nullable | Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook fires on. `NULL` means all events |
 | `created_at` | `DateTimeUtc` | Not Null | Creation timestamp |
+
+*Auth modes:*
+
+| `auth_mode` | Signed message | Headers dispatched | Requires |
+| :--- | :--- | :--- | :--- |
+| `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: <bare hex>`, `X-Timestamp`, and `X-API-Key` when `api_key` is set | `secret_token` |
+| `BODY_ONLY` | `RAW_BODY` | `X-Signature-256: sha256=<hex>` | `secret_token` |
+| `API_KEY_ONLY` | *(none)* | `X-API-Key` | `api_key` |
+| `NONE` | *(none)* | *(none)* | — |
+
+*`hmac_template` substitution rules:*
+
+- Placeholders `{method}`, `{path}`, `{timestamp}`, `{body}` are replaced by their values. `{path}` is
+  taken from `target_url` via `url.path()`. Any other `{...}` is literal text.
+- `\n`, `\r`, `\t`, `\\` are escape sequences expanded to the characters they name; every other
+  backslash sequence is kept verbatim. They are stored as two-character escapes because the template
+  is edited in a single-line HTML input where a real newline cannot be typed.
+- Both substitutions happen in **one left-to-right pass**, so a value substituted in is never
+  rescanned — a request body containing the text `{path}` or `\n` cannot inject field boundaries into
+  the signed string.
+- A literal path written into the template (e.g. `{method}\n/api/hooks/42/execute\n{timestamp}\n{body}`)
+  therefore overrides the `{path}` derived from `target_url`, which is what makes a receiver behind a
+  path-rewriting reverse proxy verifiable without an extra column.
+- `{body}` is mandatory (enforced with `400` at the API boundary): a signature that does not cover the
+  payload is replayable across payloads.
 
 ---
 

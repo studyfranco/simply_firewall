@@ -2288,3 +2288,117 @@ claim.
 `test_rotate_secret_swaps_only_the_signing_secret` asserts the *negative* space explicitly — name,
 scopes, and the per-group grant all survive — because "rotation didn't disturb anything else" is the
 whole contract of that endpoint and would otherwise be untested.
+
+---
+
+## 2026-07-30 (session 20) — Webhook auth modes, dynamic HMAC templates, proxy-aware SPA signing
+
+### Scope
+
+Four dispatch auth modes replacing the two signature modes from session 19, a user-editable HMAC
+template so a webhook can be made to match any receiver's canonicalization, and the SPA change that
+lets the dashboard work behind a path-rewriting reverse proxy. Inbound API authentication is
+untouched — it remains strictly CANONICAL_V1 with no per-key configurability, deliberately, since a
+configurable *verifier* is an attack surface in a way a configurable *signer* is not.
+
+### `signature_mode` → `auth_mode`: replaced, not added beside
+
+`signature_mode` could only ever answer "how do I sign?". Real receivers also want "authenticate with
+a key and no signature" and "send nothing"; expressing those with a second column would have created
+two fields that can contradict each other. `auth_mode` is a strict superset — its `BODY_ONLY` and
+`CANONICAL_V1` mean exactly what the old values meant — so the migration replaces the column.
+
+The migration is add → backfill → drop rather than a rename, for one specific reason: the new default
+is `CANONICAL_V1` and no portable `ALTER TABLE` can change an existing column's default. **The
+backfill is the load-bearing part.** Without it the new default would rewrite every existing
+`BODY_ONLY` webhook to canonical signing, and their receivers would reject the very next event. A test
+(`test_auth_mode_migration_preserves_existing_rows_and_reverses_cleanly`) seeds a row, runs `down`,
+then `up` again, and asserts the row keeps `BODY_ONLY` — i.e. that the backfill, not the default, is
+what decided its value.
+
+`POST /api/webhooks` still accepts `signature_mode` as a deprecated alias, so callers written against
+session 19 keep working. Only `auth_mode` is emitted on the way out.
+
+**This is a behaviour change worth flagging:** a webhook created with *no* mode specified now gets
+`CANONICAL_V1` where it previously got `BODY_ONLY`. That is what the brief specified. Existing rows
+are unaffected (see the backfill above); only newly created webhooks that omit the field are.
+
+### Single-pass template resolution
+
+`resolve_hmac_template` expands escapes (`\n`, `\r`, `\t`, `\\`) and placeholders (`{method}`,
+`{path}`, `{timestamp}`, `{body}`) in **one left-to-right scan**. This is a security property, not a
+performance one, and the obvious "simpler" implementations are both broken:
+
+- *unescape, then `.replace()`* — a body containing the characters `{path}` gets the target path
+  substituted into it, after the body was already placed in the signed string.
+- *`.replace()`, then unescape* — a body containing `\n` gains real newlines, letting it forge field
+  boundaries in the canonical string.
+
+Neither is hypothetical: the payload template interpolates `$cause`, which is attacker-influenced text
+from an IP record. `substituted_values_are_never_rescanned` pins this down. The escape layer exists at
+all because the template is edited in a single-line HTML input, where a real newline cannot be typed.
+
+The "hardcoded path overrides `{path}`" behaviour the brief asked for needs no code — a template that
+never mentions `{path}` simply never substitutes it. That is why it is a documented property rather
+than a feature: there is nothing there to break.
+
+### Validation at configuration time, not dispatch time
+
+Three preconditions are `400`s on `POST /api/webhooks` rather than warnings in the worker:
+
+1. A signing mode with an empty `secret_token` — an HMAC keyed with the empty secret is forgeable by
+   anyone while still *looking* authenticated, which is strictly worse than sending nothing.
+2. `API_KEY_ONLY` with no `api_key` — silently identical to `NONE`.
+3. An `hmac_template` without `{body}` — signs a constant, replayable across every payload.
+
+A webhook is configured once and dispatches forever in the background; a mistake caught at dispatch
+time surfaces only as a log line the operator is not watching.
+
+`AuthMode::from_stored` still falls back to `BODY_ONLY` — deliberately **not** the new column default,
+and never `NONE`. An unreadable mode must resolve to *more* authentication, not less.
+
+### Two base paths in the SPA
+
+`this.apiBase` split into `requestBase` (where to send) and `signingBase` (what to sign), because
+behind a prefix-stripping proxy they are genuinely different strings and no single value is correct
+for both. `requestBase` is derived from the page's own directory, so a `/vault/` mount needs no
+configuration to reach the API; `signingBase` is the login screen's **API Base Path Override**,
+because what the vault process sees after rewriting is unknowable from the browser. Served at `/`,
+`deriveRequestBase()` yields `/api` — byte-identical to the old hardcoded value, so direct
+deployments are unchanged.
+
+The failure mode when these are conflated is total and silent-looking: every request 401s, including
+the first, with nothing in the response to suggest the path is the problem. Hence the explicit
+callout in `AGENT.MD` §5 and `README.md`.
+
+### UI
+
+Auth Mode dropdown plus conditionally-shown API Key and HMAC Signature Template fields.
+`syncWebhookAuthFields()` keeps `required` in step with visibility — a hidden `required` input makes
+the browser refuse to submit while reporting the error on an element nobody can see, which reads as a
+dead button. Hidden fields are also omitted from the request body, so a value typed under one mode and
+then hidden cannot be persisted invisibly.
+
+`NONE` is badged in the danger colour and `API_KEY_ONLY` in the warning colour. Both are legitimate
+choices, but an unauthenticated dispatch should never look ordinary in a list of otherwise-signed
+ones.
+
+### Tests
+
+| Suite | Before | After |
+| :--- | :--- | :--- |
+| `cargo test` | 56 | 67 (13 unit + 54 integration) |
+| `scripts/test_e2e.sh` | 233 | 261 |
+
+The 7 new unit tests live in `webhooks.rs` next to the resolver; the 4 new integration tests cover the
+migration round-trip, the per-mode preconditions, a custom template with a hardcoded path, and the two
+unsigned modes.
+
+Every live dispatch assertion is made **negatively as well as positively**: the custom-template test
+checks that the template's path validates *and* that the `target_url`-derived path does not, because
+the positive check alone passes for the wrong reason if the override silently didn't happen. The
+`API_KEY_ONLY`/`NONE` tests assert the *absence* of `X-Signature-256` and `X-Timestamp`, not merely
+that delivery occurred.
+
+The E2E mock receiver now also records `X-API-Key`. New §23 exercises the executor-shaped case end to
+end: post to `/proxied/path`, sign `/api/hooks/42/execute`, verify both.

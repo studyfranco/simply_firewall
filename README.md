@@ -26,8 +26,9 @@ templated webhooks.
 - Multi-tenant RBAC: API keys can be scoped to exactly the groups (and read/write/delete rights)
   they need.
 - Webhooks: HMAC-SHA256-signed (`X-Signature-256`), templated JSON payloads, custom headers, with
-  SSRF protection against private/loopback targets by default. Two signature modes — a generic
-  body-only one, and a canonical mode that can authenticate straight into another instance's API.
+  SSRF protection against private/loopback targets by default. Four auth modes — canonical signing
+  (which can authenticate straight into another instance's API, with a fully customizable signed
+  string), generic body-only signing, API-key-only, and unauthenticated.
 - Every mutating action is recorded in an audit log.
 
 ## Getting Started
@@ -78,6 +79,13 @@ screen, or drive the API directly with `curl` (see below).
 > context (HTTPS or `http://localhost`). Over plain HTTP to a LAN address it transparently falls back
 > to a built-in pure-JS HMAC-SHA256, so the dashboard works either way — but that fallback is not
 > constant-time and your traffic is unencrypted, so TLS is still recommended.
+
+> **Behind a reverse proxy:** the dashboard sends requests relative to wherever it is served, so a
+> mount at `https://host/vault/` needs no configuration to *reach* the API. Signatures are a
+> different matter — they cover the path the vault process itself sees. If your proxy strips the
+> prefix (`/vault/api/ips` → `/api/ips`), leave the login screen's **API Base Path Override** blank.
+> If it forwards the prefix untouched, set the override to `/vault/api`. Getting it wrong produces a
+> `401` on every request, including the first.
 
 ### Configuration
 
@@ -139,24 +147,43 @@ the caller's (proxy-aware) source address get `403`. Master keys bypass all grou
 | `POST` / `GET` | `/api/webhooks` | Create / list webhook configs. |
 | `DELETE` | `/api/webhooks/{id}` | Delete a webhook config. |
 
-### Webhook signature modes
+### Webhook auth modes
 
-Each webhook chooses how its outgoing `X-Signature-256` is computed, via `signature_mode` on
-`POST /api/webhooks` (also shown in the dashboard's Webhooks tab):
+Each webhook chooses how it authenticates to its receiver, via `auth_mode` on `POST /api/webhooks`
+(also a dropdown in the dashboard's Webhooks tab):
 
 | Mode | Signed message | Headers sent | Use for |
 | :--- | :--- | :--- | :--- |
-| `BODY_ONLY` *(default)* | the raw body | `X-Signature-256: sha256=<hex>` | Generic third-party receivers (GitHub-style consumers). |
-| `CANONICAL_V1` | `POST\n<path>\n<timestamp>\n<body>` | `X-Signature-256: <bare hex>` **and** `X-Timestamp` | Another `simply_ip_vault` instance, or `simply_hook_executor`. |
+| `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: <bare hex>`, `X-Timestamp`, and `X-API-Key` if set | Another `simply_ip_vault` instance, or `simply_hook_executor`. |
+| `BODY_ONLY` | the raw body | `X-Signature-256: sha256=<hex>` | Generic third-party receivers (GitHub-style consumers). |
+| `API_KEY_ONLY` | *(none)* | `X-API-Key` | APIs whose only credential is a bearer-style key. |
+| `NONE` | *(none)* | *(none)* | Receivers authenticated by network position, or by something in `headers_json`. |
 
-`CANONICAL_V1` uses exactly the same construction as the inbound API, which is what makes **instance
-chaining** work end to end: create a key on the receiving instance, then on the sending instance set
-`secret_token` to that key's signing secret, put `{"X-API-Key": "<that key>"}` in `headers_json`, and
-point `target_url` at the receiver's `/api/ban`. The dispatch then arrives as an ordinary signed,
+`CANONICAL_V1` with the default template uses exactly the same construction as the inbound API, which
+is what makes **instance chaining** work end to end: create a key on the receiving instance, then on
+the sending instance set `secret_token` to that key's signing secret, `api_key` to the key itself, and
+point `target_url` at the receiver's `/api/ban`. The dispatch arrives as an ordinary signed,
 timestamped API request and passes the receiver's anti-replay check.
 
-Omitting `signature_mode` keeps the legacy `BODY_ONLY` behaviour, so existing webhooks are unchanged.
-An unrecognized value is rejected with `400` rather than silently downgraded.
+An unrecognized `auth_mode` is rejected with `400` rather than silently downgraded, as is a mode whose
+preconditions aren't met (a signing mode with no `secret_token`, `API_KEY_ONLY` with no `api_key`).
+The older field name `signature_mode` is still accepted as an alias.
+
+#### HMAC templates
+
+In `CANONICAL_V1` mode, `hmac_template` is the exact string that gets signed. It defaults to
+`{method}\n{path}\n{timestamp}\n{body}`, where `\n` is a two-character escape (expanded at dispatch
+time, so the field is editable in a single-line input) and `{path}` comes from `target_url`.
+
+Hardcoding a path in the template overrides `{path}` with no extra configuration — the case that
+matters behind a reverse proxy that rewrites paths:
+
+```
+{method}\n/api/hooks/42/execute\n{timestamp}\n{body}
+```
+
+The request still goes to `target_url`, but the signature covers `/api/hooks/42/execute` — the path
+the receiver actually sees, and therefore the one it will verify against. `{body}` is mandatory.
 
 `GET /api/ips` query parameters: `groups=fail2ban,sshd` (or singular `group_name=`), `ip=<substring>`,
 `cause=<substring>`, `status=ban|white`, `max_age=<seconds>`, `since=<unix timestamp>`, `limit`,

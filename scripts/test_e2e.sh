@@ -822,12 +822,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self.rfile.read(length).decode('utf-8', 'replace')
         # One JSON object per line: still exactly one line per delivery (so the existing
         # `wc -l` hit-counting checks are unaffected), but now carrying everything the
-        # signature-mode checks need to verify a CANONICAL_V1 dispatch.
+        # auth-mode checks need to verify each of the four dispatch shapes.
         with open(log_path, 'a') as f:
             f.write(json.dumps({
                 'path': self.path,
                 'signature': self.headers.get('X-Signature-256'),
                 'timestamp': self.headers.get('X-Timestamp'),
+                'api_key': self.headers.get('X-API-Key'),
                 'body': body,
             }) + '\n')
         self.send_response(200)
@@ -1170,29 +1171,56 @@ check "403" "a key without can_manage_keys cannot rotate secrets"
 api_call DELETE "/api/keys/$ROTATE_KEY_ID" "$MASTER_KEY"
 check "204" "clean up the rotation test key"
 
-# ── 22. Webhook signature modes ─────────────────────────────────────────────
+# ── 22. Webhook auth modes ──────────────────────────────────────────────────
 
-log_section "22. Webhook Signature Modes (BODY_ONLY / CANONICAL_V1)"
+log_section "22. Webhook Auth Modes (CANONICAL_V1 / BODY_ONLY / API_KEY_ONLY / NONE)"
 
 api_call POST "/api/groups" "$MASTER_KEY" '{"name":"SigMode-Group"}'
-check "200" "create a group for signature-mode webhooks"
+check "200" "create a group for auth-mode webhooks"
 SIGMODE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
-# Validation happens at the API boundary rather than silently downgrading to BODY_ONLY.
+# Validation happens at the API boundary rather than silently downgrading.
 api_call POST "/api/webhooks" "$MASTER_KEY" \
-    "{\"name\":\"bad-mode\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"s\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"signature_mode\":\"CANONICAL_V2\"}"
-check "400" "an unknown signature_mode is rejected"
+    "{\"name\":\"bad-mode\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"s\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"CANONICAL_V2\"}"
+check "400" "an unknown auth_mode is rejected"
+
+# Per-mode preconditions: a signing mode with no key signs with the empty secret (forgeable), and
+# API_KEY_ONLY with no key sends no credential at all (silently equivalent to NONE).
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"no-secret\",\"target_url\":\"https://example.com/h\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\"}"
+check "400" "a signing auth_mode without a secret_token is rejected"
+
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"no-key\",\"target_url\":\"https://example.com/h\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"API_KEY_ONLY\"}"
+check "400" "API_KEY_ONLY without an api_key is rejected"
+
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"bodyless-template\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"s\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"hmac_template\":\"{method}\\\\n{path}\\\\n{timestamp}\"}"
+check "400" "an hmac_template that omits {body} is rejected"
 
 api_call POST "/api/webhooks" "$MASTER_KEY" \
     "{\"name\":\"default-mode\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"s\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\"}"
-check "200" "omitting signature_mode is accepted"
-check_true '.signature_mode == "BODY_ONLY"' "an omitted signature_mode defaults to BODY_ONLY"
+check "200" "omitting auth_mode is accepted"
+check_true '.auth_mode == "CANONICAL_V1"' "an omitted auth_mode defaults to CANONICAL_V1"
 DEFAULT_MODE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# The previous field name still selects a mode, so existing callers keep working.
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"alias-mode\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"s\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"signature_mode\":\"BODY_ONLY\"}"
+check "200" "the deprecated signature_mode alias is still accepted"
+check_true '.auth_mode == "BODY_ONLY"' "the alias selects the same mode under the new name"
+ALIAS_MODE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
 api_call GET "/api/webhooks" "$MASTER_KEY"
 check "200" "list webhooks"
 check_true "[.[] | select(.id == \"$DEFAULT_MODE_WEBHOOK_ID\")] | length == 1" "the webhook appears in the listing"
-check_true "[.[] | select(.id == \"$DEFAULT_MODE_WEBHOOK_ID\") | .signature_mode == \"BODY_ONLY\"] | all" "the listing exposes signature_mode"
+check_true "[.[] | select(.id == \"$DEFAULT_MODE_WEBHOOK_ID\") | .auth_mode == \"CANONICAL_V1\"] | all" "the listing exposes auth_mode"
+check_true "[.[] | select(.id == \"$DEFAULT_MODE_WEBHOOK_ID\") | .hmac_template == \"{method}\\\\n{path}\\\\n{timestamp}\\\\n{body}\"] | all" "the listing resolves hmac_template to the effective default"
+check_true "[.[] | select(.id == \"$DEFAULT_MODE_WEBHOOK_ID\") | .has_api_key == false] | all" "the listing reports api_key presence, not its value"
+check_true 'all(.[]; has("api_key") | not)' "no listed webhook ever exposes its api_key"
+
+api_call DELETE "/api/webhooks/$ALIAS_MODE_WEBHOOK_ID" "$MASTER_KEY"
+check "204" "delete the alias-mode webhook"
 
 api_call DELETE "/api/webhooks/$DEFAULT_MODE_WEBHOOK_ID" "$MASTER_KEY"
 check "204" "delete the default-mode webhook"
@@ -1203,9 +1231,9 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     : > "$RECEIVER_LOG"
 
     api_call POST "/api/webhooks" "$MASTER_KEY" \
-        "{\"name\":\"canonical-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/canon\",\"secret_token\":\"$CANON_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"signature_mode\":\"CANONICAL_V1\",\"events\":\"IP_ADD\"}"
+        "{\"name\":\"canonical-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/canon\",\"secret_token\":\"$CANON_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"events\":\"IP_ADD\"}"
     check "200" "create a CANONICAL_V1 webhook"
-    check_true '.signature_mode == "CANONICAL_V1"' "creation echoes CANONICAL_V1"
+    check_true '.auth_mode == "CANONICAL_V1"' "creation echoes CANONICAL_V1"
     CANON_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
     api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.222\",\"group_name\":\"SigMode-Group\",\"cause\":\"canonical dispatch\"}"
@@ -1269,7 +1297,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     # timestamp — the regression guard for third-party consumers.
     : > "$RECEIVER_LOG"
     api_call POST "/api/webhooks" "$MASTER_KEY" \
-        "{\"name\":\"legacy-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/legacy\",\"secret_token\":\"$CANON_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"signature_mode\":\"BODY_ONLY\",\"events\":\"IP_ADD\"}"
+        "{\"name\":\"legacy-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/legacy\",\"secret_token\":\"$CANON_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"BODY_ONLY\",\"events\":\"IP_ADD\"}"
     check "200" "create a BODY_ONLY webhook on the same receiver"
     LEGACY_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
@@ -1312,6 +1340,150 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     check "204" "delete the legacy webhook"
 else
     warn "Local webhook receiver unavailable — skipping live CANONICAL_V1/BODY_ONLY dispatch verification."
+fi
+
+# ── 23. Dynamic HMAC templates & key-based dispatch ─────────────────────────
+
+log_section "23. Dynamic HMAC Templates, API_KEY_ONLY and NONE Dispatch"
+
+if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+    TEMPLATE_SECRET="template-e2e-secret"
+    DOWNSTREAM_KEY="downstream-e2e-key"
+    # The simply_hook_executor shape: the vault POSTs to whatever URL the proxy exposes, while the
+    # receiver behind it signs over the path IT sees. Hardcoding that path in the template is the
+    # whole mechanism — no extra column, no proxy-awareness in the dispatcher.
+    EXECUTOR_PATH="/api/hooks/42/execute"
+    ESCAPED_TEMPLATE="{method}\\\\n$EXECUTOR_PATH\\\\n{timestamp}\\\\n{body}"
+    : > "$RECEIVER_LOG"
+
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"executor-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/proxied/path\",\"secret_token\":\"$TEMPLATE_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"api_key\":\"$DOWNSTREAM_KEY\",\"hmac_template\":\"$ESCAPED_TEMPLATE\",\"events\":\"IP_ADD\"}"
+    check "200" "create a CANONICAL_V1 webhook with a hardcoded-path hmac_template"
+    TEMPLATE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.224\",\"group_name\":\"SigMode-Group\",\"cause\":\"templated dispatch\"}"
+    check "200" "ban an address to trigger the templated dispatch"
+
+    for _ in $(seq 1 40); do
+        [ -s "$RECEIVER_LOG" ] && break
+        sleep 0.25
+    done
+
+    if [ -s "$RECEIVER_LOG" ]; then
+        HIT=$(head -n 1 "$RECEIVER_LOG")
+        T_SIG=$(echo "$HIT" | jq -r '.signature // empty')
+        T_TS=$(echo "$HIT" | jq -r '.timestamp // empty')
+        T_BODY=$(echo "$HIT" | jq -r '.body // empty')
+        T_PATH=$(echo "$HIT" | jq -r '.path // empty')
+        T_KEY=$(echo "$HIT" | jq -r '.api_key // empty')
+
+        if [ "$T_PATH" == "/proxied/path" ]; then
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the request is still sent to target_url's path" >&2
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} expected delivery to /proxied/path, got '$T_PATH'" >&2
+        fi
+
+        if [ "$T_KEY" == "$DOWNSTREAM_KEY" ]; then
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} CANONICAL_V1 sends the configured api_key as X-API-Key" >&2
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} expected X-API-Key '$DOWNSTREAM_KEY', got '$T_KEY'" >&2
+        fi
+
+        # Signed over the template's hardcoded path...
+        TEMPLATE_EXPECTED=$(hmac_sign "$TEMPLATE_SECRET" "POST" "$EXECUTOR_PATH" "$T_TS" "$T_BODY")
+        if [ -n "$T_SIG" ] && [ "$T_SIG" == "$TEMPLATE_EXPECTED" ]; then
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the signature covers the template's hardcoded path, not target_url's" >&2
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} templated signature mismatch (got '$T_SIG', expected '$TEMPLATE_EXPECTED')" >&2
+        fi
+
+        # ...and NOT over the URL-derived one, or the check above would pass for the wrong reason.
+        URL_DERIVED=$(hmac_sign "$TEMPLATE_SECRET" "POST" "/proxied/path" "$T_TS" "$T_BODY")
+        if [ "$T_SIG" != "$URL_DERIVED" ]; then
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the URL-derived path does not produce a matching signature" >&2
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} the template's path did not override the URL-derived one" >&2
+        fi
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} the templated webhook was never delivered" >&2
+    fi
+
+    api_call DELETE "/api/webhooks/$TEMPLATE_WEBHOOK_ID" "$MASTER_KEY"
+    check "204" "delete the templated webhook"
+
+    # The two unsigned modes, back to back through the same receiver.
+    for MODE_SPEC in "API_KEY_ONLY:198.51.100.225:$DOWNSTREAM_KEY" "NONE:198.51.100.226:"; do
+        MODE="${MODE_SPEC%%:*}"
+        REST="${MODE_SPEC#*:}"
+        MODE_ADDR="${REST%%:*}"
+        EXPECT_KEY="${REST#*:}"
+        : > "$RECEIVER_LOG"
+
+        api_call POST "/api/webhooks" "$MASTER_KEY" \
+            "{\"name\":\"${MODE}-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/unsigned\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"$MODE\",\"api_key\":\"$DOWNSTREAM_KEY\",\"events\":\"IP_ADD\"}"
+        check "200" "create a $MODE webhook (no secret_token required)"
+        UNSIGNED_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+        api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"$MODE_ADDR\",\"group_name\":\"SigMode-Group\"}"
+        check "200" "ban an address to trigger the $MODE dispatch"
+
+        for _ in $(seq 1 40); do
+            [ -s "$RECEIVER_LOG" ] && break
+            sleep 0.25
+        done
+
+        if [ -s "$RECEIVER_LOG" ]; then
+            HIT=$(head -n 1 "$RECEIVER_LOG")
+            U_SIG=$(echo "$HIT" | jq -r '.signature // empty')
+            U_TS=$(echo "$HIT" | jq -r '.timestamp // empty')
+            U_KEY=$(echo "$HIT" | jq -r '.api_key // empty')
+            U_BODY=$(echo "$HIT" | jq -r '.body // empty')
+
+            if [ -z "$U_SIG" ] && [ -z "$U_TS" ]; then
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $MODE sends neither X-Signature-256 nor X-Timestamp" >&2
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} $MODE unexpectedly sent sig='$U_SIG' ts='$U_TS'" >&2
+            fi
+
+            if [ "$U_KEY" == "$EXPECT_KEY" ]; then
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $MODE X-API-Key header is as expected ('$EXPECT_KEY')" >&2
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} $MODE expected X-API-Key '$EXPECT_KEY', got '$U_KEY'" >&2
+            fi
+
+            case "$U_BODY" in
+                *"$MODE_ADDR"*)
+                    PASS_COUNT=$((PASS_COUNT + 1))
+                    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $MODE still delivers the templated payload" >&2
+                    ;;
+                *)
+                    FAIL_COUNT=$((FAIL_COUNT + 1))
+                    echo -e "$(ts)   ${RED}✗ FAIL${RESET} $MODE payload did not contain $MODE_ADDR (got '$U_BODY')" >&2
+                    ;;
+            esac
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} the $MODE webhook was never delivered" >&2
+        fi
+
+        api_call DELETE "/api/webhooks/$UNSIGNED_WEBHOOK_ID" "$MASTER_KEY"
+        check "204" "delete the $MODE webhook"
+    done
+else
+    warn "Local webhook receiver unavailable — skipping live template/API_KEY_ONLY/NONE dispatch verification."
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
