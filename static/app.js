@@ -1,6 +1,133 @@
 // Simply IP Vault SPA Client
 // No external dependencies (Vanilla JS)
 
+// ═══════════════════════════════════════════════════════════════════════════
+// Pure-JS HMAC-SHA256 fallback
+//
+// Every API request must be signed (see FirewallClient.signRequest). The Web Crypto API is the
+// preferred implementation, but `crypto.subtle` exists ONLY in a secure context — HTTPS, or
+// http://localhost. A homelab deployment reached over plain HTTP at a LAN address (which is the
+// normal way this tool gets used) therefore has no `crypto.subtle` at all, and without a fallback
+// the dashboard simply cannot authenticate there.
+//
+// So: a self-contained SHA-256 + HMAC implementation, no dependencies, per the project's strict
+// vanilla-JS rule. It is used ONLY when `crypto.subtle` is unavailable — where Web Crypto exists it
+// wins, being both constant-time and far faster.
+//
+// Security note: this fallback is not constant-time and the derived signature is computed in
+// interpreted JS. That is an accepted, explicit trade-off — on a plain-HTTP LAN connection the
+// request and its headers are already fully visible to anyone on the path, so timing side-channels
+// in the browser are not the weak link. HTTPS remains the recommended deployment.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** SHA-256 round constants (first 32 bits of the fractional parts of the cube roots of the first 64 primes). */
+const SHA256_K = new Uint32Array([
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+]);
+
+/** SHA-256 block size in bytes — also the HMAC key-padding width. */
+const SHA256_BLOCK_BYTES = 64;
+
+/** Rotate a 32-bit word right by n bits (1..31). */
+function rotr32(x, n) {
+    return (x >>> n) | (x << (32 - n));
+}
+
+/**
+ * SHA-256 of a Uint8Array, returning a 32-byte Uint8Array.
+ *
+ * Intermediate sums are reduced with `>>> 0` (ToUint32), which is correct even when an operand is a
+ * negative int32 — JS bitwise operators yield signed 32-bit values, but ToUint32 adds 2^32, leaving
+ * every result congruent mod 2^32 as the spec requires.
+ */
+function sha256Bytes(bytes) {
+    const h = new Uint32Array([
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+        0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19
+    ]);
+
+    // Pad to a multiple of 64: the 0x80 marker, then zeros, then a 64-bit big-endian bit length.
+    const bitLen = bytes.length * 8;
+    const totalLen = ((bytes.length + 9 + 63) >> 6) << 6;
+    const msg = new Uint8Array(totalLen);
+    msg.set(bytes);
+    msg[bytes.length] = 0x80;
+
+    const view = new DataView(msg.buffer);
+    // The high word is derived by division, not by shifting: JS bitwise ops truncate to 32 bits, so
+    // `bitLen >>> 32` would be wrong for inputs above 512 MiB.
+    view.setUint32(totalLen - 8, Math.floor(bitLen / 0x100000000), false);
+    view.setUint32(totalLen - 4, bitLen >>> 0, false);
+
+    const w = new Uint32Array(64);
+    for (let off = 0; off < totalLen; off += SHA256_BLOCK_BYTES) {
+        for (let i = 0; i < 16; i++) {
+            w[i] = view.getUint32(off + i * 4, false);
+        }
+        for (let i = 16; i < 64; i++) {
+            const s0 = rotr32(w[i - 15], 7) ^ rotr32(w[i - 15], 18) ^ (w[i - 15] >>> 3);
+            const s1 = rotr32(w[i - 2], 17) ^ rotr32(w[i - 2], 19) ^ (w[i - 2] >>> 10);
+            w[i] = (w[i - 16] + s0 + w[i - 7] + s1) >>> 0;
+        }
+
+        let [a, b, c, d, e, f, g, hh] = h;
+        for (let i = 0; i < 64; i++) {
+            const S1 = rotr32(e, 6) ^ rotr32(e, 11) ^ rotr32(e, 25);
+            const ch = (e & f) ^ (~e & g);
+            const t1 = (hh + S1 + ch + SHA256_K[i] + w[i]) >>> 0;
+            const S0 = rotr32(a, 2) ^ rotr32(a, 13) ^ rotr32(a, 22);
+            const maj = (a & b) ^ (a & c) ^ (b & c);
+            const t2 = (S0 + maj) >>> 0;
+            hh = g; g = f; f = e;
+            e = (d + t1) >>> 0;
+            d = c; c = b; b = a;
+            a = (t1 + t2) >>> 0;
+        }
+
+        h[0] = (h[0] + a) >>> 0; h[1] = (h[1] + b) >>> 0;
+        h[2] = (h[2] + c) >>> 0; h[3] = (h[3] + d) >>> 0;
+        h[4] = (h[4] + e) >>> 0; h[5] = (h[5] + f) >>> 0;
+        h[6] = (h[6] + g) >>> 0; h[7] = (h[7] + hh) >>> 0;
+    }
+
+    const out = new Uint8Array(32);
+    const outView = new DataView(out.buffer);
+    for (let i = 0; i < 8; i++) {
+        outView.setUint32(i * 4, h[i], false);
+    }
+    return out;
+}
+
+/** HMAC-SHA256 (RFC 2104) of `msgBytes` under `keyBytes`, returning a 32-byte Uint8Array. */
+function hmacSha256Bytes(keyBytes, msgBytes) {
+    // Keys longer than one block are hashed down first; shorter keys are zero-padded up.
+    const key = keyBytes.length > SHA256_BLOCK_BYTES ? sha256Bytes(keyBytes) : keyBytes;
+    const padded = new Uint8Array(SHA256_BLOCK_BYTES);
+    padded.set(key);
+
+    const inner = new Uint8Array(SHA256_BLOCK_BYTES + msgBytes.length);
+    const outer = new Uint8Array(SHA256_BLOCK_BYTES + 32);
+    for (let i = 0; i < SHA256_BLOCK_BYTES; i++) {
+        inner[i] = padded[i] ^ 0x36;
+        outer[i] = padded[i] ^ 0x5c;
+    }
+    inner.set(msgBytes, SHA256_BLOCK_BYTES);
+    outer.set(sha256Bytes(inner), SHA256_BLOCK_BYTES);
+    return sha256Bytes(outer);
+}
+
+/** Lowercase hex encoding of a Uint8Array, matching Rust's `hex::encode`. */
+function bytesToHex(bytes) {
+    return Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 // Reusable searchable dropdown ("combobox"): a text input plus a live-filtered option list.
 // Two modes, chosen by whether searchId and valueId are the same element:
 //   - allowFreeText: true  — searchId === valueId; the input's own text IS the value (used by
@@ -273,15 +400,6 @@ class FirewallClient {
      * here would produce a different key and fail every signature check.
      */
     async getHmacKey() {
-        if (!crypto?.subtle) {
-            // crypto.subtle only exists in a secure context (HTTPS, or http on localhost). Served
-            // over plain HTTP to a LAN address, signing is simply unavailable in the browser, so
-            // say so plainly instead of failing later with an opaque 401.
-            throw new Error(
-                'Request signing unavailable: this page must be served over HTTPS (or from localhost) ' +
-                'for the Web Crypto API to be accessible.'
-            );
-        }
         if (this.hmacKey && this.hmacKeySource === this.signingSecret) {
             return this.hmacKey;
         }
@@ -297,17 +415,35 @@ class FirewallClient {
     }
 
     /**
-     * Computes the hex X-Signature-256 over METHOD + PATH + TIMESTAMP + RAW_BODY.
+     * True when the Web Crypto API is usable. `crypto.subtle` is exposed only in a secure context
+     * (HTTPS, or http://localhost), so a homelab instance reached over plain HTTP at a LAN address
+     * lands on the pure-JS fallback instead.
+     */
+    static hasWebCrypto() {
+        return typeof crypto !== 'undefined' && typeof crypto.subtle !== 'undefined';
+    }
+
+    /**
+     * Computes the hex X-Signature-256 over the CANONICAL_V1 string
+     * `METHOD\nPATH\nTIMESTAMP\nRAW_BODY`.
      *
      * `path` must exclude the query string, matching the server's `crypto::verify_signature`.
+     *
+     * Prefers Web Crypto and falls back to the pure-JS HMAC above when `crypto.subtle` is absent.
+     * Both paths produce byte-identical output: the secret is used as its raw UTF-8 bytes (NOT
+     * hex-decoded), because the server keys its HMAC with `secret.as_bytes()`.
      */
     async signRequest(method, path, timestamp, body) {
+        const encoder = new TextEncoder();
+        const message = encoder.encode(`${method}\n${path}\n${timestamp}\n${body}`);
+
+        if (!FirewallClient.hasWebCrypto()) {
+            return bytesToHex(hmacSha256Bytes(encoder.encode(this.signingSecret), message));
+        }
+
         const key = await this.getHmacKey();
-        const message = new TextEncoder().encode(`${method}${path}${timestamp}${body}`);
         const digest = await crypto.subtle.sign('HMAC', key, message);
-        return Array.from(new Uint8Array(digest))
-            .map(b => b.toString(16).padStart(2, '0'))
-            .join('');
+        return bytesToHex(new Uint8Array(digest));
     }
 
     // ───────────────────────────────────────────────────────
@@ -794,7 +930,8 @@ class FirewallClient {
                 <td>
                     <div class="flex gap-2">
                         <button class="btn btn-sm btn-secondary" onclick="window.app.openEditKeyModal('${k.id}')">Edit</button>
-                        <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateKeySecret('${k.id}')">Regenerate</button>
+                        <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateKeySecret('${k.id}')" title="Replace BOTH the API key and its signing secret">Regenerate</button>
+                        <button class="btn btn-sm btn-cancel" onclick="window.app.rotateSigningSecret('${k.id}')" title="Replace only the HMAC signing secret; the API key, name and permissions stay the same">Rotate Secret</button>
                         <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>
                     </div>
                 </td>
@@ -885,22 +1022,29 @@ class FirewallClient {
     renderWebhooksTable() {
         const tbody = document.getElementById('webhooks-table-body');
         if (this.state.webhooks.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="4" class="text-center text-muted">No webhooks.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No webhooks.</td></tr>';
             return;
         }
 
-        tbody.innerHTML = this.state.webhooks.map(w => `
+        tbody.innerHTML = this.state.webhooks.map(w => {
+            // Older rows (and any response from a pre-signature-mode server) carry no field at all;
+            // treat that as the legacy default rather than rendering "undefined".
+            const mode = w.signature_mode || 'BODY_ONLY';
+            const badgeClass = mode === 'CANONICAL_V1' ? 'badge-canonical' : 'badge-body-only';
+            return `
             <tr>
                 <td class="font-mono text-sm">${w.id.split('-')[0]}...</td>
                 <td><strong>${escapeHtml(w.name)}</strong></td>
                 <td class="font-mono text-sm">${escapeHtml(w.target_url)}</td>
+                <td><span class="badge ${badgeClass}">${escapeHtml(mode)}</span></td>
                 <td>
                     <div class="flex gap-2">
                         <button class="btn btn-sm btn-danger" onclick="window.app.deleteWebhook('${w.id}')">Delete</button>
                     </div>
                 </td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
     }
 
     updatePaginationUI() {
@@ -1135,6 +1279,41 @@ class FirewallClient {
         } catch(e) {}
     }
 
+    /**
+     * Rotates only the HMAC signing secret via POST /api/keys/{id}/rotate-secret.
+     *
+     * Narrower than regenerateKeySecret(): the API key itself, its name, and every RBAC grant are
+     * left intact, so only the signing half of the credential needs redistributing.
+     */
+    async rotateSigningSecret(id) {
+        const key = this.state.apiKeys.find(k => k.id === id);
+        const ok = await this.showConfirmModal({
+            title: 'Rotate Signing Secret',
+            message: `Generate a new HMAC signing secret for "${key ? key.name : id}"? `
+                + `The API key, its name and its permissions stay the same, but the current signing `
+                + `secret stops working immediately — every client using this key must be updated.`,
+            confirmText: 'Rotate Secret',
+            danger: true
+        });
+        if (!ok) return;
+
+        try {
+            const res = await this.apiFetch(`/keys/${id}/rotate-secret`, { method: 'POST' });
+            document.getElementById('signing-secret-key-name').textContent = res.name;
+            document.getElementById('signing-secret-value').textContent = res.signing_secret;
+            document.getElementById('signing-secret-modal').classList.remove('hidden');
+            this.showToast('Signing secret rotated', 'success');
+
+            // Rotating your own key re-keys the credential this very session signs with. Unlike a
+            // full regenerate, the API key is still valid — so re-sign in place with the new secret
+            // rather than forcing a logout, keeping the session alive.
+            if (this.state.profile && this.state.profile.id === id) {
+                this.setCredentials(this.apiKey, res.signing_secret);
+                this.showToast('Your own signing secret was updated — this session now uses it.', 'success');
+            }
+        } catch (e) {}
+    }
+
     async regenerateKeySecret(id) {
         const ok = await this.showConfirmModal({
             title: 'Regenerate Secret',
@@ -1258,6 +1437,7 @@ class FirewallClient {
             group_id: groupId,
             headers_json: document.getElementById('webhook-headers').value || null,
             payload_template: document.getElementById('webhook-template').value,
+            signature_mode: document.getElementById('webhook-signature-mode').value,
             events
         };
 
@@ -1377,6 +1557,30 @@ class FirewallClient {
         // Secret reveal modal (used after key rotation)
         document.getElementById('secret-reveal-close').addEventListener('click', () => {
             document.getElementById('secret-reveal-modal').classList.add('hidden');
+        });
+
+        // Signing-secret reveal modal (used after POST /api/keys/{id}/rotate-secret)
+        document.getElementById('signing-secret-close').addEventListener('click', () => {
+            document.getElementById('signing-secret-modal').classList.add('hidden');
+        });
+        document.getElementById('signing-secret-copy').addEventListener('click', async () => {
+            const value = document.getElementById('signing-secret-value').textContent;
+            // navigator.clipboard is itself gated on a secure context — the same limitation that
+            // makes the pure-JS HMAC fallback necessary — so fall back to selecting the text and
+            // telling the user to copy manually rather than silently doing nothing.
+            try {
+                if (!navigator.clipboard) throw new Error('clipboard unavailable');
+                await navigator.clipboard.writeText(value);
+                this.showToast('Signing secret copied to clipboard', 'success');
+            } catch {
+                const node = document.getElementById('signing-secret-value');
+                const range = document.createRange();
+                range.selectNodeContents(node);
+                const sel = window.getSelection();
+                sel.removeAllRanges();
+                sel.addRange(range);
+                this.showToast('Clipboard unavailable (needs HTTPS) — the secret is selected, press Ctrl+C', 'error');
+            }
         });
 
         // Audit log pagination — same client-side-slice-first model as the IP table above.

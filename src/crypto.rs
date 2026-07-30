@@ -4,8 +4,12 @@
 //!
 //! 1. **Request authentication** — every `/api/*` call carries `X-API-Key` (identity lookup),
 //!    `X-Timestamp` (anti-replay) and `X-Signature-256` (proof of possession). The signature is an
-//!    HMAC-SHA256 over the canonical string `METHOD + PATH + TIMESTAMP + RAW_BODY` using the
+//!    HMAC-SHA256 over the **CANONICAL_V1** string `METHOD\nPATH\nTIMESTAMP\nRAW_BODY` using the
 //!    looked-up key's `signing_secret`. See [`compute_signature`] and [`verify_signature`].
+//!
+//!    The same canonical string is used for outbound `CANONICAL_V1` webhook dispatches
+//!    (`crate::webhooks`), so a `simply_ip_vault` instance can sign a request that another instance
+//!    — or `simply_hook_executor` — verifies with identical code.
 //! 2. **Secret confidentiality at rest** — unlike `key_hash` (a one-way hash), a `signing_secret`
 //!    must be recoverable verbatim to verify a signature, so it cannot be hashed. When
 //!    `VAULT_ENCRYPTION_KEY` is set it is therefore sealed with AES-GCM-256 before being written to
@@ -54,17 +58,28 @@ pub fn generate_signing_secret() -> String {
     hex::encode(bytes)
 }
 
-/// Builds the canonical byte string that gets signed: `METHOD + PATH + TIMESTAMP + RAW_BODY`.
+/// Builds the **CANONICAL_V1** byte string that gets signed:
+/// `METHOD\nPATH\nTIMESTAMP\nRAW_BODY`.
 ///
-/// The four fields are concatenated with no separator, exactly as specified in `AGENT.MD`. `method`
-/// is expected uppercase and `path` is the URL path *without* the query string — see
+/// The four fields are joined by a single `\n` (LF), exactly as specified in `AGENT.MD`. `method` is
+/// expected uppercase and `path` is the URL path *without* the query string — see
 /// [`verify_signature`] for why the query is excluded.
-fn signing_payload(method: &str, path: &str, timestamp: &str, body: &[u8]) -> Vec<u8> {
+///
+/// The newline delimiter is what makes the encoding *unambiguous*: with plain concatenation, the
+/// pair `("POST", "/api/ban")` and `("POS", "T/api/ban")` produce identical bytes, so a signature
+/// over one is a valid signature over the other. A delimiter that cannot appear in a method or a URL
+/// path removes that whole class of boundary confusion. It is also the format
+/// `simply_hook_executor` speaks, so one canonical string now serves both the inbound API and
+/// outbound `CANONICAL_V1` webhook dispatches.
+pub fn canonical_v1_payload(method: &str, path: &str, timestamp: &str, body: &[u8]) -> Vec<u8> {
     let mut message =
-        Vec::with_capacity(method.len() + path.len() + timestamp.len() + body.len());
+        Vec::with_capacity(method.len() + path.len() + timestamp.len() + body.len() + 3);
     message.extend_from_slice(method.as_bytes());
+    message.push(b'\n');
     message.extend_from_slice(path.as_bytes());
+    message.push(b'\n');
     message.extend_from_slice(timestamp.as_bytes());
+    message.push(b'\n');
     message.extend_from_slice(body);
     message
 }
@@ -85,7 +100,7 @@ pub fn compute_signature(
         tracing::error!("Failed to build HMAC from signing secret: {}", e);
         AppError::Internal
     })?;
-    mac.update(&signing_payload(method, path, timestamp, body));
+    mac.update(&canonical_v1_payload(method, path, timestamp, body));
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
@@ -122,7 +137,7 @@ pub fn verify_signature(
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
         return false;
     };
-    mac.update(&signing_payload(method, path, timestamp, body));
+    mac.update(&canonical_v1_payload(method, path, timestamp, body));
     mac.verify_slice(&provided_bytes).is_ok()
 }
 
@@ -243,6 +258,30 @@ mod tests {
     /// concurrently on different libtest threads (`set_var` is `unsafe` precisely because
     /// concurrent mutation is a data race).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn canonical_v1_payload_is_newline_delimited() {
+        assert_eq!(
+            canonical_v1_payload("POST", "/api/ban", "1700000000", b"{\"a\":1}"),
+            b"POST\n/api/ban\n1700000000\n{\"a\":1}".to_vec(),
+            "CANONICAL_V1 joins the four fields with a single LF"
+        );
+        // An empty body still leaves the third delimiter in place, so "no body" is distinguishable
+        // from a body that happens to start where the timestamp ends.
+        assert_eq!(
+            canonical_v1_payload("GET", "/api/ips", "1700000000", b""),
+            b"GET\n/api/ips\n1700000000\n".to_vec()
+        );
+    }
+
+    #[test]
+    fn delimiter_removes_field_boundary_ambiguity() {
+        // The concrete attack the delimiter closes: under plain concatenation these two distinct
+        // requests hash identically, so a signature for one authenticates the other.
+        let shifted = compute_signature("secret", "POS", "T/api/ban", "1700000000", b"");
+        let real = compute_signature("secret", "POST", "/api/ban", "1700000000", b"");
+        assert_ne!(real.as_deref().ok(), shifted.as_deref().ok());
+    }
 
     #[test]
     fn signature_is_stable_and_order_sensitive() {

@@ -70,7 +70,10 @@ Stores authentication tokens, global access rights, and CIDR network binding rul
 the public `X-API-Key` (identity — never recoverable). `signing_secret` proves possession and
 therefore **cannot** be hashed, since verifying an HMAC requires the secret verbatim; it is encrypted
 at rest instead. Both are returned exactly once, by `POST /api/keys` and `POST /api/keys/{id}/rotate`.
-Rotation replaces both, so a compromised key leaves no working credential behind.
+`POST /api/keys/{id}/rotate` replaces both, so a compromised key leaves no working credential behind.
+`POST /api/keys/{id}/rotate-secret` replaces **only** `signing_secret`, leaving `key_hash`, `prefix`,
+`name`, `bound_ips`, the global scope flags and every `api_key_group_permissions` row untouched — the
+narrow operation for routine hygiene, and the recovery path for a `NULL` `signing_secret`.
 
 ---
 
@@ -141,7 +144,8 @@ Defines HTTP endpoints to notify when IP events occur within a specific group.
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique webhook configuration ID |
 | `name` | `String` | Not Null | Human-readable name for the webhook |
 | `target_url` | `String` | Not Null | HTTP/HTTPS target endpoint URL |
-| `secret_token` | `String` | Not Null | Shared secret used to generate the HMAC SHA-256 signature (`X-Signature-256`) |
+| `secret_token` | `String` | Not Null | Shared secret used to generate the HMAC SHA-256 signature (`X-Signature-256`). Never returned by `GET /api/webhooks` |
+| `signature_mode` | `Text` | Not Null, Default: `'BODY_ONLY'` | How dispatches are signed. `'BODY_ONLY'` → HMAC over `RAW_BODY`, sent as `sha256=<hex>` (legacy/generic receivers). `'CANONICAL_V1'` → HMAC over `POST\n<path>\n<timestamp>\n<raw_body>`, sent as bare hex plus an `X-Timestamp` header (Simply IP Vault instance chaining, `simply_hook_executor`). Unrecognized stored values fall back to `'BODY_ONLY'` |
 | `headers_json` | `Text` | Nullable | Custom JSON key-value object of HTTP headers to inject into requests |
 | `payload_template` | `Text` | Not Null | Template string with dynamic variables (e.g. `{"ip":"$target_address","group":"$group_name"}`) |
 | `group_id` | `UUID` | FK -> `ip_groups.id` (CASCADE) | Monitored IP Group |
@@ -161,7 +165,7 @@ Security audit trail tracking mutating operations across the application.
 | `api_key_name` | `String` | Nullable | Performing key's name, denormalized at write time so it survives that key later being deleted (unlike `api_key_id`, never nulled out by the FK's `SET NULL`) |
 | `api_key_prefix` | `String` | Nullable | Performing key's prefix, denormalized for the same reason as `api_key_name` |
 | `client_ip` | `String` | Nullable | Caller's resolved client IP (rightmost `X-Forwarded-For` hop, `X-Real-IP`, or raw TCP peer address) |
-| `action` | `String` | Not Null, Indexed | Operation type, e.g. `IP_ADD`, `IP_UPDATE`, `IP_DELETE`, `KEY_CREATE`, `KEY_DELETE`, `KEY_PERM_UPDATE`, `GROUP_CREATE`, `GROUP_DELETE`, `WEBHOOK_CREATE`, `WEBHOOK_DELETE` (non-exhaustive — any mutating action may log its own type) |
+| `action` | `String` | Not Null, Indexed | Operation type, e.g. `IP_ADD`, `IP_UPDATE`, `IP_DELETE`, `KEY_CREATE`, `KEY_DELETE`, `KEY_UPDATE`, `KEY_ROTATE`, `KEY_SECRET_ROTATE`, `KEY_PERM_UPDATE`, `GROUP_CREATE`, `GROUP_DELETE`, `WEBHOOK_CREATE`, `WEBHOOK_DELETE` (non-exhaustive — any mutating action may log its own type) |
 | `target_address` | `String` | Nullable | Target IP or CIDR range affected |
 | `group_names` | `String` | Nullable | Comma-separated list of group names involved |
 | `details` | `Text` | Nullable | Additional context or raw payload overview |

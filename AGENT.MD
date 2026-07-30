@@ -42,9 +42,10 @@ To keep this context clean and modular, responsibilities are split across three 
   | :--- | :--- |
   | `X-API-Key` | The plaintext key. Used **only** to look up the key record (by SHA-256 of its value). Identity, not proof. |
   | `X-Timestamp` | Current UTC Unix time in **seconds**. |
-  | `X-Signature-256` | Hex HMAC-SHA256 over `METHOD + PATH + TIMESTAMP + RAW_BODY`, keyed with the key's `signing_secret`. A `sha256=` prefix is accepted and stripped. |
+  | `X-Signature-256` | Hex HMAC-SHA256 over the **CANONICAL_V1** string (below), keyed with the key's `signing_secret`. A `sha256=` prefix is accepted and stripped. |
 
-  - **Canonical signed string:** the four parts concatenated with **no separator**. `METHOD` is uppercase; `PATH` is the URL path **excluding the query string**; `RAW_BODY` is the exact request body bytes (empty string when there is no body).
+  - **CANONICAL_V1 signed string:** `METHOD\nPATH\nTIMESTAMP\nRAW_BODY` — the four parts joined by a single `\n` (LF), with **no trailing newline**. `METHOD` is uppercase; `PATH` is the URL path **excluding the query string**; `RAW_BODY` is the exact request body bytes (empty when there is no body).
+  - **Why a delimiter:** plain concatenation is ambiguous — `("POST", "/api/ban")` and `("POS", "T/api/ban")` produce identical bytes, so a signature over one authenticates the other. `\n` cannot appear in a method or a URL path, so it eliminates that class of boundary confusion. This is also the format `simply_hook_executor` speaks, so a single canonical string serves the inbound API and outbound `CANONICAL_V1` webhooks alike.
   - **Why the query string is excluded:** reverse proxies routinely reorder, re-encode, or append query parameters, which would silently invalidate valid requests. Query parameters on `/api/*` are read-only filters — every mutating field travels in the signed body.
   - **`PATH` is the full request path** as the client sent it (e.g. `/api/ban`), not the path relative to the router's `/api` mount point. The middleware reads `OriginalUri` for exactly this reason.
   - **Anti-Replay Guard:** reject with `401 Unauthorized` when `|server_time - X-Timestamp| > 300` seconds. The window is **symmetric** — a future-dated timestamp is as suspect as a stale one, since allowing it would extend a captured request's usable lifetime.
@@ -79,7 +80,16 @@ To keep this context clean and modular, responsibilities are split across three 
 
 - **Group Scoping:** Webhooks are bound to specific `IpGroup`s. Actions on IPs in those groups dispatch asynchronous HTTP POST requests via Tokio tasks.
 - **Templating & Headers:** Custom JSON payload templates (e.g., `{"ip": "$target_address", "group": "$group_name"}`) and custom HTTP headers (e.g., `X-API-Key` for chaining `simply_ip_vault` instances).
-  - ⚠ **Known limitation — instance chaining is currently broken by HMAC auth.** An outbound dispatch sends `X-API-Key` (from `headers_json`) and an `X-Signature-256` computed over *the payload alone* using the webhook's `secret_token`. A receiving `simply_ip_vault` now requires `X-Timestamp` plus a signature over `METHOD + PATH + TIMESTAMP + RAW_BODY` keyed by the *receiving key's* `signing_secret` — a different message and a different key — so a chained dispatch is rejected with `401`. Chaining needs a dedicated dispatch mode (emitting vault-style auth headers from the target key's signing secret) before it works again. Webhooks to ordinary third-party consumers are unaffected.
+- **Signature Modes (`webhook_configs.signature_mode`):** each webhook picks how its `X-Signature-256` is computed. The column defaults to `BODY_ONLY`, so existing webhooks are unaffected; the API validates the value and rejects anything unrecognized with `400` rather than silently downgrading.
+
+  | Mode | Signed message | Headers sent |
+  | :--- | :--- | :--- |
+  | `BODY_ONLY` *(default)* | `RAW_BODY` only | `X-Signature-256: sha256=<hex>` |
+  | `CANONICAL_V1` | `POST\n<path>\n<timestamp>\n<raw_body>` — `<path>` from `target_url` | `X-Signature-256: <bare hex>` **and** `X-Timestamp` |
+
+  - `BODY_ONLY` is the legacy/generic scheme, matching what GitHub-style third-party receivers expect. Never change an existing webhook's mode without coordinating with its receiver — it changes both the signed bytes and the header set.
+  - `CANONICAL_V1` is byte-identical to the inbound API scheme above, which is what makes **instance chaining** work: set `X-API-Key` in `headers_json` to a key on the receiving instance, set `secret_token` to *that key's* `signing_secret`, point `target_url` at its `/api/ban`, and the dispatch authenticates as a normal signed API request (including the receiver's own anti-replay check, hence the `X-Timestamp`). This is also the mode `simply_hook_executor` consumes.
+  - An unrecognized value already in the database falls back to `BODY_ONLY` with a warning rather than erroring — a webhook worker must not be taken down by one bad row.
 - **HMAC Signatures:** All webhook dispatches MUST include a signature header: `X-Signature-256: sha256=<hex_hmac>` calculated using the webhook's secret token.
 - **SSRF Prevention:** Validate target URLs. Reject private/loopback IP ranges (RFC 1918, RFC 4193, loopback) unless `ALLOW_PRIVATE_WEBHOOKS=true` is set in environment.
 
@@ -88,8 +98,12 @@ To keep this context clean and modular, responsibilities are split across three 
 - The UI is a Single Page Application (SPA). Authentication state is held in `localStorage`.
 - Single Page Application served from `static/`.
 - **Credentials:** the login screen prompts for **both** the API key and its **signing secret**, stored as `simply_ip_vault_key` and `simply_ip_vault_signing_secret`. Both are required; either alone is useless.
-- **Request signing:** the global `fetch` wrapper injects `X-API-Key`, computes `X-Timestamp`, and signs every call with `X-Signature-256` using the **Web Crypto API** (`crypto.subtle.importKey` + `crypto.subtle.sign`, HMAC/SHA-256) — no external crypto library, per the no-dependencies rule. The secret is imported as its raw **UTF-8 bytes** (not hex-decoded), matching the server's `secret.as_bytes()`, and the resulting `CryptoKey` is memoized per session.
-- **Secure-context requirement:** `crypto.subtle` exists only in a secure context (HTTPS, or `http://localhost`). Served over plain HTTP to a LAN address the dashboard cannot sign requests at all; the wrapper detects this and reports it explicitly rather than failing with an opaque `401`. Deploy the UI behind TLS.
+- **Request signing:** the global `fetch` wrapper injects `X-API-Key`, computes `X-Timestamp`, and signs every call with `X-Signature-256` over the CANONICAL_V1 string. The secret is used as its raw **UTF-8 bytes** (not hex-decoded), matching the server's `secret.as_bytes()`.
+- **Two crypto backends, automatically selected:**
+  1. **Web Crypto** (`crypto.subtle.importKey` + `crypto.subtle.sign`, HMAC/SHA-256) whenever available — constant-time and fast. The imported `CryptoKey` is memoized per session.
+  2. A **self-contained pure-JS HMAC-SHA256** (`sha256Bytes` / `hmacSha256Bytes` at the top of `app.js`) as fallback. `crypto.subtle` exists *only* in a secure context (HTTPS or `http://localhost`), so a homelab instance reached over plain HTTP at a LAN address — the normal way this tool is used — has no Web Crypto at all. Without the fallback the dashboard simply cannot authenticate there.
+  - Both paths produce identical bytes. The fallback is **not** constant-time; that is an accepted, documented trade-off, because on a plain-HTTP LAN connection the request and its headers are already fully visible on the wire, so browser timing side-channels are not the weak link. HTTPS remains the recommended deployment.
+  - The fallback must stay dependency-free (per the no-external-dependencies rule) and must never be preferred over `crypto.subtle` when the latter exists.
 - **Dynamic Permission Rendering:** On startup, `app.js` calls `GET /api/auth/me`. The UI dynamically renders/hides tabs and controls (e.g., Webhooks, Key Management) based solely on the returned permissions based on the RBAC payload received from `GET /api/auth/me`.
 - The JS implements a global fetch wrapper that automatically injects the `X-API-Key` header and intercepts `401/403` responses to clear the token and return to the login screen.
 
@@ -130,7 +144,8 @@ SECRET="<SIGNING_SECRET>"          # returned once by POST /api/keys or /rotate
 call() {
   local method="$1" path="$2" body="${3:-}"
   local ts; ts=$(date -u +%s)
-  local sig; sig=$(printf '%s' "${method}${path%%\?*}${ts}${body}" \
+  # CANONICAL_V1: the four fields joined by real newlines, no trailing newline.
+  local sig; sig=$(printf '%s\n%s\n%s\n%s' "$method" "${path%%\?*}" "$ts" "$body" \
                    | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.*= //')
   curl -sS -X "$method" \
     -H "X-API-Key: $KEY" -H "X-Timestamp: $ts" -H "X-Signature-256: $sig" \
@@ -183,6 +198,9 @@ For every route registered under `/api`, tests MUST assert three distinct outcom
     `DELETE /api/ips` MUST accept parameters both via URL Query strings (`?target_address=...&group_name=...`) and via JSON request body (`{"target_address": "...", "group_name": "..."}`).
   - **Key Rotation & Editing:**
     `POST /api/keys/{id}/rotate` MUST generate a new secret while keeping key ID/name intact and invalidating the old secret. `PUT /api/keys/{id}` MUST allow updating key name, bound IPs, and global scopes.
+  - **Signing-Secret Rotation (`POST /api/keys/{id}/rotate-secret`):**
+    Replaces **only** the HMAC `signing_secret`, in place. The key's id, name, `key_hash`/`X-API-Key`, `bound_ips`, global scopes, and every `api_key_group_permissions` row MUST be left untouched — this is the narrow sibling of `/rotate`, for routine credential hygiene without forcing a full identity change on every client. It is also the documented recovery path for a key whose `signing_secret` is `NULL` (created before HMAC auth existed).
+    Master or `can_manage_keys` only; writes a `KEY_SECRET_ROTATE` audit entry; returns the new secret exactly once and MUST NOT reissue `plaintext_key`. The previous secret stops working immediately.
   - **Revoking Group Permissions:**
     `DELETE /api/keys/{id}/permissions/{group_identifier}` MUST remove specific group permission mappings from a key.
   - **Audit Log Interface & Endpoint:**

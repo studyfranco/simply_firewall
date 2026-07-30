@@ -2164,3 +2164,127 @@ three-header scheme, the bootstrap banner sample was refreshed (it now prints th
 the box is drawn against a computed width — the old hardcoded one never actually aligned around a
 64-char key), and every `curl` example was rewritten around a copy-pasteable `call()` signing helper,
 since a bare `curl -H "X-API-Key: ..."` no longer works at all.
+
+---
+
+## 2026-07-30 (session 19) — CANONICAL_V1 signing, webhook signature modes, signing-secret rotation, SPA crypto fallback
+
+Harmonized the inbound auth engine and the outbound webhook dispatcher onto one canonical signature
+format, added a per-webhook signature mode, a narrow signing-secret rotation endpoint, and a pure-JS
+HMAC fallback so the dashboard works over plain HTTP.
+
+### Results
+
+| Check | Result |
+| --- | --- |
+| `cargo check --all-targets` | ✅ clean |
+| `cargo clippy --all-targets -- -D warnings` | ✅ clean |
+| `cargo test --all-targets` | ✅ **56/56** (6 crypto unit + 50 integration, up from 48) |
+| `./scripts/test_e2e.sh` | ✅ **233/233** (up from 195; +38 new checks) |
+
+### The inbound signature format changed — a second breaking change
+
+The task brief specifies CANONICAL_V1 as `METHOD\nPATH\nTIMESTAMP\nRAW_BODY` "for incoming API
+requests **AND** outgoing Webhook dispatches". Session 18 had shipped the inbound format as plain
+concatenation with **no** separator, so honouring "harmonize" meant changing the inbound format too,
+not just adding the webhook one. Every signer moved in lockstep: `crypto::canonical_v1_payload`,
+the test helper, `scripts/test_e2e.sh`'s `hmac_sign`, `app.js`, and the `curl` helpers in `AGENT.MD`
+and `README.md`. Clients written against session 18's format break; that is inherent to the request.
+
+The delimiter is a genuine improvement, not just a compatibility choice, and there is now a test
+pinning it (`delimiter_removes_field_boundary_ambiguity`): under plain concatenation
+`("POST", "/api/ban")` and `("POS", "T/api/ban")` hash identically, so a signature over one is a
+valid signature over the other. `\n` cannot occur in an HTTP method or a URL path, so the encoding
+becomes unambiguous. The empty-body case keeps its trailing delimiter, so "no body" stays
+distinguishable from a body that begins where the timestamp ended.
+
+### Webhook signature modes
+
+`webhook_configs.signature_mode`, `TEXT NOT NULL DEFAULT 'BODY_ONLY'` via an additive migration, so
+applying it changes nothing about how existing webhooks are delivered.
+
+- `BODY_ONLY` (default, unchanged): HMAC over the body alone, `X-Signature-256: sha256=<hex>`.
+- `CANONICAL_V1`: HMAC over `POST\n<path>\n<timestamp>\n<body>` where `<path>` comes from
+  `target_url`, sent as **bare hex** alongside an `X-Timestamp` header.
+
+Bare hex vs the `sha256=` prefix was a deliberate split: `CANONICAL_V1` output must be byte-identical
+to what the inbound middleware produces, since the entire point is that a dispatch can authenticate
+as a normal API request. `BODY_ONLY` keeps its prefix because GitHub-style third-party receivers
+expect exactly that, and a silent change there would break real integrations. (The middleware accepts
+either form, so this is about matching each *receiver's* expectations, not about our own parsing.)
+
+Modelled as a real `SignatureMode` enum rather than stringly-typed comparisons, so a future third mode
+is a compiler-enforced exhaustive match. Two deliberate asymmetries in how invalid values are treated:
+
+- **At the API boundary** an unrecognized `signature_mode` is a `400`, never a silent downgrade. A
+  caller who believes they enabled canonical signing would otherwise deploy a receiver that rejects
+  every dispatch, with nothing in the response to point at.
+- **When read from the database** an unrecognized value falls back to `BODY_ONLY` with a warning. One
+  hand-edited or downgraded row must not take the whole webhook worker down.
+
+### This fixes the chaining limitation flagged in session 18
+
+Session 18 recorded that instance chaining had been broken by HMAC auth, and left it as a decision to
+be made. `CANONICAL_V1` is that decision, implemented without disturbing generic receivers: point a
+webhook at another instance's `/api/ban`, set `secret_token` to the *receiving* key's signing secret,
+put that key in `headers_json` as `X-API-Key`, and the dispatch arrives as an ordinary signed,
+timestamped API request that passes the receiver's own anti-replay check. `AGENT.MD` §4's warning has
+been replaced with the working recipe.
+
+### `POST /api/keys/{id}/rotate-secret`
+
+Deliberately a *separate* endpoint from the existing `/rotate` rather than a flag on it, because the
+two have very different blast radii. `/rotate` reissues the API key itself, forcing every client to be
+reconfigured with a new identity. `/rotate-secret` re-keys only the HMAC while id, name, `key_hash`,
+`bound_ips`, global scopes and every `api_key_group_permissions` row stay exactly as they were — the
+right tool for routine hygiene, and the recovery path for a `NULL` `signing_secret` left by session
+18's migration. A test asserts the response carries no `plaintext_key`, so the two can never quietly
+converge.
+
+The UI handles self-rotation differently from `/rotate` for the same reason: rotating your own key via
+`/rotate` logs you out (the API key changed), whereas `/rotate-secret` re-signs the live session in
+place with the new secret, since the key you authenticate with is still valid.
+
+### Pure-JS HMAC fallback
+
+`crypto.subtle` exists only in a secure context, so session 18's dashboard could not authenticate at
+all when served over plain HTTP to a LAN address — which is the normal way a homelab tool is reached.
+`app.js` now carries a dependency-free SHA-256 + HMAC implementation and picks Web Crypto whenever it
+is available, falling back automatically otherwise.
+
+**Verification without a JS runtime.** No `node`/`deno`/`qjs` is installed on this machine, so the
+implementation could not be executed. Instead it was transliterated 1:1 into Python and checked
+against `hashlib`/`hmac` across every SHA-256 input length from 0–199 plus the block-boundary cases
+(439/440/447/448/449/511/512/513/1000) and 56 HMAC key×message length combinations including keys
+shorter than, equal to, and longer than the 64-byte block — all matching. That validates the constants
+and the algorithm; JS-specific correctness was covered separately by a structural scanner (bracket
+balance, string/template/comment termination) and by cross-checking all 87 literal
+`getElementById` targets against `index.html`. Worth redoing properly if a JS runtime ever lands here.
+
+Two JS-specific details that are easy to get wrong and are commented in place: the 64-bit length field
+is built with `Math.floor(bitLen / 2**32)` rather than a shift (JS bitwise ops truncate to 32 bits),
+and intermediate sums are reduced with `>>> 0`, which is correct even when an operand is a negative
+int32 because ToUint32 adds 2^32.
+
+The fallback is **not** constant-time. That is an accepted, documented trade-off rather than an
+oversight: it only ever runs on a plain-HTTP connection where the request and all its headers are
+already fully visible on the wire, so a browser-side timing side-channel is not the weak link. Web
+Crypto still wins wherever it exists, and TLS remains the recommendation.
+
+### Tests
+
+6 new integration tests and 38 new E2E checks. The E2E mock receiver was upgraded from writing a bare
+`hit\n` per delivery to one JSON object per line carrying path/headers/body — still exactly one line
+per hit, so §13's existing `wc -l` counting is unaffected, but now enough to verify a dispatch.
+
+Both signature modes are verified **live** against that receiver, not just at the API contract level:
+a `CANONICAL_V1` dispatch is captured and its signature recomputed from the observed path, timestamp
+and body, and a `BODY_ONLY` dispatch through the same receiver is asserted to still be
+`sha256=`-prefixed with no `X-Timestamp` — the regression guard for third-party consumers. The
+integration test additionally round-trips the captured bytes back through `crypto::verify_signature`,
+i.e. literally the function the inbound middleware calls, closing the loop on the interoperability
+claim.
+
+`test_rotate_secret_swaps_only_the_signing_secret` asserts the *negative* space explicitly — name,
+scopes, and the per-group grant all survive — because "rotation didn't disturb anything else" is the
+whole contract of that endpoint and would otherwise be untested.

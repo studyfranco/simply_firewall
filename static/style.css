@@ -776,6 +776,21 @@ body {
     border: 1px solid var(--border);
 }
 
+/* Webhook signature mode. CANONICAL_V1 gets the same bluish-slate accent as the modal Cancel
+   button, marking it as the "speaks our own protocol" option; BODY_ONLY stays deliberately neutral
+   since it is the legacy default and carries no special meaning. */
+.badge-canonical {
+    background-color: rgba(37, 99, 235, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(96, 165, 250, 0.35);
+}
+
+.badge-body-only {
+    background-color: rgba(189, 195, 199, 0.1);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+}
+
 .badge-conflict {
     background-color: rgba(243, 156, 18, 0.15);
     color: var(--warning);

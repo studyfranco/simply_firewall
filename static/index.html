@@ -348,6 +348,19 @@
                                     <div class="combobox-menu hidden"></div>
                                 </div>
                             </div>
+                            <div class="form-group">
+                                <label for="webhook-signature-mode">Signature Mode <span>*</span></label>
+                                <select id="webhook-signature-mode" class="input-field select-field">
+                                    <option value="BODY_ONLY" selected>BODY_ONLY (generic receivers)</option>
+                                    <option value="CANONICAL_V1">CANONICAL_V1 (Simply IP Vault / hook executor)</option>
+                                </select>
+                                <small class="field-hint">
+                                    <strong>BODY_ONLY</strong> signs the payload alone as <code>sha256=&lt;hex&gt;</code> — what
+                                    GitHub-style consumers expect. <strong>CANONICAL_V1</strong> signs
+                                    <code>POST\npath\ntimestamp\nbody</code> and adds an <code>X-Timestamp</code> header, so the
+                                    dispatch can authenticate directly against another Simply IP Vault instance.
+                                </small>
+                            </div>
                             <div class="form-group col-span-2">
                                 <label for="webhook-headers">Custom Headers (JSON)</label>
                                 <textarea id="webhook-headers" placeholder='{"Authorization": "Bearer token"}' class="input-field" rows="2"></textarea>
@@ -380,7 +393,7 @@
                     </form>
                     <div class="table-container mt-4">
                         <table class="data-table">
-                            <thead><tr><th>ID</th><th>Name</th><th>URL</th><th>Actions</th></tr></thead>
+                            <thead><tr><th>ID</th><th>Name</th><th>URL</th><th>Signing</th><th>Actions</th></tr></thead>
                             <tbody id="webhooks-table-body"></tbody>
                         </table>
                     </div>
@@ -471,6 +484,24 @@
             <code id="secret-reveal-signing-secret" class="key-reveal-value"></code>
             <div class="form-actions mt-4">
                 <button type="button" id="secret-reveal-close" class="btn btn-primary">Done</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Signing-Secret Reveal Modal (used after POST /api/keys/{id}/rotate-secret) -->
+    <div id="signing-secret-modal" class="modal-overlay hidden">
+        <div class="modal-card card">
+            <h3>New Signing Secret</h3>
+            <p class="subtitle">
+                The API key, its name, and all permissions are unchanged — only the HMAC signing
+                secret was replaced. The previous secret stopped working immediately, so update every
+                client using this key. This value is shown once and cannot be retrieved again.
+            </p>
+            <p class="key-reveal-label">Key: <span id="signing-secret-key-name"></span></p>
+            <code id="signing-secret-value" class="key-reveal-value"></code>
+            <div class="modal-actions mt-4">
+                <button type="button" id="signing-secret-copy" class="btn btn-cancel">Copy</button>
+                <button type="button" id="signing-secret-close" class="btn btn-primary">Done</button>
             </div>
         </div>
     </div>

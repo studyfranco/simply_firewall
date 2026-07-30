@@ -37,6 +37,9 @@ pub fn create_app(state: AppState) -> Router {
         .route("/keys/{id}", put(api::update_api_key))
         .route("/keys/{id}", delete(api::delete_api_key))
         .route("/keys/{id}/rotate", post(api::rotate_api_key))
+        // Narrower sibling of `/rotate`: re-keys only the HMAC signing secret, leaving the key's
+        // identity and RBAC grants untouched.
+        .route("/keys/{id}/rotate-secret", post(api::rotate_signing_secret))
         .route("/keys/{id}/groups", post(api::update_key_group_permissions))
         // `/permissions` is the same assignment handler as `/groups` under a name that matches
         // the new revoke route below; `/groups` is kept working for backward compatibility.

@@ -123,20 +123,21 @@ print_response_body() {
     fi
 }
 
-# Computes the hex HMAC-SHA256 the server expects in X-Signature-256, over the canonical string
-# METHOD + PATH + TIMESTAMP + RAW_BODY (concatenated, no separator).
+# Computes the hex HMAC-SHA256 the server expects in X-Signature-256, over the CANONICAL_V1 string
+# METHOD\nPATH\nTIMESTAMP\nRAW_BODY (the four fields joined by single LFs, no trailing newline).
 #
 # The query string is stripped from PATH before signing, matching the server's
 # `crypto::verify_signature` — it signs the URL path only, so that reverse proxies are free to
 # rewrite query parameters without invalidating otherwise-valid requests.
 #
-# `printf '%s'` (not `echo`) keeps the message byte-exact: no trailing newline, and no mangling of
-# JSON bodies containing backslashes or leading dashes.
+# `printf` with an explicit `%s\n%s\n%s\n%s` format (rather than `echo`, or interpolating "\n" into
+# a single string) is what makes the delimiters real newlines and keeps the message byte-exact:
+# no trailing newline, and no mangling of JSON bodies containing backslashes or leading dashes.
 # Usage: hmac_sign SECRET METHOD PATH TIMESTAMP BODY
 hmac_sign() {
     local secret="$1" method="$2" path="$3" timestamp="$4" body="${5:-}"
     local path_only="${path%%\?*}"
-    printf '%s' "${method}${path_only}${timestamp}${body}" \
+    printf '%s\n%s\n%s\n%s' "$method" "$path_only" "$timestamp" "$body" \
         | openssl dgst -sha256 -hmac "$secret" \
         | sed 's/^.*= //'
 }
@@ -809,6 +810,7 @@ if command -v python3 >/dev/null 2>&1; then
     else
         cat > "$WORK_DIR/receiver.py" <<'PYEOF'
 import http.server
+import json
 import sys
 
 port = int(sys.argv[1])
@@ -817,9 +819,17 @@ log_path = sys.argv[2]
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get('Content-Length', 0))
-        self.rfile.read(length)
+        body = self.rfile.read(length).decode('utf-8', 'replace')
+        # One JSON object per line: still exactly one line per delivery (so the existing
+        # `wc -l` hit-counting checks are unaffected), but now carrying everything the
+        # signature-mode checks need to verify a CANONICAL_V1 dispatch.
         with open(log_path, 'a') as f:
-            f.write('hit\n')
+            f.write(json.dumps({
+                'path': self.path,
+                'signature': self.headers.get('X-Signature-256'),
+                'timestamp': self.headers.get('X-Timestamp'),
+                'body': body,
+            }) + '\n')
         self.send_response(200)
         self.end_headers()
 
@@ -1103,6 +1113,206 @@ check "204" "delete the key"
 api_call GET "/api/audit-logs?action=KEY_DELETE&limit=1" "$MASTER_KEY"
 check "200" "fetch the most recent KEY_DELETE entry"
 check_true '.[0].details | contains("readable_logs_key")' "the delete log also names the key by name, even though it no longer exists"
+
+# ── 21. API key signing-secret rotation ─────────────────────────────────────
+
+log_section "21. Signing Secret Rotation (POST /api/keys/{id}/rotate-secret)"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"rotate_secret_key","bound_ips":"0.0.0.0/0","can_create_groups":true}'
+check "200" "create a key to rotate the secret of"
+ROTATE_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+ROTATE_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+ROTATE_OLD_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+register_key_secret "$ROTATE_KEY" "$ROTATE_OLD_SECRET"
+
+api_call GET "/api/auth/me" "$ROTATE_KEY"
+check "200" "the key authenticates with its original signing secret"
+
+api_call POST "/api/keys/$ROTATE_KEY_ID/rotate-secret" "$MASTER_KEY"
+check "200" "rotate the signing secret"
+check_true '.id != null' "the response carries the key id"
+check_true '.name == "rotate_secret_key"' "the key name is preserved"
+check_true '.signing_secret != null and (.signing_secret | length) > 0' "a new signing secret is returned"
+check_true '.plaintext_key == null' "rotate-secret does NOT reissue the API key"
+ROTATE_NEW_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+
+if [ "$ROTATE_NEW_SECRET" != "$ROTATE_OLD_SECRET" ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the new signing secret differs from the old one" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} rotate-secret returned the same signing secret" >&2
+fi
+
+# The old secret is dead: sign with it explicitly (the same API key, the previous secret).
+NOW_TS=$(date -u +%s)
+OLD_SIG=$(hmac_sign "$ROTATE_OLD_SECRET" "GET" "/api/auth/me" "$NOW_TS" "")
+raw_call GET "/api/auth/me" -H "X-API-Key: $ROTATE_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: $OLD_SIG"
+check "401" "the OLD signing secret no longer authenticates"
+
+# The same, unchanged API key works with the new secret.
+register_key_secret "$ROTATE_KEY" "$ROTATE_NEW_SECRET"
+api_call GET "/api/auth/me" "$ROTATE_KEY"
+check "200" "the SAME API key authenticates with the new signing secret"
+check_true ".id == \"$ROTATE_KEY_ID\"" "identity is unchanged after rotation"
+check_true '.can_create_groups == true' "global scopes survive rotation"
+
+api_call GET "/api/audit-logs?action=KEY_SECRET_ROTATE&limit=1" "$MASTER_KEY"
+check "200" "fetch the KEY_SECRET_ROTATE audit entry"
+check_true '.[0].details | contains("rotate_secret_key")' "the audit entry names the rotated key"
+
+api_call POST "/api/keys/00000000-0000-0000-0000-000000000000/rotate-secret" "$MASTER_KEY"
+check "404" "rotating an unknown key id is a 404"
+
+api_call POST "/api/keys/$ROTATE_KEY_ID/rotate-secret" "$NOACCESS_KEY"
+check "403" "a key without can_manage_keys cannot rotate secrets"
+
+api_call DELETE "/api/keys/$ROTATE_KEY_ID" "$MASTER_KEY"
+check "204" "clean up the rotation test key"
+
+# ── 22. Webhook signature modes ─────────────────────────────────────────────
+
+log_section "22. Webhook Signature Modes (BODY_ONLY / CANONICAL_V1)"
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"SigMode-Group"}'
+check "200" "create a group for signature-mode webhooks"
+SIGMODE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# Validation happens at the API boundary rather than silently downgrading to BODY_ONLY.
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"bad-mode\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"s\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"signature_mode\":\"CANONICAL_V2\"}"
+check "400" "an unknown signature_mode is rejected"
+
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"default-mode\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"s\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\"}"
+check "200" "omitting signature_mode is accepted"
+check_true '.signature_mode == "BODY_ONLY"' "an omitted signature_mode defaults to BODY_ONLY"
+DEFAULT_MODE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call GET "/api/webhooks" "$MASTER_KEY"
+check "200" "list webhooks"
+check_true "[.[] | select(.id == \"$DEFAULT_MODE_WEBHOOK_ID\")] | length == 1" "the webhook appears in the listing"
+check_true "[.[] | select(.id == \"$DEFAULT_MODE_WEBHOOK_ID\") | .signature_mode == \"BODY_ONLY\"] | all" "the listing exposes signature_mode"
+
+api_call DELETE "/api/webhooks/$DEFAULT_MODE_WEBHOOK_ID" "$MASTER_KEY"
+check "204" "delete the default-mode webhook"
+
+# Live CANONICAL_V1 dispatch verification needs the local receiver from §13.
+if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+    CANON_SECRET="canonical-e2e-secret"
+    : > "$RECEIVER_LOG"
+
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"canonical-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/canon\",\"secret_token\":\"$CANON_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"signature_mode\":\"CANONICAL_V1\",\"events\":\"IP_ADD\"}"
+    check "200" "create a CANONICAL_V1 webhook"
+    check_true '.signature_mode == "CANONICAL_V1"' "creation echoes CANONICAL_V1"
+    CANON_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.222\",\"group_name\":\"SigMode-Group\",\"cause\":\"canonical dispatch\"}"
+    check "200" "ban an address to trigger the canonical dispatch"
+
+    # Dispatch is asynchronous; poll for the delivery line.
+    for _ in $(seq 1 40); do
+        [ -s "$RECEIVER_LOG" ] && break
+        sleep 0.25
+    done
+
+    if [ -s "$RECEIVER_LOG" ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the CANONICAL_V1 webhook was delivered" >&2
+
+        HIT=$(head -n 1 "$RECEIVER_LOG")
+        HOOK_SIG=$(echo "$HIT" | jq -r '.signature // empty')
+        HOOK_TS=$(echo "$HIT" | jq -r '.timestamp // empty')
+        HOOK_BODY=$(echo "$HIT" | jq -r '.body // empty')
+        HOOK_PATH=$(echo "$HIT" | jq -r '.path // empty')
+        log "Captured dispatch: path=$HOOK_PATH ts=$HOOK_TS sig=${HOOK_SIG:0:16}..."
+
+        if [ -n "$HOOK_TS" ]; then
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the dispatch carries an X-Timestamp header" >&2
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} CANONICAL_V1 dispatch is missing X-Timestamp" >&2
+        fi
+
+        # Recompute the signature exactly as the server should have: POST\npath\nts\nbody.
+        EXPECTED_SIG=$(hmac_sign "$CANON_SECRET" "POST" "$HOOK_PATH" "$HOOK_TS" "$HOOK_BODY")
+        if [ -n "$HOOK_SIG" ] && [ "$HOOK_SIG" == "$EXPECTED_SIG" ]; then
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} X-Signature-256 matches HMAC(POST\\npath\\ntimestamp\\nbody)" >&2
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} canonical signature mismatch (got '$HOOK_SIG', expected '$EXPECTED_SIG')" >&2
+        fi
+
+        # Bare hex, unlike BODY_ONLY's `sha256=` prefix — identical to what the API itself emits.
+        case "$HOOK_SIG" in
+            sha256=*)
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} CANONICAL_V1 signature should be bare hex, not sha256=-prefixed" >&2
+                ;;
+            *)
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} CANONICAL_V1 sends a bare hex signature" >&2
+                ;;
+        esac
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} CANONICAL_V1 webhook was never delivered" >&2
+    fi
+
+    api_call DELETE "/api/webhooks/$CANON_WEBHOOK_ID" "$MASTER_KEY"
+    check "204" "delete the canonical webhook"
+
+    # And the legacy mode, through the same receiver, must still be `sha256=`-prefixed with no
+    # timestamp — the regression guard for third-party consumers.
+    : > "$RECEIVER_LOG"
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"legacy-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/legacy\",\"secret_token\":\"$CANON_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"signature_mode\":\"BODY_ONLY\",\"events\":\"IP_ADD\"}"
+    check "200" "create a BODY_ONLY webhook on the same receiver"
+    LEGACY_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.223\",\"group_name\":\"SigMode-Group\"}"
+    check "200" "ban an address to trigger the legacy dispatch"
+
+    for _ in $(seq 1 40); do
+        [ -s "$RECEIVER_LOG" ] && break
+        sleep 0.25
+    done
+
+    if [ -s "$RECEIVER_LOG" ]; then
+        HIT=$(head -n 1 "$RECEIVER_LOG")
+        LEGACY_SIG=$(echo "$HIT" | jq -r '.signature // empty')
+        LEGACY_TS=$(echo "$HIT" | jq -r '.timestamp // empty')
+        LEGACY_BODY=$(echo "$HIT" | jq -r '.body // empty')
+        LEGACY_EXPECTED="sha256=$(printf '%s' "$LEGACY_BODY" | openssl dgst -sha256 -hmac "$CANON_SECRET" | sed 's/^.*= //')"
+
+        if [ -z "$LEGACY_TS" ]; then
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} BODY_ONLY sends no X-Timestamp header" >&2
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} BODY_ONLY unexpectedly sent X-Timestamp: $LEGACY_TS" >&2
+        fi
+
+        if [ "$LEGACY_SIG" == "$LEGACY_EXPECTED" ]; then
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} BODY_ONLY signature is sha256=HMAC(body) — unchanged legacy format" >&2
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} BODY_ONLY signature mismatch (got '$LEGACY_SIG', expected '$LEGACY_EXPECTED')" >&2
+        fi
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} BODY_ONLY webhook was never delivered" >&2
+    fi
+
+    api_call DELETE "/api/webhooks/$LEGACY_WEBHOOK_ID" "$MASTER_KEY"
+    check "204" "delete the legacy webhook"
+else
+    warn "Local webhook receiver unavailable — skipping live CANONICAL_V1/BODY_ONLY dispatch verification."
+fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 

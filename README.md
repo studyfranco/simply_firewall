@@ -26,7 +26,8 @@ templated webhooks.
 - Multi-tenant RBAC: API keys can be scoped to exactly the groups (and read/write/delete rights)
   they need.
 - Webhooks: HMAC-SHA256-signed (`X-Signature-256`), templated JSON payloads, custom headers, with
-  SSRF protection against private/loopback targets by default.
+  SSRF protection against private/loopback targets by default. Two signature modes — a generic
+  body-only one, and a canonical mode that can authenticate straight into another instance's API.
 - Every mutating action is recorded in an audit log.
 
 ## Getting Started
@@ -73,9 +74,10 @@ On first boot, `simply_ip_vault`:
 Open `http://localhost:3000` and paste **both** the key and the signing secret into the login
 screen, or drive the API directly with `curl` (see below).
 
-> **Note:** the dashboard signs requests with the Web Crypto API, which browsers only expose in a
-> secure context. `http://localhost` works; serving the UI over plain HTTP to a LAN address does
-> not — put it behind TLS.
+> **Note:** the dashboard prefers the browser's Web Crypto API, which is only exposed in a secure
+> context (HTTPS or `http://localhost`). Over plain HTTP to a LAN address it transparently falls back
+> to a built-in pure-JS HMAC-SHA256, so the dashboard works either way — but that fallback is not
+> constant-time and your traffic is unencrypted, so TLS is still recommended.
 
 ### Configuration
 
@@ -111,7 +113,7 @@ enough:
 | :--- | :--- |
 | `X-API-Key` | The plaintext key. Identifies which key record to look up. |
 | `X-Timestamp` | Current UTC Unix time in seconds. Rejected if more than **300s** from the server's clock, in either direction (anti-replay). |
-| `X-Signature-256` | Hex HMAC-SHA256 of `METHOD + PATH + TIMESTAMP + RAW_BODY` (concatenated, no separator), keyed with the key's **signing secret**. `PATH` excludes the query string. |
+| `X-Signature-256` | Hex HMAC-SHA256 of the **CANONICAL_V1** string `METHOD\nPATH\nTIMESTAMP\nRAW_BODY` — the four fields joined by single newlines, no trailing newline — keyed with the key's **signing secret**. `PATH` excludes the query string. |
 
 The signing secret is issued alongside the key by `POST /api/keys` and `POST /api/keys/{id}/rotate`
 and is shown **once** — it is never returned by any read endpoint. See the `call()` helper under
@@ -129,11 +131,32 @@ the caller's (proxy-aware) source address get `403`. Master keys bypass all grou
 | `DELETE` | `/api/ips` | Remove an address from a group. |
 | `POST` / `GET` | `/api/keys` | Create / list API keys (requires `is_master` or `can_manage_keys`). |
 | `DELETE` | `/api/keys/{id}` | Delete an API key. |
+| `POST` | `/api/keys/{id}/rotate` | Reissue **both** the API key and its signing secret. |
+| `POST` | `/api/keys/{id}/rotate-secret` | Reissue **only** the signing secret; id, name, and permissions are unchanged. |
 | `POST` | `/api/keys/{id}/groups` | Grant/update a key's read/write/delete rights on a group. |
 | `POST` / `GET` | `/api/groups` | Create / list IP groups. |
 | `DELETE` | `/api/groups/{id}` | Delete a group (cascades its memberships and permissions). |
 | `POST` / `GET` | `/api/webhooks` | Create / list webhook configs. |
 | `DELETE` | `/api/webhooks/{id}` | Delete a webhook config. |
+
+### Webhook signature modes
+
+Each webhook chooses how its outgoing `X-Signature-256` is computed, via `signature_mode` on
+`POST /api/webhooks` (also shown in the dashboard's Webhooks tab):
+
+| Mode | Signed message | Headers sent | Use for |
+| :--- | :--- | :--- | :--- |
+| `BODY_ONLY` *(default)* | the raw body | `X-Signature-256: sha256=<hex>` | Generic third-party receivers (GitHub-style consumers). |
+| `CANONICAL_V1` | `POST\n<path>\n<timestamp>\n<body>` | `X-Signature-256: <bare hex>` **and** `X-Timestamp` | Another `simply_ip_vault` instance, or `simply_hook_executor`. |
+
+`CANONICAL_V1` uses exactly the same construction as the inbound API, which is what makes **instance
+chaining** work end to end: create a key on the receiving instance, then on the sending instance set
+`secret_token` to that key's signing secret, put `{"X-API-Key": "<that key>"}` in `headers_json`, and
+point `target_url` at the receiver's `/api/ban`. The dispatch then arrives as an ordinary signed,
+timestamped API request and passes the receiver's anti-replay check.
+
+Omitting `signature_mode` keeps the legacy `BODY_ONLY` behaviour, so existing webhooks are unchanged.
+An unrecognized value is rejected with `400` rather than silently downgraded.
 
 `GET /api/ips` query parameters: `groups=fail2ban,sshd` (or singular `group_name=`), `ip=<substring>`,
 `cause=<substring>`, `status=ban|white`, `max_age=<seconds>`, `since=<unix timestamp>`, `limit`,
@@ -154,7 +177,8 @@ call() {
   local method="$1" path="$2" body="${3:-}"
   local ts; ts=$(date -u +%s)
   # The query string is stripped before signing, but still sent.
-  local sig; sig=$(printf '%s' "${method}${path%%\?*}${ts}${body}" \
+  # CANONICAL_V1: real newlines between the four fields, none at the end.
+  local sig; sig=$(printf '%s\n%s\n%s\n%s' "$method" "${path%%\?*}" "$ts" "$body" \
                    | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.*= //')
   curl -sS -X "$method" \
     -H "X-API-Key: $KEY" -H "X-Timestamp: $ts" -H "X-Signature-256: $sig" \

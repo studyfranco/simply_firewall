@@ -1223,6 +1223,70 @@ pub async fn rotate_api_key(
     Ok(Json(RotateKeyResponse { id, plaintext_key, signing_secret }))
 }
 
+/// Response after rotating only an API key's HMAC signing secret.
+#[derive(Serialize)]
+pub struct RotateSigningSecretResponse {
+    /// Key ID — unchanged by this operation.
+    pub id: Uuid,
+    /// Key name — unchanged by this operation, echoed back so the caller can confirm which key it
+    /// just re-keyed without a second lookup.
+    pub name: String,
+    /// The new signing secret, in plaintext. Returned **only** here: the stored copy is encrypted at
+    /// rest when `VAULT_ENCRYPTION_KEY` is set, and no read endpoint ever echoes it.
+    pub signing_secret: String,
+}
+
+/// Handles `POST /api/keys/{id}/rotate-secret` — replaces a key's HMAC signing secret in place.
+///
+/// Distinct from [`rotate_api_key`] (`POST /api/keys/{id}/rotate`), which replaces *both*
+/// credentials. This narrower operation exists because the two secrets have very different blast
+/// radii: rotating `X-API-Key` forces every client to be reconfigured with a new identity, whereas
+/// rotating only the signing secret re-keys the HMAC while the key's id, name, `bound_ips`, global
+/// scopes, and every per-group permission grant stay exactly as they were. That makes it the right
+/// tool for routine credential hygiene, and for recovering a key whose `signing_secret` is `NULL`
+/// because it predates HMAC authentication.
+///
+/// The previous signing secret stops working the instant this returns — the column is overwritten,
+/// not versioned — so callers must be updated in lockstep.
+pub async fn rotate_signing_secret(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_keys {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target_name = target.name.clone();
+    let target_ref = format_key_reference(&target_name, id);
+
+    let signing_secret = crate::crypto::generate_signing_secret();
+    let stored_signing_secret = crate::crypto::seal_signing_secret(&signing_secret)?;
+
+    // Only `signing_secret` (and the bookkeeping `updated_at`) is touched: `key_hash`, `prefix`,
+    // `name`, `bound_ips` and every global scope are left untouched by construction, and the
+    // separate `api_key_group_permissions` rows are never referenced at all.
+    let mut active: api_key::ActiveModel = target.into();
+    active.signing_secret = Set(Some(stored_signing_secret));
+    active.updated_at = Set(Utc::now().naive_utc());
+    active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        Some(&key),
+        Some(client_ip.0),
+        "KEY_SECRET_ROTATE",
+        None,
+        None,
+        Some(format!("Rotated signing secret for key {target_ref}")),
+    )
+    .await?;
+
+    Ok(Json(RotateSigningSecretResponse { id, name: target_name, signing_secret }))
+}
+
 /// Handles POST /api/v1/keys/:id/groups
 pub async fn update_key_group_permissions(
     State(state): State<AppState>,
@@ -1486,6 +1550,9 @@ pub struct CreateWebhookPayload {
     /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` to trigger on. `None` (the
     /// default if omitted) means all events — the historical, pre-filtering behavior.
     pub events: Option<String>,
+    /// How dispatches are signed: `"BODY_ONLY"` (default) or `"CANONICAL_V1"`. Omitting it keeps
+    /// the legacy body-only signature, so existing integrations are unaffected.
+    pub signature_mode: Option<String>,
 }
 
 /// Handles POST /api/v1/webhooks
@@ -1519,6 +1586,18 @@ pub async fn create_webhook(
         }
     }
 
+    // Rejected rather than silently defaulted: a caller who asks for a signing mode and gets a
+    // different one would ship a receiver that rejects every dispatch, with nothing to point at.
+    let signature_mode = match payload.signature_mode.as_deref() {
+        None => webhook_config::SignatureMode::BodyOnly,
+        Some(raw) => webhook_config::SignatureMode::parse(raw).ok_or_else(|| {
+            AppError::InvalidInput(format!(
+                "Invalid signature_mode '{raw}': must be one of {}",
+                webhook_config::SignatureMode::ALL.join(", ")
+            ))
+        })?,
+    };
+
     let id = Uuid::new_v4();
     let now = chrono::Utc::now().naive_utc();
     let model = webhook_config::ActiveModel {
@@ -1526,6 +1605,7 @@ pub async fn create_webhook(
         name: Set(payload.name.clone()),
         target_url: Set(payload.target_url.clone()),
         secret_token: Set(payload.secret_token.clone()),
+        signature_mode: Set(signature_mode.as_str().to_owned()),
         headers_json: Set(payload.headers_json.clone()),
         payload_template: Set(payload.payload_template.clone()),
         group_id: Set(payload.group_id),
@@ -1537,7 +1617,11 @@ pub async fn create_webhook(
 
     create_audit_log(&state.db, Some(&key), Some(client_ip.0), "WEBHOOK_CREATE", None, None, Some(payload.target_url.clone())).await?;
 
-    Ok(Json(serde_json::json!({ "id": id, "target_url": payload.target_url })))
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "target_url": payload.target_url,
+        "signature_mode": signature_mode.as_str(),
+    })))
 }
 
 /// Public-safe summary of a webhook configuration. Deliberately omits `secret_token`: unlike
@@ -1563,12 +1647,18 @@ pub struct WebhookSummary {
     /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook fires for; `None`
     /// means all events.
     pub events: Option<String>,
+    /// How dispatches are signed: `"BODY_ONLY"` or `"CANONICAL_V1"`. Safe to expose — it describes
+    /// the signing *scheme*, not the `secret_token` that keys it.
+    pub signature_mode: String,
     /// Creation timestamp
     pub created_at: chrono::NaiveDateTime,
 }
 
 impl From<webhook_config::Model> for WebhookSummary {
     fn from(w: webhook_config::Model) -> Self {
+        // Normalized through the enum so a hand-edited or legacy row is reported as the mode it
+        // will actually be dispatched with, rather than as whatever string happens to be stored.
+        let signature_mode = webhook_config::SignatureMode::from_stored(&w.signature_mode);
         WebhookSummary {
             id: w.id,
             name: w.name,
@@ -1578,6 +1668,7 @@ impl From<webhook_config::Model> for WebhookSummary {
             group_id: w.group_id,
             is_active: w.is_active,
             events: w.events,
+            signature_mode: signature_mode.as_str().to_owned(),
             created_at: w.created_at,
         }
     }

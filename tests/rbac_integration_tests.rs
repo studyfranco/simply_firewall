@@ -2726,3 +2726,495 @@ async fn test_signing_secret_is_encrypted_at_rest_when_vault_key_is_set() {
 
     unsafe { std::env::remove_var("VAULT_ENCRYPTION_KEY") };
 }
+
+// ─────────────────────────────────────────────────────────────
+// Webhook signature modes (BODY_ONLY / CANONICAL_V1)
+// ─────────────────────────────────────────────────────────────
+
+/// What a mock webhook receiver captured from a single dispatch.
+#[derive(Default, Clone)]
+struct CapturedHook {
+    body: Option<String>,
+    signature: Option<String>,
+    timestamp: Option<String>,
+}
+
+/// Spawns a loopback mock receiver on an ephemeral port, returning its base URL and the shared slot
+/// it records into. Used by the signature-mode tests below in place of the ad-hoc receiver that the
+/// older webhook tests each built inline.
+async fn spawn_capturing_receiver() -> (String, std::sync::Arc<std::sync::Mutex<CapturedHook>>) {
+    use std::sync::{Arc, Mutex};
+
+    let captured: Arc<Mutex<CapturedHook>> = Arc::new(Mutex::new(CapturedHook::default()));
+    let for_handler = captured.clone();
+
+    let hook_app = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(move |headers: axum::http::HeaderMap, body: String| {
+            let captured = for_handler.clone();
+            async move {
+                let header = |name: &str| {
+                    headers.get(name).and_then(|h| h.to_str().ok()).map(|s| s.to_owned())
+                };
+                let mut c = captured.lock().unwrap();
+                c.signature = header("X-Signature-256");
+                c.timestamp = header("X-Timestamp");
+                c.body = Some(body);
+                StatusCode::OK
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, hook_app).await.unwrap();
+    });
+
+    (format!("http://{addr}"), captured)
+}
+
+/// Polls until the receiver records a dispatch, or gives up. Dispatch is asynchronous (channel →
+/// background worker → spawned HTTP task), so there is nothing to await directly.
+async fn await_dispatch(
+    captured: &std::sync::Arc<std::sync::Mutex<CapturedHook>>,
+) -> Option<CapturedHook> {
+    for _ in 0..40 {
+        {
+            let c = captured.lock().unwrap();
+            if c.body.is_some() {
+                return Some(c.clone());
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    None
+}
+
+/// Boilerplate shared by the signature-mode tests: a master key, a group, and a running webhook
+/// worker wired to the app.
+async fn setup_webhook_fixture(
+    group_name: &str,
+) -> (axum::Router, DatabaseConnection, String, Uuid) {
+    let db = setup_test_db().await;
+    let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
+    let db_for_worker = db.clone();
+    tokio::spawn(async move {
+        simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+    });
+
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_key_id, plaintext) = insert_key(&db, "Webhook Tester", true, true, true, true).await;
+
+    let group_id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_group::ActiveModel {
+        id: Set(group_id),
+        name: Set(group_name.to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    (app, db, plaintext, group_id)
+}
+
+/// A `CANONICAL_V1` webhook must send **both** `X-Signature-256` and `X-Timestamp`, with the
+/// signature computed over `POST\n<path>\n<timestamp>\n<body>` — the exact construction the inbound
+/// API middleware verifies, which is what makes vault-to-vault dispatch work.
+#[tokio::test]
+async fn test_canonical_v1_webhook_sends_timestamp_and_canonical_signature() {
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
+
+    let (base_url, captured) = spawn_capturing_receiver().await;
+    let (app, _db, plaintext, group_id) = setup_webhook_fixture("canonical-hook-group").await;
+
+    let secret = "canonical-webhook-secret";
+    let hook_url = format!("{base_url}/hook");
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")), json!({
+            "name": "Canonical Hook",
+            "target_url": hook_url,
+            "secret_token": secret,
+            "payload_template": "{\"ip\":\"$target_address\"}",
+            "group_id": group_id.to_string(),
+            "signature_mode": "CANONICAL_V1",
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(created["signature_mode"], "CANONICAL_V1", "creation echoes the stored mode");
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")),
+        json!({ "target_address": "5.5.5.5", "group_name": "canonical-hook-group" }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let hit = await_dispatch(&captured).await.expect("webhook was not delivered within timeout");
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "false") };
+
+    let delivered_body = hit.body.expect("body");
+    let signature = hit.signature.expect("CANONICAL_V1 dispatch must send X-Signature-256");
+    let timestamp = hit.timestamp.expect("CANONICAL_V1 dispatch must send X-Timestamp");
+
+    // The timestamp must be a plausible current epoch, not a placeholder — a receiver's anti-replay
+    // window would reject anything else.
+    let parsed: i64 = timestamp.parse().expect("X-Timestamp must be an integer epoch");
+    let skew = (chrono::Utc::now().timestamp() - parsed).abs();
+    assert!(skew < 300, "X-Timestamp should be current, was {skew}s off");
+
+    // Bare hex, not the `sha256=` prefix BODY_ONLY uses — byte-identical to what the API produces.
+    assert!(!signature.starts_with("sha256="), "CANONICAL_V1 sends bare hex, got {signature}");
+
+    let expected = simply_ip_vault::crypto::compute_signature(
+        secret, "POST", "/hook", &timestamp, delivered_body.as_bytes(),
+    ).unwrap();
+    assert_eq!(signature, expected, "signature must cover POST\\npath\\ntimestamp\\nbody");
+    assert!(delivered_body.contains("5.5.5.5"));
+
+    // The receiving end of the contract: the same bytes verify through the shared helper, which is
+    // literally the function the inbound middleware calls.
+    assert!(simply_ip_vault::crypto::verify_signature(
+        secret, "POST", "/hook", &timestamp, delivered_body.as_bytes(), &signature,
+    ));
+}
+
+/// Omitting `signature_mode` must keep the legacy behaviour exactly: body-only HMAC, `sha256=`
+/// prefix, and **no** `X-Timestamp` header. Guards third-party receivers against a silent change.
+#[tokio::test]
+async fn test_body_only_is_the_default_and_sends_no_timestamp() {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
+
+    let (base_url, captured) = spawn_capturing_receiver().await;
+    let (app, _db, plaintext, group_id) = setup_webhook_fixture("legacy-hook-group").await;
+
+    let secret = "legacy-webhook-secret";
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")), json!({
+            "name": "Legacy Hook",
+            "target_url": format!("{base_url}/hook"),
+            "secret_token": secret,
+            "payload_template": "{\"ip\":\"$target_address\"}",
+            "group_id": group_id.to_string(),
+            // signature_mode deliberately omitted
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(created["signature_mode"], "BODY_ONLY", "omitted mode defaults to BODY_ONLY");
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")),
+        json!({ "target_address": "6.6.6.6", "group_name": "legacy-hook-group" }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let hit = await_dispatch(&captured).await.expect("webhook was not delivered within timeout");
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "false") };
+
+    let delivered_body = hit.body.expect("body");
+    let signature = hit.signature.expect("missing X-Signature-256");
+    assert!(hit.timestamp.is_none(), "BODY_ONLY must not send X-Timestamp");
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(delivered_body.as_bytes());
+    assert_eq!(signature, format!("sha256={}", hex::encode(mac.finalize().into_bytes())));
+}
+
+/// `signature_mode` is validated at the API boundary rather than silently defaulted, and the stored
+/// value is surfaced by `GET /api/webhooks` so the UI can display it.
+#[tokio::test]
+async fn test_signature_mode_is_validated_and_exposed_in_listings() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_key_id, plaintext) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let group_id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("mode-group".to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }.insert(&db).await.unwrap();
+
+    let make = |mode: serde_json::Value, name: &str| {
+        let mut payload = json!({
+            "name": name,
+            "target_url": "https://example.com/hook",
+            "secret_token": "s3cret",
+            "payload_template": "{}",
+            "group_id": group_id.to_string(),
+        });
+        if !mode.is_null() {
+            payload["signature_mode"] = mode;
+        }
+        signed(inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/webhooks")
+            .header("X-API-Key", &plaintext)
+            .header("Content-Type", "application/json")), payload.to_string())
+    };
+
+    // A typo must be a 400, not a silent downgrade to BODY_ONLY: a caller who believes they enabled
+    // canonical signing would otherwise ship a receiver that rejects every dispatch.
+    let res = app.clone().oneshot(make(json!("CANONICAL_V2"), "typo")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    let res = app.clone().oneshot(make(json!("nonsense"), "nonsense")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // Casing is normalized rather than rejected — the value is an enum, not a password.
+    let res = app.clone().oneshot(make(json!("canonical_v1"), "lowercase")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app.clone().oneshot(make(json!("BODY_ONLY"), "explicit-legacy")).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let listed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let mode_of = |name: &str| -> String {
+        listed.as_array().unwrap().iter()
+            .find(|w| w["name"] == name).unwrap()["signature_mode"]
+            .as_str().unwrap().to_owned()
+    };
+    assert_eq!(mode_of("lowercase"), "CANONICAL_V1", "casing is normalized on the way in");
+    assert_eq!(mode_of("explicit-legacy"), "BODY_ONLY");
+
+    // The listing must still never leak the HMAC key itself.
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!text.contains("s3cret"), "GET /api/webhooks leaked secret_token");
+}
+
+// ─────────────────────────────────────────────────────────────
+// POST /api/keys/{id}/rotate-secret
+// ─────────────────────────────────────────────────────────────
+
+/// Rotating the signing secret invalidates the old one, activates the new one, and leaves the API
+/// key itself — plus name, scopes and per-group grants — completely untouched.
+#[tokio::test]
+async fn test_rotate_secret_swaps_only_the_signing_secret() {
+    // Serialized against the VAULT_ENCRYPTION_KEY test: whether the new secret is sealed is decided
+    // by that variable at rotation time. See ENV_MUTATION_LOCK.
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (target_id, target_key) = insert_key(&db, "Worker Bot", false, false, true, true).await;
+
+    // Give the target a per-group grant, so we can prove rotation doesn't disturb RBAC.
+    let group_id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_group::ActiveModel {
+        id: Set(group_id),
+        name: Set("rotate-secret-group".to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }.insert(&db).await.unwrap();
+    simply_ip_vault::entities::api_key_group_permission::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        api_key_id: Set(target_id),
+        group_id: Set(group_id),
+        can_read: Set(true),
+        can_write: Set(true),
+        can_delete: Set(true),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }.insert(&db).await.unwrap();
+
+    let old_secret = test_signing_secret(&target_key);
+
+    // Baseline: the original secret works.
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &target_key)), "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{target_id}/rotate-secret"))
+        .header("X-API-Key", &master_key)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let rotated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(rotated["id"], target_id.to_string(), "the key id is preserved");
+    assert_eq!(rotated["name"], "Worker Bot", "the key name is preserved");
+    let new_secret = rotated["signing_secret"].as_str().unwrap().to_owned();
+    assert!(!new_secret.is_empty());
+    assert_ne!(new_secret, old_secret, "a genuinely new secret is issued");
+    // The response must not hand back a new API key — that is `/rotate`'s job, not this one's.
+    assert!(rotated.get("plaintext_key").is_none(), "rotate-secret must not reissue the API key");
+
+    // The old signing secret is dead...
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &target_key)), &old_secret, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // ...and the new one works with the *same, unchanged* API key.
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &target_key)), &new_secret, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // Identity and RBAC survived intact.
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let me: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(me["id"], target_id.to_string());
+    assert_eq!(me["name"], "Worker Bot");
+    assert_eq!(me["can_manage_webhooks"], true);
+    assert_eq!(me["can_create_groups"], true);
+    assert_eq!(me["is_master"], false);
+    let perms = me["group_permissions"].as_array().unwrap();
+    assert_eq!(perms.len(), 1, "the per-group grant is untouched");
+    assert_eq!(perms[0]["group_name"], "rotate-secret-group");
+    assert_eq!(perms[0]["can_write"], true);
+    assert_eq!(perms[0]["can_delete"], true);
+}
+
+/// A key whose `signing_secret` is `NULL` (a row predating HMAC auth) is recoverable through
+/// `rotate-secret` — the documented upgrade path — without reissuing its API key.
+#[tokio::test]
+async fn test_rotate_secret_recovers_a_key_with_no_signing_secret() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let legacy_id = Uuid::new_v4();
+    let legacy_key = simply_ip_vault::api::generate_random_key();
+    simply_ip_vault::entities::api_key::ActiveModel {
+        id: Set(legacy_id),
+        key_hash: Set(simply_ip_vault::api::hash_key(&legacy_key)),
+        signing_secret: Set(None),
+        name: Set("Legacy".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(false),
+        can_manage_keys: Set(false),
+        can_manage_webhooks: Set(false),
+        can_create_groups: Set(false),
+        prefix: Set("dummy123".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }.insert(&db).await.unwrap();
+
+    // Before: unusable.
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &legacy_key)), "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{legacy_id}/rotate-secret"))
+        .header("X-API-Key", &master_key)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let rotated: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let new_secret = rotated["signing_secret"].as_str().unwrap().to_owned();
+
+    // After: the same API key now authenticates.
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &legacy_key)), &new_secret, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+}
+
+/// `rotate-secret` is master/`can_manage_keys`-only, 404s for unknown keys, and writes an audit
+/// entry naming the key it re-keyed.
+#[tokio::test]
+async fn test_rotate_secret_authorization_and_audit_trail() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (victim_id, _victim_key) = insert_key(&db, "Victim", false, false, false, false).await;
+    let (_low_id, low_key) = insert_key(&db, "Lowly", false, false, false, false).await;
+
+    // A key without can_manage_keys cannot re-key anyone — including itself.
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{victim_id}/rotate-secret"))
+        .header("X-API-Key", &low_key)), "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    // Unauthenticated is rejected before authorization.
+    let req = inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{victim_id}/rotate-secret")))
+        .body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // An unknown key id is a 404, not a silently-created key.
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{}/rotate-secret", Uuid::new_v4()))
+        .header("X-API-Key", &master_key)), "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    // The successful path writes a readable audit entry.
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{victim_id}/rotate-secret"))
+        .header("X-API-Key", &master_key)), "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/audit-logs?action=KEY_SECRET_ROTATE&limit=1")
+        .header("X-API-Key", &master_key)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let logs: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let entry = &logs.as_array().unwrap()[0];
+    assert_eq!(entry["action"], "KEY_SECRET_ROTATE");
+    let details = entry["details"].as_str().unwrap();
+    assert!(details.contains("'Victim'"), "audit details should name the key, got {details}");
+    // The secret itself must never reach the audit trail.
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(!text.contains("signing_secret"), "audit log leaked a signing secret field");
+}

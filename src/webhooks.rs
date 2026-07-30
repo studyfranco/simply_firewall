@@ -3,7 +3,7 @@
 use std::time::Duration;
 use std::str::FromStr;
 use std::net::IpAddr;
-use crate::entities::{prelude::*, webhook_config};
+use crate::entities::{prelude::*, webhook_config::{self, SignatureMode}};
 use crate::state::WebhookEvent;
 use reqwest::{Client, header::{HeaderMap, HeaderName, HeaderValue}};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
@@ -131,20 +131,61 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
                 }
             }
             
-            let mac_result = Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes());
-            let mut mac = match mac_result {
-                Ok(m) => m,
-                Err(e) => {
-                    tracing::error!("Failed to create HMAC key: {}", e);
-                    continue;
+            let mode = SignatureMode::from_stored(&config.signature_mode);
+            let signature = match mode {
+                // Legacy/generic: HMAC over the body alone, prefixed `sha256=` the way
+                // GitHub-style receivers expect. Unchanged from before signature modes existed.
+                SignatureMode::BodyOnly => {
+                    let mut mac = match Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::error!("Failed to create HMAC key: {}", e);
+                            continue;
+                        }
+                    };
+                    mac.update(payload.as_bytes());
+                    Some(format!("sha256={}", hex::encode(mac.finalize().into_bytes())))
+                }
+                // CANONICAL_V1: sign POST\n<path>\n<timestamp>\n<body> and send the timestamp
+                // alongside, so the receiver can run its own anti-replay check. The signature is
+                // bare hex — byte-identical to what the inbound API middleware produces — so a
+                // dispatch can authenticate directly against another instance's /api/* route.
+                SignatureMode::CanonicalV1 => {
+                    let timestamp = chrono::Utc::now().timestamp().to_string();
+                    // The path is taken from the target URL; a URL that failed to parse cannot be
+                    // dispatched at all, so skipping here loses nothing (is_url_safe would reject
+                    // it moments later regardless).
+                    let path = match reqwest::Url::parse(&config.target_url) {
+                        Ok(url) => url.path().to_owned(),
+                        Err(e) => {
+                            error!(url = %config.target_url, "Unparseable webhook target URL: {}", e);
+                            continue;
+                        }
+                    };
+                    match crate::crypto::compute_signature(
+                        &config.secret_token,
+                        "POST",
+                        &path,
+                        &timestamp,
+                        payload.as_bytes(),
+                    ) {
+                        Ok(sig) => {
+                            if let Ok(hv) = HeaderValue::from_str(&timestamp) {
+                                headers.insert("X-Timestamp", hv);
+                            }
+                            Some(sig)
+                        }
+                        Err(e) => {
+                            error!("Failed to compute canonical webhook signature: {}", e);
+                            continue;
+                        }
+                    }
                 }
             };
-            mac.update(payload.as_bytes());
-            let result = mac.finalize();
-            let hex_sig = hex::encode(result.into_bytes());
-            let sig_val = format!("sha256={}", hex_sig);
-            
-            if let Ok(hv) = HeaderValue::from_str(&sig_val) {
+
+            if let Some(sig_val) = signature
+                && let Ok(hv) = HeaderValue::from_str(&sig_val)
+            {
                 headers.insert("X-Signature-256", hv);
             }
 
