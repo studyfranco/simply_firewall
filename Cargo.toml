@@ -24,6 +24,7 @@ rand = "0.10"
 thiserror = "2"
 dotenvy = "0.15"
 log = "0.4"
+aes-gcm = "0.11"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

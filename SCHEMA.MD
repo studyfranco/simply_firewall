@@ -54,6 +54,7 @@ Stores authentication tokens, global access rights, and CIDR network binding rul
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique identifier for the API key |
 | `name` | `String` | Not Null | Human-readable key description |
 | `key_hash` | `String` | Not Null, Unique | Argon2 / SHA-256 hash of the secret API key |
+| `signing_secret` | `Text` | Nullable | Per-key HMAC-SHA256 secret used to verify the `X-Signature-256` request header. Encrypted with AES-GCM-256 when `VAULT_ENCRYPTION_KEY` is set (stored as `aesgcm256:<hex nonce><hex ciphertext‖tag>`), stored raw otherwise. `NULL` only for keys created before this column existed — such keys cannot authenticate and must be rotated. Never returned by any read endpoint |
 | `prefix` | `String` | Not Null, Indexed | First 8 characters of key for display and fast lookup |
 | `is_master` | `Boolean` | Default: `false` | Bypasses all group permission checks |
 | `can_manage_keys` | `Boolean` | Default: `false` | Global privilege to create/edit/delete API keys |
@@ -62,6 +63,14 @@ Stores authentication tokens, global access rights, and CIDR network binding rul
 | `bound_ips` | `Text` | Nullable | Comma-separated CIDR ranges allowed to use this key (e.g. `127.0.0.1/32,::/0`) |
 | `created_at` | `DateTimeUtc` | Not Null | Key generation timestamp |
 | `updated_at` | `DateTimeUtc` | Not Null | Key last update timestamp |
+
+---
+
+*Credential model:* an API key is a **pair** of independent secrets. `key_hash` is a one-way hash of
+the public `X-API-Key` (identity — never recoverable). `signing_secret` proves possession and
+therefore **cannot** be hashed, since verifying an HMAC requires the secret verbatim; it is encrypted
+at rest instead. Both are returned exactly once, by `POST /api/keys` and `POST /api/keys/{id}/rotate`.
+Rotation replaces both, so a compromised key leaves no working credential behind.
 
 ---
 
@@ -173,6 +182,8 @@ Security audit trail tracking mutating operations across the application.
 To ensure optimal query performance under high load, the following indexes are mandatory in migrations:
 
 1. `api_keys.prefix`: Fast lookup during `X-API-Key` middleware header matching.
+   (`signing_secret` is deliberately **not** indexed — it is only ever read via the row already
+   located by `key_hash`, never searched on.)
 2. `api_keys.key_hash`: Fast validation of exact key hashes.
 3. `ip_groups.name`: Unique index for quick group resolution.
 4. `ip_records.target_address`: Indexed for fast IP checking / duplicates.

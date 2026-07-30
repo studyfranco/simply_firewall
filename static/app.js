@@ -197,7 +197,13 @@ class PagedCache {
 class FirewallClient {
     constructor() {
         this.apiKey = localStorage.getItem('simply_ip_vault_key') || '';
+        this.signingSecret = localStorage.getItem('simply_ip_vault_signing_secret') || '';
         this.apiBase = '/api';
+        // Cached CryptoKey for HMAC signing, so the secret is imported once per session rather than
+        // on every request. Invalidated (alongside the cached secret it was derived from) whenever
+        // the credentials change — see setCredentials().
+        this.hmacKey = null;
+        this.hmacKeySource = '';
         this.state = {
             profile: null,
             apiKeys: [],
@@ -247,7 +253,8 @@ class FirewallClient {
 
     async init() {
         this.bindEvents();
-        if (this.apiKey) {
+        // Both halves of the credential are required: the key alone can no longer authenticate.
+        if (this.apiKey && this.signingSecret) {
             await this.verifyAuth();
         } else {
             this.showLogin();
@@ -255,16 +262,82 @@ class FirewallClient {
     }
 
     // ───────────────────────────────────────────────────────
+    // Request Signing (HMAC-SHA256 via Web Crypto)
+    // ───────────────────────────────────────────────────────
+
+    /**
+     * Imports this.signingSecret as an HMAC-SHA256 CryptoKey, memoized for the session.
+     *
+     * The secret is imported as its raw UTF-8 bytes — NOT hex-decoded — because the server keys its
+     * HMAC with `secret.as_bytes()`, i.e. the ASCII bytes of the hex string. Decoding to 32 bytes
+     * here would produce a different key and fail every signature check.
+     */
+    async getHmacKey() {
+        if (!crypto?.subtle) {
+            // crypto.subtle only exists in a secure context (HTTPS, or http on localhost). Served
+            // over plain HTTP to a LAN address, signing is simply unavailable in the browser, so
+            // say so plainly instead of failing later with an opaque 401.
+            throw new Error(
+                'Request signing unavailable: this page must be served over HTTPS (or from localhost) ' +
+                'for the Web Crypto API to be accessible.'
+            );
+        }
+        if (this.hmacKey && this.hmacKeySource === this.signingSecret) {
+            return this.hmacKey;
+        }
+        this.hmacKey = await crypto.subtle.importKey(
+            'raw',
+            new TextEncoder().encode(this.signingSecret),
+            { name: 'HMAC', hash: 'SHA-256' },
+            false,
+            ['sign']
+        );
+        this.hmacKeySource = this.signingSecret;
+        return this.hmacKey;
+    }
+
+    /**
+     * Computes the hex X-Signature-256 over METHOD + PATH + TIMESTAMP + RAW_BODY.
+     *
+     * `path` must exclude the query string, matching the server's `crypto::verify_signature`.
+     */
+    async signRequest(method, path, timestamp, body) {
+        const key = await this.getHmacKey();
+        const message = new TextEncoder().encode(`${method}${path}${timestamp}${body}`);
+        const digest = await crypto.subtle.sign('HMAC', key, message);
+        return Array.from(new Uint8Array(digest))
+            .map(b => b.toString(16).padStart(2, '0'))
+            .join('');
+    }
+
+    // ───────────────────────────────────────────────────────
     // Fetch Wrapper (Global 401/403 interceptor)
     // ───────────────────────────────────────────────────────
     async apiFetch(endpoint, options = {}) {
+        // The signature covers the path only, so strip any query string before signing while still
+        // requesting the full URL. Mutating fields all travel in the (signed) body.
+        const [pathOnly] = endpoint.split('?');
+        const method = (options.method || 'GET').toUpperCase();
+        const rawBody = options.body ?? '';
+        const timestamp = Math.floor(Date.now() / 1000).toString();
+
         const headers = {
             'Content-Type': 'application/json',
-            ...(this.apiKey ? { 'X-API-Key': this.apiKey } : {}),
             ...(options.headers || {})
         };
 
         try {
+            if (this.apiKey && this.signingSecret) {
+                headers['X-API-Key'] = this.apiKey;
+                headers['X-Timestamp'] = timestamp;
+                headers['X-Signature-256'] = await this.signRequest(
+                    method,
+                    `${this.apiBase}${pathOnly}`,
+                    timestamp,
+                    rawBody
+                );
+            }
+
             const res = await fetch(`${this.apiBase}${endpoint}`, { ...options, headers });
 
             // 401 means the key itself is invalid/missing — the session is unrecoverable, so log
@@ -309,9 +382,28 @@ class FirewallClient {
     // ───────────────────────────────────────────────────────
     // Auth Flow
     // ───────────────────────────────────────────────────────
+    /**
+     * Sets (or clears, when called with empty strings) both halves of the credential at once, in
+     * localStorage and in memory. Centralized so the key and its signing secret can never drift out
+     * of sync — a stale secret paired with a fresh key would fail every request with a 401.
+     */
+    setCredentials(key, signingSecret) {
+        this.apiKey = key;
+        this.signingSecret = signingSecret;
+        this.hmacKey = null;
+        this.hmacKeySource = '';
+
+        if (key && signingSecret) {
+            localStorage.setItem('simply_ip_vault_key', key);
+            localStorage.setItem('simply_ip_vault_signing_secret', signingSecret);
+        } else {
+            localStorage.removeItem('simply_ip_vault_key');
+            localStorage.removeItem('simply_ip_vault_signing_secret');
+        }
+    }
+
     handleAuthFailure() {
-        this.apiKey = '';
-        localStorage.removeItem('simply_ip_vault_key');
+        this.setCredentials('', '');
         this.showLogin();
     }
 
@@ -326,9 +418,8 @@ class FirewallClient {
         }
     }
 
-    async login(key) {
-        this.apiKey = key;
-        localStorage.setItem('simply_ip_vault_key', key);
+    async login(key, signingSecret) {
+        this.setCredentials(key, signingSecret);
         document.getElementById('login-error').classList.add('hidden');
         await this.verifyAuth();
     }
@@ -568,7 +659,14 @@ class FirewallClient {
             const checkedCount = boxes.filter(cb => cb.checked).length;
             selectAllEl.checked = boxes.length > 0 && checkedCount === boxes.length;
             selectAllEl.indeterminate = checkedCount > 0 && checkedCount < boxes.length;
-            deleteBtn.disabled = selectedSet.size === 0;
+            // With nothing selected the batch-delete control is hidden outright rather than merely
+            // disabled: a greyed-out button that can never be clicked in that state is pure noise.
+            // The wrapper is hidden alongside the button so it reclaims its vertical space instead
+            // of leaving a gap above the table.
+            const nothingSelected = selectedSet.size === 0;
+            deleteBtn.classList.toggle('hidden', nothingSelected);
+            deleteBtn.closest('.batch-actions')?.classList.toggle('hidden', nothingSelected);
+            deleteBtn.disabled = nothingSelected;
             deleteBtn.textContent = selectedSet.size > 0 ? `${deleteBtnLabel} (${selectedSet.size})` : deleteBtnLabel;
         };
 
@@ -929,6 +1027,9 @@ class FirewallClient {
             const reveal = document.getElementById('apikey-created');
             const pt = document.getElementById('apikey-plaintext');
             pt.textContent = res.plaintext_key;
+            // Both halves must be surfaced: a key without its signing secret cannot sign a single
+            // request, and the secret is never retrievable again after this response.
+            document.getElementById('apikey-signing-secret').textContent = res.signing_secret;
             reveal.classList.remove('hidden');
             
             document.getElementById('form-create-apikey').reset();
@@ -1045,8 +1146,21 @@ class FirewallClient {
         try {
             const res = await this.apiFetch(`/keys/${id}/rotate`, { method: 'POST' });
             document.getElementById('secret-reveal-value').textContent = res.plaintext_key;
+            document.getElementById('secret-reveal-signing-secret').textContent = res.signing_secret;
             document.getElementById('secret-reveal-modal').classList.remove('hidden');
             this.showToast("Secret rotated", 'success');
+
+            // Rotating the key you are currently logged in with invalidates the credential this
+            // session is signing with, so every subsequent request would 401. Log out deliberately
+            // (after the modal has the new values on screen) rather than letting that look like a
+            // random session failure.
+            if (this.state.profile && this.state.profile.id === id) {
+                this.showToast("You rotated your own key — log in again with the new credentials.", 'error');
+                this.setCredentials('', '');
+                // The reveal modal (z-index 20000) stays layered above the login screen (10000), so
+                // the new credentials remain readable and copyable while logged out.
+                this.showLogin();
+            }
         } catch(e) {}
     }
 
@@ -1177,7 +1291,10 @@ class FirewallClient {
     bindEvents() {
         document.getElementById('login-form').addEventListener('submit', (e) => {
             e.preventDefault();
-            this.login(document.getElementById('login-key').value);
+            this.login(
+                document.getElementById('login-key').value.trim(),
+                document.getElementById('login-secret').value.trim()
+            );
         });
 
         document.getElementById('logout-btn').addEventListener('click', () => this.logout());

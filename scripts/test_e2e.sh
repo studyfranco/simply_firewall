@@ -40,6 +40,15 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
 # Deterministic bootstrap secret: passed to the server as INITIAL_MASTER_KEY so this script never
 # needs to scrape the master key back out of the (buffered, redirected) server log.
 MASTER_KEY="e2e_master_secret_key_for_testing_123456789"
+# Its HMAC counterpart, passed as INITIAL_MASTER_SIGNING_SECRET for the same reason: every request
+# must now carry an X-Signature-256, so the script needs the bootstrap key's signing secret up front.
+MASTER_SIGNING_SECRET="e2e_master_signing_secret_for_testing_987654321"
+
+# Maps a plaintext API key -> its HMAC signing secret, so api_call() can sign on behalf of whichever
+# key a check happens to use without every call site having to pass a second credential.
+# register_key_secret() populates it as keys are minted during the run.
+declare -A SIGNING_SECRETS=()
+SIGNING_SECRETS["$MASTER_KEY"]="$MASTER_SIGNING_SECRET"
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/simply_ip_vault_e2e.XXXXXX")"
 DB_PATH="$WORK_DIR/e2e.db"
 SERVER_LOG="$WORK_DIR/server.log"
@@ -114,13 +123,57 @@ print_response_body() {
     fi
 }
 
+# Computes the hex HMAC-SHA256 the server expects in X-Signature-256, over the canonical string
+# METHOD + PATH + TIMESTAMP + RAW_BODY (concatenated, no separator).
+#
+# The query string is stripped from PATH before signing, matching the server's
+# `crypto::verify_signature` — it signs the URL path only, so that reverse proxies are free to
+# rewrite query parameters without invalidating otherwise-valid requests.
+#
+# `printf '%s'` (not `echo`) keeps the message byte-exact: no trailing newline, and no mangling of
+# JSON bodies containing backslashes or leading dashes.
+# Usage: hmac_sign SECRET METHOD PATH TIMESTAMP BODY
+hmac_sign() {
+    local secret="$1" method="$2" path="$3" timestamp="$4" body="${5:-}"
+    local path_only="${path%%\?*}"
+    printf '%s' "${method}${path_only}${timestamp}${body}" \
+        | openssl dgst -sha256 -hmac "$secret" \
+        | sed 's/^.*= //'
+}
+
+# Records the signing secret for a freshly minted key so subsequent api_call invocations using that
+# key can sign with it. Call immediately after any response carrying .plaintext_key/.signing_secret.
+# Usage: register_key_secret PLAINTEXT_KEY SIGNING_SECRET
+register_key_secret() {
+    local key="$1" secret="$2"
+    if [ -z "$key" ] || [ "$key" == "null" ] || [ -z "$secret" ] || [ "$secret" == "null" ]; then
+        err "register_key_secret called with an empty key/secret — the API response was malformed"
+        return 1
+    fi
+    SIGNING_SECRETS["$key"]="$secret"
+}
+
 # Performs an HTTP request and leaves the outcome in $RESP_STATUS / $RESP_BODY. Every call prints
 # a timestamped, colored "[STATUS] METHOD /path" line followed by the jq-formatted response body.
 # Usage: api_call METHOD PATH [API_KEY] [JSON_BODY] [X_FORWARDED_FOR]
 api_call() {
     local method="$1" path="$2" api_key="${3:-}" data="${4:-}" xff="${5:-}"
     local args=(-s -o "$RESP_BODY_FILE" -w "%{http_code}" -X "$method")
-    [ -n "$api_key" ] && args+=(-H "X-API-Key: $api_key")
+
+    # Anti-replay timestamp: always sent, even for the deliberately-unauthenticated checks, so those
+    # still fail on the credential under test rather than on a missing X-Timestamp.
+    local timestamp; timestamp=$(date -u +%s)
+    args+=(-H "X-Timestamp: $timestamp")
+
+    if [ -n "$api_key" ]; then
+        args+=(-H "X-API-Key: $api_key")
+        # An unknown key (the "invalid key is rejected" checks) has no registered secret; sign with a
+        # placeholder so the request is still well-formed and gets rejected at key lookup, which is
+        # the failure those checks are actually asserting.
+        local secret="${SIGNING_SECRETS[$api_key]:-unregistered-key-has-no-signing-secret}"
+        args+=(-H "X-Signature-256: $(hmac_sign "$secret" "$method" "$path" "$timestamp" "$data")")
+    fi
+
     [ -n "$xff" ] && args+=(-H "X-Forwarded-For: $xff")
     if [ -n "$data" ]; then
         args+=(-H "Content-Type: application/json" -d "$data")
@@ -191,7 +244,7 @@ trap cleanup EXIT INT TERM
 
 log_section "Preflight"
 
-for bin in curl jq cargo; do
+for bin in curl jq cargo openssl; do
     if ! command -v "$bin" >/dev/null 2>&1; then
         err "$bin is required but not found on PATH"
         exit 1
@@ -228,11 +281,15 @@ log "Build succeeded."
 
 log_section "Boot"
 log "Starting server against a fresh database at $DB_PATH"
-log "Using INITIAL_MASTER_KEY for deterministic bootstrap (no log-scraping needed)"
+log "Using INITIAL_MASTER_KEY + INITIAL_MASTER_SIGNING_SECRET for deterministic bootstrap (no log-scraping needed)"
 # ALLOW_PRIVATE_WEBHOOKS=true: §13 targets a webhook at a loopback receiver to observe deliveries,
 # which SSRF protection would otherwise block by default. Every other webhook test in this script
 # targets a real public host, so this doesn't loosen anything they depend on.
+# VAULT_ENCRYPTION_KEY is set so the run exercises the AES-GCM-256 seal/open path for signing
+# secrets end to end, rather than the plaintext development fallback.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
+    INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
+    VAULT_ENCRYPTION_KEY="e2e-vault-encryption-passphrase" \
     ALLOW_PRIVATE_WEBHOOKS=true \
     "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -281,6 +338,93 @@ check "401" "no X-API-Key header is rejected"
 api_call GET "/api/auth/me" "not-a-real-key"
 check "401" "an invalid key is rejected"
 
+# ── 1b. HMAC signing & anti-replay guard ────────────────────────────────────
+#
+# These checks bypass api_call() and drive curl directly: they need to send deliberately malformed
+# or omitted auth headers, which api_call() exists precisely to get right.
+
+log_section "1b. HMAC Signing & Anti-Replay Guard"
+
+# Usage: raw_call METHOD PATH [curl args...] — same $RESP_STATUS/$RESP_BODY contract as api_call.
+raw_call() {
+    local method="$1" path="$2"; shift 2
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X "$method" "$@" "$BASE_URL$path")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    local color; color=$(status_color "$RESP_STATUS")
+    printf "%s ${color}[%s]${RESET} %-6s %s\n" "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" >&2
+    print_response_body
+}
+
+NOW_TS=$(date -u +%s)
+VALID_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$NOW_TS" "")
+
+# Control: the three headers together authenticate.
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: $VALID_SIG"
+check "200" "X-API-Key + X-Timestamp + X-Signature-256 authenticates"
+
+# Each header is individually mandatory.
+raw_call GET "/api/auth/me" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: $VALID_SIG"
+check "401" "missing X-API-Key is rejected"
+
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Signature-256: $VALID_SIG"
+check "401" "missing X-Timestamp is rejected"
+
+# This is exactly the pre-HMAC request shape — it must no longer be sufficient.
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS"
+check "401" "missing X-Signature-256 is rejected (a bare API key no longer authenticates)"
+
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: not-a-number" -H "X-Signature-256: $VALID_SIG"
+check "401" "a malformed X-Timestamp is rejected"
+
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: deadbeef"
+check "401" "a wrong signature is rejected"
+
+# Anti-replay window: +/-300s, symmetric. Each of these carries a *correct* signature for the
+# timestamp it sends, so only the freshness check can reject it.
+STALE_TS=$((NOW_TS - 301))
+STALE_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$STALE_TS" "")
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $STALE_TS" -H "X-Signature-256: $STALE_SIG"
+check "401" "a 301s-stale timestamp is rejected as a replay"
+
+FUTURE_TS=$((NOW_TS + 301))
+FUTURE_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$FUTURE_TS" "")
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $FUTURE_TS" -H "X-Signature-256: $FUTURE_SIG"
+check "401" "a 301s-future timestamp is rejected"
+
+EDGE_TS=$((NOW_TS - 290))
+EDGE_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$EDGE_TS" "")
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $EDGE_TS" -H "X-Signature-256: $EDGE_SIG"
+check "200" "a 290s-old timestamp is still inside the 300s window"
+
+# The signature binds the body: replaying an authentic signature over different content fails.
+BIND_BODY='{"target_address":"198.51.100.77","group_name":"Group-Sig","cause":"signed"}'
+BIND_TS=$(date -u +%s)
+BIND_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/ban" "$BIND_TS" "$BIND_BODY")
+raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $BIND_TS" \
+    -H "X-Signature-256: $BIND_SIG" -H "Content-Type: application/json" -d "$BIND_BODY"
+check "200" "a correctly signed body is accepted"
+
+raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $BIND_TS" \
+    -H "X-Signature-256: $BIND_SIG" -H "Content-Type: application/json" \
+    -d '{"target_address":"9.9.9.9","group_name":"Group-Sig","cause":"tampered"}'
+check "401" "the same signature over a tampered body is rejected"
+
+# ...and the path: a /api/ban signature cannot be replayed onto /api/white.
+raw_call POST "/api/white" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $BIND_TS" \
+    -H "X-Signature-256: $BIND_SIG" -H "Content-Type: application/json" -d "$BIND_BODY"
+check "401" "a /api/ban signature replayed onto /api/white is rejected"
+
+# The signing secret must never come back from a read endpoint.
+api_call GET "/api/keys" "$MASTER_KEY"
+check "200" "list keys"
+if echo "$RESP_BODY" | grep -q "signing_secret"; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} GET /api/keys must not expose signing_secret" >&2
+else
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} GET /api/keys does not expose signing_secret" >&2
+fi
+
 # ── 2. Multi-key permission matrix ──────────────────────────────────────────
 
 log_section "2. Multi-Key Permission Matrix (Group A)"
@@ -298,6 +442,8 @@ create_scoped_key() {
     api_call POST "/api/keys" "$MASTER_KEY" "{\"name\":\"$name\",\"bound_ips\":\"0.0.0.0/0\"}"
     check "200" "create scoped key '$name'"
     CREATED_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+    CREATED_SIGNING_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+    register_key_secret "$CREATED_KEY" "$CREATED_SIGNING_SECRET"
     CREATED_ID=$(echo "$RESP_BODY" | jq -r '.id')
 }
 
@@ -431,6 +577,7 @@ log "Rotating the Read-Only Key's secret..."
 api_call POST "/api/keys/$READONLY_ID/rotate" "$MASTER_KEY"
 check "200" "rotate succeeds"
 NEW_READONLY_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+register_key_secret "$NEW_READONLY_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
 api_call GET "/api/auth/me" "$READONLY_KEY"
 check "401" "the OLD secret is rejected immediately after rotation"
@@ -446,6 +593,7 @@ log_section "6. Bound IP / CIDR Restrictions"
 api_call POST "/api/keys" "$MASTER_KEY" '{"name":"CIDR-Restricted Key","bound_ips":"203.0.113.0/24"}'
 check "200" "create a key bound to 203.0.113.0/24"
 RESTRICTED_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+register_key_secret "$RESTRICTED_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
 api_call GET "/api/auth/me" "$RESTRICTED_KEY" "" "203.0.113.99"
 check "200" "an X-Forwarded-For address inside the bound CIDR is allowed"
@@ -460,6 +608,7 @@ log "Dedicated strict scenario: bound_ips=127.0.0.1/32, request claims to be fro
 api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Loopback-Only Key","bound_ips":"127.0.0.1/32"}'
 check "200" "create a key bound to 127.0.0.1/32"
 LOOPBACK_ONLY_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+register_key_secret "$LOOPBACK_ONLY_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
 api_call GET "/api/auth/me" "$LOOPBACK_ONLY_KEY" "" "203.0.113.50"
 check "403" "an out-of-CIDR X-Forwarded-For is strictly rejected"
@@ -812,6 +961,7 @@ log_section "16. Auto-Grant Full Permissions on Group Creation"
 api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Group Creator Key","bound_ips":"0.0.0.0/0","can_create_groups":true}'
 check "200" "create a key with can_create_groups=true"
 GROUP_CREATOR_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+register_key_secret "$GROUP_CREATOR_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
 log "Explicit creation via POST /api/groups..."
 api_call POST "/api/groups" "$GROUP_CREATOR_KEY" '{"name":"explicit-creator-group"}'

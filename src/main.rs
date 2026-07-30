@@ -75,7 +75,22 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
         }
         _ => api::generate_random_key(),
     };
+    // The signing secret follows the same rule as the key itself: deterministic when explicitly
+    // provided for test/CI bootstrap, random otherwise.
+    let signing_secret = match std::env::var("INITIAL_MASTER_SIGNING_SECRET") {
+        Ok(fixed_secret) if !fixed_secret.is_empty() => {
+            tracing::warn!(
+                "INITIAL_MASTER_SIGNING_SECRET is set: using the provided value as the master \
+                 key's HMAC signing secret instead of generating a random one. Intended for \
+                 deterministic test/CI bootstrap only — do not set this in a real deployment."
+            );
+            fixed_secret
+        }
+        _ => simply_ip_vault::crypto::generate_signing_secret(),
+    };
+
     let key_hash = api::hash_key(&plaintext_key);
+    let stored_signing_secret = simply_ip_vault::crypto::seal_signing_secret(&signing_secret)?;
     let bound_ip = std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0".to_owned());
 
     let prefix = plaintext_key.chars().take(8).collect::<String>();
@@ -84,6 +99,7 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     let model = api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
         key_hash: Set(key_hash),
+        signing_secret: Set(Some(stored_signing_secret)),
         name: Set("System Master".to_owned()),
         prefix: Set(prefix),
         bound_ips: Set(Some(bound_ip.clone())),
@@ -97,14 +113,25 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
 
     model.insert(db).await?;
 
+    // The box is drawn against an explicit inner width rather than hardcoded runs of ═, so the
+    // borders stay aligned around a 64-hex-char credential (the previous fixed layout did not).
+    const W: usize = 82;
+    let border = "═".repeat(W);
+    let body: String = [
+        format!("X-API-Key      : {plaintext_key}"),
+        format!("Signing secret : {signing_secret}"),
+        format!("Bound IPs      : {bound_ip}"),
+        String::new(),
+        "Both values are needed to sign requests (X-Timestamp + X-Signature-256).".to_owned(),
+        "They will NOT be shown again — store them securely!".to_owned(),
+    ]
+    .iter()
+    .map(|row| format!("║ {row:<W$} ║\n"))
+    .collect();
+
     tracing::info!(
-        "\n╔══════════════════════════════════════════════════════════════╗\n\
-         ║  BOOTSTRAP: Master API Key Generated                       ║\n\
-         ║  Key:    {}  ║\n\
-         ║  Bound:  {:54}║\n\
-         ║  ⚠ This key will NOT be shown again. Store it securely!    ║\n\
-         ╚══════════════════════════════════════════════════════════════╝",
-        plaintext_key, bound_ip
+        "\n╔{border}╗\n║ {:<W$} ║\n╠{border}╣\n{body}╚{border}╝",
+        "BOOTSTRAP: Master API Key Generated"
     );
 
     // tracing's fmt subscriber buffers writes; a reader tailing/polling the redirected log file
@@ -131,6 +158,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://simply_ip_vault.db?mode=rwc".to_owned());
+
+    // Surfaced at boot because the two modes are indistinguishable from the API's behaviour: an
+    // operator who mistyped the env var would otherwise never learn that signing secrets are
+    // sitting in the database in plaintext.
+    if simply_ip_vault::crypto::encryption_enabled() {
+        tracing::info!("VAULT_ENCRYPTION_KEY is set: signing secrets are encrypted at rest (AES-GCM-256).");
+    } else {
+        tracing::warn!(
+            "VAULT_ENCRYPTION_KEY is not set: API key signing secrets are stored UNENCRYPTED. \
+             This is the zero-config development default — set it for any real deployment."
+        );
+    }
 
     tracing::info!("Connecting to database...");
     let mut opt = ConnectOptions::new(db_url);

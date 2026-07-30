@@ -15,6 +15,22 @@ pub struct Model {
     /// SHA-256 hash of the secret API key (the plaintext key is never stored).
     #[sea_orm(unique)]
     pub key_hash: String,
+    /// The key's HMAC-SHA256 signing secret, used to verify the `X-Signature-256` request header.
+    ///
+    /// Unlike [`Self::key_hash`], this cannot be a one-way hash — verifying a signature requires
+    /// the secret verbatim — so it is instead encrypted with AES-GCM-256 whenever
+    /// `VAULT_ENCRYPTION_KEY` is configured, and stored raw otherwise (development fallback). Always
+    /// read it through [`crate::crypto::open_signing_secret`] rather than using the field directly.
+    ///
+    /// `None` for keys created before this column existed; such keys cannot authenticate and must be
+    /// rotated (`POST /api/keys/{id}/rotate`) to obtain a secret.
+    ///
+    /// Never serialized: `api_key::Model` derives `Serialize` and is carried in request extensions,
+    /// so `skip_serializing` is a standing guard against this secret leaking into any response body
+    /// that ever serializes a whole model.
+    #[serde(skip_serializing)]
+    #[serde(default)]
+    pub signing_secret: Option<String>,
     /// First 8 characters of the plaintext key, kept for display and fast lookup.
     pub prefix: String,
     /// Comma-separated CIDR ranges allowed to use this key (e.g. `127.0.0.1/32,::/0`). An empty

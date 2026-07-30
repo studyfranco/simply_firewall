@@ -12,6 +12,7 @@ use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
 
 pub mod api;
+pub mod crypto;
 pub mod entities;
 pub mod error;
 pub mod middleware;

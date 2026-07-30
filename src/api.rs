@@ -930,6 +930,10 @@ pub struct CreateApiKeyResponse {
     pub id: Uuid,
     /// Raw key string
     pub plaintext_key: String,
+    /// The key's HMAC signing secret, for computing `X-Signature-256`. Returned **only** here, at
+    /// creation: the stored copy is encrypted at rest (when `VAULT_ENCRYPTION_KEY` is set) and is
+    /// never echoed by any read endpoint, so a caller that loses it must rotate the key.
+    pub signing_secret: String,
     /// Name
     pub name: String,
     /// Bound ips
@@ -957,12 +961,16 @@ pub async fn create_api_key(
     let plaintext_key = generate_random_key();
     let key_hash = hash_key(&plaintext_key);
     let prefix = plaintext_key.chars().take(8).collect::<String>();
+    // The signing secret is independent of the API key: leaking one must not compromise the other.
+    let signing_secret = crate::crypto::generate_signing_secret();
+    let stored_signing_secret = crate::crypto::seal_signing_secret(&signing_secret)?;
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
 
     let model = api_key::ActiveModel {
         id: Set(id),
         key_hash: Set(key_hash),
+        signing_secret: Set(Some(stored_signing_secret)),
         name: Set(payload.name.clone()),
         prefix: Set(prefix),
         bound_ips: Set(payload.bound_ips.clone()),
@@ -981,6 +989,7 @@ pub async fn create_api_key(
     Ok(Json(CreateApiKeyResponse {
         id,
         plaintext_key,
+        signing_secret,
         name: payload.name,
         bound_ips: payload.bound_ips,
     }))
@@ -1171,11 +1180,18 @@ pub struct RotateKeyResponse {
     pub id: Uuid,
     /// The new plaintext key. Shown only once — only its hash is stored.
     pub plaintext_key: String,
+    /// The new HMAC signing secret. Shown only once, like [`Self::plaintext_key`].
+    pub signing_secret: String,
 }
 
 /// Handles POST /api/v1/keys/:id/rotate — generates a new secret for an existing key, returning
 /// the plaintext once while immediately invalidating the previous secret (the old `key_hash` is
 /// overwritten, not kept around).
+///
+/// Rotation replaces **both** credentials: the API key *and* its HMAC signing secret. Leaving the
+/// old signing secret in place would defeat the point of rotating after a suspected compromise, and
+/// it doubles as the recovery path for keys created before `signing_secret` existed (which carry
+/// `NULL` and cannot authenticate until rotated).
 pub async fn rotate_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
@@ -1192,16 +1208,19 @@ pub async fn rotate_api_key(
     let plaintext_key = generate_random_key();
     let key_hash = hash_key(&plaintext_key);
     let prefix = plaintext_key.chars().take(8).collect::<String>();
+    let signing_secret = crate::crypto::generate_signing_secret();
+    let stored_signing_secret = crate::crypto::seal_signing_secret(&signing_secret)?;
 
     let mut active: api_key::ActiveModel = target.into();
     active.key_hash = Set(key_hash);
     active.prefix = Set(prefix);
+    active.signing_secret = Set(Some(stored_signing_secret));
     active.updated_at = Set(Utc::now().naive_utc());
     active.update(&state.db).await?;
 
     create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_ROTATE", None, None, Some(format!("Rotated secret for key {target_ref}"))).await?;
 
-    Ok(Json(RotateKeyResponse { id, plaintext_key }))
+    Ok(Json(RotateKeyResponse { id, plaintext_key, signing_secret }))
 }
 
 /// Handles POST /api/v1/keys/:id/groups

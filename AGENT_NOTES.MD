@@ -1994,3 +1994,173 @@ No cleanup action was necessary — the suites leave nothing behind by design, v
   dev artifact, not something this session created or removed.
 - `git status --porcelain` → empty. The working tree is byte-identical to commit `71767a4`.
 - No orphaned server or webhook-receiver processes left listening on ports 3000 / the receiver port.
+
+---
+
+## 2026-07-30 (session 18) — HMAC-SHA256 request authentication, anti-replay, encryption at rest, UI fixes
+
+Replaced bearer-style `X-API-Key` authentication with an HMAC-SHA256 signature scheme plus a
+±300-second anti-replay window, added per-key signing secrets encrypted at rest with AES-GCM-256,
+and fixed three UI issues. **This is a breaking API change**: possession of an API key alone no
+longer authenticates anything.
+
+### Results
+
+| Check | Result |
+| --- | --- |
+| `cargo check --all-targets` | ✅ clean |
+| `cargo clippy --all-targets -- -D warnings` | ✅ clean |
+| `cargo test --all-targets` | ✅ **48/48** (4 new `crypto` unit tests + 44 integration, up from 36) |
+| `./scripts/test_e2e.sh` | ✅ **195/195** (up from 181; +14 new HMAC/anti-replay checks) |
+
+### The signing scheme
+
+Canonical signed string is `METHOD + PATH + TIMESTAMP + RAW_BODY`, concatenated with **no**
+separator, hex HMAC-SHA256, keyed by the key's `signing_secret`.
+
+Two decisions inside that deserve recording:
+
+- **`PATH` excludes the query string.** Reverse proxies routinely reorder, re-encode or append query
+  parameters; signing them would silently break valid requests behind ordinary infrastructure. The
+  security cost is bounded because every mutating field on `/api/*` travels in the (signed) body —
+  query parameters are read-only filters. Documented explicitly in `AGENT.MD` rather than left
+  implicit, since it is the one place the scheme is deliberately weaker than "sign everything".
+- **`PATH` is the *original* request path.** This cost an hour of debugging: the auth middleware is
+  layered *inside* `.nest("/api", ...)`, and Axum's nesting rewrites `req.uri()` to the path relative
+  to the mount point — the middleware saw `/ips` while every client signs `/api/ips`, so all 36
+  integration tests failed with `401`. Fixed by reading `axum::extract::OriginalUri` from the request
+  extensions, with `req.uri()` only as a fallback for the (currently impossible) un-nested case.
+  Worth remembering for any future middleware that hashes or logs the request path.
+
+### Ordering: authenticate, then authorize
+
+The middleware now runs: timestamp validation (no I/O) → key lookup → **signature verification** →
+CIDR binding check. The CIDR check deliberately moved *after* signature verification, which is a
+behaviour change from the previous ordering. Rationale: with the old order, a caller who merely
+guessed a valid `X-API-Key` could distinguish `403` ("that key exists but isn't bound to your
+network") from `401`, learning something about a key it cannot actually use. All CIDR tests still
+pass unchanged because the test helper signs every request that carries a key.
+
+Timestamp validation runs first purely as a cheap gate: it needs no database round-trip, so an
+unauthenticated flood of stale requests never costs a query.
+
+### `signing_secret`: why it is encrypted rather than hashed
+
+`key_hash` is a one-way hash, but a signing secret must be recoverable *verbatim* to verify an HMAC,
+so hashing is not an option. Hence AES-GCM-256 (`src/crypto.rs`) when `VAULT_ENCRYPTION_KEY` is set,
+raw storage otherwise. Specifics:
+
+- The env var is **SHA-256'd** to derive the 32-byte key, so operators can supply a passphrase of any
+  length instead of hitting a "must be exactly 64 hex chars" footgun. Deterministic, so the same
+  passphrase always opens the same database.
+- Sealed values are tagged `aesgcm256:<hex nonce><hex ciphertext‖tag>`. Detection keys off **the
+  prefix, not off whether the env var is currently set** — that makes enabling encryption on an
+  existing database non-destructive (old raw rows keep working), and makes a *removed* key surface as
+  a loud error instead of silently handing ciphertext to the HMAC and producing a baffling `401`.
+- Fresh random 12-byte nonce per value (GCM loses all confidentiality on nonce reuse). A unit test
+  asserts the same plaintext seals to two different ciphertexts, and that flipping one ciphertext
+  byte is caught by the auth tag.
+- `Model::signing_secret` carries `#[serde(skip_serializing)]` as a standing guard: `api_key::Model`
+  derives `Serialize` and rides in request extensions, so the annotation prevents a future endpoint
+  from leaking the secret by serializing a whole model. An integration test asserts neither
+  `GET /api/auth/me` nor `GET /api/keys` mentions it, and the E2E suite greps the key listing too.
+
+Rotation replaces **both** credentials. Leaving the old signing secret in place would defeat the
+purpose of rotating after a compromise, and it doubles as the upgrade path for pre-existing keys.
+
+### Migration strategy for existing databases
+
+Added as a separate additive migration (`m20260729_000002_add_api_key_signing_secret`) rather than by
+editing the initial schema — that migration has already run on existing databases and would never
+re-run. The column is **nullable**, so the `ALTER TABLE` cannot fail on a populated table.
+
+Existing keys therefore carry `NULL` and **cannot authenticate**; they fail closed with a `401`
+naming the fix (`POST /api/keys/{id}/rotate`). Back-filling random secrets in the migration was
+considered and rejected: a secret generated inside a migration can never be shown to its owner, so it
+would be unusable anyway — silently converting "must rotate" into "permanently broken".
+
+The new migration re-declares the `ApiKeys` iden locally instead of importing it from the initial
+schema module. Making that module `pub` would have exported a dozen undocumented public enums and
+tripped the crate's `#![warn(missing_docs)]`.
+
+### Test-suite convention (the reason the diff is ~105 lines wide but shallow)
+
+Every `/api/*` request in `tests/` now needs a timestamp and a signature. Rather than thread a second
+credential through ~105 call sites by hand, keys seeded directly into the database use a deterministic
+signing secret derived from their plaintext key (`test_signing_secret`), so the `signed()` helper
+recovers it from the request's own `X-API-Key` header. The 105 sites were converted mechanically
+(`inject_connect_info(B).body(X).unwrap()` → `signed(inject_connect_info(B), X)`) by a script, and
+the compiler plus the full suite verified the result — no call site needed individual review.
+
+Keys minted through `POST /api/keys` or `/rotate` get a server-generated random secret and use
+`signed_with(...)` explicitly. Those tests now also hold `ENV_MUTATION_LOCK`, even though they set no
+env var themselves: whether their key's secret is sealed is decided by `VAULT_ENCRYPTION_KEY` *at
+creation time*, so a concurrent encryption test clearing it in between would leave them unable to
+decrypt their own secret. That was a latent flake, not an observed one — caught by reasoning about
+the shared global rather than by a failure.
+
+8 new integration tests and a new E2E section (§1b) cover the auth surface directly: each of the
+three headers individually mandatory (including the exact pre-HMAC "key + timestamp" shape), the
+replay window enforced symmetrically using *correctly signed* stale/future timestamps (so the
+rejection provably comes from the freshness check and not the HMAC), and signature binding to method,
+path and body (an authentic `/api/ban` signature replayed onto `/api/white`, or over a tampered body,
+must fail). The E2E suite now boots the server **with** `VAULT_ENCRYPTION_KEY` set, so the whole run
+exercises the seal/open path rather than the plaintext fallback.
+
+`scripts/test_e2e.sh` signs via `openssl dgst -sha256 -hmac` (now a hard preflight dependency) and
+keeps a `key -> secret` map so all ~180 pre-existing call sites were left untouched.
+
+### Frontend
+
+`app.js`'s fetch wrapper signs every call with the Web Crypto API. The secret is imported as its raw
+**UTF-8 bytes**, not hex-decoded — the server keys its HMAC with `secret.as_bytes()`, i.e. the ASCII
+bytes of the hex string, so decoding to 32 bytes would silently fail every check. The imported
+`CryptoKey` is memoized and invalidated through `setCredentials()`, which writes/clears both
+localStorage entries together so the key and secret can never drift out of sync.
+
+Two consequences worth flagging:
+
+- **`crypto.subtle` requires a secure context.** Served over plain HTTP to a LAN address, the
+  dashboard cannot sign anything. The wrapper detects this and reports it explicitly instead of
+  failing with an opaque `401`, and both `AGENT.MD` and `README.md` now say to deploy behind TLS.
+  This is a genuine new deployment constraint on the UI, not a code defect.
+- Rotating the key you are logged in with now invalidates your own session. Handled explicitly:
+  the new credentials are shown in the reveal modal (z-index 20000, layered above the login screen at
+  10000, so they stay readable) and the session logs out deliberately rather than appearing to fail
+  at random.
+
+### UI fixes
+
+- **Modal actions**: `justify-content: space-between` → `flex-end`, so Cancel sits immediately left of
+  Confirm as a right-aligned pair instead of being pushed to the opposite edge of the card. Cancel got
+  a dedicated `.btn-cancel` bluish-slate theme (`#1e293b` / `#60a5fa`, hover `#2563eb`) rather than the
+  generic dark grey `.btn-secondary`.
+- **Batch delete visibility**: hidden outright (`display: none`) at 0 selections instead of merely
+  disabled. Toggled at the single existing choke point (`wireRowSelection`'s `updateControls`), on both
+  the button and its `.batch-actions` wrapper so the row reclaims its vertical space. The containers
+  are also `hidden` in the initial markup, so there is no flash of a dead button before first render.
+- **API Keys tab spacing**: new `.batch-actions-keys` adds `margin-top: 1.5rem` plus a hairline rule,
+  separating "Delete Selected" from the "Create API Key" form (and the key-reveal box between them)
+  that it was previously flush against.
+
+### Known limitation introduced (not fixed — needs a decision)
+
+**Chaining `simply_ip_vault` instances via webhooks is now broken.** `AGENT.MD` §4 advertises setting
+`X-API-Key` in a webhook's `headers_json` to forward events to another instance. An outbound dispatch
+signs *the payload alone* with the webhook's `secret_token` and sends no `X-Timestamp`; a receiving
+instance now demands a timestamp plus a signature over `METHOD + PATH + TIMESTAMP + RAW_BODY` keyed by
+the *receiving key's* `signing_secret` — different message, different key — so the dispatch gets `401`.
+
+Not fixed here because a correct fix changes webhook semantics (the dispatcher would need to emit
+vault-style auth headers derived from the target key's signing secret, which would break generic
+third-party consumers of the existing payload signature) and that is a design decision outside this
+task's scope. Documented inline in `AGENT.MD` §4 so it cannot be rediscovered by surprise. Webhooks to
+ordinary third-party endpoints are entirely unaffected.
+
+### Also updated
+
+`README.md`: the env-var table gained `VAULT_ENCRYPTION_KEY`, the API reference documents the
+three-header scheme, the bootstrap banner sample was refreshed (it now prints the signing secret, and
+the box is drawn against a computed width — the old hardcoded one never actually aligned around a
+64-char key), and every `curl` example was rewritten around a copy-pasteable `call()` signing helper,
+since a bare `curl -H "X-API-Key: ..."` no longer works at all.

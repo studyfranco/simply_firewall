@@ -20,9 +20,119 @@ fn inject_connect_info(req: axum::http::request::Builder) -> axum::http::request
     req.extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 8080))))
 }
 
-/// `ALLOW_PRIVATE_WEBHOOKS` is process-wide global state. Any test that mutates it must hold this
-/// lock for the duration, so two such tests running on different libtest threads can never
-/// interleave their `set_var` calls (which is itself a data race, hence why `set_var` is `unsafe`).
+// ─────────────────────────────────────────────────────────────
+// HMAC request signing helpers
+//
+// Every `/api/*` request now needs `X-Timestamp` and an `X-Signature-256` over
+// `METHOD + PATH + TIMESTAMP + RAW_BODY`. Rather than thread a second credential through each of
+// the ~100 request-building sites below, keys seeded directly into the database follow a fixed
+// convention (see `test_signing_secret`) that lets `signed()` recover the right secret from the
+// request's own `X-API-Key` header.
+// ─────────────────────────────────────────────────────────────
+
+/// Test-only convention: a database-seeded key's signing secret is derived from its plaintext API
+/// key, so [`signed`] can rediscover it from the `X-API-Key` header alone.
+///
+/// Only valid for keys inserted by these tests. Keys minted through `POST /api/keys` (or rotated via
+/// `POST /api/keys/{id}/rotate`) get a server-generated random secret returned in the response body,
+/// and must be signed with [`signed_with`] instead.
+fn test_signing_secret(api_key: &str) -> String {
+    format!("signing-secret-for-{api_key}")
+}
+
+/// Builds a signed request, deriving the signing secret from the builder's own `X-API-Key` header.
+///
+/// A builder carrying no `X-API-Key` still gets an `X-Timestamp` but no signature — exactly what the
+/// "missing key is rejected" cases need, since they must fail on authentication rather than on a
+/// missing timestamp.
+fn signed(builder: axum::http::request::Builder, body: impl Into<String>) -> Request<Body> {
+    let derived = builder
+        .headers_ref()
+        .and_then(|h| h.get("X-API-Key"))
+        .and_then(|v| v.to_str().ok())
+        .map(test_signing_secret);
+    build_signed(builder, derived.as_deref(), body.into())
+}
+
+/// Builds a signed request using an explicitly supplied signing secret, for keys whose secret was
+/// generated server-side and read back out of a `POST /api/keys` or `/rotate` response.
+fn signed_with(
+    builder: axum::http::request::Builder,
+    signing_secret: &str,
+    body: impl Into<String>,
+) -> Request<Body> {
+    build_signed(builder, Some(signing_secret), body.into())
+}
+
+/// Builds a request signed at an explicit `X-Timestamp`, for exercising the anti-replay window.
+///
+/// The signature is computed over the same (possibly stale) timestamp that is sent, so these
+/// requests are cryptographically valid and can only be rejected by the freshness check itself —
+/// which is precisely what makes them a test of the anti-replay guard rather than of the HMAC.
+fn signed_at(
+    builder: axum::http::request::Builder,
+    signing_secret: &str,
+    timestamp: i64,
+    body: impl Into<String>,
+) -> Request<Body> {
+    build_signed_at(builder, Some(signing_secret), timestamp.to_string(), body.into())
+}
+
+/// Attaches `X-Timestamp` (and, when a secret is available, `X-Signature-256`) and finishes the
+/// request. The timestamp is always "now", so these requests sit comfortably inside the server's
+/// 300-second anti-replay window.
+fn build_signed(
+    builder: axum::http::request::Builder,
+    signing_secret: Option<&str>,
+    body: String,
+) -> Request<Body> {
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+    build_signed_at(builder, signing_secret, timestamp, body)
+}
+
+/// Shared implementation behind [`build_signed`] and [`signed_at`].
+fn build_signed_at(
+    builder: axum::http::request::Builder,
+    signing_secret: Option<&str>,
+    timestamp: String,
+    body: String,
+) -> Request<Body> {
+    // Read method/path back off the builder so the signature always matches what is actually sent.
+    // The query string is deliberately excluded, mirroring `crypto::verify_signature`.
+    let method = builder
+        .method_ref()
+        .map(|m| m.as_str().to_owned())
+        .unwrap_or_else(|| "GET".to_owned());
+    let path = builder
+        .uri_ref()
+        .map(|u| u.path().to_owned())
+        .unwrap_or_else(|| "/".to_owned());
+
+    let mut builder = builder.header("X-Timestamp", &timestamp);
+    if let Some(secret) = signing_secret {
+        let signature = simply_ip_vault::crypto::compute_signature(
+            secret,
+            &method,
+            &path,
+            &timestamp,
+            body.as_bytes(),
+        )
+        .unwrap();
+        builder = builder.header("X-Signature-256", signature);
+    }
+
+    builder.body(Body::from(body)).unwrap()
+}
+
+/// `ALLOW_PRIVATE_WEBHOOKS` and `VAULT_ENCRYPTION_KEY` are process-wide global state. Any test that
+/// mutates it must hold this lock for the duration, so two such tests running on different libtest
+/// threads can never interleave their `set_var` calls (which is itself a data race, hence why
+/// `set_var` is `unsafe`).
+///
+/// Tests that mint a key through `POST /api/keys` (or `/rotate`) and then authenticate as it must
+/// hold this lock too, even though they set nothing themselves: whether that key's signing secret
+/// gets sealed is decided by `VAULT_ENCRYPTION_KEY` *at creation time*, so a concurrent test
+/// clearing the variable in between would leave them unable to decrypt their own secret.
 static ENV_MUTATION_LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -40,6 +150,7 @@ async fn test_auth_and_cidr_rejection() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set("Test Key".to_owned()),
         bound_ips: Set(Some("192.168.1.1/32".to_owned())),
         is_master: Set(false),
@@ -55,17 +166,17 @@ async fn test_auth_and_cidr_rejection() {
     .unwrap();
 
     // 1. Missing Key -> 401
-    let req = inject_connect_info(Request::builder().uri("/api/ips")).body(Body::empty()).unwrap();
+    let req = signed(inject_connect_info(Request::builder().uri("/api/ips")), "");
     let response = app.clone().oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
     // 2. Invalid CIDR -> 403 (Client IP matches 127.0.0.1 from ConnectInfo, not 192.168.1.1)
-    let req = inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", &plaintext)).body(Body::empty()).unwrap();
+    let req = signed(inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", &plaintext)), "");
     let response = app.clone().oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     // 3. Valid CIDR (simulated via X-Forwarded-For) -> 200
-    let req = inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", &plaintext).header("X-Forwarded-For", "192.168.1.1")).body(Body::empty()).unwrap();
+    let req = signed(inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", &plaintext).header("X-Forwarded-For", "192.168.1.1")), "");
     let response = app.clone().oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
@@ -94,6 +205,7 @@ async fn test_tenant_isolation_mn_rbac() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set("Tenant Key".to_owned()),
         bound_ips: Set(Some("0.0.0.0/0".to_owned())),
         is_master: Set(false),
@@ -108,13 +220,11 @@ async fn test_tenant_isolation_mn_rbac() {
     // Key has NO explicit junction mapping yet.
     
     // Attempt POST to Group A without permissions -> 403
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "8.8.8.8", "group_name": "Group A" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "8.8.8.8", "group_name": "Group A" }).to_string());
     
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
@@ -131,13 +241,11 @@ async fn test_tenant_isolation_mn_rbac() {
     }.insert(&db).await.unwrap();
 
     // POST to Group A -> Should Work
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "8.8.8.8", "group_name": "Group A" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "8.8.8.8", "group_name": "Group A" }).to_string());
     
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -157,6 +265,7 @@ async fn test_auto_provisioning_on_group_creation() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set("Creator Key".to_owned()),
         bound_ips: Set(Some("0.0.0.0/0".to_owned())),
         is_master: Set(false),
@@ -169,13 +278,11 @@ async fn test_auto_provisioning_on_group_creation() {
     }.insert(&db).await.unwrap();
 
     // Post to an completely new group
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "4.4.4.4", "group_name": "Dynamic Group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "4.4.4.4", "group_name": "Dynamic Group" }).to_string());
     
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -204,13 +311,11 @@ async fn test_explicit_group_creation_grants_full_permissions_to_creator() {
 
     let (key_id, plaintext) = insert_key(&db, "Group Creator", false, false, false, true).await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/groups")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "name": "explicitly-created-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "name": "explicitly-created-group" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -245,24 +350,20 @@ async fn test_rbac_denial_precedes_group_type_validation() {
     let (_key_b_id, key_b) = insert_key(&db, "No-Access Key", false, false, false, false).await;
 
     // Master creates a whitelist-typed group.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/white")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "203.0.113.9", "group_name": "precedence-whitelist" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "203.0.113.9", "group_name": "precedence-whitelist" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // key_b has NO permission mapping at all on this group — must get 403, not 400, even though
     // the group is also the "wrong" type for a ban.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &key_b)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "198.51.100.5", "group_name": "precedence-whitelist" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "198.51.100.5", "group_name": "precedence-whitelist" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -284,49 +385,41 @@ async fn test_group_type_mismatch_rejected_with_exact_message_for_authorized_key
     let (key_b_id, key_b) = insert_key(&db, "Key_B", false, false, false, false).await;
 
     // Master creates a whitelist group and a banlist group, each seeded with an address.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/white")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "203.0.113.10", "group_name": "type-check-whitelist" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "203.0.113.10", "group_name": "type-check-whitelist" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "203.0.113.11", "group_name": "type-check-banlist" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "203.0.113.11", "group_name": "type-check-banlist" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Grant Key_B full read+write on BOTH groups.
     for group_name in ["type-check-whitelist", "type-check-banlist"] {
-        let req = inject_connect_info(Request::builder()
+        let req = signed(inject_connect_info(Request::builder()
             .method("POST")
             .uri(format!("/api/keys/{key_b_id}/groups"))
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json"))
-            .body(Body::from(json!({
+            .header("Content-Type", "application/json")), json!({
                 "group_name": group_name,
                 "can_read": true,
                 "can_write": true,
                 "can_delete": false
-            }).to_string()))
-            .unwrap();
+            }).to_string());
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     // Banning into the whitelist group is rejected with the exact specified message.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &key_b)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "198.51.100.20", "group_name": "type-check-whitelist" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "198.51.100.20", "group_name": "type-check-whitelist" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -337,13 +430,11 @@ async fn test_group_type_mismatch_rejected_with_exact_message_for_authorized_key
     );
 
     // Whitelisting into the banlist group is rejected with the exact specified (reverse) message.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/white")
         .header("X-API-Key", &key_b)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "198.51.100.21", "group_name": "type-check-banlist" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "198.51.100.21", "group_name": "type-check-banlist" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -368,6 +459,7 @@ async fn test_explicit_key_group_manipulation() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(master_id),
         key_hash: Set(master_hash),
+        signing_secret: Set(Some(test_signing_secret(&master_plaintext))),
         name: Set("System Master".to_owned()),
         bound_ips: Set(Some("0.0.0.0/0".to_owned())),
         is_master: Set(true), // CAN MANAGE KEYS
@@ -386,6 +478,7 @@ async fn test_explicit_key_group_manipulation() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(target_id),
         key_hash: Set(simply_ip_vault::api::hash_key("dummy")),
+        signing_secret: Set(Some(test_signing_secret("dummy"))),
         name: Set("Target Sub-Key".to_owned()),
         bound_ips: Set(Some("192.168.1.1/32".to_owned())),
         is_master: Set(false),
@@ -400,18 +493,16 @@ async fn test_explicit_key_group_manipulation() {
     .await
     .unwrap();
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{}/groups", target_id))
         .header("X-API-Key", &master_plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_name": "Dynamic Access Hub",
             "can_read": true,
             "can_write": false,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
 
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -442,6 +533,7 @@ async fn test_multi_group_and_temporal_filtering() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set("Master".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -457,13 +549,11 @@ async fn test_multi_group_and_temporal_filtering() {
     .unwrap();
 
     // A fresh record, created "now" through the API, in "group-fresh".
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "9.9.9.9", "group_name": "group-fresh" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "9.9.9.9", "group_name": "group-fresh" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
@@ -504,11 +594,9 @@ async fn test_multi_group_and_temporal_filtering() {
     .unwrap();
 
     // `groups` filter: only the fresh record's group should be returned.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?groups=group-fresh")
-        .header("X-API-Key", &plaintext))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &plaintext)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -518,11 +606,9 @@ async fn test_multi_group_and_temporal_filtering() {
 
     // `max_age` filter: a 60-second window must exclude the 2-hour-old record but keep the
     // fresh one, and the exclusion must happen in the query (not just be truncated by paging).
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?max_age=60")
-        .header("X-API-Key", &plaintext))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &plaintext)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -532,11 +618,9 @@ async fn test_multi_group_and_temporal_filtering() {
 
     // `since` filter: a very recent Unix timestamp must also exclude the stale record.
     let since_ts = (chrono::Utc::now() - chrono::Duration::minutes(5)).timestamp();
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri(format!("/api/ips?since={since_ts}"))
-        .header("X-API-Key", &plaintext))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &plaintext)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -609,6 +693,7 @@ async fn test_webhook_hmac_signature_and_delivery() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set("Webhook Tester".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -637,29 +722,25 @@ async fn test_webhook_hmac_signature_and_delivery() {
 
     let secret = "top-secret-webhook-key";
     let hook_url = format!("http://{hook_addr}/hook");
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/webhooks")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "name": "Test Hook",
             "target_url": hook_url,
             "secret_token": secret,
             "payload_template": "{\"ip\":\"$target_address\"}",
             "group_id": group_id.to_string(),
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "5.5.5.5", "group_name": "hook-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "5.5.5.5", "group_name": "hook-group" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
@@ -744,6 +825,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set("Event Filter Tester".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -771,31 +853,27 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
     .unwrap();
 
     let hook_url = format!("http://{hook_addr}/hook");
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/webhooks")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "name": "Add-Only Hook",
             "target_url": hook_url,
             "secret_token": "irrelevant-for-this-test",
             "payload_template": "{\"ip\":\"$target_address\"}",
             "group_id": group_id.to_string(),
             "events": "IP_ADD",
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     // A brand-new address is an IP_ADD — the webhook IS subscribed to this, so it must fire.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "9.9.9.9", "group_name": "event-filter-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "9.9.9.9", "group_name": "event-filter-group" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
@@ -814,25 +892,21 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
     // be skipped. There's no "it happened" signal to poll for here, so wait a fixed, generous
     // window (dispatch to a local loopback listener normally completes in low single-digit ms)
     // and confirm the hit count did NOT advance.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "9.9.9.9", "group_name": "event-filter-group", "cause": "updated" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "9.9.9.9", "group_name": "event-filter-group", "cause": "updated" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     assert_eq!(hit_count.load(Ordering::SeqCst), 1, "IP_UPDATE must NOT be delivered to an events:\"IP_ADD\"-only webhook");
 
     // Deleting it is an IP_DELETE — also not subscribed, must also be skipped.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri("/api/ips?target_address=9.9.9.9&group_name=event-filter-group")
-        .header("X-API-Key", &plaintext))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &plaintext)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::NO_CONTENT);
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -864,6 +938,7 @@ async fn test_reban_into_same_group_does_not_500() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set("Master".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -883,34 +958,28 @@ async fn test_reban_into_same_group_does_not_500() {
     };
 
     // First ban: creates the record and the membership row (no conflict).
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(ban("first offense")))
-        .unwrap();
+        .header("Content-Type", "application/json")), ban("first offense"));
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     // Second ban into the SAME group: the membership insert hits the conflict path. Must still
     // return 200, not 500.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(ban("second offense")))
-        .unwrap();
+        .header("Content-Type", "application/json")), ban("second offense"));
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     // Exactly one record and one membership row must exist, with the cause updated.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?groups=reban-group")
-        .header("X-API-Key", &plaintext))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &plaintext)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -936,6 +1005,7 @@ async fn test_create_webhook_rejects_invalid_url() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set("Master".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -963,19 +1033,17 @@ async fn test_create_webhook_rejects_invalid_url() {
     .unwrap();
 
     let make_req = |url: &str| {
-        inject_connect_info(Request::builder()
+        signed(inject_connect_info(Request::builder()
             .method("POST")
             .uri("/api/webhooks")
             .header("X-API-Key", &plaintext)
-            .header("Content-Type", "application/json"))
-            .body(Body::from(json!({
+            .header("Content-Type", "application/json")), json!({
                 "name": "Test",
                 "target_url": url,
                 "secret_token": "s",
                 "payload_template": "{}",
                 "group_id": group_id.to_string(),
-            }).to_string()))
-            .unwrap()
+            }).to_string())
     };
 
     let res = app.clone().oneshot(make_req("not a url")).await.unwrap();
@@ -1006,6 +1074,7 @@ async fn insert_key(
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set(name.to_owned()),
         bound_ips: Set(None),
         is_master: Set(is_master),
@@ -1033,18 +1102,16 @@ async fn test_key_creation_lifecycle() {
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/keys")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "name": "CI Bot",
             "bound_ips": "10.0.0.0/8",
             "can_manage_keys": true,
             "can_manage_webhooks": true
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -1067,13 +1134,11 @@ async fn test_key_creation_lifecycle() {
 
     // A non-privileged key (no is_master, no can_manage_keys) must be forbidden from creating keys.
     let (_plain_id, plain_key) = insert_key(&db, "Plain", false, false, false, false).await;
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/keys")
         .header("X-API-Key", &plain_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "name": "Should Not Exist" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "name": "Should Not Exist" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
 }
@@ -1092,37 +1157,31 @@ async fn test_group_permission_assignment_boundaries() {
     let (key_b_id, key_b) = insert_key(&db, "Key_B", false, false, false, false).await;
 
     // Master grants Key_B read-only rights on "Group_X" (auto-provisions the group).
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{key_b_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_name": "Group_X",
             "can_read": true,
             "can_write": false,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
     // Master seeds an address into Group_X so there is something for Key_B to read.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "203.0.113.1", "group_name": "Group_X" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "203.0.113.1", "group_name": "Group_X" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Key_B can read Group_X.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?groups=Group_X")
-        .header("X-API-Key", &key_b))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &key_b)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -1131,38 +1190,32 @@ async fn test_group_permission_assignment_boundaries() {
     assert_eq!(items[0]["target_address"], "203.0.113.1");
 
     // Key_B cannot write to Group_X yet.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &key_b)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "203.0.113.2", "group_name": "Group_X" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "203.0.113.2", "group_name": "Group_X" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
 
     // Master upgrades Key_B to can_write = true.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{key_b_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_name": "Group_X",
             "can_read": true,
             "can_write": true,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Key_B can now write to Group_X.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &key_b)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "203.0.113.2", "group_name": "Group_X" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "203.0.113.2", "group_name": "Group_X" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
 
@@ -1179,26 +1232,22 @@ async fn test_key_deletion_revokes_access_and_cascades_permissions() {
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
     let (key_b_id, key_b) = insert_key(&db, "Key_B", false, false, false, false).await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{key_b_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_name": "Group_X",
             "can_read": true,
             "can_write": true,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Sanity check: Key_B actually works before deletion.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
-        .header("X-API-Key", &key_b))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &key_b)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     let perms_before = simply_ip_vault::entities::api_key_group_permission::Entity::find()
@@ -1209,27 +1258,21 @@ async fn test_key_deletion_revokes_access_and_cascades_permissions() {
     assert_eq!(perms_before.len(), 1);
 
     // Master deletes Key_B.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri(format!("/api/keys/{key_b_id}"))
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
     // Immediately, any request using Key_B's header must be rejected as unauthorized.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
-        .header("X-API-Key", &key_b))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &key_b)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?groups=Group_X")
-        .header("X-API-Key", &key_b))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &key_b)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 
     // No orphaned api_key_group_permissions rows survive the deleted key.
@@ -1252,6 +1295,7 @@ async fn insert_key_with_bound_ips(db: &DatabaseConnection, name: &str, bound_ip
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(id),
         key_hash: Set(hash),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
         name: Set(name.to_owned()),
         bound_ips: Set(Some(bound_ips.to_owned())),
         is_master: Set(false),
@@ -1289,17 +1333,15 @@ async fn test_concurrent_burst_ban_requests() {
         let app = app.clone();
         let master_key = master_key.clone();
         handles.push(tokio::spawn(async move {
-            let req = inject_connect_info(Request::builder()
+            let req = signed(inject_connect_info(Request::builder()
                 .method("POST")
                 .uri("/api/ban")
                 .header("X-API-Key", &master_key)
-                .header("Content-Type", "application/json"))
-                .body(Body::from(json!({
+                .header("Content-Type", "application/json")), json!({
                     "target_address": "44.44.44.44",
                     "group_name": "burst-group",
                     "cause": "fail2ban burst"
-                }).to_string()))
-                .unwrap();
+                }).to_string());
             app.oneshot(req).await.unwrap().status()
         }));
     }
@@ -1320,11 +1362,9 @@ async fn test_concurrent_burst_ban_requests() {
 
     // Exactly one record must exist in exactly one membership row — no duplicates, no partial
     // failures, despite 10 simultaneous writers targeting the same (address, group) pair.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?groups=burst-group")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -1354,24 +1394,20 @@ async fn test_reverse_proxy_xff_extracts_rightmost_trusted_hop() {
 
     // A key bound to the rightmost (trusted-proxy-appended) address must be let through.
     let (_id, key_trusted) = insert_key_with_bound_ips(&db, "trusted-hop", "10.0.0.1/32").await;
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
         .header("X-API-Key", &key_trusted)
-        .header("X-Forwarded-For", &xff_header))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-Forwarded-For", &xff_header)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // A key bound to the leftmost, client-forgeable claim must NOT be let through: if it were,
     // any client could bypass CIDR restriction just by prepending an allowed address to the
     // header.
     let (_id2, key_forged) = insert_key_with_bound_ips(&db, "forged-claim", "8.8.8.8/32").await;
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
         .header("X-API-Key", &key_forged)
-        .header("X-Forwarded-For", &xff_header))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-Forwarded-For", &xff_header)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
 }
 
@@ -1386,13 +1422,11 @@ async fn test_cidr_and_ipv6_boundary_validation() {
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
     let ban = |addr: &str| {
-        inject_connect_info(Request::builder()
+        signed(inject_connect_info(Request::builder()
             .method("POST")
             .uri("/api/ban")
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json"))
-            .body(Body::from(json!({ "target_address": addr, "group_name": "cidr-boundary-group" }).to_string()))
-            .unwrap()
+            .header("Content-Type", "application/json")), json!({ "target_address": addr, "group_name": "cidr-boundary-group" }).to_string())
     };
 
     // Octet out of range (> 255).
@@ -1451,30 +1485,24 @@ async fn test_ban_deduplicates_slash_32_and_bare_ip_representations() {
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
     // Ban the /32 form first.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "188.190.74.128/32", "group_name": "canon-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "188.190.74.128/32", "group_name": "canon-group" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Ban the bare form of the SAME address — must update the same row, not create a second one.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "188.190.74.128", "group_name": "canon-group", "cause": "re-banned bare" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "188.190.74.128", "group_name": "canon-group", "cause": "re-banned bare" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?groups=canon-group")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -1486,30 +1514,24 @@ async fn test_ban_deduplicates_slash_32_and_bare_ip_representations() {
     // Deleting via the bare form must find and remove the record, even though nothing was ever
     // literally stored or requested with that exact string until now — canonicalization, not
     // string luck, is what makes this work.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri("/api/ips?target_address=188.190.74.128&group_name=canon-group")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
     // And deleting via the /32 form of an address that was actually stored bare must ALSO work.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "203.0.113.77", "group_name": "canon-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "203.0.113.77", "group_name": "canon-group" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri("/api/ips?target_address=203.0.113.77/32&group_name=canon-group")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 }
 
@@ -1566,29 +1588,25 @@ async fn test_webhook_dispatch_does_not_block_api_response() {
     .await
     .unwrap();
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/webhooks")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "name": "Slow Hook",
             "target_url": format!("http://{slow_addr}/slow-hook"),
             "secret_token": "s",
             "payload_template": "{}",
             "group_id": group_id.to_string(),
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     let start = std::time::Instant::now();
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "66.66.66.66", "group_name": "slow-hook-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "66.66.66.66", "group_name": "slow-hook-group" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     let elapsed = start.elapsed();
 
@@ -1621,40 +1639,32 @@ async fn test_delete_ip_accepts_query_or_json_body() {
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
     for addr in ["55.55.55.1", "55.55.55.2"] {
-        let req = inject_connect_info(Request::builder()
+        let req = signed(inject_connect_info(Request::builder()
             .method("POST")
             .uri("/api/ban")
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json"))
-            .body(Body::from(json!({ "target_address": addr, "group_name": "delete-shape-group" }).to_string()))
-            .unwrap();
+            .header("Content-Type", "application/json")), json!({ "target_address": addr, "group_name": "delete-shape-group" }).to_string());
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
     // Delete via URL query string.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri("/api/ips?target_address=55.55.55.1&group_name=delete-shape-group")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
     // Delete via JSON body instead — previously this failed before the handler even ran.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri("/api/ips")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "55.55.55.2", "group_name": "delete-shape-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "55.55.55.2", "group_name": "delete-shape-group" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?groups=delete-shape-group")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
@@ -1674,13 +1684,11 @@ async fn test_group_identification_by_id_and_name_are_interchangeable() {
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
     let (key_c_id, key_c) = insert_key(&db, "Key_C", false, false, false, false).await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "77.1.1.1", "group_name": "interop-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "77.1.1.1", "group_name": "interop-group" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     let group_id = simply_ip_vault::entities::ip_group::Entity::find()
@@ -1688,69 +1696,60 @@ async fn test_group_identification_by_id_and_name_are_interchangeable() {
         .one(&db).await.unwrap().unwrap().id;
 
     // Grant Key_C rights on the group BY ID.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{key_c_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "group_id": group_id, "can_read": true, "can_write": true, "can_delete": false }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "group_id": group_id, "can_read": true, "can_write": true, "can_delete": false }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Key_C bans an address identifying the group BY NAME...
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &key_c)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "77.1.1.2", "group_name": "interop-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "77.1.1.2", "group_name": "interop-group" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // ...and another identifying it BY ID.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &key_c)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "77.1.1.3", "group_id": group_id }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "77.1.1.3", "group_id": group_id }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Supplying both is rejected.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &key_c)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "77.1.1.4", "group_id": group_id, "group_name": "interop-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "77.1.1.4", "group_id": group_id, "group_name": "interop-group" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
 
     // Supplying neither is rejected.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &key_c)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "77.1.1.5" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "77.1.1.5" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
 
     // An unknown group_id is 404 — unlike group_name, an ID is never auto-creatable.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "77.1.1.6", "group_id": Uuid::new_v4() }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "77.1.1.6", "group_id": Uuid::new_v4() }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
 }
 
 /// `POST /api/keys/{id}/rotate` must generate a new secret and immediately invalidate the old one.
 #[tokio::test]
 async fn test_key_rotation_invalidates_old_secret() {
+    // Serialized against the VAULT_ENCRYPTION_KEY test: this key's secret is sealed (or not)
+    // according to the variable's value at creation time. See ENV_MUTATION_LOCK.
+    let _guard = ENV_MUTATION_LOCK.lock().await;
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
     let state = AppState { db: db.clone(), webhook_tx };
@@ -1759,50 +1758,52 @@ async fn test_key_rotation_invalidates_old_secret() {
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
     let (rotate_id, old_secret) = insert_key(&db, "Rotate_Me", false, false, false, false).await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
-        .header("X-API-Key", &old_secret))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &old_secret)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{rotate_id}/rotate"))
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     let new_secret = parsed["plaintext_key"].as_str().unwrap().to_owned();
     assert_ne!(new_secret, old_secret);
+    // Rotation mints a fresh signing secret alongside the key; it is returned exactly once, here.
+    // From now on this key must be signed with `signed_with`, since its secret is server-generated
+    // rather than following the seeded-key convention.
+    let new_signing_secret = parsed["signing_secret"].as_str().unwrap().to_owned();
+    assert_ne!(new_signing_secret, test_signing_secret(&old_secret));
 
     // Old secret immediately stops working.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
-        .header("X-API-Key", &old_secret))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &old_secret)), "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // The old *signing* secret is invalidated too: presenting the new key with the pre-rotation
+    // secret must fail, or rotation would leave a working credential behind after a compromise.
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &new_secret)), &test_signing_secret(&old_secret), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
 
     // New secret works.
-    let req = inject_connect_info(Request::builder()
+    let req = signed_with(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
-        .header("X-API-Key", &new_secret))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &new_secret)), &new_signing_secret, "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // A non-privileged key cannot rotate someone else's key.
     let (other_id, _) = insert_key(&db, "Other", false, false, false, false).await;
-    let req = inject_connect_info(Request::builder()
+    let req = signed_with(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{other_id}/rotate"))
-        .header("X-API-Key", &new_secret))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &new_secret)), &new_signing_secret, "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
 }
 
@@ -1819,24 +1820,20 @@ async fn test_update_api_key_changes_take_effect_immediately() {
     let (target_id, target_key) = insert_key(&db, "Before", false, false, false, false).await;
 
     // Not yet allowed to manage webhooks.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/webhooks")
-        .header("X-API-Key", &target_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &target_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("PUT")
         .uri(format!("/api/keys/{target_id}"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "name": "After",
             "bound_ips": "0.0.0.0/0",
             "can_manage_webhooks": true
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -1846,11 +1843,9 @@ async fn test_update_api_key_changes_take_effect_immediately() {
     assert_eq!(updated["can_manage_webhooks"], true);
 
     // Now allowed, immediately, with the same (unrotated) secret.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/webhooks")
-        .header("X-API-Key", &target_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &target_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
 
@@ -1867,13 +1862,11 @@ async fn test_revoke_group_permission_by_name_and_by_id() {
     let (key_id, key_plain) = insert_key(&db, "Key_D", false, false, false, false).await;
 
     for group_name in ["revoke-by-name-group", "revoke-by-id-group"] {
-        let req = inject_connect_info(Request::builder()
+        let req = signed(inject_connect_info(Request::builder()
             .method("POST")
             .uri(format!("/api/keys/{key_id}/permissions"))
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json"))
-            .body(Body::from(json!({ "group_name": group_name, "can_read": true, "can_write": true, "can_delete": true }).to_string()))
-            .unwrap();
+            .header("Content-Type", "application/json")), json!({ "group_name": group_name, "can_read": true, "can_write": true, "can_delete": true }).to_string());
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
@@ -1882,38 +1875,30 @@ async fn test_revoke_group_permission_by_name_and_by_id() {
         .one(&db).await.unwrap().unwrap().id;
 
     // Revoke the first by name.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri("/api/keys/".to_owned() + &key_id.to_string() + "/permissions/revoke-by-name-group")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
     // Revoke the second by ID.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri(format!("/api/keys/{key_id}/permissions/{group_id_2}"))
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
     // Revoking again is 404 — the grant is already gone.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri("/api/keys/".to_owned() + &key_id.to_string() + "/permissions/revoke-by-name-group")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
 
     // The key can no longer read either group.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?groups=revoke-by-name-group,revoke-by-id-group")
-        .header("X-API-Key", &key_plain))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &key_plain)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -1933,28 +1918,22 @@ async fn test_audit_log_query_returns_entries_after_mutations() {
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
     let (_sub_id, sub_key) = insert_key(&db, "Sub", false, false, false, false).await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "target_address": "88.1.1.1", "group_name": "audit-check-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "target_address": "88.1.1.1", "group_name": "audit-check-group" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Non-master keys cannot view audit logs, even with other broad global scopes.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/audit-logs")
-        .header("X-API-Key", &sub_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &sub_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/audit-logs?action=IP_ADD")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -1982,13 +1961,11 @@ async fn test_create_duplicate_group_returns_conflict_not_500() {
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
     let make_req = || {
-        inject_connect_info(Request::builder()
+        signed(inject_connect_info(Request::builder()
             .method("POST")
             .uri("/api/groups")
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json"))
-            .body(Body::from(json!({ "name": "duplicate-group-test" }).to_string()))
-            .unwrap()
+            .header("Content-Type", "application/json")), json!({ "name": "duplicate-group-test" }).to_string())
     };
 
     let res = app.clone().oneshot(make_req()).await.unwrap();
@@ -2021,13 +1998,11 @@ async fn test_group_permission_assignment_accepts_uuid_or_name_in_group_id_field
     let (key_e_id, _key_e) = insert_key(&db, "Key_E", false, false, false, false).await;
     let (key_f_id, _key_f) = insert_key(&db, "Key_F", false, false, false, false).await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/groups")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({ "name": "flex-id-group" }).to_string()))
-        .unwrap();
+        .header("Content-Type", "application/json")), json!({ "name": "flex-id-group" }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -2035,33 +2010,29 @@ async fn test_group_permission_assignment_accepts_uuid_or_name_in_group_id_field
     let group_uuid = created["id"].as_str().unwrap().to_owned();
 
     // A NAME string in the group_id field — previously a guaranteed 422.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{key_e_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_id": "flex-id-group",
             "can_read": true,
             "can_write": false,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // An actual UUID string in the group_id field, via the /permissions alias.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{key_f_id}/permissions"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_id": group_uuid,
             "can_read": true,
             "can_write": true,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Both grants landed on the exact same group.
@@ -2083,47 +2054,41 @@ async fn test_group_permission_write_or_delete_requires_read() {
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
     let (key_id, _key_plain) = insert_key(&db, "Key_G", false, false, false, false).await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{key_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_name": "no-read-group",
             "can_read": false,
             "can_write": true,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{key_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_name": "no-read-group",
             "can_read": false,
             "can_write": false,
             "can_delete": true
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::BAD_REQUEST);
 
     // can_read alone, or read+write together, are both fine.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{key_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_name": "no-read-group",
             "can_read": true,
             "can_write": true,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
 
@@ -2146,37 +2111,31 @@ async fn test_multi_group_overlap_exposes_both_memberships_for_conflict_detectio
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "target_address": "192.0.2.200",
             "group_name": "conflict-banlist",
             "cause": "flagged as hostile"
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/white")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "target_address": "192.0.2.200",
             "group_name": "conflict-whitelist",
             "cause": "also a trusted partner"
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/ips?ip=192.0.2.200")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -2204,66 +2163,56 @@ async fn test_group_permission_assignment_via_group_name_alongside_uuid() {
     let (uuid_key_id, uuid_key) = insert_key(&db, "fail2ban-nginx-uuid-grant", false, false, false, false).await;
 
     // Seed the group into existence via a normal ban, using a realistic fail2ban-style name.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "target_address": "198.51.100.77",
             "group_name": "fail2ban_nginx",
             "cause": "nginx probing"
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/groups")
-        .header("X-API-Key", &master_key))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-API-Key", &master_key)), "");
     let res = app.clone().oneshot(req).await.unwrap();
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let groups: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
     let group_id = groups.iter().find(|g| g["name"] == "fail2ban_nginx").unwrap()["id"].as_str().unwrap().to_owned();
 
     // Grant via the literal group_name field.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{name_key_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_name": "fail2ban_nginx",
             "can_read": true,
             "can_write": true,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Grant a DIFFERENT key on the SAME group via its UUID, seamlessly alongside the name grant.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{uuid_key_id}/groups"))
         .header("X-API-Key", &master_key)
-        .header("Content-Type", "application/json"))
-        .body(Body::from(json!({
+        .header("Content-Type", "application/json")), json!({
             "group_id": group_id,
             "can_read": true,
             "can_write": false,
             "can_delete": false
-        }).to_string()))
-        .unwrap();
+        }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
     // Both keys can now read the group, and both grants reference the identical group id.
     for key in [&name_key, &uuid_key] {
-        let req = inject_connect_info(Request::builder()
+        let req = signed(inject_connect_info(Request::builder()
             .uri("/api/ips?group_name=fail2ban_nginx")
-            .header("X-API-Key", key))
-            .body(Body::empty())
-            .unwrap();
+            .header("X-API-Key", key)), "");
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -2290,13 +2239,11 @@ async fn test_audit_log_pagination() {
 
     // Six distinct GROUP_CREATE audit entries, so two limit=3 pages fully partition them.
     for i in 0..6 {
-        let req = inject_connect_info(Request::builder()
+        let req = signed(inject_connect_info(Request::builder()
             .method("POST")
             .uri("/api/groups")
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json"))
-            .body(Body::from(json!({ "name": format!("pagination-group-{i}") }).to_string()))
-            .unwrap();
+            .header("Content-Type", "application/json")), json!({ "name": format!("pagination-group-{i}") }).to_string());
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
 
@@ -2304,11 +2251,9 @@ async fn test_audit_log_pagination() {
         let app = app.clone();
         let master_key = master_key.clone();
         async move {
-            let req = inject_connect_info(Request::builder()
+            let req = signed(inject_connect_info(Request::builder()
                 .uri(format!("/api/audit-logs?action=GROUP_CREATE&limit=3&offset={offset}"))
-                .header("X-API-Key", &master_key))
-                .body(Body::empty())
-                .unwrap();
+                .header("X-API-Key", &master_key)), "");
             let res = app.oneshot(req).await.unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -2340,12 +2285,10 @@ async fn test_bound_ip_strictly_rejects_out_of_cidr_forwarded_address() {
 
     let (_id, restricted_key) = insert_key_with_bound_ips(&db, "loopback-only", "127.0.0.1/32").await;
 
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
         .header("X-API-Key", &restricted_key)
-        .header("X-Forwarded-For", "203.0.113.50"))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-Forwarded-For", "203.0.113.50")), "");
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::FORBIDDEN);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -2353,12 +2296,10 @@ async fn test_bound_ip_strictly_rejects_out_of_cidr_forwarded_address() {
     assert_eq!(parsed["error"], "Client IP not allowed");
 
     // Sanity check: the same key from the bound address itself is let through.
-    let req = inject_connect_info(Request::builder()
+    let req = signed(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
         .header("X-API-Key", &restricted_key)
-        .header("X-Forwarded-For", "127.0.0.1"))
-        .body(Body::empty())
-        .unwrap();
+        .header("X-Forwarded-For", "127.0.0.1")), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
 
@@ -2376,13 +2317,11 @@ async fn test_list_ips_iplist_format_returns_deduplicated_address_list() {
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
     let ban = |addr: &'static str, group: &'static str| {
-        inject_connect_info(Request::builder()
+        signed(inject_connect_info(Request::builder()
             .method("POST")
             .uri("/api/ban")
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json"))
-            .body(Body::from(json!({ "target_address": addr, "group_name": group }).to_string()))
-            .unwrap()
+            .header("Content-Type", "application/json")), json!({ "target_address": addr, "group_name": group }).to_string())
     };
 
     assert_eq!(app.clone().oneshot(ban("198.51.100.1", "iplist-group-a")).await.unwrap().status(), StatusCode::OK);
@@ -2391,11 +2330,9 @@ async fn test_list_ips_iplist_format_returns_deduplicated_address_list() {
     assert_eq!(app.clone().oneshot(ban("198.51.100.1", "iplist-group-b")).await.unwrap().status(), StatusCode::OK);
 
     for query in ["format=iplist", "mode=iplist"] {
-        let req = inject_connect_info(Request::builder()
+        let req = signed(inject_connect_info(Request::builder()
             .uri(format!("/api/ips?groups=iplist-group-a,iplist-group-b&{query}"))
-            .header("X-API-Key", &master_key))
-            .body(Body::empty())
-            .unwrap();
+            .header("X-API-Key", &master_key)), "");
         let res = app.clone().oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK, "query string was `{query}`");
         let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -2422,13 +2359,11 @@ async fn test_list_ips_orders_by_updated_at_descending() {
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
     let ban = |addr: &'static str| {
-        inject_connect_info(Request::builder()
+        signed(inject_connect_info(Request::builder()
             .method("POST")
             .uri("/api/ban")
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json"))
-            .body(Body::from(json!({ "target_address": addr, "group_name": "ordering-group" }).to_string()))
-            .unwrap()
+            .header("Content-Type", "application/json")), json!({ "target_address": addr, "group_name": "ordering-group" }).to_string())
     };
 
     // Created in order A, B, C — freshly created, so C (most recent) should sort first.
@@ -2440,11 +2375,9 @@ async fn test_list_ips_orders_by_updated_at_descending() {
         let app = app.clone();
         let master_key = master_key.to_owned();
         async move {
-            let req = inject_connect_info(Request::builder()
+            let req = signed(inject_connect_info(Request::builder()
                 .uri("/api/ips?groups=ordering-group")
-                .header("X-API-Key", &master_key))
-                .body(Body::empty())
-                .unwrap();
+                .header("X-API-Key", &master_key)), "");
             let res = app.oneshot(req).await.unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -2462,4 +2395,334 @@ async fn test_list_ips_orders_by_updated_at_descending() {
 
     let addresses = list(&app, &master_key).await;
     assert_eq!(addresses, vec!["203.0.113.101", "203.0.113.103", "203.0.113.102"], "re-registered record jumps to the front");
+}
+
+// ─────────────────────────────────────────────────────────────
+// HMAC-SHA256 authentication & anti-replay guard
+// ─────────────────────────────────────────────────────────────
+
+/// Every one of the three auth headers is individually mandatory: dropping any single one must
+/// produce `401`, so no combination of two can ever authenticate a request on its own.
+#[tokio::test]
+async fn test_each_auth_header_is_individually_required() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, key) = insert_key(&db, "Signer", true, true, true, true).await;
+    let secret = test_signing_secret(&key);
+
+    // Control: all three headers present and correct.
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &key)), "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let now = chrono::Utc::now().timestamp().to_string();
+    let signature = simply_ip_vault::crypto::compute_signature(
+        &secret, "GET", "/api/auth/me", &now, b"",
+    ).unwrap();
+
+    // Missing X-API-Key (timestamp + signature present).
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-Timestamp", &now)
+        .header("X-Signature-256", &signature))
+        .body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // Missing X-Timestamp (key + signature present).
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &key)
+        .header("X-Signature-256", &signature))
+        .body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // Missing X-Signature-256 (key + timestamp present) — i.e. exactly the pre-HMAC request shape,
+    // which must no longer be sufficient.
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &key)
+        .header("X-Timestamp", &now))
+        .body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // A malformed (non-numeric) timestamp is rejected rather than treated as 0 or as "now".
+    let req = inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &key)
+        .header("X-Timestamp", "not-a-number")
+        .header("X-Signature-256", &signature))
+        .body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The anti-replay window is +/- 300 seconds and symmetric: a captured request replayed later is
+/// rejected, and so is one timestamped in the future (which is what a replay attacker would forge
+/// to extend a captured request's usable lifetime).
+#[tokio::test]
+async fn test_anti_replay_timestamp_window_is_enforced_in_both_directions() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, key) = insert_key(&db, "Replay", true, true, true, true).await;
+    let secret = test_signing_secret(&key);
+    let now = chrono::Utc::now().timestamp();
+
+    let call = |offset: i64| {
+        let app = app.clone();
+        let key = key.clone();
+        let secret = secret.clone();
+        async move {
+            let req = signed_at(inject_connect_info(Request::builder()
+                .uri("/api/auth/me")
+                .header("X-API-Key", &key)), &secret, now + offset, "");
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    // Comfortably inside the window, in both directions, is accepted.
+    assert_eq!(call(0).await, StatusCode::OK);
+    assert_eq!(call(-290).await, StatusCode::OK, "290s stale is within the 300s window");
+    assert_eq!(call(290).await, StatusCode::OK, "290s ahead is within the 300s window");
+
+    // Outside it, in both directions, is rejected — with a correct signature, proving the
+    // rejection comes from the freshness check and not from the HMAC.
+    assert_eq!(call(-301).await, StatusCode::UNAUTHORIZED, "stale request is a replay");
+    assert_eq!(call(301).await, StatusCode::UNAUTHORIZED, "future-dated request is rejected");
+    assert_eq!(call(-86_400).await, StatusCode::UNAUTHORIZED, "day-old capture is rejected");
+}
+
+/// The signature must genuinely bind method, path and body — not merely prove key possession.
+/// Each case below replays an *authentic* signature against a different request.
+#[tokio::test]
+async fn test_signature_binds_method_path_and_body() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, key) = insert_key(&db, "Binder", true, true, true, true).await;
+    let secret = test_signing_secret(&key);
+    let now = chrono::Utc::now().timestamp().to_string();
+
+    let body = json!({ "target_address": "51.51.51.51", "group_name": "sig-bind-group" }).to_string();
+    let authentic = simply_ip_vault::crypto::compute_signature(
+        &secret, "POST", "/api/ban", &now, body.as_bytes(),
+    ).unwrap();
+
+    // Sanity: the authentic signature works for the exact request it was made for.
+    let req = inject_connect_info(Request::builder()
+        .method("POST").uri("/api/ban")
+        .header("X-API-Key", &key)
+        .header("Content-Type", "application/json")
+        .header("X-Timestamp", &now)
+        .header("X-Signature-256", &authentic))
+        .body(Body::from(body.clone())).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Same signature, tampered body: an attacker swapping the target address is caught.
+    let tampered = json!({ "target_address": "9.9.9.9", "group_name": "sig-bind-group" }).to_string();
+    let req = inject_connect_info(Request::builder()
+        .method("POST").uri("/api/ban")
+        .header("X-API-Key", &key)
+        .header("Content-Type", "application/json")
+        .header("X-Timestamp", &now)
+        .header("X-Signature-256", &authentic))
+        .body(Body::from(tampered)).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // Same signature, different path: a POST /api/ban signature cannot be replayed onto
+    // /api/white, which would flip a ban into a whitelist entry.
+    let req = inject_connect_info(Request::builder()
+        .method("POST").uri("/api/white")
+        .header("X-API-Key", &key)
+        .header("Content-Type", "application/json")
+        .header("X-Timestamp", &now)
+        .header("X-Signature-256", &authentic))
+        .body(Body::from(body.clone())).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+    // Garbage and empty signatures fail closed rather than erroring out.
+    for bogus in ["", "not-hex", "deadbeef"] {
+        let req = inject_connect_info(Request::builder()
+            .method("POST").uri("/api/ban")
+            .header("X-API-Key", &key)
+            .header("Content-Type", "application/json")
+            .header("X-Timestamp", &now)
+            .header("X-Signature-256", bogus))
+            .body(Body::from(body.clone())).unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED,
+            "bogus signature {bogus:?} must be rejected"
+        );
+    }
+}
+
+/// A key signed with the *wrong* key's secret must not authenticate, even though both keys exist
+/// and both secrets are individually valid. Guards against the signature ever being verified
+/// against something other than the looked-up key's own secret.
+#[tokio::test]
+async fn test_signature_must_match_the_looked_up_key() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_a_id, key_a) = insert_key(&db, "Key A", true, true, true, true).await;
+    let (_b_id, key_b) = insert_key(&db, "Key B", true, true, true, true).await;
+
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &key_a)), &test_signing_secret(&key_b), "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+/// A key row predating the `signing_secret` column (NULL) cannot authenticate at all — it fails
+/// closed rather than skipping signature verification.
+#[tokio::test]
+async fn test_key_without_signing_secret_cannot_authenticate() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    simply_ip_vault::entities::api_key::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        key_hash: Set(simply_ip_vault::api::hash_key(&plaintext)),
+        signing_secret: Set(None), // as left by the additive migration on a pre-existing row
+        name: Set("Legacy Key".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(true),
+        can_manage_keys: Set(true),
+        can_manage_webhooks: Set(true),
+        can_create_groups: Set(true),
+        prefix: Set("dummy123".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }.insert(&db).await.unwrap();
+
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &plaintext)), "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+/// End-to-end credential lifecycle: a key minted through `POST /api/keys` comes back with a
+/// signing secret that actually works for signing subsequent requests.
+#[tokio::test]
+async fn test_created_key_returns_a_usable_signing_secret() {
+    // Serialized against the VAULT_ENCRYPTION_KEY test: this key's secret is sealed (or not)
+    // according to the variable's value at creation time. See ENV_MUTATION_LOCK.
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST").uri("/api/keys")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json")),
+        json!({ "name": "minted", "bound_ips": "0.0.0.0/0" }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let new_key = created["plaintext_key"].as_str().unwrap().to_owned();
+    let new_signing_secret = created["signing_secret"].as_str().unwrap().to_owned();
+    assert!(!new_signing_secret.is_empty(), "creation must return a signing secret");
+    assert_ne!(new_signing_secret, new_key, "the two credentials must be independent values");
+
+    // The returned secret authenticates...
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &new_key)), &new_signing_secret, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // ...and nothing else does.
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &new_key)), "guessed-secret", "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+/// The signing secret must never appear in any read endpoint's output — only in the one-shot
+/// create/rotate responses. `GET /api/keys` and `GET /api/auth/me` are the two that expose key
+/// metadata and are therefore the realistic leak paths.
+#[tokio::test]
+async fn test_signing_secret_is_never_exposed_by_read_endpoints() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_id, key) = insert_key(&db, "Master", true, true, true, true).await;
+    let secret = test_signing_secret(&key);
+
+    for path in ["/api/auth/me", "/api/keys"] {
+        let req = signed(inject_connect_info(Request::builder()
+            .uri(path)
+            .header("X-API-Key", &key)), "");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(!text.contains(&secret), "{path} leaked the signing secret");
+        assert!(!text.contains("signing_secret"), "{path} exposed a signing_secret field");
+    }
+}
+
+/// With `VAULT_ENCRYPTION_KEY` set, a key created through the API stores its signing secret
+/// encrypted at rest, yet still authenticates — proving the seal/open round trip is wired into the
+/// real request path, not just the crypto unit tests.
+#[tokio::test]
+async fn test_signing_secret_is_encrypted_at_rest_when_vault_key_is_set() {
+    let _guard = ENV_MUTATION_LOCK.lock().await;
+    unsafe { std::env::set_var("VAULT_ENCRYPTION_KEY", "integration-test-passphrase") };
+
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState { db: db.clone(), webhook_tx };
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST").uri("/api/keys")
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json")),
+        json!({ "name": "sealed", "bound_ips": "0.0.0.0/0" }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let new_key = created["plaintext_key"].as_str().unwrap().to_owned();
+    let new_signing_secret = created["signing_secret"].as_str().unwrap().to_owned();
+
+    // What landed in the database is ciphertext, not the secret the caller was handed.
+    let stored = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::KeyHash
+            .eq(simply_ip_vault::api::hash_key(&new_key)))
+        .one(&db).await.unwrap().unwrap()
+        .signing_secret.unwrap();
+    assert!(stored.starts_with("aesgcm256:"), "stored secret must be sealed, got {stored}");
+    assert!(!stored.contains(&new_signing_secret), "plaintext secret must not survive in the DB");
+
+    // And it still authenticates, so decryption happens transparently in the middleware.
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &new_key)), &new_signing_secret, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    unsafe { std::env::remove_var("VAULT_ENCRYPTION_KEY") };
 }

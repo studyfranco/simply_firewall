@@ -317,6 +317,22 @@ body {
     color: var(--text-main);
 }
 
+/* Modal "Cancel": a deliberate bluish-slate theme rather than the generic dark grey of
+   .btn-secondary, so the safe escape hatch reads as its own affordance next to the red confirm
+   button instead of blending into the card background. */
+.btn-cancel {
+    background-color: #1e293b;
+    color: #60a5fa;
+    border-color: #60a5fa;
+    font-weight: 600;
+}
+
+.btn-cancel:hover:not(:disabled) {
+    background-color: #2563eb;
+    color: #ffffff;
+    border-color: #2563eb;
+}
+
 .btn-logout {
     background-color: rgba(231, 76, 60, 0.1);
     color: var(--danger);
@@ -688,6 +704,15 @@ body {
 
 .admin-form {
     margin-bottom: 0;
+}
+
+/* Inline explanatory note beneath an input (e.g. the login form's signing-secret field). */
+.field-hint {
+    display: block;
+    margin-top: 0.35rem;
+    font-size: 0.75rem;
+    line-height: 1.4;
+    color: var(--text-muted);
 }
 
 /* Key Reveal Box */
@@ -1121,9 +1146,11 @@ body {
     margin-top: 0.5rem;
 }
 
+/* Cancel and Confirm are kept adjacent as a right-aligned pair (previously `space-between` pushed
+   them to opposite edges of the card, so the destructive button sat far from its escape hatch). */
 .modal-actions {
     display: flex;
-    justify-content: space-between;
+    justify-content: flex-end;
     gap: 0.75rem;
 }
 
@@ -1133,6 +1160,16 @@ body {
     display: flex;
     justify-content: flex-start;
     margin-bottom: 0.75rem;
+}
+
+/* The API Keys tab stacks this control directly beneath the "Create API Key" form (and the
+   key-reveal box that appears between them), where the default margin alone left the two buttons
+   visually touching. The extra top margin plus a hairline rule separates the "create" area from the
+   "act on existing rows" area. */
+.batch-actions-keys {
+    margin-top: 1.5rem;
+    padding-top: 1.25rem;
+    border-top: 1px solid var(--border);
 }
 
 /* ─── Universal Checkbox Theming ───────────────────────────── */

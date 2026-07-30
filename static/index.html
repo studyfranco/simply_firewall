@@ -18,11 +18,16 @@
                 <h1>Simply IP Vault</h1>
             </div>
             <h2>Enterprise Auth Router</h2>
-            <p class="subtitle">Please enter your API key to access the dashboard.</p>
+            <p class="subtitle">Enter your API key and its signing secret to access the dashboard.</p>
             <form id="login-form" class="login-form">
                 <div class="form-group">
                     <label for="login-key">API Key</label>
                     <input type="password" id="login-key" placeholder="Enter X-API-Key..." required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="login-secret">Signing Secret</label>
+                    <input type="password" id="login-secret" placeholder="Enter HMAC signing secret..." required class="input-field">
+                    <small class="field-hint">Used locally to sign every request (HMAC-SHA256). Never transmitted.</small>
                 </div>
                 <button type="submit" id="login-submit" class="btn btn-primary">Unlock Dashboard</button>
             </form>
@@ -107,7 +112,7 @@
                         </div>
                     </div>
 
-                    <div class="batch-actions">
+                    <div class="batch-actions hidden">
                         <button type="button" id="delete-selected-ips" class="btn btn-batch-delete" disabled>Delete Selected</button>
                     </div>
 
@@ -169,7 +174,7 @@
                             </div>
                         </div>
                     </form>
-                    <div class="batch-actions">
+                    <div class="batch-actions hidden">
                         <button type="button" id="delete-selected-groups" class="btn btn-batch-delete" disabled>Delete Selected</button>
                     </div>
 
@@ -237,9 +242,13 @@
                     <div id="apikey-created" class="key-reveal hidden">
                         <p class="key-reveal-label">New API Key (copy now):</p>
                         <code id="apikey-plaintext" class="key-reveal-value"></code>
+                        <p class="key-reveal-label">Signing Secret (copy now — required to sign requests):</p>
+                        <code id="apikey-signing-secret" class="key-reveal-value"></code>
                     </div>
 
-                    <div class="batch-actions">
+                    <!-- `batch-actions-keys` adds the vertical separation from the Create API Key
+                         form above; without it the two controls sat flush against each other. -->
+                    <div class="batch-actions batch-actions-keys hidden">
                         <button type="button" id="delete-selected-keys" class="btn btn-batch-delete" disabled>Delete Selected</button>
                     </div>
 
@@ -455,8 +464,11 @@
     <div id="secret-reveal-modal" class="modal-overlay hidden">
         <div class="modal-card card">
             <h3>New Secret Generated</h3>
-            <p class="subtitle">Copy this key now — it will not be shown again.</p>
+            <p class="subtitle">Copy both values now — they will not be shown again.</p>
+            <p class="key-reveal-label">API Key:</p>
             <code id="secret-reveal-value" class="key-reveal-value"></code>
+            <p class="key-reveal-label">Signing Secret:</p>
+            <code id="secret-reveal-signing-secret" class="key-reveal-value"></code>
             <div class="form-actions mt-4">
                 <button type="button" id="secret-reveal-close" class="btn btn-primary">Done</button>
             </div>
@@ -468,8 +480,9 @@
         <div class="modal-card card">
             <h3 id="confirm-modal-title">Are you sure?</h3>
             <p id="confirm-modal-message" class="subtitle"></p>
+            <!-- Cancel sits immediately left of Confirm, both right-aligned as one pair. -->
             <div class="modal-actions mt-4">
-                <button type="button" id="confirm-modal-cancel" class="btn btn-secondary">Cancel</button>
+                <button type="button" id="confirm-modal-cancel" class="btn btn-cancel">Cancel</button>
                 <button type="button" id="confirm-modal-confirm" class="btn btn-danger">Confirm</button>
             </div>
         </div>

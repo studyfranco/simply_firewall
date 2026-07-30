@@ -36,7 +36,21 @@ To keep this context clean and modular, responsibilities are split across three 
 ### 1. Security & Network (Zero-Trust)
 
 - **Middleware Protection:** All `/api/*` routes pass through custom authentication middleware (`src/middleware.rs`).
-- **Authentication:** Verified via `X-API-Key` header.
+- **Authentication (HMAC-SHA256):** Every request MUST carry **three** headers. Possession of `X-API-Key` alone is NOT sufficient.
+
+  | Header | Purpose |
+  | :--- | :--- |
+  | `X-API-Key` | The plaintext key. Used **only** to look up the key record (by SHA-256 of its value). Identity, not proof. |
+  | `X-Timestamp` | Current UTC Unix time in **seconds**. |
+  | `X-Signature-256` | Hex HMAC-SHA256 over `METHOD + PATH + TIMESTAMP + RAW_BODY`, keyed with the key's `signing_secret`. A `sha256=` prefix is accepted and stripped. |
+
+  - **Canonical signed string:** the four parts concatenated with **no separator**. `METHOD` is uppercase; `PATH` is the URL path **excluding the query string**; `RAW_BODY` is the exact request body bytes (empty string when there is no body).
+  - **Why the query string is excluded:** reverse proxies routinely reorder, re-encode, or append query parameters, which would silently invalidate valid requests. Query parameters on `/api/*` are read-only filters — every mutating field travels in the signed body.
+  - **`PATH` is the full request path** as the client sent it (e.g. `/api/ban`), not the path relative to the router's `/api` mount point. The middleware reads `OriginalUri` for exactly this reason.
+  - **Anti-Replay Guard:** reject with `401 Unauthorized` when `|server_time - X-Timestamp| > 300` seconds. The window is **symmetric** — a future-dated timestamp is as suspect as a stale one, since allowing it would extend a captured request's usable lifetime.
+  - **Ordering:** authenticate, then authorize. Timestamp (no I/O) → key lookup → signature verification → CIDR binding check. A caller that cannot prove possession of the signing secret must never learn, from a `403`-vs-`401` distinction, whether a guessed key is bound to its network.
+  - Signature comparison MUST be constant-time (`Mac::verify_slice`), never `==` on hex strings.
+- **Signing Secrets at Rest (`VAULT_ENCRYPTION_KEY`):** `signing_secret` cannot be hashed — verifying an HMAC needs it verbatim. When the `VAULT_ENCRYPTION_KEY` environment variable is set, it is encrypted with **AES-GCM-256** (fresh random 12-byte nonce per value; the env var is SHA-256'd to derive the 32-byte key, so any passphrase length works). Without it, the secret is stored raw — the zero-config **development** fallback only, logged as a warning at startup. Sealed values are tagged `aesgcm256:`, so enabling encryption later is non-destructive and a missing key surfaces as a clear error instead of a silent auth failure.
 - **CIDR Restriction:** API Keys are bound to CIDR network ranges (`bound_ips`, supporting comma-separated IPv4/IPv6 ranges like `127.0.0.1/32, 10.0.0.0/8, ::/0`). Middleware MUST validate the client's IP against these bounds.
 - **Resilient IP Extraction:** Do NOT use external IP extraction crates. Extract the rightmost IP from `X-Forwarded-For` or `X-Real-IP`, falling back safely to `axum::extract::ConnectInfo`.
 
@@ -65,6 +79,7 @@ To keep this context clean and modular, responsibilities are split across three 
 
 - **Group Scoping:** Webhooks are bound to specific `IpGroup`s. Actions on IPs in those groups dispatch asynchronous HTTP POST requests via Tokio tasks.
 - **Templating & Headers:** Custom JSON payload templates (e.g., `{"ip": "$target_address", "group": "$group_name"}`) and custom HTTP headers (e.g., `X-API-Key` for chaining `simply_ip_vault` instances).
+  - ⚠ **Known limitation — instance chaining is currently broken by HMAC auth.** An outbound dispatch sends `X-API-Key` (from `headers_json`) and an `X-Signature-256` computed over *the payload alone* using the webhook's `secret_token`. A receiving `simply_ip_vault` now requires `X-Timestamp` plus a signature over `METHOD + PATH + TIMESTAMP + RAW_BODY` keyed by the *receiving key's* `signing_secret` — a different message and a different key — so a chained dispatch is rejected with `401`. Chaining needs a dedicated dispatch mode (emitting vault-style auth headers from the target key's signing secret) before it works again. Webhooks to ordinary third-party consumers are unaffected.
 - **HMAC Signatures:** All webhook dispatches MUST include a signature header: `X-Signature-256: sha256=<hex_hmac>` calculated using the webhook's secret token.
 - **SSRF Prevention:** Validate target URLs. Reject private/loopback IP ranges (RFC 1918, RFC 4193, loopback) unless `ALLOW_PRIVATE_WEBHOOKS=true` is set in environment.
 
@@ -72,7 +87,9 @@ To keep this context clean and modular, responsibilities are split across three 
 
 - The UI is a Single Page Application (SPA). Authentication state is held in `localStorage`.
 - Single Page Application served from `static/`.
-- Authenticates via `X-API-Key` stored in `localStorage`.
+- **Credentials:** the login screen prompts for **both** the API key and its **signing secret**, stored as `simply_ip_vault_key` and `simply_ip_vault_signing_secret`. Both are required; either alone is useless.
+- **Request signing:** the global `fetch` wrapper injects `X-API-Key`, computes `X-Timestamp`, and signs every call with `X-Signature-256` using the **Web Crypto API** (`crypto.subtle.importKey` + `crypto.subtle.sign`, HMAC/SHA-256) — no external crypto library, per the no-dependencies rule. The secret is imported as its raw **UTF-8 bytes** (not hex-decoded), matching the server's `secret.as_bytes()`, and the resulting `CryptoKey` is memoized per session.
+- **Secure-context requirement:** `crypto.subtle` exists only in a secure context (HTTPS, or `http://localhost`). Served over plain HTTP to a LAN address the dashboard cannot sign requests at all; the wrapper detects this and reports it explicitly rather than failing with an opaque `401`. Deploy the UI behind TLS.
 - **Dynamic Permission Rendering:** On startup, `app.js` calls `GET /api/auth/me`. The UI dynamically renders/hides tabs and controls (e.g., Webhooks, Key Management) based solely on the returned permissions based on the RBAC payload received from `GET /api/auth/me`.
 - The JS implements a global fetch wrapper that automatically injects the `X-API-Key` header and intercepts `401/403` responses to clear the token and return to the login screen.
 
@@ -96,18 +113,42 @@ To keep this context clean and modular, responsibilities are split across three 
   2. **Negative RBAC:** Unauthorized attempts MUST return HTTP `403 Forbidden`.
   3. **Webhook Signatures:** Mock HTTP endpoints (e.g., via Tokio task) verifying payload delivery and HMAC `X-Signature-256` validity.
   4. **Multi-Group & Temporal Querying:** Validate `GET /api/ips` with group filters and `max_age`/`since` constraints.
+  5. **Request Authentication (HMAC):** each of the three auth headers is individually mandatory (`401` when any is dropped — in particular the pre-HMAC "key + timestamp only" shape); the anti-replay window is enforced symmetrically at ±300s using *correctly signed* stale/future timestamps, so the rejection provably comes from the freshness check and not the HMAC; and the signature binds method, path, and body (replaying an authentic signature over a tampered body, or onto a different route, MUST fail).
+  6. **Signing Secret Handling:** a `NULL` `signing_secret` fails closed; `signing_secret` never appears in any read endpoint's response; and with `VAULT_ENCRYPTION_KEY` set, the stored value is ciphertext yet still authenticates (round trip through the real request path).
+
+*Test-suite convention:* keys seeded directly into the database use a deterministic signing secret derived from their plaintext key, so the request-building helper can rediscover it from the `X-API-Key` header. Keys minted through `POST /api/keys` or `/rotate` carry a server-generated random secret and must be signed with it explicitly.
 
 Compilation via `cargo build` or `cargo check` is recommended to validate syntax. Integration tests reside in `tests/` using SQLite in-memory (`sqlite::memory:`).
-To test endpoints manually during development, use `curl`:
+
+To test endpoints manually during development, requests must be signed. A bare `curl -H "X-API-Key: ..."` no longer authenticates. Use this helper (it is the same computation `scripts/test_e2e.sh` performs):
+
+```bash
+KEY="<PLAINTEXT_API_KEY>"
+SECRET="<SIGNING_SECRET>"          # returned once by POST /api/keys or /rotate
+
+# call METHOD PATH [JSON_BODY]  — PATH excludes the host, includes the query string.
+call() {
+  local method="$1" path="$2" body="${3:-}"
+  local ts; ts=$(date -u +%s)
+  local sig; sig=$(printf '%s' "${method}${path%%\?*}${ts}${body}" \
+                   | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.*= //')
+  curl -sS -X "$method" \
+    -H "X-API-Key: $KEY" -H "X-Timestamp: $ts" -H "X-Signature-256: $sig" \
+    ${body:+-H "Content-Type: application/json" -d "$body"} \
+    "http://localhost:3000$path"
+}
+```
 
 - **Auth check:**
-  `curl -H "X-API-Key: <KEY>" http://localhost:3000/api/auth/me`
+  `call GET /api/auth/me`
 - **Ban an IP (adds it to a banlist group):**
-  `curl -X POST -H "X-API-Key: <KEY>" -H "Content-Type: application/json" -d '{"target_address": "192.168.1.100/32", "group_name": "fail2ban", "cause": "SSH brute force"}' http://localhost:3000/api/ban`
+  `call POST /api/ban '{"target_address": "192.168.1.100/32", "group_name": "fail2ban", "cause": "SSH brute force"}'`
 - **List IPs (Filtered by groups):**
-  `curl -H "X-API-Key: <KEY>" "http://localhost:3000/api/ips?groups=fail2ban,sshd&limit=10"`
+  `call GET "/api/ips?groups=fail2ban,sshd&limit=10"`
 - **Delete IP:**
-  `curl -X DELETE -H "X-API-Key: <KEY>" "http://localhost:3000/api/ips?target_address=192.168.1.100/32&group_name=fail2ban"`
+  `call DELETE "/api/ips?target_address=192.168.1.100/32&group_name=fail2ban"`
+
+Note the query string is stripped before signing (`${path%%\?*}`) but still sent — see the signing rules in §1.
 
 ### 1. Mandatory Test Matrix per Endpoint
 For every route registered under `/api`, tests MUST assert three distinct outcomes:
