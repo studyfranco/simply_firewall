@@ -288,15 +288,17 @@ log "Using INITIAL_MASTER_KEY + INITIAL_MASTER_SIGNING_SECRET for deterministic 
 # targets a real public host, so this doesn't loosen anything they depend on.
 # VAULT_ENCRYPTION_KEY is set so the run exercises the AES-GCM-256 seal/open path for signing
 # secrets end to end, rather than the plaintext development fallback.
-# TRUSTED_PROXIES=127.0.0.1: curl connects over loopback, so declaring it a trusted proxy is what
+# TRUSTED_PROXIES=localhost: curl connects over loopback, so declaring it a trusted proxy is what
 # lets the CIDR checks below use X-Forwarded-For to stand in for a client address — exactly as a
-# real reverse proxy would. It deliberately does NOT include 127.0.0.2, which §6b connects from to
-# exercise the untrusted-peer path where the header must be ignored.
+# real reverse proxy would. Spelled as a *hostname* rather than 127.0.0.1 on purpose: that exercises
+# the dynamic DNS resolution path (the Docker/Traefik case) end to end against a real resolver,
+# rather than only the literal-CIDR path the unit tests cover. It resolves to 127.0.0.1 and
+# deliberately NOT to 127.0.0.2, which §6b connects from to exercise the untrusted-peer path.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
     INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
     VAULT_ENCRYPTION_KEY="e2e-vault-encryption-passphrase" \
     ALLOW_PRIVATE_WEBHOOKS=true \
-    TRUSTED_PROXIES="127.0.0.1" \
+    TRUSTED_PROXIES="localhost" \
     "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -387,15 +389,27 @@ check "401" "a wrong signature is rejected"
 
 # Anti-replay window: +/-300s, symmetric. Each of these carries a *correct* signature for the
 # timestamp it sends, so only the freshness check can reject it.
+#
+# The two directions need different margins, because elapsed wall-clock time moves them oppositely:
+# a stale timestamp only gets staler while the script runs, so 301 can never drift back inside the
+# window. A *future* timestamp decays toward it — at NOW+301, one second of elapsed time between
+# capturing NOW_TS and the server reading its own clock leaves a skew of 300, which is inside the
+# window and legitimately returns 200. Hence a fresh capture immediately before the call plus a
+# margin comfortably clear of the boundary.
+#
+# The exact ±300/±301 edge is pinned deterministically in
+# `tests/security_tests.rs::attack_timestamp_forgery_outside_the_window_is_rejected_both_directions`,
+# where the request is handled in-process microseconds after the timestamp is chosen. E2E asserts
+# the behaviour, not the boundary.
 STALE_TS=$((NOW_TS - 301))
 STALE_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$STALE_TS" "")
 raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $STALE_TS" -H "X-Signature-256: $STALE_SIG"
 check "401" "a 301s-stale timestamp is rejected as a replay"
 
-FUTURE_TS=$((NOW_TS + 301))
+FUTURE_TS=$(( $(date -u +%s) + 360 ))
 FUTURE_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$FUTURE_TS" "")
 raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $FUTURE_TS" -H "X-Signature-256: $FUTURE_SIG"
-check "401" "a 301s-future timestamp is rejected"
+check "401" "a future-dated timestamp beyond the window is rejected"
 
 EDGE_TS=$((NOW_TS - 290))
 EDGE_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$EDGE_TS" "")
@@ -709,6 +723,10 @@ if curl -s -o /dev/null --interface 127.0.0.2 --max-time 5 "$BASE_URL/api/auth/m
     # Impersonating the trusted proxy inside the header must not bootstrap trust either.
     call_from_interface "127.0.0.2" GET "/api/auth/me" "$SPOOF_KEY" "127.0.0.1, 203.0.113.99"
     check "403" "naming the trusted proxy inside X-Forwarded-For does not bootstrap trust"
+
+    # TRUSTED_PROXIES is spelled as the hostname "localhost" for this run, so the control below
+    # passing proves the dynamic DNS resolution path works against a real resolver — the same
+    # mechanism a Docker/Traefik deployment relies on to keep trusting a container whose IP moves.
 
     # Control: the identical header from the trusted peer (127.0.0.1) IS honoured, proving the
     # difference is the peer address and not something incidental about the request.
@@ -1619,7 +1637,158 @@ fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
 
-log_section "24. RBAC Privilege Escalation & Webhook Hijacking"
+log_section "24. IP Soft Delete, Restore, Hard Delete & 92-Day Purge"
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"softdelete-group"}'
+check "200" "create a group for the soft-delete checks"
+SOFTDEL_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# A delegated key with full group rights but no master status — the one whose deletes must be soft.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Soft Deleter"}'
+check "200" "create a non-master deleter key"
+SOFTDEL_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+SOFTDEL_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$SOFTDEL_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call POST "/api/keys/$SOFTDEL_KEY_ID/permissions" "$MASTER_KEY" \
+    "{\"group_id\":\"$SOFTDEL_GROUP_ID\",\"can_read\":true,\"can_write\":true,\"can_delete\":true}"
+check "200" "grant the deleter full rights on the group"
+
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group","cause":"soft delete test"}'
+check "200" "ban an address to soft-delete"
+
+api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
+check "200" "list the group before deletion"
+SOFTDEL_RECORD_ID=$(echo "$RESP_BODY" | jq -r '.[] | select(.target_address == "198.51.100.201") | .id')
+log "Soft-delete target record id: $SOFTDEL_RECORD_ID"
+
+# A non-master delete must be soft: hidden from reads, row retained.
+api_call DELETE "/api/ips/$SOFTDEL_RECORD_ID" "$SOFTDEL_KEY"
+check "200" "a non-master DELETE /api/ips/{id} succeeds"
+check_true '.deleted == "soft"' "a non-master delete is soft, not permanent"
+
+api_call GET "/api/ips?groups=softdelete-group" "$SOFTDEL_KEY"
+check "200" "the deleter lists the group after deleting"
+check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
+    "the soft-deleted record is hidden from the non-master listing"
+
+api_call GET "/api/ips?groups=softdelete-group&format=iplist" "$SOFTDEL_KEY"
+check "200" "the iplist export also runs after deletion"
+check_true '[.ip_list[] | select(. == "198.51.100.201")] | length == 0' \
+    "the soft-deleted record is excluded from the iplist export too"
+
+# A non-master cannot escalate to a permanent delete.
+api_call DELETE "/api/ips/$SOFTDEL_RECORD_ID?hard=true" "$SOFTDEL_KEY"
+check "403" "a non-master cannot hard-delete a record"
+
+# The master trash view sees it, with its attribution.
+api_call GET "/api/ips?include_deleted=true&groups=softdelete-group" "$MASTER_KEY"
+check "200" "master lists the trash with include_deleted=true"
+check_true '[.[] | select(.target_address == "198.51.100.201" and .is_deleted == true)] | length == 1' \
+    "the master trash view exposes the soft-deleted record"
+check_true "[.[] | select(.target_address == \"198.51.100.201\") | .deleted_by == \"$SOFTDEL_KEY_ID\"] | all" \
+    "deleted_by attributes the key that issued the delete"
+
+# The master's DEFAULT listing still hides it — the trash is opt-in, not a master-only default view.
+api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
+check "200" "master lists the group without include_deleted"
+check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
+    "the trash stays hidden unless include_deleted is explicitly requested"
+
+# Restore.
+api_call POST "/api/ips/$SOFTDEL_RECORD_ID/restore" "$SOFTDEL_KEY"
+check "403" "a non-master cannot restore a deleted record"
+
+api_call POST "/api/ips/$SOFTDEL_RECORD_ID/restore" "$MASTER_KEY"
+check "200" "master restores the soft-deleted record"
+check_true '.restored == true' "the restore is reported"
+
+api_call GET "/api/ips?groups=softdelete-group" "$SOFTDEL_KEY"
+check "200" "list the group after restoration"
+check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 1' \
+    "the restored record is visible again"
+
+api_call POST "/api/ips/$SOFTDEL_RECORD_ID/restore" "$MASTER_KEY"
+check "400" "restoring an already-live record is rejected"
+
+# Re-banning a soft-deleted address must resurrect it rather than collide with the unique index.
+api_call DELETE "/api/ips/$SOFTDEL_RECORD_ID" "$SOFTDEL_KEY"
+check "200" "soft-delete the record again"
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.201","group_name":"softdelete-group","cause":"seen again"}'
+check "200" "re-banning a soft-deleted address succeeds instead of colliding"
+api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 1' \
+    "re-registration resurrected the record"
+
+# Purge: master-only, and the window cannot be set to a destructive zero.
+api_call POST "/api/system/purge-ips" "$SOFTDEL_KEY"
+check "403" "a non-master cannot purge deleted records"
+
+api_call POST "/api/system/purge-ips" "$MASTER_KEY" '{"older_than_days":0}'
+check "400" "older_than_days=0 is rejected rather than treated as 'purge everything'"
+
+api_call POST "/api/system/purge-ips" "$MASTER_KEY" '{"older_than_days":-5}'
+check "400" "a negative older_than_days is rejected"
+
+api_call POST "/api/system/purge-ips" "$MASTER_KEY"
+check "200" "master runs the purge with the default window"
+check_true '.retention_days == 92' "the default retention window is 92 days"
+check_true '.purged == 0' "nothing is purged: the only deleted record is far younger than 92 days"
+
+api_call GET "/api/ips?groups=softdelete-group" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 1' \
+    "the live record survived the purge"
+
+# Master hard delete really drops the row.
+api_call DELETE "/api/ips/$SOFTDEL_RECORD_ID?hard=true" "$MASTER_KEY"
+check "200" "master hard-deletes the record"
+check_true '.deleted == "permanent"' "the hard delete is reported as permanent"
+
+api_call GET "/api/ips?include_deleted=true&groups=softdelete-group" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
+    "a hard-deleted record is gone even from the trash view"
+
+# ── SQLite concurrency pragmas ──────────────────────────────────────────────
+# Asserted from the startup log rather than by querying, because the pragma is applied once at
+# connection setup and this is the only place its actual effect is reported.
+
+log_section "24b. SQLite WAL Mode & Busy Timeout"
+
+if grep -q "journal_mode=WAL enabled" "$SERVER_LOG"; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} SQLite journal_mode=WAL is enabled at startup" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} SQLite WAL mode was not reported at startup" >&2
+fi
+
+if grep -q "busy_timeout set to 5000ms" "$SERVER_LOG"; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} SQLite busy_timeout is set to 5000ms" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} SQLite busy_timeout was not reported at startup" >&2
+fi
+
+# WAL leaves a -wal sidecar next to the database file while connections are open.
+if [ -f "$DB_PATH-wal" ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the WAL sidecar file exists alongside the database" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} no -wal sidecar found at $DB_PATH-wal" >&2
+fi
+
+# The retention worker must have started with the 92-day window.
+if grep -q "IP retention worker started" "$SERVER_LOG"; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the IP retention worker started" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} the IP retention worker did not start" >&2
+fi
+
+log_section "25. RBAC Privilege Escalation & Webhook Hijacking"
 
 # A delegated key manager: full can_manage_keys, but NOT master. Everything below asks whether that
 # scope can be turned into master authority.
@@ -1656,6 +1825,14 @@ check "403" "a non-master cannot delete a master key"
 # 5. Widening its own scopes through the generic update endpoint.
 api_call PUT "/api/keys/$MANAGER_ID" "$MANAGER_KEY" '{"can_create_groups":true}'
 check "403" "a key cannot grant itself additional scopes"
+
+# The master-only scopes cannot be handed to ANY key by a non-master, not just to itself: each is a
+# path back to master authority (co-administrators, or groups whose creator is auto-granted access).
+api_call POST "/api/keys" "$MANAGER_KEY" '{"name":"Escalated Manager","can_manage_keys":true}'
+check "403" "a non-master cannot grant can_manage_keys"
+
+api_call POST "/api/keys" "$MANAGER_KEY" '{"name":"Escalated Groups","can_create_groups":true}'
+check "403" "a non-master cannot grant can_create_groups"
 
 # Controls: the delegated scope still works against non-master targets, so the guards are scoped to
 # master escalation rather than having disabled key administration.
@@ -1729,6 +1906,42 @@ else
     PASS_COUNT=$((PASS_COUNT + 1))
     echo -e "$(ts)   ${GREEN}✓ PASS${RESET} no secret_token is exposed by the webhook listing" >&2
 fi
+
+# A webhook that carries an api_key is *privileged*: its dispatches authenticate as a real caller on
+# the receiving system (instance chaining), and that credential belongs to the remote system so
+# rotation cannot invalidate it. Repointing one is therefore master-only.
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"privileged-hook\",\"target_url\":\"https://legitimate.example.com/hook\",\"secret_token\":\"s\",\"api_key\":\"downstream-credential\",\"payload_template\":\"{}\",\"group_id\":\"$HIJACK_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\"}"
+check "200" "create a privileged webhook that carries an api_key"
+PRIV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Webhook Manager","can_manage_webhooks":true}'
+check "200" "create a non-master webhook manager"
+WHM_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+WHM_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$WHM_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call POST "/api/keys/$WHM_KEY_ID/permissions" "$MASTER_KEY" \
+    "{\"group_id\":\"$HIJACK_GROUP_ID\",\"can_read\":true,\"can_write\":true,\"can_delete\":true}"
+check "200" "grant the webhook manager access to the hijack group"
+
+api_call PUT "/api/webhooks/$PRIV_HOOK_ID" "$WHM_KEY" '{"target_url":"https://attacker.example.net/collect"}'
+check "403" "a non-master cannot repoint a privileged (api_key-bearing) webhook"
+
+api_call PUT "/api/webhooks/$PRIV_HOOK_ID" "$WHM_KEY" '{"hmac_template":"{method}\\n{path}\\n{timestamp}\\n{body}\\nx"}'
+check "403" "a non-master cannot rewrite a privileged webhook's hmac_template"
+
+# Non-critical fields stay editable by the delegated manager.
+api_call PUT "/api/webhooks/$PRIV_HOOK_ID" "$WHM_KEY" '{"name":"privileged-hook-renamed"}'
+check "200" "a non-master can still rename a privileged webhook"
+
+# ...and a master may repoint it, which still forces the secret to rotate.
+api_call PUT "/api/webhooks/$PRIV_HOOK_ID" "$MASTER_KEY" '{"target_url":"https://elsewhere.example.com/h"}'
+check "200" "a master can repoint a privileged webhook"
+check_true '.secret_rotated == true' "repointing a privileged webhook still rotates its secret"
+
+api_call DELETE "/api/webhooks/$PRIV_HOOK_ID" "$MASTER_KEY"
+check "204" "delete the privileged webhook"
 
 api_call DELETE "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY"
 check "204" "delete the hijack-target webhook"

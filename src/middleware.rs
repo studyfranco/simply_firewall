@@ -91,7 +91,8 @@ pub async fn auth_middleware(
     // proxy; every other caller is identified by its peer address alone. See
     // `crate::config::resolve_client_ip` — this is what stops any client from satisfying an
     // arbitrary `bound_ips` restriction by writing an allowed address into a request header.
-    let client_ip = crate::config::resolve_client_ip(addr.ip(), &headers, &state.trusted_proxies);
+    let client_ip =
+        crate::config::resolve_client_ip(addr.ip(), &headers, &state.trusted_proxies).await;
 
     // Anti-replay guard first: it needs no database round-trip, so a stale or absent timestamp is
     // rejected before an unauthenticated caller can cost us a query.

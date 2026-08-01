@@ -166,6 +166,53 @@ fn guard_delegated_group_grant(
     Ok(())
 }
 
+/// The global scopes only a master key may hand out.
+///
+/// `is_master` is obvious. The other two are here because each is a *path back to* master authority
+/// rather than a leaf capability:
+///
+/// - `can_manage_keys` is the scope that reaches every other key — granting it creates a second
+///   administrator, so a non-master able to grant it could multiply itself without limit and, in
+///   combination with any future gap in [`guard_master_target`], reach a master key.
+/// - `can_create_groups` mints groups whose creator is auto-granted full read/write/delete
+///   (`AGENT.MD` §2), which is the one way to obtain group access without a master signing off.
+///
+/// `can_manage_webhooks` is deliberately **not** on this list: it confers no authority over keys or
+/// groups, and is bounded by the caller's own group access. A delegated key manager can still hand
+/// it out.
+const MASTER_ONLY_SCOPES: [&str; 3] = ["is_master", "can_manage_keys", "can_create_groups"];
+
+/// Rejects any attempt by a non-master to grant one of [`MASTER_ONLY_SCOPES`].
+///
+/// `held` describes the target's current values, so this permits a no-op re-submission of a scope
+/// the target already has (an idempotent `PUT` from a dashboard that posts every field) while still
+/// refusing an actual elevation. Revoking is always allowed — removing authority is not escalation.
+fn guard_scope_elevation(
+    caller: &api_key::Model,
+    requested: [Option<bool>; 3],
+    held: [bool; 3],
+) -> Result<(), AppError> {
+    if caller.is_master {
+        return Ok(());
+    }
+
+    for ((request, current), name) in
+        requested.iter().zip(held.iter()).zip(MASTER_ONLY_SCOPES.iter())
+    {
+        if *request == Some(true) && !*current {
+            tracing::warn!(
+                "Blocked privilege escalation: key {} attempted to grant {}",
+                caller.prefix,
+                name
+            );
+            return Err(AppError::Forbidden(format!(
+                "Only a master key can grant '{name}'"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn guard_master_target(caller: &api_key::Model, target: &api_key::Model) -> Result<(), AppError> {
     if target.is_master && !caller.is_master {
         tracing::warn!(
@@ -488,14 +535,33 @@ async fn handle_ip_upsert(
                 return Err(AppError::Forbidden("This IP is protected and cannot be modified".to_owned()));
             }
 
+            // Re-registering a soft-deleted address resurrects it. The alternative — refusing, or
+            // silently re-adding a row that stays hidden — would make `target_address`'s unique
+            // constraint into a denial: an address someone deleted last week could never be banned
+            // again until a master emptied the trash. The deletion metadata is cleared so the
+            // record is indistinguishable from one that was never deleted, and its 92-day
+            // retention clock does not keep running against a now-live record.
+            let was_deleted = record.is_deleted;
+
             let mut active_rec: ip_record::ActiveModel = record.into();
             active_rec.last_seen_at = Set(now);
             active_rec.updated_at = Set(now);
+            if was_deleted {
+                active_rec.is_deleted = Set(false);
+                active_rec.deleted_at = Set(None);
+                active_rec.deleted_by = Set(None);
+            }
             if let Some(c) = &payload.cause {
                 active_rec.cause = Set(Some(c.clone()));
             }
             let updated = active_rec.update(&state.db).await?;
             record_id = updated.id;
+            if was_deleted {
+                tracing::info!(
+                    address = %normalized_address,
+                    "Re-registration restored a soft-deleted IP record"
+                );
+            }
             break;
         }
 
@@ -508,6 +574,9 @@ async fn handle_ip_upsert(
             created_at: Set(now),
             updated_at: Set(now),
             last_seen_at: Set(now),
+            is_deleted: Set(false),
+            deleted_at: Set(None),
+            deleted_by: Set(None),
         };
         match ip_record::Entity::insert(model).exec(&state.db).await {
             Ok(_) => {
@@ -602,6 +671,12 @@ pub struct QueryFilters {
     pub format: Option<String>,
     /// Synonym for `format` — `format=iplist` and `mode=iplist` are both accepted.
     pub mode: Option<String>,
+    /// Master-only: also return soft-deleted records (the "trash" view).
+    ///
+    /// Ignored for non-master callers rather than rejected — a scoped key asking for the trash is
+    /// asking for something it has no concept of, and answering `403` would tell it the flag
+    /// exists. It simply gets the normal, live-only listing.
+    pub include_deleted: Option<bool>,
 }
 
 /// Response payload for a single IP record
@@ -625,6 +700,15 @@ pub struct IpRecordResponse {
     pub updated_at: chrono::NaiveDateTime,
     /// Last seen at
     pub last_seen_at: chrono::NaiveDateTime,
+    /// Whether the record is soft-deleted. Always `false` in a normal listing; only ever `true`
+    /// in a master's `include_deleted=true` view.
+    pub is_deleted: bool,
+    /// When it was soft-deleted, if it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+    /// Which API key soft-deleted it, if it was.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deleted_by: Option<String>,
 }
 
 /// Handles GET /api/v1/ips to list IP records
@@ -637,6 +721,14 @@ pub async fn list_ips(
     // Manual join fetching because of M:N
     let mut query = ip_record_group_membership::Entity::find()
         .find_also_related(ip_record::Entity);
+
+    // Soft-deleted records are invisible unless a master explicitly asks for the trash. Applied
+    // here, before every other filter, so no later branch can accidentally reintroduce them —
+    // including the `iplist` export format, which shares this query.
+    let include_deleted = key.is_master && filters.include_deleted.unwrap_or(false);
+    if !include_deleted {
+        query = query.filter(ip_record::Column::IsDeleted.eq(false));
+    }
 
     if !key.is_master {
         let accessible_groups: Vec<Uuid> = api_key_group_permission::Entity::find()
@@ -784,10 +876,287 @@ pub async fn list_ips(
             created_at: record.created_at,
             updated_at: record.updated_at,
             last_seen_at: record.last_seen_at,
+            is_deleted: record.is_deleted,
+            deleted_at: record.deleted_at,
+            deleted_by: record.deleted_by,
         });
     }
 
     Ok(Json(items).into_response())
+}
+
+/// Whether the caller may act on a record, given its group memberships.
+///
+/// A record can belong to several groups; the caller needs `can_delete` on **at least one** of
+/// them, which is the same rule the group-scoped `DELETE /api/ips` applies. Master keys short-
+/// circuit. A record with no memberships at all (orphaned by a group deletion) is master-only,
+/// since there is no group left to derive authority from.
+async fn caller_may_delete_record(
+    db: &sea_orm::DatabaseConnection,
+    key: &api_key::Model,
+    record_id: Uuid,
+) -> Result<bool, AppError> {
+    if key.is_master {
+        return Ok(true);
+    }
+
+    let group_ids: Vec<Uuid> = ip_record_group_membership::Entity::find()
+        .filter(ip_record_group_membership::Column::IpRecordId.eq(record_id))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|m| m.group_id)
+        .collect();
+
+    if group_ids.is_empty() {
+        return Ok(false);
+    }
+
+    let deletable = api_key_group_permission::Entity::find()
+        .filter(
+            Condition::all()
+                .add(api_key_group_permission::Column::ApiKeyId.eq(key.id))
+                .add(api_key_group_permission::Column::GroupId.is_in(group_ids))
+                .add(api_key_group_permission::Column::CanDelete.eq(true)),
+        )
+        .one(db)
+        .await?;
+
+    Ok(deletable.is_some())
+}
+
+/// Query parameters for [`delete_ip_record`].
+#[derive(Deserialize, Default)]
+pub struct DeleteRecordQuery {
+    /// Master-only: drop the row outright instead of soft-deleting it.
+    pub hard: Option<bool>,
+}
+
+/// Handles `DELETE /api/ips/{id}` — soft-deletes an IP record, or hard-deletes it for a master.
+///
+/// **Soft delete is the default and the only option for a non-master.** The row stays, marked
+/// `is_deleted` with `deleted_at`/`deleted_by` set, and disappears from every read (see
+/// [`list_ips`]) until a master restores it or [`crate::retention`] purges it after 92 days.
+///
+/// The reason a delegated key never gets a hard delete: `can_delete` on a group is a routine,
+/// widely-handed-out scope, and the blast radius of it being misused — or of the key being stolen —
+/// should be a recoverable mistake rather than permanent data loss. Making destruction master-only
+/// costs a legitimate operator one extra step and costs an attacker the ability to cover their
+/// tracks.
+///
+/// Distinct from `DELETE /api/ips` (query/body form), which removes a record's membership in **one
+/// group** and leaves the record itself alone. This route acts on the record as a whole.
+pub async fn delete_ip_record(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    Path(id): Path<Uuid>,
+    Query(params): Query<DeleteRecordQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    let record = ip_record::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if !caller_may_delete_record(&state.db, &key, id).await? {
+        return Err(AppError::Forbidden(
+            "Permission denied: you have no delete access to any group holding this record".to_owned(),
+        ));
+    }
+
+    if record.is_locked {
+        return Err(AppError::Forbidden("Protected records cannot be deleted".to_owned()));
+    }
+
+    let hard = params.hard.unwrap_or(false);
+    if hard && !key.is_master {
+        return Err(AppError::Forbidden(
+            "Only a master key can permanently delete an IP record".to_owned(),
+        ));
+    }
+
+    let address = record.target_address.clone();
+
+    if hard {
+        ip_record::Entity::delete_by_id(id).exec(&state.db).await?;
+        create_audit_log(
+            &state.db,
+            Some(&key),
+            Some(client_ip.0),
+            "IP_HARD_DELETE",
+            Some(address.clone()),
+            None,
+            Some("Permanently deleted".to_owned()),
+        )
+        .await?;
+
+        return Ok(Json(serde_json::json!({
+            "id": id,
+            "target_address": address,
+            "deleted": "permanent",
+        })));
+    }
+
+    // Already in the trash: report success without moving `deleted_at`, so a repeated call cannot
+    // silently extend the retention window and keep a record out of the purge indefinitely.
+    if record.is_deleted {
+        return Ok(Json(serde_json::json!({
+            "id": id,
+            "target_address": address,
+            "deleted": "soft",
+            "already_deleted": true,
+        })));
+    }
+
+    let now = Utc::now().naive_utc();
+    let mut active: ip_record::ActiveModel = record.into();
+    active.is_deleted = Set(true);
+    active.deleted_at = Set(Some(now));
+    active.deleted_by = Set(Some(key.id.to_string()));
+    active.updated_at = Set(now);
+    active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        Some(&key),
+        Some(client_ip.0),
+        "IP_SOFT_DELETE",
+        Some(address.clone()),
+        None,
+        Some(format!("Soft-deleted by key {}", format_key_reference(&key.name, key.id))),
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "target_address": address,
+        "deleted": "soft",
+        "already_deleted": false,
+    })))
+}
+
+/// Handles `POST /api/ips/{id}/restore` — brings a soft-deleted record back. Master only.
+///
+/// Restoration is master-only even though a delegated key could have caused the deletion: the whole
+/// point of the trash is that recovering from a compromised or careless key does not depend on that
+/// same key's authority.
+pub async fn restore_ip_record(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master {
+        return Err(AppError::Forbidden(
+            "Only a master key can restore a deleted IP record".to_owned(),
+        ));
+    }
+
+    let record = ip_record::Entity::find_by_id(id)
+        .one(&state.db)
+        .await?
+        .ok_or(AppError::NotFound)?;
+
+    if !record.is_deleted {
+        return Err(AppError::InvalidInput(
+            "This IP record is not deleted; nothing to restore".to_owned(),
+        ));
+    }
+
+    let address = record.target_address.clone();
+    let now = Utc::now().naive_utc();
+
+    // The deletion metadata is cleared, not just the flag: leaving a stale `deleted_at` behind
+    // would leave the record one flag-flip away from being purged as if it had been in the trash
+    // all along.
+    let mut active: ip_record::ActiveModel = record.into();
+    active.is_deleted = Set(false);
+    active.deleted_at = Set(None);
+    active.deleted_by = Set(None);
+    active.updated_at = Set(now);
+    let restored = active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        Some(&key),
+        Some(client_ip.0),
+        "IP_RESTORE",
+        Some(address.clone()),
+        None,
+        Some("Restored from soft delete".to_owned()),
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "id": restored.id,
+        "target_address": address,
+        "is_deleted": false,
+        "restored": true,
+    })))
+}
+
+/// Body for [`purge_ip_records`]. Optional; an empty body uses the configured retention window.
+#[derive(Deserialize, Default)]
+pub struct PurgeIpsPayload {
+    /// Override the retention window for this sweep only, in days.
+    ///
+    /// `0` is rejected rather than treated as "purge everything": the difference between "empty the
+    /// trash" and "empty the trash older than zero days" is one character, and the destructive
+    /// reading should never be the one a typo selects.
+    pub older_than_days: Option<i64>,
+}
+
+/// Handles `POST /api/system/purge-ips` — permanently drops soft-deleted records past retention.
+///
+/// Master only, and irreversible. Runs the same sweep as the background worker
+/// ([`crate::retention::purge_expired_ip_records`]), exposed as an endpoint so an operator can
+/// reclaim space or honour a deletion request without waiting for the next tick.
+pub async fn purge_ip_records(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    body: axum::body::Bytes,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master {
+        return Err(AppError::Forbidden(
+            "Only a master key can purge deleted IP records".to_owned(),
+        ));
+    }
+
+    let payload: PurgeIpsPayload = if body.is_empty() {
+        PurgeIpsPayload::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|e| AppError::InvalidInput(format!("Invalid JSON body: {e}")))?
+    };
+
+    let retention_days = match payload.older_than_days {
+        None => crate::retention::retention_days_from_env(),
+        Some(days) if days > 0 => days,
+        Some(days) => {
+            return Err(AppError::InvalidInput(format!(
+                "older_than_days must be a positive number of days, got {days}"
+            )));
+        }
+    };
+
+    let purged = crate::retention::purge_expired_ip_records(&state.db, retention_days).await?;
+
+    create_audit_log(
+        &state.db,
+        Some(&key),
+        Some(client_ip.0),
+        "IP_PURGE",
+        None,
+        None,
+        Some(format!("Purged {purged} record(s) soft-deleted over {retention_days} days ago")),
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({
+        "purged": purged,
+        "retention_days": retention_days,
+    })))
 }
 
 /// Parameters for deleting an IP record from a group. Every field is optional here because this
@@ -1049,15 +1418,17 @@ pub async fn create_api_key(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    // Only a master key may mint another master key. Without this, `can_manage_keys` was
-    // transitively equivalent to `is_master`: a key manager could create a master key, read its
-    // plaintext out of this very response, and use it — a one-request escalation from a delegated
-    // scope to full control of the system.
-    if payload.is_master == Some(true) && !key.is_master {
-        return Err(AppError::Forbidden(
-            "Only a master key can create another master key".to_owned(),
-        ));
-    }
+    // Only a master key may mint a key carrying master-only scopes. Without this,
+    // `can_manage_keys` was transitively equivalent to `is_master`: a key manager could create a
+    // master key, read its plaintext out of this very response, and use it — a one-request
+    // escalation from a delegated scope to full control of the system.
+    //
+    // A brand-new key holds none of these, so `held` is all-false: every `true` here is a grant.
+    guard_scope_elevation(
+        &key,
+        [payload.is_master, payload.can_manage_keys, payload.can_create_groups],
+        [false, false, false],
+    )?;
 
     if let Some(bips) = &payload.bound_ips {
         for cidr in bips.split(',') {
@@ -1249,24 +1620,31 @@ pub async fn update_api_key(
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     guard_master_target(&key, &target)?;
 
-    // A non-master editing *its own* row must not be able to widen its own scopes. `can_manage_keys`
-    // is authority over *other* keys; letting it rewrite the caller's own flags makes every scope
-    // reachable from any one of them, so the flag set collapses into a single privilege level.
-    // Narrowing is still allowed — dropping a scope you hold is not an escalation.
-    if id == key.id && !key.is_master {
-        let widens = |requested: Option<bool>, held: bool| requested == Some(true) && !held;
-        if widens(payload.can_manage_keys, key.can_manage_keys)
-            || widens(payload.can_manage_webhooks, key.can_manage_webhooks)
-            || widens(payload.can_create_groups, key.can_create_groups)
-        {
-            tracing::warn!(
-                "Blocked self-escalation: key {} attempted to widen its own global scopes",
-                key.prefix
-            );
-            return Err(AppError::Forbidden(
-                "A key cannot grant itself additional scopes; ask a master key".to_owned(),
-            ));
-        }
+    // The master-only scopes cannot be granted to *anyone* by a non-master, self or otherwise.
+    // `target`'s current values are the baseline, so re-submitting a scope the key already holds
+    // is a no-op rather than a rejection.
+    guard_scope_elevation(
+        &key,
+        [None, payload.can_manage_keys, payload.can_create_groups],
+        [target.is_master, target.can_manage_keys, target.can_create_groups],
+    )?;
+
+    // `can_manage_webhooks` is delegable, but still not to *yourself*: `can_manage_keys` is
+    // authority over other keys, and letting it rewrite the caller's own flags makes every scope
+    // reachable from any one of them. Narrowing your own is fine — dropping a scope you hold is not
+    // an escalation.
+    if id == key.id
+        && !key.is_master
+        && payload.can_manage_webhooks == Some(true)
+        && !key.can_manage_webhooks
+    {
+        tracing::warn!(
+            "Blocked self-escalation: key {} attempted to widen its own global scopes",
+            key.prefix
+        );
+        return Err(AppError::Forbidden(
+            "A key cannot grant itself additional scopes; ask a master key".to_owned(),
+        ));
     }
 
     if let Some(bips) = &payload.bound_ips {
@@ -2028,6 +2406,32 @@ pub async fn update_webhook(
         .is_some_and(|t| t != effective_template);
 
     let mode = webhook_config::AuthMode::from_stored(&target.auth_mode);
+
+    // A *privileged* webhook carries a credential the receiver recognizes as an identity — an
+    // `api_key`, which is how instance chaining works (`AGENT.MD` §4): its dispatches authenticate
+    // as a real API caller on the receiving system. Repointing one aims a working credential at a
+    // destination of the editor's choosing, which forced rotation alone does not undo, because the
+    // `api_key` is not rotated and cannot be (it belongs to the remote system, not this one).
+    //
+    // So for these, changing the destination or what the signature attests to is master-only. Every
+    // other property — name, payload template, event filter, enabled/disabled — stays editable by
+    // any `can_manage_webhooks` holder, and non-privileged webhooks are unaffected.
+    if (url_changed || template_changed)
+        && target.api_key.as_deref().is_some_and(|k| !k.is_empty())
+        && !key.is_master
+    {
+        tracing::warn!(
+            "Blocked webhook repointing: key {} attempted to alter target_url/hmac_template on \
+             privileged webhook '{}' (carries an api_key)",
+            key.prefix,
+            target.name
+        );
+        return Err(AppError::Forbidden(
+            "This webhook sends an api_key credential; only a master key may change its \
+             target_url or hmac_template"
+                .to_owned(),
+        ));
+    }
     // Only the signing modes have a secret worth protecting; forcing a rotation on API_KEY_ONLY or
     // NONE would mint a secret that is never used and cannot be verified against anything.
     let must_rotate = (url_changed || template_changed) && mode.requires_secret();

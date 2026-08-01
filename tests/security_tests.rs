@@ -51,8 +51,8 @@ fn connect_from(req: axum::http::request::Builder, peer: &str) -> axum::http::re
     req.extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(ip, 40000)))
 }
 
-/// Parses a `TRUSTED_PROXIES`-style string into the list `AppState` carries.
-fn trusted(entries: &str) -> Vec<ipnetwork::IpNetwork> {
+/// Parses a `TRUSTED_PROXIES`-style string into the matcher list `AppState` carries.
+fn trusted(entries: &str) -> Vec<simply_ip_vault::config::ProxyMatcher> {
     let (networks, rejected) = simply_ip_vault::config::parse_trusted_proxies(entries);
     assert!(rejected.is_empty(), "test fixture must use valid proxy entries");
     networks
@@ -1104,13 +1104,88 @@ async fn attack_non_master_cannot_mint_a_master_key() {
         .unwrap();
     assert_eq!(masters.len(), 1, "only the pre-seeded master victim should exist");
 
+    // The other two master-only scopes are each a path *back to* master authority — one mints
+    // co-administrators, the other mints groups whose creator is auto-granted full access — so a
+    // non-master cannot hand either out.
+    for scope in ["can_manage_keys", "can_create_groups"] {
+        let (status, _) = create(json!({ "name": format!("escalated-{scope}"), scope: true })).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "a non-master must not be able to grant '{scope}'"
+        );
+    }
+
     // Control: the same caller can still create an ordinary key, so the scope itself still works.
-    let (status, _) = create(json!({ "name": "ordinary", "can_create_groups": true })).await;
+    // `can_manage_webhooks` remains delegable — it confers no authority over keys or groups and is
+    // bounded by the caller's own group access.
+    let (status, _) = create(json!({ "name": "ordinary", "can_manage_webhooks": true })).await;
     assert_eq!(status, StatusCode::OK, "a non-master may still create non-master keys");
 
-    // An explicit `is_master: false` is not treated as a request for elevation.
-    let (status, _) = create(json!({ "name": "explicitly-not-master", "is_master": false })).await;
+    // An explicit `false` is not treated as a request for elevation.
+    let (status, _) = create(json!({
+        "name": "explicitly-not-master",
+        "is_master": false,
+        "can_manage_keys": false,
+        "can_create_groups": false,
+    }))
+    .await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The same restriction on the update path: a non-master cannot elevate an *existing* key into the
+/// master-only scopes either, which would otherwise be a two-step version of the same escalation.
+#[tokio::test]
+async fn attack_non_master_cannot_elevate_an_existing_key_into_master_scopes() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let (_mid, manager) = insert_key(&db, "Manager", false, true, true, false, None).await;
+    let secret = test_signing_secret(&manager);
+    let (victim_id, _victim) = insert_key(&db, "Ordinary", false, false, false, false, None).await;
+
+    let update = |body: serde_json::Value| {
+        let (app, manager, secret) = (app.clone(), manager.clone(), secret.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/keys/{victim_id}"))
+                        .header("X-API-Key", &manager)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                &body.to_string(),
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    for scope in ["can_manage_keys", "can_create_groups"] {
+        assert_eq!(
+            update(json!({ scope: true })).await,
+            StatusCode::FORBIDDEN,
+            "a non-master must not elevate another key into '{scope}'"
+        );
+    }
+
+    // Delegable scopes and ordinary fields still update normally.
+    assert_eq!(update(json!({ "can_manage_webhooks": true })).await, StatusCode::OK);
+    assert_eq!(update(json!({ "name": "Renamed" })).await, StatusCode::OK);
+
+    // Re-submitting a scope the target already holds is a no-op, not an elevation — an idempotent
+    // PUT from a dashboard that posts every field must not start failing.
+    assert_eq!(update(json!({ "can_manage_webhooks": true })).await, StatusCode::OK);
+
+    let after = simply_ip_vault::entities::prelude::ApiKey::find_by_id(victim_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!after.is_master && !after.can_manage_keys && !after.can_create_groups);
+    assert!(after.can_manage_webhooks, "the delegable scope did land");
 }
 
 /// Rotating a key returns fresh credentials for it. Allowing that against a *master* key handed a
@@ -1603,4 +1678,457 @@ async fn attack_webhook_admin_cannot_reach_groups_it_has_no_access_to() {
     .to_string();
     let (status, _) = as_tenant("POST", "/api/webhooks".to_owned(), own).await;
     assert_eq!(status, StatusCode::OK, "a tenant may still manage webhooks on its own group");
+}
+
+// ─────────────────────────────────────────────────────────────
+// IP record soft delete, restore, hard delete, and 92-day purge
+// ─────────────────────────────────────────────────────────────
+
+/// Seeds an IP record in a group and returns its id.
+async fn insert_ip_record(db: &DatabaseConnection, address: &str, group_id: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    let now = chrono::Utc::now().naive_utc();
+    simply_ip_vault::entities::ip_record::ActiveModel {
+        id: Set(id),
+        target_address: Set(address.to_owned()),
+        cause: Set(Some("seeded".to_owned())),
+        is_locked: Set(false),
+        created_at: Set(now),
+        updated_at: Set(now),
+        last_seen_at: Set(now),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+
+    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+        ip_record_id: Set(id),
+        group_id: Set(group_id),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+
+    id
+}
+
+/// Reads a record straight from the database, bypassing every API-level filter.
+async fn raw_record(
+    db: &DatabaseConnection,
+    id: Uuid,
+) -> Option<simply_ip_vault::entities::ip_record::Model> {
+    simply_ip_vault::entities::prelude::IpRecord::find_by_id(id).one(db).await.unwrap()
+}
+
+/// A non-master's delete must hide the record without destroying it.
+///
+/// The two halves are equally important and are asserted separately: the API must stop returning
+/// it (otherwise "delete" did nothing observable) *and* the row must survive with its attribution
+/// intact (otherwise it is an ordinary delete wearing a different name, and nothing is recoverable).
+#[tokio::test]
+async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let (deleter_id, deleter) = insert_key(&db, "Deleter", false, false, false, false, None).await;
+    let secret = test_signing_secret(&deleter);
+    let group_id = insert_group(&db, "soft-delete-group").await;
+    grant(&db, deleter_id, group_id, true, true, true).await;
+
+    let record_id = insert_ip_record(&db, "198.51.100.10", group_id).await;
+
+    // Visible before the delete.
+    let req = signed(
+        inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", &deleter)),
+        &secret,
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    assert!(String::from_utf8(body.to_vec()).unwrap().contains("198.51.100.10"));
+
+    // Delete.
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/ips/{record_id}"))
+                .header("X-API-Key", &deleter),
+        ),
+        &secret,
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["deleted"], "soft", "a non-master delete must be soft");
+
+    // Half one: the row is still there, flagged and attributed.
+    let row = raw_record(&db, record_id).await.expect("the row must survive a soft delete");
+    assert!(row.is_deleted, "is_deleted must be set");
+    assert!(row.deleted_at.is_some(), "deleted_at must be stamped");
+    assert_eq!(
+        row.deleted_by.as_deref(),
+        Some(deleter_id.to_string().as_str()),
+        "deleted_by must attribute the acting key"
+    );
+    assert_eq!(row.target_address, "198.51.100.10", "the record's data is untouched");
+
+    // Half two: it is gone from every read the caller has.
+    for path in ["/api/ips", "/api/ips?format=iplist", "/api/ips?include_deleted=true"] {
+        let req = signed(
+            inject_connect_info(Request::builder().uri(path).header("X-API-Key", &deleter)),
+            &secret,
+            "",
+        );
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        let text = String::from_utf8(body.to_vec()).unwrap();
+        assert!(
+            !text.contains("198.51.100.10"),
+            "{path} must not expose a soft-deleted record to a non-master (got {text})"
+        );
+    }
+
+    // A non-master cannot escalate to a hard delete by asking for one.
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/ips/{record_id}?hard=true"))
+                .header("X-API-Key", &deleter),
+        ),
+        &secret,
+        "",
+    );
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "hard delete must be master-only"
+    );
+    assert!(raw_record(&db, record_id).await.is_some(), "the row must still be there");
+}
+
+/// A key with no delete permission on any of the record's groups cannot delete it at all.
+#[tokio::test]
+async fn deleting_a_record_requires_delete_permission_on_one_of_its_groups() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let (reader_id, reader) = insert_key(&db, "Reader", false, false, false, false, None).await;
+    let secret = test_signing_secret(&reader);
+    let group_id = insert_group(&db, "read-only-group").await;
+    // Read and write, but explicitly NOT delete.
+    grant(&db, reader_id, group_id, true, true, false).await;
+
+    let record_id = insert_ip_record(&db, "198.51.100.20", group_id).await;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/ips/{record_id}"))
+                .header("X-API-Key", &reader),
+        ),
+        &secret,
+        "",
+    );
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    let row = raw_record(&db, record_id).await.expect("row survives");
+    assert!(!row.is_deleted, "a rejected delete must not have flagged the record");
+}
+
+/// The master's side of the trash: see it, restore it, or destroy it for good.
+#[tokio::test]
+async fn master_can_view_restore_and_hard_delete_soft_deleted_records() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let master = insert_master_key(&db, "Trash Admin").await;
+    let secret = test_signing_secret(&master);
+    let group_id = insert_group(&db, "trash-group").await;
+    let record_id = insert_ip_record(&db, "198.51.100.30", group_id).await;
+
+    let call = |method: &'static str, path: String| {
+        let (app, master, secret) = (app.clone(), master.clone(), secret.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder().method(method).uri(&path).header("X-API-Key", &master),
+                ),
+                &secret,
+                "",
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    let (status, _) = call("DELETE", format!("/api/ips/{record_id}")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Hidden from the default listing even for a master — the trash is opt-in, so a master's
+    // ordinary view is not silently different from everyone else's.
+    let (_, body) = call("GET", "/api/ips".to_owned()).await;
+    assert!(!body.contains("198.51.100.30"), "the default listing hides deleted records");
+
+    // ...and visible with the explicit flag.
+    let (status, body) = call("GET", "/api/ips?include_deleted=true".to_owned()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("198.51.100.30"), "include_deleted must surface the trash");
+    let listed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let row = listed.as_array().unwrap().iter().find(|r| r["target_address"] == "198.51.100.30").unwrap();
+    assert_eq!(row["is_deleted"], true, "the trash view reports the flag");
+    assert!(row["deleted_at"].is_string(), "and when it happened");
+
+    // Restore.
+    let (status, body) = call("POST", format!("/api/ips/{record_id}/restore")).await;
+    assert_eq!(status, StatusCode::OK, "master restore must succeed");
+    assert!(body.contains("\"restored\":true"));
+
+    let row = raw_record(&db, record_id).await.expect("row exists");
+    assert!(!row.is_deleted, "restore clears the flag");
+    assert!(row.deleted_at.is_none(), "restore clears deleted_at");
+    assert!(row.deleted_by.is_none(), "restore clears deleted_by");
+
+    // Back in the normal listing.
+    let (_, body) = call("GET", "/api/ips".to_owned()).await;
+    assert!(body.contains("198.51.100.30"), "a restored record is visible again");
+
+    // Restoring a live record is a no-op error, not a silent success.
+    let (status, _) = call("POST", format!("/api/ips/{record_id}/restore")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "nothing to restore");
+
+    // Hard delete really removes the row.
+    let (status, body) = call("DELETE", format!("/api/ips/{record_id}?hard=true")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("permanent"));
+    assert!(raw_record(&db, record_id).await.is_none(), "hard delete drops the row");
+}
+
+/// Restore is master-only: recovering from a careless or compromised key must not depend on that
+/// same key's authority.
+#[tokio::test]
+async fn restore_and_purge_are_master_only() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    // Every delegated scope short of master.
+    let (id, delegated) = insert_key(&db, "Delegated", false, true, true, true, None).await;
+    let secret = test_signing_secret(&delegated);
+    let group_id = insert_group(&db, "perm-group").await;
+    grant(&db, id, group_id, true, true, true).await;
+    let record_id = insert_ip_record(&db, "198.51.100.40", group_id).await;
+
+    let post = |path: String| {
+        let (app, delegated, secret) = (app.clone(), delegated.clone(), secret.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri(&path)
+                        .header("X-API-Key", &delegated)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                "",
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    assert_eq!(post(format!("/api/ips/{record_id}/restore")).await, StatusCode::FORBIDDEN);
+    assert_eq!(post("/api/system/purge-ips".to_owned()).await, StatusCode::FORBIDDEN);
+}
+
+/// The purge drops records past the retention window and keeps everything else.
+///
+/// Three records with deliberately chosen ages pin the boundary: one well past 92 days (purged),
+/// one just inside it (kept), and one live-but-old (kept, because it was never deleted). The last
+/// is the important one — a purge that filtered on `deleted_at` alone without also checking
+/// `is_deleted` would destroy restored records that kept an old timestamp.
+#[tokio::test]
+async fn purge_removes_only_records_past_the_92_day_retention_window() {
+    use simply_ip_vault::retention::{purge_expired_ip_records, DEFAULT_RETENTION_DAYS};
+
+    let db = setup_test_db().await;
+    let group_id = insert_group(&db, "purge-group").await;
+
+    let expired = insert_ip_record(&db, "203.0.113.1", group_id).await;
+    let recent = insert_ip_record(&db, "203.0.113.2", group_id).await;
+    let live = insert_ip_record(&db, "203.0.113.3", group_id).await;
+
+    let age = |days: i64| (chrono::Utc::now() - chrono::Duration::days(days)).naive_utc();
+
+    let mark_deleted = |id: Uuid, at: chrono::NaiveDateTime, deleted: bool| {
+        let db = db.clone();
+        async move {
+            let record = raw_record(&db, id).await.unwrap();
+            let mut active: simply_ip_vault::entities::ip_record::ActiveModel = record.into();
+            active.is_deleted = Set(deleted);
+            active.deleted_at = Set(Some(at));
+            active.update(&db).await.unwrap();
+        }
+    };
+
+    mark_deleted(expired, age(DEFAULT_RETENTION_DAYS + 1), true).await;
+    mark_deleted(recent, age(DEFAULT_RETENTION_DAYS - 1), true).await;
+    // Deleted long ago, then restored: `is_deleted` is false but the stale timestamp remains.
+    mark_deleted(live, age(DEFAULT_RETENTION_DAYS + 365), false).await;
+
+    let purged = purge_expired_ip_records(&db, DEFAULT_RETENTION_DAYS).await.unwrap();
+    assert_eq!(purged, 1, "exactly the one aged-out record is purged");
+
+    assert!(raw_record(&db, expired).await.is_none(), "the aged-out record is gone");
+    assert!(raw_record(&db, recent).await.is_some(), "a record inside the window is kept");
+    assert!(
+        raw_record(&db, live).await.is_some(),
+        "a restored record must survive regardless of its stale deleted_at"
+    );
+
+    // Cascade: the purged record's group membership went with it, leaving no orphan junction row.
+    let orphans = simply_ip_vault::entities::prelude::IpRecordGroupMembership::find()
+        .filter(
+            simply_ip_vault::entities::ip_record_group_membership::Column::IpRecordId.eq(expired),
+        )
+        .all(&db)
+        .await
+        .unwrap();
+    assert!(orphans.is_empty(), "cascade removed the membership rows");
+
+    // A retention window of 0 disables purging entirely rather than meaning "purge everything".
+    assert_eq!(purge_expired_ip_records(&db, 0).await.unwrap(), 0);
+    assert_eq!(purge_expired_ip_records(&db, -1).await.unwrap(), 0);
+    assert!(raw_record(&db, recent).await.is_some(), "nothing was destroyed by the disabled sweep");
+}
+
+/// The master-only purge endpoint runs the same sweep and reports what it removed.
+#[tokio::test]
+async fn purge_endpoint_reports_the_number_of_records_removed() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let master = insert_master_key(&db, "Purger").await;
+    let secret = test_signing_secret(&master);
+    let group_id = insert_group(&db, "endpoint-purge-group").await;
+    let old = insert_ip_record(&db, "203.0.113.50", group_id).await;
+
+    let record = raw_record(&db, old).await.unwrap();
+    let mut active: simply_ip_vault::entities::ip_record::ActiveModel = record.into();
+    active.is_deleted = Set(true);
+    active.deleted_at = Set(Some((chrono::Utc::now() - chrono::Duration::days(200)).naive_utc()));
+    active.update(&db).await.unwrap();
+
+    let purge = |body: &'static str| {
+        let (app, master, secret) = (app.clone(), master.clone(), secret.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/system/purge-ips")
+                        .header("X-API-Key", &master)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                body,
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    // `older_than_days: 0` would read as "purge everything" — rejected rather than obeyed, because
+    // the destructive reading must never be what a typo selects.
+    let (status, _) = purge(r#"{"older_than_days":0}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = purge(r#"{"older_than_days":-5}"#).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(raw_record(&db, old).await.is_some(), "the rejected purges destroyed nothing");
+
+    // An empty body uses the configured 92-day default.
+    let (status, body) = purge("").await;
+    assert_eq!(status, StatusCode::OK);
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["purged"], 1);
+    assert_eq!(parsed["retention_days"], 92, "the default window is 92 days");
+    assert!(raw_record(&db, old).await.is_none());
+
+    // A second sweep finds nothing left.
+    let (_, body) = purge("").await;
+    let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(parsed["purged"], 0);
+}
+
+/// Re-banning a soft-deleted address must resurrect it rather than colliding with the unique
+/// index. Otherwise an address someone deleted could never be banned again until a master emptied
+/// the trash — a delete would be a denial of service on that address.
+#[tokio::test]
+async fn re_registering_a_soft_deleted_address_restores_it() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let master = insert_master_key(&db, "Rebanner").await;
+    let secret = test_signing_secret(&master);
+    let group_id = insert_group(&db, "reban-group").await;
+    let record_id = insert_ip_record(&db, "203.0.113.77", group_id).await;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/ips/{record_id}"))
+                .header("X-API-Key", &master),
+        ),
+        &secret,
+        "",
+    );
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    assert!(raw_record(&db, record_id).await.unwrap().is_deleted);
+
+    // Ban the same address again.
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ban")
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        &json!({
+            "target_address": "203.0.113.77",
+            "group_name": "reban-group",
+            "cause": "seen again",
+        })
+        .to_string(),
+    );
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "re-banning a soft-deleted address must succeed, not collide with the unique index"
+    );
+
+    let row = raw_record(&db, record_id).await.expect("the same row is reused");
+    assert!(!row.is_deleted, "re-registration clears the deleted flag");
+    assert!(row.deleted_at.is_none(), "...and the retention clock");
+    assert!(row.deleted_by.is_none(), "...and the attribution");
+    assert_eq!(row.cause.as_deref(), Some("seen again"), "the new cause was applied");
 }

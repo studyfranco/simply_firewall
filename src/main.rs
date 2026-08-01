@@ -175,7 +175,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // trusted proxies configured, a deployment that *is* behind a reverse proxy will reject every
     // request from a CIDR-bound key with 403, because every request appears to come from the proxy.
     // That is the safe direction to fail, but only if the operator is told why.
-    let trusted_proxies = simply_ip_vault::config::trusted_proxies_from_env();
+    let trusted_proxies = simply_ip_vault::config::TrustedProxies::from_env();
     if trusted_proxies.is_empty() {
         tracing::warn!(
             "{} is not set: X-Forwarded-For and X-Real-IP are IGNORED and every key is matched \
@@ -185,10 +185,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     } else {
         tracing::info!(
-            "{} is set: forwarding headers are honoured from {} network(s): {:?}",
+            "{} is set: forwarding headers are honoured from {} matcher(s): {:?}",
             simply_ip_vault::config::TRUSTED_PROXIES_ENV,
-            trusted_proxies.len(),
-            trusted_proxies
+            trusted_proxies.matchers().len(),
+            trusted_proxies.matchers()
         );
     }
 
@@ -197,10 +197,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     opt.sqlx_logging_level(log::LevelFilter::Debug);
     let db: DatabaseConnection = Database::connect(opt).await?;
 
+    // Before migrations: the migration itself writes, and should already benefit from WAL and the
+    // busy timeout rather than being the one write that still takes an exclusive lock.
+    simply_ip_vault::state::apply_sqlite_pragmas(&db).await?;
+
     tracing::info!("Running database migrations...");
     migration::Migrator::up(&db, None).await?;
 
     bootstrap_master_key(&db).await?;
+
+    // Retention sweep for soft-deleted IP records. Its own shutdown channel, so it drains on
+    // SIGTERM instead of being cancelled mid-delete.
+    let (retention_tx, retention_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let retention_db = db.clone();
+    let retention_handle = tokio::spawn(async move {
+        simply_ip_vault::retention::run_retention_worker(retention_db, retention_rx).await;
+    });
 
     let (state, tx, worker_handle) = setup_state(db);
 
@@ -217,9 +229,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .with_graceful_shutdown(shutdown_signal())
     .await?;
 
-    tracing::info!("Stopping webhook worker...");
+    tracing::info!("Stopping background workers...");
     drop(tx);
+    drop(retention_tx);
     let _ = worker_handle.await;
+    let _ = retention_handle.await;
 
     tracing::info!("Graceful shutdown complete.");
     Ok(())

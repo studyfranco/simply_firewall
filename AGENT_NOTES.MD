@@ -2670,3 +2670,157 @@ alias is Linux-specific.
 Every escalation test carries a **positive control against a non-master target** — a guard that
 returned 403 unconditionally would pass the attack assertions while having broken key administration
 outright, and only the control catches that.
+
+## 2026-08-01 (session 23) — Dynamic proxy resolution, IP soft delete + 92-day purge, SQLite WAL
+
+### Scope
+
+Completes the security parity pass against `simply_hook_executor` (now vendored at
+`example/simply_hook_executor/` and audited directly) and adds the operational features the vault
+was missing: recoverable IP deletion, container-friendly proxy trust, and SQLite concurrency
+settings. Sessions 21–22 did the bulk of the security work; this session extends it rather than
+repeating it.
+
+### 1. `TRUSTED_PROXIES` now accepts hostnames, resolved at request time
+
+The reference implementation parses `TRUSTED_PROXIES` as IPs and CIDRs only. That is fine for a
+static deployment and useless in Docker or Kubernetes, where the proxy's address is assigned by the
+orchestrator and changes on every recreate while its *name* is stable. Pinning a CIDR wide enough to
+cover the whole bridge network re-opens the bypass for every container on it.
+
+`ProxyMatcher` is now either a `Network` or a `Hostname`. Resolution happens in
+`TrustedProxies::contains`, which is `async`, with a 30-second cache keyed on the name. The TTL is a
+deliberate compromise: a recreated container is over-trusted at its *old* address for up to 30s and
+under-trusted at its new one for the same window. Both windows are small; making the cache longer
+trades safety for fewer lookups, and making it shorter puts a DNS round-trip on the request path.
+
+**Divergence from the reference, kept on purpose:** the reference takes the rightmost
+`X-Forwarded-For` entry unconditionally. This implementation walks the chain right-to-left *skipping
+entries that are themselves trusted proxies*. In the single-proxy case the two are identical; with
+chained proxies (`client → P1 → P2 → us`) the reference resolves to `P1` — a proxy — while this
+resolves to `client`. The *validation* rule the task asked to match is identical: the peer, and only
+the peer, decides whether a forwarding header is evidence.
+
+The chain walk deliberately consults only *literal* networks (`is_literal_network`), never hostnames.
+It runs per header entry, and firing a DNS lookup for each would put resolution latency on the
+request path for no security gain — the decision that matters was already made by `contains`. The
+consequence is narrow and conservative: a chained hop identified only by hostname is treated as a
+client rather than skipped, resolving to that hop instead of the one behind it. It never trusts an
+address further left than it should.
+
+Parsing changed shape as a result. Anything that is not an address or CIDR but *could* be a DNS name
+now becomes a hostname matcher, so a typo is no longer dropped at parse time — it becomes a name that
+never resolves, which fails in the same safe direction. Only shapes that cannot be a hostname are
+rejected outright, and `is_plausible_hostname` specifically rejects anything containing `/` so a
+near-miss CIDR like `10.0.0.0/99` surfaces as a configuration error instead of silently becoming a
+nonsense hostname.
+
+### 2. RBAC: three scopes are now master-only to grant
+
+Session 22 blocked minting `is_master`. This extends it to `can_manage_keys` and `can_create_groups`
+on both the create and update paths, because each is a *path back to* master authority rather than a
+leaf capability: the first mints co-administrators, the second mints groups whose creator is
+auto-granted full read/write/delete (`AGENT.MD` §2), which is the one way to obtain group access
+without a master signing off.
+
+`can_manage_webhooks` is deliberately **not** on the list — it confers no authority over keys or
+groups and is bounded by the caller's own group access, so a delegated key manager can still hand it
+out. Without that exception the delegated role would have nothing left to delegate.
+
+`guard_scope_elevation` compares against the target's *current* values, so re-submitting a scope a
+key already holds is a no-op rather than a rejection. That matters for an idempotent `PUT` from a
+dashboard that posts every field on every save.
+
+### 3. Webhook repointing: privileged webhooks are master-only
+
+Session 22 forced `secret_token` rotation on any `target_url`/`hmac_template` change. That is
+sufficient when the only credential is the vault's own secret. It is *not* sufficient for a webhook
+carrying an `api_key`: that credential belongs to the receiving system (instance chaining,
+`AGENT.MD` §4), so rotating our secret does not invalidate it, and repointing aims a working remote
+credential at a destination of the editor's choosing.
+
+So for webhooks with a non-empty `api_key`, changing `target_url` or `hmac_template` now requires
+master. Everything else about them — name, payload template, event filter, enabled/disabled — stays
+editable by any `can_manage_webhooks` holder, and non-privileged webhooks are unaffected. Forced
+rotation still applies on top, for both.
+
+### 4. IP records: soft delete, master trash, 92-day purge
+
+Migration `m20260801_000005` adds `is_deleted` / `deleted_at` / `deleted_by`, both flags indexed.
+`deleted_by` is `TEXT` holding the acting key's UUID rather than a foreign key — a FK would either
+block deleting that key later or null the attribution out via `ON DELETE SET NULL`, and the point of
+an attribution field is that it survives the actor.
+
+New `DELETE /api/ips/{id}` is **record-level** and distinct from the existing `DELETE /api/ips`
+(query/body), which removes a membership in one group and leaves the record alone. Both still exist;
+`AGENT.MD` §3 mandates the latter's flexible query/body contract.
+
+A non-master can only ever soft-delete. The reasoning: `can_delete` on a group is a routine,
+widely-handed-out scope, and the blast radius of it being misused — or of the key being stolen —
+should be a recoverable mistake rather than permanent data loss. Making destruction master-only costs
+a legitimate operator one extra step and costs an attacker the ability to cover their tracks.
+
+Three details that are easy to get wrong and are pinned by tests:
+
+- **The purge matches on `is_deleted = true` AND `deleted_at < threshold`, not the timestamp alone.**
+  A restored record keeps no `deleted_at` (restore clears all three columns), but a hand-edited row
+  or a future code path could leave one set — and filtering on the timestamp alone would then destroy
+  live data. `purge_removes_only_records_past_the_92_day_retention_window` seeds exactly that row.
+- **Re-registering a soft-deleted address resurrects it.** `target_address` is unique, so without
+  this a delete would permanently deny that address until a master emptied the trash — a delete
+  would function as a denial of service on the address.
+- **A repeated soft delete does not move `deleted_at`.** Otherwise a caller could keep a record out
+  of the purge indefinitely by re-deleting it.
+
+`POST /api/system/purge-ips` rejects `older_than_days: 0` rather than treating it as "purge
+everything": the difference between "empty the trash" and "empty the trash older than zero days" is
+one character, and the destructive reading should never be what a typo selects. (`IP_RETENTION_DAYS=0`
+in the *environment* does mean "disable purging", which is the opposite default and safe.)
+
+### 5. SQLite WAL mode and busy timeout
+
+`state::apply_sqlite_pragmas` sets `journal_mode=WAL` and `busy_timeout=5000`, guarded on
+`get_database_backend() == Sqlite` rather than on the URL string. Called *before* migrations, so the
+migration writes benefit too.
+
+This is the one deliberate exception to the SQL-agnostic rule in `AGENT.MD`: `PRAGMA` is a syntax
+error on PostgreSQL and MySQL. It configures the *engine*, not a query, and every other backend skips
+it entirely. The applied `journal_mode` is read back and logged rather than assumed — it legitimately
+comes back as `memory` for `sqlite::memory:` (which is what the whole test suite uses), and an
+operator debugging lock contention needs to know which mode is actually in force.
+
+### Tests
+
+| Suite | Before | After |
+| :--- | :--- | :--- |
+| `cargo test` | 97 | 110 (31 unit + 54 RBAC + 25 security) |
+| `scripts/test_e2e.sh` | 309 | 360 |
+
+`clippy --all-targets -- -D warnings` is clean.
+
+**The E2E run now sets `TRUSTED_PROXIES="localhost"` rather than `127.0.0.1`** — spelled as a
+hostname on purpose, so the whole suite's proxy-dependent checks exercise the dynamic DNS path
+against a real resolver end to end, not just the literal-CIDR path the unit tests cover. It still
+resolves to `127.0.0.1` and still deliberately excludes `127.0.0.2`, which §6b connects from via
+`curl --interface` to prove the untrusted-peer rejection.
+
+**One pre-existing E2E flake fixed, not papered over.** `a 301s-future timestamp is rejected` captured
+`NOW_TS` once near the top of the script and asserted `NOW_TS + 301` was rejected. Elapsed wall-clock
+time moves a *future* timestamp toward the window (at one second elapsed the skew is 300, which is
+legitimately inside it), so the check only passed when the request landed in the same second the
+timestamp was captured. It now captures fresh immediately before the call and uses a margin clear of
+the boundary. The stale direction keeps `301` unchanged — a stale timestamp only gets staler, so it
+can never drift back inside. The exact ±300/±301 edge stays pinned deterministically in
+`tests/security_tests.rs`, where the request is handled in-process microseconds after the timestamp
+is chosen; E2E asserts the behaviour, not the boundary.
+
+Two other existing tests needed updating, both because they encoded assumptions this session
+invalidated rather than because they broke:
+
+- `attack_non_master_cannot_mint_a_master_key`'s control granted `can_create_groups`, which is now
+  master-only; it uses `can_manage_webhooks` instead and gained explicit coverage of the two newly
+  restricted scopes.
+- `test_auth_mode_migration_preserves_existing_rows_and_reverses_cleanly` called
+  `Migrator::down(Some(1))`, which unwinds from the *newest* migration — so adding the soft-delete
+  migration silently retargeted it. It now derives the step count by locating the auth-mode migration
+  in the registry by name, so future migrations cannot turn it into a test of something else.

@@ -30,6 +30,24 @@ pub struct Model {
     pub updated_at: DateTime,
     /// Timestamp of last re-registration or recorded activity.
     pub last_seen_at: DateTime,
+    /// Whether the record has been soft-deleted.
+    ///
+    /// A soft-deleted record is hidden from every normal read and from webhook dispatch, but the
+    /// row survives for the retention window in [`crate::retention`] so a master key can inspect or
+    /// restore it. `NOT NULL` with a `false` default: there is no "unknown" state, and a nullable
+    /// flag would make every read filter spell out `IS NULL OR = false`.
+    pub is_deleted: bool,
+    /// When the soft delete happened; `None` while the record is live.
+    ///
+    /// This — not `updated_at` — is what the 92-day purge measures against, so restoring and
+    /// re-deleting a record restarts its retention window rather than inheriting an old one.
+    pub deleted_at: Option<DateTime>,
+    /// The `api_keys.id` of whoever soft-deleted the record, as text; `None` while live.
+    ///
+    /// Stored as text rather than a foreign key so the attribution outlives the key that performed
+    /// the deletion — a FK would either block deleting that key or null this out, and an
+    /// attribution that disappears with its actor is not an attribution.
+    pub deleted_by: Option<String>,
 }
 
 /// Relations from `ip_records` to other entities.

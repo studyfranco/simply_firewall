@@ -599,6 +599,9 @@ async fn test_multi_group_and_temporal_filtering() {
         created_at: Set(old_time),
         updated_at: Set(old_time),
         last_seen_at: Set(old_time),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
     }
     .insert(&db)
     .await
@@ -3150,8 +3153,18 @@ async fn test_auth_mode_migration_preserves_existing_rows_and_reverses_cleanly()
           VALUES ('w', 'legacy', 'https://example.com/hook', 's', 'BODY_ONLY', '{}', 'g', 1, '2026-01-01 00:00:00')")
         .await.unwrap();
 
-    // Reverse the auth-mode migration: the row must reappear under the old column, still BODY_ONLY.
-    migration::Migrator::down(&db, Some(1)).await.unwrap();
+    // Reverse *back through* the auth-mode migration. The step count is derived from the registry
+    // rather than hardcoded: `down` always unwinds from the newest migration, so every migration
+    // added after this one shifts how far back the auth-mode change sits. Computing it here means
+    // adding a migration cannot silently turn this into a test of something else.
+    let all = migration::Migrator::migrations();
+    let auth_mode_index = all
+        .iter()
+        .position(|m| m.name().contains("add_webhook_auth_modes"))
+        .expect("the auth-mode migration must be registered");
+    let steps = (all.len() - auth_mode_index) as u32;
+
+    migration::Migrator::down(&db, Some(steps)).await.unwrap();
     let row = db.query_one_raw(Statement::from_string(backend,
         "SELECT signature_mode FROM webhook_configs WHERE id = 'w'".to_owned())).await.unwrap().unwrap();
     assert_eq!(row.try_get::<String>("", "signature_mode").unwrap(), "BODY_ONLY");

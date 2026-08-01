@@ -18,6 +18,7 @@ pub mod entities;
 pub mod error;
 pub mod middleware;
 pub mod migration;
+pub mod retention;
 pub mod state;
 pub mod webhooks;
 
@@ -30,6 +31,11 @@ pub fn create_app(state: AppState) -> Router {
         .route("/auth/me", get(api::get_me))
         .route("/ips", get(api::list_ips))
         .route("/ips", delete(api::delete_ip))
+        // Record-level lifecycle, distinct from the group-scoped `DELETE /ips` above: this acts on
+        // the record as a whole and soft-deletes by default.
+        .route("/ips/{id}", delete(api::delete_ip_record))
+        .route("/ips/{id}/restore", post(api::restore_ip_record))
+        .route("/system/purge-ips", post(api::purge_ip_records))
         .route("/ban", post(api::handle_ban))
         .route("/white", post(api::handle_white))
         // Admin endpoints
