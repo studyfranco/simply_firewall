@@ -13,7 +13,10 @@ use axum::{
     body::Body,
     http::{Request, StatusCode},
 };
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, Database, DatabaseConnection};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
+    QueryFilter,
+};
 use sea_orm_migration::MigratorTrait;
 use serde_json::json;
 use tower::ServiceExt;
@@ -39,10 +42,98 @@ fn inject_connect_info(req: axum::http::request::Builder) -> axum::http::request
     ))))
 }
 
+/// Injects an explicit TCP peer address, standing in for what the kernel reports.
+///
+/// This is the value an attacker **cannot** control. Everything the spoofing tests turn on is the
+/// difference between it and the headers a client writes freely.
+fn connect_from(req: axum::http::request::Builder, peer: &str) -> axum::http::request::Builder {
+    let ip: std::net::IpAddr = peer.parse().expect("test peer literal parses");
+    req.extension(axum::extract::ConnectInfo(std::net::SocketAddr::new(ip, 40000)))
+}
+
+/// Parses a `TRUSTED_PROXIES`-style string into the list `AppState` carries.
+fn trusted(entries: &str) -> Vec<ipnetwork::IpNetwork> {
+    let (networks, rejected) = simply_ip_vault::config::parse_trusted_proxies(entries);
+    assert!(rejected.is_empty(), "test fixture must use valid proxy entries");
+    networks
+}
+
 /// Test-only convention mirroring the RBAC suite: a seeded key's signing secret is derived from its
 /// plaintext API key.
 fn test_signing_secret(api_key: &str) -> String {
     format!("signing-secret-for-{api_key}")
+}
+
+/// Seeds an API key with explicit scopes and an optional `bound_ips`, returning `(id, plaintext)`.
+#[allow(clippy::too_many_arguments)]
+async fn insert_key(
+    db: &DatabaseConnection,
+    name: &str,
+    is_master: bool,
+    can_manage_keys: bool,
+    can_manage_webhooks: bool,
+    can_create_groups: bool,
+    bound_ips: Option<&str>,
+) -> (Uuid, String) {
+    let id = Uuid::new_v4();
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    simply_ip_vault::entities::api_key::ActiveModel {
+        id: Set(id),
+        key_hash: Set(simply_ip_vault::api::hash_key(&plaintext)),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        name: Set(name.to_owned()),
+        bound_ips: Set(bound_ips.map(str::to_owned)),
+        is_master: Set(is_master),
+        can_manage_keys: Set(can_manage_keys),
+        can_manage_webhooks: Set(can_manage_webhooks),
+        can_create_groups: Set(can_create_groups),
+        prefix: Set("sectest2".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    (id, plaintext)
+}
+
+/// Seeds an IP group and returns its id.
+async fn insert_group(db: &DatabaseConnection, name: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_group::ActiveModel {
+        id: Set(id),
+        name: Set(name.to_owned()),
+        group_type: Set("banlist".to_owned()),
+        description: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+    id
+}
+
+/// Grants a key explicit read/write/delete on a group.
+async fn grant(
+    db: &DatabaseConnection,
+    key_id: Uuid,
+    group_id: Uuid,
+    read: bool,
+    write: bool,
+    del: bool,
+) {
+    simply_ip_vault::entities::api_key_group_permission::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        api_key_id: Set(key_id),
+        group_id: Set(group_id),
+        can_read: Set(read),
+        can_write: Set(write),
+        can_delete: Set(del),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(db)
+    .await
+    .unwrap();
 }
 
 /// Seeds a master API key directly into the database and returns its plaintext form.
@@ -114,7 +205,7 @@ fn signed(builder: axum::http::request::Builder, secret: &str, body: &str) -> Re
 async fn attack_timestamp_forgery_outside_the_window_is_rejected_both_directions() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState { db: db.clone(), webhook_tx });
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
 
     let key = insert_master_key(&db, "Replay Attacker").await;
     let secret = test_signing_secret(&key);
@@ -168,7 +259,7 @@ async fn attack_timestamp_forgery_outside_the_window_is_rejected_both_directions
 async fn attack_omitting_the_timestamp_header_does_not_skip_the_replay_check() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState { db: db.clone(), webhook_tx });
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
 
     let key = insert_master_key(&db, "No Timestamp").await;
     let secret = test_signing_secret(&key);
@@ -236,7 +327,7 @@ fn flip_last_hex_digit(signature: &str) -> String {
 async fn attack_signature_forgery_by_last_character_flip_is_rejected() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState { db: db.clone(), webhook_tx });
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
 
     let key = insert_master_key(&db, "Forger").await;
     let secret = test_signing_secret(&key);
@@ -414,7 +505,7 @@ async fn attack_hmac_template_injection_via_payload_body_cannot_forge_canonical_
     tokio::spawn(async move {
         simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
-    let app = create_app(AppState { db: db.clone(), webhook_tx });
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
 
     let key = insert_master_key(&db, "Injection Tester").await;
     let secret = test_signing_secret(&key);
@@ -593,7 +684,7 @@ fn attack_template_resolution_never_rescans_substituted_values() {
 async fn attack_canonical_v1_webhook_without_a_secret_is_rejected() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState { db: db.clone(), webhook_tx });
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
 
     let key = insert_master_key(&db, "Webhook Admin").await;
     let secret = test_signing_secret(&key);
@@ -710,7 +801,7 @@ async fn attack_canonical_v1_webhook_without_a_secret_is_rejected() {
 async fn attack_webhook_secret_is_not_recoverable_from_read_endpoints() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState { db: db.clone(), webhook_tx });
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
 
     let key = insert_master_key(&db, "Reader").await;
     let secret = test_signing_secret(&key);
@@ -767,4 +858,749 @@ async fn attack_webhook_secret_is_not_recoverable_from_read_endpoints() {
     let listing = String::from_utf8(listing.to_vec()).unwrap();
     assert!(!listing.contains(hook_secret), "GET /api/webhooks leaked secret_token");
     assert!(!listing.contains(downstream_key), "GET /api/webhooks leaked api_key");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Attack 5 — X-Forwarded-For spoofing against bound_ips
+// ─────────────────────────────────────────────────────────────
+
+/// The headline IP-spoofing attack: a key restricted to a CIDR must not be usable from outside it
+/// merely by claiming an allowed address in a header.
+///
+/// `X-Forwarded-For` is an ordinary request header — anyone can send any value. Honouring it from
+/// an arbitrary peer turns `bound_ips` from a network restriction into a self-asserted one, i.e.
+/// into no restriction at all. The peer address in `connect_from` is the part the attacker cannot
+/// forge, and it is the only thing that may decide whether the header is believed.
+#[tokio::test]
+async fn attack_spoofed_forwarded_for_from_an_untrusted_peer_cannot_bypass_bound_ips() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    // A proxy IS configured — but not the attacker's. The check is per-peer, not
+    // "is anything configured at all".
+    let app = create_app(AppState::with_trusted_proxies(
+        db.clone(),
+        webhook_tx,
+        trusted("10.0.0.0/8"),
+    ));
+
+    let (_id, key) = insert_key(&db, "Bound", false, false, false, false, Some("192.168.1.0/24")).await;
+    let secret = test_signing_secret(&key);
+
+    let probe = |peer: &'static str, xff: Option<&'static str>, real_ip: Option<&'static str>| {
+        let (app, key, secret) = (app.clone(), key.clone(), secret.clone());
+        async move {
+            let mut builder =
+                connect_from(Request::builder().uri("/api/auth/me").header("X-API-Key", &key), peer);
+            if let Some(v) = xff {
+                builder = builder.header("X-Forwarded-For", v);
+            }
+            if let Some(v) = real_ip {
+                builder = builder.header("X-Real-IP", v);
+            }
+            app.oneshot(signed(builder, &secret, "")).await.unwrap().status()
+        }
+    };
+
+    // Control: from an address genuinely inside the bound CIDR, with no headers at all, it works.
+    // Without this the assertions below could all be passing for an unrelated reason.
+    assert_eq!(probe("192.168.1.50", None, None).await, StatusCode::OK);
+
+    // The attack: an untrusted peer claiming to be inside the bound CIDR.
+    assert_eq!(
+        probe("203.0.113.9", Some("192.168.1.50"), None).await,
+        StatusCode::FORBIDDEN,
+        "a spoofed X-Forwarded-For from an untrusted peer must not satisfy bound_ips"
+    );
+    assert_eq!(
+        probe("203.0.113.9", None, Some("192.168.1.50")).await,
+        StatusCode::FORBIDDEN,
+        "a spoofed X-Real-IP from an untrusted peer must not satisfy bound_ips"
+    );
+    assert_eq!(
+        probe("203.0.113.9", Some("192.168.1.50"), Some("192.168.1.50")).await,
+        StatusCode::FORBIDDEN,
+        "sending both spoofed headers must not satisfy bound_ips either"
+    );
+
+    // Claiming to *be* the trusted proxy does not make the claim believable — trust is decided by
+    // the peer address, never by the header's contents.
+    assert_eq!(
+        probe("203.0.113.9", Some("10.0.0.1, 192.168.1.50"), None).await,
+        StatusCode::FORBIDDEN,
+        "impersonating a trusted proxy inside the header must not bootstrap trust"
+    );
+
+    // A multi-hop chain forged entirely by the client is equally inert.
+    assert_eq!(
+        probe("203.0.113.9", Some("192.168.1.50, 192.168.1.51, 192.168.1.52"), None).await,
+        StatusCode::FORBIDDEN,
+        "a fully forged proxy chain must not satisfy bound_ips"
+    );
+}
+
+/// The other half of the contract: from a peer that genuinely *is* a configured proxy, the header
+/// is honoured — otherwise the fix would simply have broken every proxied deployment.
+#[tokio::test]
+async fn forwarded_for_is_honoured_from_a_configured_trusted_proxy() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(
+        db.clone(),
+        webhook_tx,
+        trusted("10.0.0.0/8"),
+    ));
+
+    let (_id, key) = insert_key(&db, "Proxied", false, false, false, false, Some("192.168.1.0/24")).await;
+    let secret = test_signing_secret(&key);
+
+    let probe = |peer: &'static str, xff: &'static str| {
+        let (app, key, secret) = (app.clone(), key.clone(), secret.clone());
+        async move {
+            let req = signed(
+                connect_from(
+                    Request::builder().uri("/api/auth/me").header("X-API-Key", &key),
+                    peer,
+                )
+                .header("X-Forwarded-For", xff),
+                &secret,
+                "",
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    // The trusted proxy declares an in-CIDR client.
+    assert_eq!(probe("10.0.0.1", "192.168.1.50").await, StatusCode::OK);
+
+    // A client-supplied prefix is ignored in favour of the proxy-appended rightmost entry, so a
+    // client behind the proxy still cannot forge its way in.
+    assert_eq!(
+        probe("10.0.0.1", "192.168.1.50, 203.0.113.9").await,
+        StatusCode::FORBIDDEN,
+        "the rightmost (proxy-appended) hop wins over a client-supplied prefix"
+    );
+
+    // ...and the reverse ordering resolves to the real client.
+    assert_eq!(probe("10.0.0.1", "203.0.113.9, 192.168.1.50").await, StatusCode::OK);
+
+    // A chained trusted hop is skipped, exposing the genuine client behind it.
+    assert_eq!(probe("10.0.0.1", "192.168.1.50, 10.0.0.2").await, StatusCode::OK);
+}
+
+/// A master key with a configured `bound_ips` must be held to it like any other key.
+///
+/// The previous `!key.is_master` bypass made the single most powerful credential in the system the
+/// only one whose network restriction was decorative — and silently ignored a restriction an
+/// operator had explicitly set, which is worse than not offering the field at all.
+#[tokio::test]
+async fn attack_master_key_is_not_exempt_from_its_bound_ips() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let (_id, bound_master) =
+        insert_key(&db, "Bound Master", true, true, true, true, Some("192.168.1.0/24")).await;
+    let bound_secret = test_signing_secret(&bound_master);
+
+    let call = |key: String, secret: String, peer: &'static str| {
+        let app = app.clone();
+        async move {
+            let req = signed(
+                connect_from(
+                    Request::builder().uri("/api/auth/me").header("X-API-Key", &key),
+                    peer,
+                ),
+                &secret,
+                "",
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    // From inside its bound network the master key works normally.
+    assert_eq!(
+        call(bound_master.clone(), bound_secret.clone(), "192.168.1.50").await,
+        StatusCode::OK
+    );
+
+    // From outside it, master status is no longer an exemption.
+    assert_eq!(
+        call(bound_master.clone(), bound_secret.clone(), "203.0.113.9").await,
+        StatusCode::FORBIDDEN,
+        "a master key with bound_ips set must be rejected outside that CIDR"
+    );
+
+    // A master key with *no* bound_ips is still unrestricted — an empty column means "no
+    // restriction configured", not "restrict to nothing".
+    let (_id2, free_master) = insert_key(&db, "Free Master", true, true, true, true, None).await;
+    assert_eq!(
+        call(free_master.clone(), test_signing_secret(&free_master), "203.0.113.9").await,
+        StatusCode::OK,
+        "a key without bound_ips stays unrestricted"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Attack 6 — Master privilege escalation via key administration
+// ─────────────────────────────────────────────────────────────
+
+/// Builds a `can_manage_keys` (but non-master) caller plus a master victim, and returns the app.
+async fn escalation_fixture(
+    db: &DatabaseConnection,
+) -> (axum::Router, String, String, Uuid, Uuid) {
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let (manager_id, manager) = insert_key(db, "Key Manager", false, true, true, true, None).await;
+    let (victim_id, _victim) = insert_key(db, "Master Victim", true, true, true, true, None).await;
+
+    let secret = test_signing_secret(&manager);
+    (app, manager, secret, manager_id, victim_id)
+}
+
+/// `can_manage_keys` must not be a route to `is_master`.
+///
+/// Minting a master key returns its plaintext in the very same response, so accepting
+/// `is_master: true` from a non-master was a single-request escalation from a delegated scope to
+/// full control of the system.
+#[tokio::test]
+async fn attack_non_master_cannot_mint_a_master_key() {
+    let db = setup_test_db().await;
+    let (app, manager, secret, _mid, _vid) = escalation_fixture(&db).await;
+
+    let create = |body: serde_json::Value| {
+        let (app, manager, secret) = (app.clone(), manager.clone(), secret.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/keys")
+                        .header("X-API-Key", &manager)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                &body.to_string(),
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+    };
+
+    let (status, body) = create(json!({ "name": "escalated", "is_master": true })).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a non-master must not be able to create a master key (got body {body})"
+    );
+
+    // Nothing was written — the rejection happens before the insert, so no orphan key is left over.
+    let masters = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::IsMaster.eq(true))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(masters.len(), 1, "only the pre-seeded master victim should exist");
+
+    // Control: the same caller can still create an ordinary key, so the scope itself still works.
+    let (status, _) = create(json!({ "name": "ordinary", "can_create_groups": true })).await;
+    assert_eq!(status, StatusCode::OK, "a non-master may still create non-master keys");
+
+    // An explicit `is_master: false` is not treated as a request for elevation.
+    let (status, _) = create(json!({ "name": "explicitly-not-master", "is_master": false })).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+/// Rotating a key returns fresh credentials for it. Allowing that against a *master* key handed a
+/// non-master complete, immediate takeover of the master credential — the single most direct
+/// escalation path in the system.
+#[tokio::test]
+async fn attack_non_master_cannot_rotate_or_destroy_a_master_key() {
+    let db = setup_test_db().await;
+    let (app, manager, secret, manager_id, victim_id) = escalation_fixture(&db).await;
+
+    let call = |method: &'static str, path: String, body: &'static str| {
+        let (app, manager, secret) = (app.clone(), manager.clone(), secret.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method(method)
+                        .uri(&path)
+                        .header("X-API-Key", &manager)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                body,
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    // Full rotation — would have returned a working master API key *and* signing secret.
+    let (status, body) = call("POST", format!("/api/keys/{victim_id}/rotate"), "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-master rotated a master key");
+    assert!(
+        !body.contains("plaintext_key") && !body.contains("signing_secret"),
+        "the rejection must not leak credentials, got {body}"
+    );
+
+    // Signing-secret-only rotation — same takeover, narrower blast radius.
+    let (status, body) = call("POST", format!("/api/keys/{victim_id}/rotate-secret"), "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-master rotated a master key's signing secret");
+    assert!(!body.contains("signing_secret"), "the rejection must not leak a secret, got {body}");
+
+    // Relocating a master key's network binding to the attacker's own range.
+    let (status, _) = call(
+        "PUT",
+        format!("/api/keys/{victim_id}"),
+        r#"{"bound_ips":"203.0.113.0/24"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-master rewrote a master key's bound_ips");
+
+    // Removing the master keys that would otherwise contain the incident.
+    let (status, _) = call("DELETE", format!("/api/keys/{victim_id}"), "").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "non-master deleted a master key");
+
+    // The victim is untouched: still master, still holding its original signing secret.
+    let victim = simply_ip_vault::entities::prelude::ApiKey::find_by_id(victim_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the master key must still exist");
+    assert!(victim.is_master);
+
+    // Control: the same operations against a *non-master* target still succeed, so the guard is
+    // scoped to master targets rather than having disabled key administration outright.
+    let (other_id, _other) = insert_key(&db, "Ordinary", false, false, false, false, None).await;
+    let (status, _) = call("POST", format!("/api/keys/{other_id}/rotate"), "").await;
+    assert_eq!(status, StatusCode::OK, "rotating a non-master key must still work");
+    let (status, _) = call("DELETE", format!("/api/keys/{other_id}"), "").await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "deleting a non-master key must still work");
+
+    // ...and the caller can still rotate itself.
+    let (status, _) = call("POST", format!("/api/keys/{manager_id}/rotate-secret"), "").await;
+    assert_eq!(status, StatusCode::OK, "a key may still re-key itself");
+}
+
+/// A key must not be able to widen its own global scopes through the generic update endpoint.
+#[tokio::test]
+async fn attack_non_master_cannot_widen_its_own_scopes() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    // Holds only `can_manage_keys`.
+    let (self_id, key) = insert_key(&db, "Self Escalator", false, true, false, false, None).await;
+    let secret = test_signing_secret(&key);
+
+    let update = |target: Uuid, body: String| {
+        let (app, key, secret) = (app.clone(), key.clone(), secret.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/keys/{target}"))
+                        .header("X-API-Key", &key)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                &body,
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    assert_eq!(
+        update(self_id, r#"{"can_manage_webhooks":true}"#.to_owned()).await,
+        StatusCode::FORBIDDEN,
+        "a key must not grant itself can_manage_webhooks"
+    );
+    assert_eq!(
+        update(self_id, r#"{"can_create_groups":true}"#.to_owned()).await,
+        StatusCode::FORBIDDEN,
+        "a key must not grant itself can_create_groups"
+    );
+
+    // Narrowing its own scopes is not an escalation and stays allowed.
+    assert_eq!(
+        update(self_id, r#"{"can_manage_keys":false}"#.to_owned()).await,
+        StatusCode::OK,
+        "dropping a scope you already hold is not an escalation"
+    );
+
+    let after = simply_ip_vault::entities::prelude::ApiKey::find_by_id(self_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!after.can_manage_webhooks && !after.can_create_groups, "no scope was widened");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Attack 7 — Self-granting and over-granting group permissions
+// ─────────────────────────────────────────────────────────────
+
+/// A caller must not be able to widen its own group access, nor hand out access it does not hold.
+///
+/// Without this, per-group RBAC was advisory: any `can_manage_keys` holder could grant itself — or a
+/// second key it controls — full read/write/delete over every group in the system.
+#[tokio::test]
+async fn attack_cannot_self_grant_or_over_grant_group_permissions() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let (caller_id, caller) = insert_key(&db, "Granter", false, true, false, false, None).await;
+    let (accomplice_id, _accomplice) = insert_key(&db, "Accomplice", false, false, false, false, None).await;
+    let secret = test_signing_secret(&caller);
+
+    let own_group = insert_group(&db, "own-group").await;
+    let foreign_group = insert_group(&db, "foreign-group").await;
+    // The caller can read and write its own group, but cannot delete in it.
+    grant(&db, caller_id, own_group, true, true, false).await;
+
+    // `group_id` is a plain string (it doubles as a name), and all three verbs are required fields.
+    let post = |target: Uuid, group: Uuid, read: bool, write: bool, del: bool| {
+        let (app, caller, secret) = (app.clone(), caller.clone(), secret.clone());
+        async move {
+            let body = json!({
+                "group_id": group.to_string(),
+                "can_read": read,
+                "can_write": write,
+                "can_delete": del,
+            });
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri(format!("/api/keys/{target}/permissions"))
+                        .header("X-API-Key", &caller)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                &body.to_string(),
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    // Self-granting is refused outright, even for a group the caller can already read.
+    assert_eq!(
+        post(caller_id, own_group, true, false, false).await,
+        StatusCode::FORBIDDEN,
+        "a key must not modify its own group permissions"
+    );
+    assert_eq!(
+        post(caller_id, foreign_group, true, false, false).await,
+        StatusCode::FORBIDDEN,
+        "a key must not grant itself access to a group it cannot reach"
+    );
+
+    // Granting a third party access to a group the caller cannot reach is refused too — otherwise
+    // the accomplice becomes a trivial proxy around the self-grant rule.
+    assert_eq!(
+        post(accomplice_id, foreign_group, true, false, false).await,
+        StatusCode::FORBIDDEN,
+        "a key must not delegate access to a group it has none on"
+    );
+
+    // Nor may it delegate a verb it does not hold on a group it *can* reach.
+    assert_eq!(
+        post(accomplice_id, own_group, true, true, true).await,
+        StatusCode::FORBIDDEN,
+        "a key holding read+write must not grant delete"
+    );
+
+    // Control: delegating exactly what it does hold is legitimate and still works.
+    assert_eq!(
+        post(accomplice_id, own_group, true, true, false).await,
+        StatusCode::OK,
+        "delegating permissions the caller holds must still work"
+    );
+
+    // The accomplice ended up with precisely the delegated verbs and nothing more.
+    let perms = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(
+            simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(accomplice_id),
+        )
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(perms.len(), 1, "only the one legitimate grant landed");
+    assert!(perms[0].can_read && perms[0].can_write && !perms[0].can_delete);
+}
+
+// ─────────────────────────────────────────────────────────────
+// Attack 8 — Webhook hijacking by repointing
+// ─────────────────────────────────────────────────────────────
+
+/// Repointing a webhook must invalidate the secret it signs with.
+///
+/// `secret_token` is write-only — no endpoint returns it — so an editor cannot read the secret
+/// directly. The hijack is indirect: point the webhook at a server you control and wait, and the
+/// next dispatch arrives at your endpoint carrying a valid `X-Signature-256` over a payload you
+/// influenced, which is a working forgery oracle for the receiver's shared secret. Forcing rotation
+/// on repoint means a secret is only ever usable against the destination it was configured for.
+#[tokio::test]
+async fn attack_repointing_a_webhook_forces_its_secret_to_rotate() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let key = insert_master_key(&db, "Hook Admin").await;
+    let secret = test_signing_secret(&key);
+    let group_id = insert_group(&db, "hijack-group").await;
+
+    let original_secret = "original-webhook-secret-do-not-leak";
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        &json!({
+            "name": "Hijack Target",
+            "target_url": "https://legitimate.example.com/hook",
+            "secret_token": original_secret,
+            "payload_template": "{}",
+            "group_id": group_id.to_string(),
+            "auth_mode": "CANONICAL_V1",
+        })
+        .to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+    let hook_id = created["id"].as_str().unwrap().to_owned();
+
+    let put = |body: serde_json::Value| {
+        let (app, key, secret, hook_id) =
+            (app.clone(), key.clone(), secret.clone(), hook_id.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/webhooks/{hook_id}"))
+                        .header("X-API-Key", &key)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                &body.to_string(),
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+            (status, parsed)
+        }
+    };
+
+    let stored_secret = |db: DatabaseConnection, hook_id: String| async move {
+        let id: Uuid = hook_id.parse().unwrap();
+        simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .secret_token
+    };
+
+    // A rename touches neither the URL nor the template, so the secret is left alone.
+    let (status, body) = put(json!({ "name": "Renamed" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["secret_rotated"], false, "a rename must not churn the secret");
+    assert_eq!(
+        stored_secret(db.clone(), hook_id.clone()).await,
+        original_secret,
+        "the secret survives an unrelated edit"
+    );
+
+    // Re-submitting the identical URL is not a repoint — an idempotent PUT must not rotate.
+    let (status, body) = put(json!({ "target_url": "https://legitimate.example.com/hook" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["secret_rotated"], false, "re-submitting the same URL is not a repoint");
+    assert_eq!(stored_secret(db.clone(), hook_id.clone()).await, original_secret);
+
+    // ── The attack: repoint at an attacker-controlled server. ──────────────
+    let (status, body) = put(json!({ "target_url": "https://attacker.example.net/collect" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["secret_rotated"], true, "repointing must rotate the secret");
+
+    let after_repoint = stored_secret(db.clone(), hook_id.clone()).await;
+    assert_ne!(after_repoint, original_secret, "the old secret must not survive a repoint");
+    assert_eq!(after_repoint.len(), 64, "the replacement is a full-width generated secret");
+
+    // The new secret is disclosed exactly once, to the caller that caused the rotation...
+    assert_eq!(
+        body["secret_token"].as_str(),
+        Some(after_repoint.as_str()),
+        "the generated secret is returned once so the operator can reconfigure the receiver"
+    );
+    // ...and the *old* one is never echoed anywhere in that response.
+    assert!(
+        !body.to_string().contains(original_secret),
+        "the pre-rotation secret must never appear in a response"
+    );
+
+    // Rewriting the template is treated the same way: it decides which bytes the signature covers,
+    // so a caller who can rewrite it can make the existing secret vouch for content it never saw.
+    let before_template_edit = stored_secret(db.clone(), hook_id.clone()).await;
+    let (status, body) = put(json!({ "hmac_template": r"{method}\n{path}\n{timestamp}\n{body}\nx" })).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["secret_rotated"], true, "rewriting hmac_template must rotate the secret");
+    assert_ne!(stored_secret(db.clone(), hook_id.clone()).await, before_template_edit);
+
+    // A template that does not cover the body is still refused outright, rotation or not.
+    let (status, _) = put(json!({ "hmac_template": r"{method}\n{path}\n{timestamp}" })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a bodyless template is rejected on update too");
+
+    // A caller supplying its own replacement gets no generated value echoed back.
+    let (status, body) =
+        put(json!({ "target_url": "https://elsewhere.example.com/h", "secret_token": "chosen-by-caller" }))
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["secret_rotated"], true);
+    assert!(body["secret_token"].is_null(), "a caller-supplied secret is not echoed back");
+    assert_eq!(stored_secret(db.clone(), hook_id.clone()).await, "chosen-by-caller");
+
+    // No read endpoint ever discloses the secret, before or after rotation.
+    let req = signed(
+        inject_connect_info(Request::builder().uri("/api/webhooks").header("X-API-Key", &key)),
+        &secret,
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    let listing = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let listing = String::from_utf8(listing.to_vec()).unwrap();
+    assert!(!listing.contains(original_secret) && !listing.contains("chosen-by-caller"));
+}
+
+/// Webhook administration must be bounded by the caller's own group access.
+///
+/// A webhook is a standing export of everything that happens in its group, to a URL the creator
+/// chooses. `can_manage_webhooks` alone let a key scoped to one group subscribe to *every* group's
+/// events and stream them to a server it controls.
+#[tokio::test]
+async fn attack_webhook_admin_cannot_reach_groups_it_has_no_access_to() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::new(db.clone(), webhook_tx));
+
+    let master = insert_master_key(&db, "Owner").await;
+    let master_secret = test_signing_secret(&master);
+    let (tenant_id, tenant) = insert_key(&db, "Tenant", false, false, true, false, None).await;
+    let tenant_secret = test_signing_secret(&tenant);
+
+    let own_group = insert_group(&db, "tenant-group").await;
+    let foreign_group = insert_group(&db, "other-tenant-group").await;
+    grant(&db, tenant_id, own_group, true, true, true).await;
+
+    // The master seeds a webhook on the group the tenant cannot see.
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
+        &master_secret,
+        &json!({
+            "name": "Foreign Hook",
+            "target_url": "https://foreign.example.com/hook",
+            "secret_token": "foreign-secret",
+            "payload_template": "{}",
+            "group_id": foreign_group.to_string(),
+            "auth_mode": "CANONICAL_V1",
+        })
+        .to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+    let foreign_hook_id = created["id"].as_str().unwrap().to_owned();
+
+    let as_tenant = |method: &'static str, path: String, body: String| {
+        let (app, tenant, tenant_secret) = (app.clone(), tenant.clone(), tenant_secret.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method(method)
+                        .uri(&path)
+                        .header("X-API-Key", &tenant)
+                        .header("Content-Type", "application/json"),
+                ),
+                &tenant_secret,
+                &body,
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    // Subscribing to a group it cannot read is refused.
+    let exfil = json!({
+        "name": "Exfiltrator",
+        "target_url": "https://attacker.example.net/collect",
+        "secret_token": "s",
+        "payload_template": "{\"ip\":\"$target_address\"}",
+        "group_id": foreign_group.to_string(),
+        "auth_mode": "CANONICAL_V1",
+    })
+    .to_string();
+    let (status, _) = as_tenant("POST", "/api/webhooks".to_owned(), exfil).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a tenant must not subscribe a webhook to another tenant's group"
+    );
+
+    // The foreign webhook is invisible in its listing...
+    let (status, body) = as_tenant("GET", "/api/webhooks".to_owned(), String::new()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("Foreign Hook"), "listing leaked another group's webhook: {body}");
+    assert!(!body.contains("foreign.example.com"), "listing leaked another group's target URL");
+
+    // ...and neither editable nor deletable, reported as absent rather than forbidden.
+    let (status, _) = as_tenant(
+        "PUT",
+        format!("/api/webhooks/{foreign_hook_id}"),
+        r#"{"target_url":"https://attacker.example.net/collect"}"#.to_owned(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a tenant must not repoint another group's webhook");
+
+    let (status, _) =
+        as_tenant("DELETE", format!("/api/webhooks/{foreign_hook_id}"), String::new()).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a tenant must not delete another group's webhook");
+
+    // Control: on its own group everything still works.
+    let own = json!({
+        "name": "Own Hook",
+        "target_url": "https://tenant.example.com/hook",
+        "secret_token": "s",
+        "payload_template": "{}",
+        "group_id": own_group.to_string(),
+        "auth_mode": "CANONICAL_V1",
+    })
+    .to_string();
+    let (status, _) = as_tenant("POST", "/api/webhooks".to_owned(), own).await;
+    assert_eq!(status, StatusCode::OK, "a tenant may still manage webhooks on its own group");
 }

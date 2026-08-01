@@ -2525,3 +2525,148 @@ whitespace-only `secret_token` is accepted for `CANONICAL_V1`. It is a weak oper
 rather than an attacker-reachable flaw — and trimming would silently change the signing key of any
 existing webhook whose secret legitimately has surrounding whitespace. Left as-is; noted so the
 inconsistency is a decision rather than an oversight.
+
+## 2026-08-01 (session 22) — XFF spoofing, RBAC master escalation, permission self-granting
+
+### Scope
+
+Audit prompted by findings in the sister project `simply_hook_executor`, on the theory that both
+share flawed boilerplate. They do. Six distinct escalation paths were live, four of them reachable by
+any holder of a *delegated* scope — i.e. exactly the keys an operator hands out believing they are
+limited.
+
+### 1. `X-Forwarded-For` was trusted unconditionally
+
+The middleware took the rightmost `X-Forwarded-For` entry (falling back to `X-Real-IP`) from **any**
+peer. Both are ordinary request headers. `bound_ips` was therefore not a network restriction at all:
+any client, anywhere, could satisfy an arbitrary CIDR by writing an allowed address into a header.
+The prior test `test_reverse_proxy_xff_extracts_rightmost_trusted_hop` did not catch this because it
+only proved that the *leftmost* (client-supplied) entry is ignored — with no trusted-proxy concept,
+the rightmost entry is equally client-supplied when there is no proxy in front.
+
+New `src/config.rs` holds `TRUSTED_PROXIES` (comma-separated IPs or CIDRs; a bare address is promoted
+to a single-host network) and the resolution logic. `resolve_client_ip(peer, headers, trusted)` is a
+**pure function** — no environment, no state — which is why it carries 11 unit tests covering cases
+that would be awkward through the HTTP stack.
+
+The algorithm: if the TCP peer is not itself inside `TRUSTED_PROXIES`, the headers are not read at
+all. If it is, `X-Forwarded-For` is walked **right to left, skipping entries that are themselves
+trusted proxies**, and the first remaining address is the client. Rightmost-first is what makes a
+client-supplied prefix unforgeable (each proxy appends the address it actually saw). Skipping trusted
+entries is what makes a *chain* work: with `client → P1 → P2 → us` the header reads `client, P1` and
+the naive rightmost entry is `P1`, a proxy rather than the client.
+
+**Breaking change, and the reason it is the right one:** `TRUSTED_PROXIES` unset means trust nothing,
+so a proxied deployment that does not set it will reject every CIDR-bound key with `403`. That is the
+safe direction to fail — the alternative is honouring a header the client writes — but it is a
+silent, confusing failure if undocumented, so `main.rs` now warns loudly at startup in both
+directions (set and unset).
+
+The list lives in `AppState` rather than being re-read per request. It is an authorization input, and
+a value that can change under a running process is one that cannot be reasoned about. It also lets
+one test process exercise both the trusted and untrusted paths, which a process-wide env var cannot.
+That cost 57 mechanical `AppState { .. }` → `AppState::new(..)` edits; `with_trusted_proxies` is the
+test-only escape hatch.
+
+### 2. Master keys were exempt from their own `bound_ips`
+
+`if !is_allowed && !key_record.is_master` — the single most powerful credential in the system was the
+only one whose network restriction was decorative. Worse than not offering the field: it silently
+ignored a restriction an operator had explicitly configured. Removed. An *empty* `bound_ips` still
+means unrestricted; that is how a key opts out, and it is unchanged.
+
+### 3. `can_manage_keys` was transitively equal to `is_master`
+
+Four separate paths, all reachable by a non-master key manager:
+
+- `POST /keys` accepted `is_master: true` and returned the new key's plaintext in the same response —
+  a **one-request** escalation from a delegated scope to full control.
+- `POST /keys/{id}/rotate` against a master key returned a working master API key *and* signing
+  secret. Complete, immediate takeover.
+- `POST /keys/{id}/rotate-secret` — the same takeover, narrower blast radius.
+- `PUT /keys/{id}` could rewrite a master key's `bound_ips` (relocating it to the attacker's network);
+  `DELETE /keys/{id}` could remove the master keys that would otherwise contain the incident.
+
+`guard_master_target` now gates every operation whose target is another key. `403` not `404`: the
+caller legitimately holds `can_manage_keys` and can already see the key in `GET /api/keys`, so hiding
+its existence buys nothing and makes a legitimate operator's failure inscrutable.
+
+Separately, `PUT /keys/{id}` let a key **widen its own** global scopes. Narrowing is still allowed —
+dropping a scope you hold is not an escalation — but widening now requires a second party.
+
+### 4. Group permissions could be self-granted
+
+`POST /keys/{id}/permissions` checked only `can_manage_keys`, so a caller could target its own id and
+grant itself read/write/delete on any group in the system. Two rules now:
+
+- **Self-granting is refused outright** for non-masters, rather than merely bounded by the rule
+  below. The two are not equivalent: the "cannot grant beyond your own" check compares against the
+  grants held *at this instant*, so a caller allowed to target itself could ratchet — grant itself
+  `can_read` on a group it can already read, then use that row as the basis for widening. Requiring a
+  second party for every self-affecting change removes the ratchet entirely.
+- **Cannot grant what you do not hold**, per verb. Holding `can_read` on a group does not confer the
+  right to grant `can_write` on it. Without this the accomplice pattern (grant a second key you
+  control, then use it) walks straight around the self-grant rule.
+
+The group auto-create path needs no special case: it grants the creator full permissions first, so
+the subsequent lookup legitimately permits the delegation.
+
+### 5. Webhook CRUD ignored per-group RBAC entirely
+
+Not in the brief, found while auditing it. A webhook is a standing export of everything that happens
+in its group, to a URL the creator chooses — so `can_manage_webhooks` alone let a key scoped to one
+group subscribe to **every** group's events and stream them to a server it controls. `list_webhooks`
+also returned every row regardless of group, leaking other tenants' target URLs and headers. Create,
+list, update and delete are now all scoped to groups the caller can read (master bypasses). Delete and
+update answer `404` rather than `403` for an invisible webhook, matching what the caller's own
+listing shows.
+
+### 6. `PUT /api/webhooks/{id}` — the endpoint the brief assumed existed
+
+Task 4 asked to secure editing a webhook's `target_url`/`hmac_template`. **No update endpoint
+existed** — routes were create, list, delete only — so there was nothing to patch. Rather than leave
+the task unimplemented, the endpoint was added *with the mandated protection built in*, which also
+removes the delete-and-recreate dance that was previously the only way to edit a webhook.
+
+**Repointing rotates the secret.** If `target_url` or `hmac_template` changes, `secret_token` is
+replaced — with the caller's value if supplied, otherwise generated and returned exactly once.
+
+The attack this closes is indirect, which is what makes it easy to miss. `secret_token` is write-only
+(no endpoint returns it, pinned by `attack_webhook_secret_is_not_recoverable_from_read_endpoints`), so
+an editor cannot read it. Instead they point the webhook at a server they control and *wait*: the next
+dispatch arrives at their endpoint carrying a valid `X-Signature-256` over a payload they influenced
+via `$cause` — a working forgery oracle for the receiver's shared secret. Rotating on repoint means a
+secret is only ever usable against the destination it was configured for.
+
+`hmac_template` is treated identically because it decides *which bytes* the signature covers: a caller
+who can rewrite it can make the existing secret vouch for content it never saw.
+
+Comparison is against the **effective** current values, so re-submitting a field unchanged is not a
+repoint. A dashboard that PUTs every field on every save must not churn the secret on each click.
+Rotation is also skipped for `API_KEY_ONLY`/`NONE`, which have no secret worth protecting — minting
+one there would produce a value that is never used and cannot be verified against anything.
+
+### Tests
+
+| Suite | Before | After |
+| :--- | :--- | :--- |
+| `cargo test` | 77 | 97 (26 unit + 54 RBAC + 17 security) |
+| `scripts/test_e2e.sh` | 271 | 309 |
+
+Three existing tests (`test_auth_and_cidr_rejection`,
+`test_reverse_proxy_xff_extracts_rightmost_trusted_hop`,
+`test_bound_ip_strictly_rejects_out_of_cidr_forwarded_address`) asserted the old always-trust-XFF
+behaviour and now build state through a `proxied_state()` helper that trusts `127.0.0.1`. Their
+original intent — that the *leftmost* hop is never honoured, and that out-of-CIDR is rejected — is
+preserved exactly; what changed is that they now say *why* the header is believed.
+
+**The E2E spoofing check is the one worth keeping.** `curl --interface 127.0.0.2` gives a real
+untrusted TCP peer over loopback without a second machine (127/8 is entirely loopback on Linux), and
+the run sets `TRUSTED_PROXIES=127.0.0.1` — deliberately not `.2`. So the same request, with the same
+header, is honoured from `127.0.0.1` and ignored from `127.0.0.2`, which isolates the peer address as
+the only variable. Guarded with a capability probe and a skip, since `--interface` against a 127/8
+alias is Linux-specific.
+
+Every escalation test carries a **positive control against a non-master target** — a guard that
+returned 403 unconditionally would pass the attack assertions while having broken key administration
+outright, and only the control catches that.

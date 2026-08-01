@@ -288,10 +288,15 @@ log "Using INITIAL_MASTER_KEY + INITIAL_MASTER_SIGNING_SECRET for deterministic 
 # targets a real public host, so this doesn't loosen anything they depend on.
 # VAULT_ENCRYPTION_KEY is set so the run exercises the AES-GCM-256 seal/open path for signing
 # secrets end to end, rather than the plaintext development fallback.
+# TRUSTED_PROXIES=127.0.0.1: curl connects over loopback, so declaring it a trusted proxy is what
+# lets the CIDR checks below use X-Forwarded-For to stand in for a client address — exactly as a
+# real reverse proxy would. It deliberately does NOT include 127.0.0.2, which §6b connects from to
+# exercise the untrusted-peer path where the header must be ignored.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
     INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
     VAULT_ENCRYPTION_KEY="e2e-vault-encryption-passphrase" \
     ALLOW_PRIVATE_WEBHOOKS=true \
+    TRUSTED_PROXIES="127.0.0.1" \
     "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -660,6 +665,70 @@ register_key_secret "$LOOPBACK_ONLY_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_
 api_call GET "/api/auth/me" "$LOOPBACK_ONLY_KEY" "" "203.0.113.50"
 check "403" "an out-of-CIDR X-Forwarded-For is strictly rejected"
 check_jq ".error" "Client IP not allowed" "the error message is exactly 'Client IP not allowed'"
+
+# ── 6b. X-Forwarded-For spoofing from an UNTRUSTED peer ─────────────────────
+#
+# Everything above connects from 127.0.0.1, which this run declares a trusted proxy, so the header
+# is honoured. The attack is the opposite case: a client that is NOT a configured proxy must not be
+# able to satisfy bound_ips by writing an allowed address into a header it controls.
+#
+# 127.0.0.2 is a loopback address that is NOT in TRUSTED_PROXIES, so binding curl's source address
+# to it reproduces an untrusted peer without needing a second machine. Guarded, because
+# `--interface` against a 127/8 alias is Linux-specific.
+
+log_section "6b. X-Forwarded-For Spoofing From an Untrusted Peer"
+
+# Signs and sends a request from an explicit source address. Mirrors api_call's signing, but adds
+# --interface so the server sees a different TCP peer.
+call_from_interface() {
+    local iface="$1" method="$2" path="$3" api_key="$4" xff="$5"
+    local timestamp; timestamp=$(date -u +%s)
+    local secret="${SIGNING_SECRETS[$api_key]:-unregistered-key-has-no-signing-secret}"
+    local args=(-s -o "$RESP_BODY_FILE" -w "%{http_code}" -X "$method" --interface "$iface")
+    args+=(-H "X-API-Key: $api_key" -H "X-Timestamp: $timestamp")
+    args+=(-H "X-Signature-256: $(hmac_sign "$secret" "$method" "$path" "$timestamp" "")")
+    [ -n "$xff" ] && args+=(-H "X-Forwarded-For: $xff")
+    RESP_STATUS=$(curl "${args[@]}" "$BASE_URL$path")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    local color; color=$(status_color "$RESP_STATUS")
+    printf "%s ${color}[%s]${RESET} %-6s %s (from %s)\n" "$(ts)" "$RESP_STATUS" "$method" "$BASE_URL$path" "$iface" >&2
+    print_response_body
+}
+
+if curl -s -o /dev/null --interface 127.0.0.2 --max-time 5 "$BASE_URL/api/auth/me" 2>/dev/null; then
+    api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Spoof-Target Key","bound_ips":"203.0.113.0/24"}'
+    check "200" "create a key bound to 203.0.113.0/24 for the spoofing test"
+    SPOOF_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+    register_key_secret "$SPOOF_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+    # The attack: an untrusted peer claiming an address inside the bound CIDR.
+    call_from_interface "127.0.0.2" GET "/api/auth/me" "$SPOOF_KEY" "203.0.113.99"
+    check "403" "a spoofed X-Forwarded-For from an untrusted peer does NOT satisfy bound_ips"
+    check_jq ".error" "Client IP not allowed" "the spoofing rejection is the CIDR check, not an auth error"
+
+    # Impersonating the trusted proxy inside the header must not bootstrap trust either.
+    call_from_interface "127.0.0.2" GET "/api/auth/me" "$SPOOF_KEY" "127.0.0.1, 203.0.113.99"
+    check "403" "naming the trusted proxy inside X-Forwarded-For does not bootstrap trust"
+
+    # Control: the identical header from the trusted peer (127.0.0.1) IS honoured, proving the
+    # difference is the peer address and not something incidental about the request.
+    api_call GET "/api/auth/me" "$SPOOF_KEY" "" "203.0.113.99"
+    check "200" "the same X-Forwarded-For from the trusted proxy IS honored"
+
+    # A master key with bound_ips is subject to them like any other key — no exemption.
+    api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Bound Master Key","is_master":true,"bound_ips":"203.0.113.0/24"}'
+    check "200" "create a master key bound to 203.0.113.0/24"
+    BOUND_MASTER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+    register_key_secret "$BOUND_MASTER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+    api_call GET "/api/auth/me" "$BOUND_MASTER_KEY" "" "203.0.113.99"
+    check "200" "a bound master key works from inside its CIDR"
+
+    api_call GET "/api/auth/me" "$BOUND_MASTER_KEY" "" "8.8.8.8"
+    check "403" "a bound MASTER key is rejected outside its CIDR (no master exemption)"
+else
+    warn "curl --interface 127.0.0.2 unavailable — skipping untrusted-peer spoofing checks."
+fi
 
 # ── 7. Audit log generation & pagination ────────────────────────────────────
 
@@ -1549,6 +1618,120 @@ else
 fi
 
 # ── Summary ──────────────────────────────────────────────────────────────────
+
+log_section "24. RBAC Privilege Escalation & Webhook Hijacking"
+
+# A delegated key manager: full can_manage_keys, but NOT master. Everything below asks whether that
+# scope can be turned into master authority.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Delegated Key Manager","can_manage_keys":true,"can_manage_webhooks":true}'
+check "200" "create a non-master key manager"
+MANAGER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+MANAGER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$MANAGER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+# A master key for it to attack.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Escalation Victim","is_master":true}'
+check "200" "create a master key to serve as the escalation target"
+VICTIM_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# 1. Minting a master key would return its plaintext in this very response.
+api_call POST "/api/keys" "$MANAGER_KEY" '{"name":"Self-Promoted Master","is_master":true}'
+check "403" "a non-master cannot mint a master key"
+
+# 2. Rotating a master key hands back a working master credential outright.
+api_call POST "/api/keys/$VICTIM_ID/rotate" "$MANAGER_KEY"
+check "403" "a non-master cannot rotate a master key"
+
+api_call POST "/api/keys/$VICTIM_ID/rotate-secret" "$MANAGER_KEY"
+check "403" "a non-master cannot rotate a master key's signing secret"
+
+# 3. Relocating a master key's network binding to the attacker's own range.
+api_call PUT "/api/keys/$VICTIM_ID" "$MANAGER_KEY" '{"bound_ips":"203.0.113.0/24"}'
+check "403" "a non-master cannot rewrite a master key's bound_ips"
+
+# 4. Removing the master keys that would contain the incident.
+api_call DELETE "/api/keys/$VICTIM_ID" "$MANAGER_KEY"
+check "403" "a non-master cannot delete a master key"
+
+# 5. Widening its own scopes through the generic update endpoint.
+api_call PUT "/api/keys/$MANAGER_ID" "$MANAGER_KEY" '{"can_create_groups":true}'
+check "403" "a key cannot grant itself additional scopes"
+
+# Controls: the delegated scope still works against non-master targets, so the guards are scoped to
+# master escalation rather than having disabled key administration.
+api_call POST "/api/keys" "$MANAGER_KEY" '{"name":"Ordinary Delegated Key"}'
+check "200" "a non-master can still create ordinary keys"
+ORDINARY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/keys/$ORDINARY_ID/rotate" "$MANAGER_KEY"
+check "200" "a non-master can still rotate a non-master key"
+
+api_call DELETE "/api/keys/$ORDINARY_ID" "$MANAGER_KEY"
+check "204" "a non-master can still delete a non-master key"
+
+# Webhook hijacking: repointing a webhook must invalidate the secret it signs with, since
+# secret_token is write-only and the attacker's route to it is to redirect a signed dispatch to a
+# server they control.
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"hijack-group"}'
+check "200" "create a group for the webhook hijacking checks"
+HIJACK_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"hijack-target\",\"target_url\":\"https://legitimate.example.com/hook\",\"secret_token\":\"original-e2e-secret\",\"payload_template\":\"{}\",\"group_id\":\"$HIJACK_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\"}"
+check "200" "create a webhook to attempt to hijack"
+HIJACK_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# An unrelated edit must not churn the secret.
+api_call PUT "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY" '{"name":"hijack-target-renamed"}'
+check "200" "renaming a webhook succeeds"
+check_true '.secret_rotated == false' "a rename does not rotate the secret"
+
+# Re-submitting the identical URL is not a repoint, so an idempotent save must not rotate either.
+api_call PUT "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY" '{"target_url":"https://legitimate.example.com/hook"}'
+check "200" "re-submitting the same target_url succeeds"
+check_true '.secret_rotated == false' "re-submitting the same URL is not a repoint"
+
+# The attack: repoint at an attacker-controlled server.
+api_call PUT "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY" '{"target_url":"https://attacker.example.net/collect"}'
+check "200" "repointing a webhook succeeds"
+check_true '.secret_rotated == true' "repointing a webhook FORCES its secret_token to rotate"
+check_true '.secret_token != null and (.secret_token | length) == 64' "the replacement secret is returned once, full width"
+if echo "$RESP_BODY" | grep -q "original-e2e-secret"; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} the pre-rotation secret leaked in the update response" >&2
+else
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} the pre-rotation secret never appears in the response" >&2
+fi
+
+# Rewriting the template decides which bytes the signature covers, so it rotates too.
+api_call PUT "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY" '{"hmac_template":"{method}\\n{path}\\n{timestamp}\\n{body}\\nx"}'
+check "200" "rewriting hmac_template succeeds"
+check_true '.secret_rotated == true' "rewriting hmac_template also forces rotation"
+
+# A template that never covers the body is refused on update as it is on create.
+api_call PUT "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY" '{"hmac_template":"{method}\\n{path}\\n{timestamp}"}'
+check "400" "an hmac_template omitting {body} is rejected on update"
+
+# A caller supplying its own replacement gets no generated value echoed back.
+api_call PUT "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY" '{"target_url":"https://elsewhere.example.com/h","secret_token":"caller-chosen-secret"}'
+check "200" "repointing with a caller-supplied secret succeeds"
+check_true '.secret_rotated == true' "a caller-supplied secret still counts as a rotation"
+check_true '.secret_token == null' "a caller-supplied secret is not echoed back"
+
+# No read endpoint ever discloses either secret.
+api_call GET "/api/webhooks" "$MASTER_KEY"
+check "200" "list webhooks after the rotations"
+if echo "$RESP_BODY" | grep -qE "original-e2e-secret|caller-chosen-secret"; then
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} GET /api/webhooks leaked a secret_token" >&2
+else
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} no secret_token is exposed by the webhook listing" >&2
+fi
+
+api_call DELETE "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY"
+check "204" "delete the hijack-target webhook"
 
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2

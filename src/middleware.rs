@@ -33,29 +33,6 @@ const MAX_SIGNED_BODY_BYTES: usize = 2 * 1024 * 1024;
 #[derive(Clone, Copy, Debug)]
 pub struct ClientIp(pub std::net::IpAddr);
 
-/// Normalizes an IPv4-mapped IPv6 address (e.g. `::ffff:192.168.1.1`) down to its plain
-/// IPv4 form so it can be matched against IPv4 CIDR ranges in `bound_ips`. Reverse proxies and
-/// dual-stack sockets commonly surface IPv4 clients this way, which would otherwise silently fail
-/// to match an otherwise-correct IPv4 CIDR and cause a false `403 Forbidden`.
-fn normalize_ip(ip: std::net::IpAddr) -> std::net::IpAddr {
-    match ip {
-        std::net::IpAddr::V6(v6) => v6
-            .to_ipv4_mapped()
-            .map(std::net::IpAddr::V4)
-            .unwrap_or(std::net::IpAddr::V6(v6)),
-        v4 => v4,
-    }
-}
-
-/// Extracts the rightmost address from a comma-separated forwarding header, trimmed and parsed.
-fn rightmost_ip(header_value: &str) -> Option<std::net::IpAddr> {
-    header_value
-        .split(',')
-        .next_back()
-        .map(|s| s.trim())
-        .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-}
-
 /// Validates `X-Timestamp` against the server clock, returning the header's raw string for signing.
 ///
 /// The raw string — not a re-serialized integer — is what gets fed to the HMAC: the caller signed
@@ -110,21 +87,11 @@ pub async fn auth_middleware(
     req: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
-    // Resilient IP resolution logic: prefer X-Forwarded-For (rightmost hop), then X-Real-IP,
-    // and only fall back to the raw TCP peer address if neither proxy header is present/valid.
-    let client_ip = headers
-        .get("X-Forwarded-For")
-        .and_then(|h| h.to_str().ok())
-        .and_then(rightmost_ip)
-        .or_else(|| {
-            headers
-                .get("X-Real-IP")
-                .and_then(|h| h.to_str().ok())
-                .map(|s| s.trim())
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-        })
-        .unwrap_or(addr.ip()); // Fallback to raw TCP IP
-    let client_ip = normalize_ip(client_ip);
+    // `X-Forwarded-For`/`X-Real-IP` are honoured **only** when the TCP peer is a configured trusted
+    // proxy; every other caller is identified by its peer address alone. See
+    // `crate::config::resolve_client_ip` — this is what stops any client from satisfying an
+    // arbitrary `bound_ips` restriction by writing an allowed address into a request header.
+    let client_ip = crate::config::resolve_client_ip(addr.ip(), &headers, &state.trusted_proxies);
 
     // Anti-replay guard first: it needs no database round-trip, so a stale or absent timestamp is
     // rejected before an unauthenticated caller can cost us a query.
@@ -227,13 +194,20 @@ pub async fn auth_middleware(
             AppError::Internal
         })?;
 
+    // An empty `bound_ips` means "unrestricted" and is how a key opts out; a *populated* one is
+    // enforced against every key, master included. Exempting master keys made the single most
+    // powerful credential in the system the only one whose network restriction was decorative —
+    // and it silently ignored a restriction an operator had explicitly configured, which is worse
+    // than never offering the field.
     let is_allowed = networks.is_empty() || networks.iter().any(|net| net.contains(client_ip));
 
-    if !is_allowed && !key_record.is_master {
+    if !is_allowed {
         tracing::warn!(
-            "Access denied: Client IP {} not in bound networks {:?}",
+            "Access denied: Client IP {} not in bound networks {:?} for key {} (master={})",
             client_ip,
-            key_record.bound_ips
+            key_record.bound_ips,
+            key_record.prefix,
+            key_record.is_master
         );
         return Err(AppError::Forbidden("Client IP not allowed".to_owned()));
     }

@@ -171,6 +171,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Same reasoning as the encryption warning above, and with a sharper failure mode: with no
+    // trusted proxies configured, a deployment that *is* behind a reverse proxy will reject every
+    // request from a CIDR-bound key with 403, because every request appears to come from the proxy.
+    // That is the safe direction to fail, but only if the operator is told why.
+    let trusted_proxies = simply_ip_vault::config::trusted_proxies_from_env();
+    if trusted_proxies.is_empty() {
+        tracing::warn!(
+            "{} is not set: X-Forwarded-For and X-Real-IP are IGNORED and every key is matched \
+             against its raw TCP peer address. This is correct for a directly-exposed deployment; \
+             behind a reverse proxy you must set it, or CIDR-bound keys will be rejected.",
+            simply_ip_vault::config::TRUSTED_PROXIES_ENV
+        );
+    } else {
+        tracing::info!(
+            "{} is set: forwarding headers are honoured from {} network(s): {:?}",
+            simply_ip_vault::config::TRUSTED_PROXIES_ENV,
+            trusted_proxies.len(),
+            trusted_proxies
+        );
+    }
+
     tracing::info!("Connecting to database...");
     let mut opt = ConnectOptions::new(db_url);
     opt.sqlx_logging_level(log::LevelFilter::Debug);

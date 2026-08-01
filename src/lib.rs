@@ -12,6 +12,7 @@ use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
 
 pub mod api;
+pub mod config;
 pub mod crypto;
 pub mod entities;
 pub mod error;
@@ -50,6 +51,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/groups/{id}", delete(api::delete_ip_group))
         .route("/webhooks", post(api::create_webhook))
         .route("/webhooks", get(api::list_webhooks))
+        .route("/webhooks/{id}", put(api::update_webhook))
         .route("/webhooks/{id}", delete(api::delete_webhook))
         .route("/audit-logs", get(api::list_audit_logs))
         .layer(axum::middleware::from_fn_with_state(
@@ -73,10 +75,7 @@ pub fn setup_state(db: DatabaseConnection) -> (AppState, mpsc::Sender<WebhookEve
         webhooks::run_webhook_worker(db_worker, rx).await;
     });
 
-    let state = AppState {
-        db,
-        webhook_tx: tx.clone(),
-    };
+    let state = AppState::new(db, tx.clone());
 
     (state, tx, worker_handle)
 }
