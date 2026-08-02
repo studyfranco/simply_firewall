@@ -1,175 +1,267 @@
 # Comparative Security Audit — `simply_ip_vault` ↔ `simply_hook_executor`
 
-**Date:** 2026-08-02
-**Mode:** Strictly read-only. No source file in `src/` or `./example` was modified; no commit was created. This report supersedes the 2026-08-01 edition (committed as `ca6ecf4`), which predates both projects' convergence passes.
+**Date:** 2026-08-02 · **Mode:** strictly read-only — no source file in `src/` or `./example` was
+modified, and no commit was created. **Scope:** closing pass on the audit committed as `f6239ee`,
+re-verifying its contested findings against current source rather than against commit messages.
 
 ---
 
 ## 0. Reference freshness
 
-### 0.1 Reference commit
+### 0.1 The reference is not a git checkout — and `rev-parse` lies about it
 
-**`./example` is not a git checkout, so no commit hash exists to record.**
+`git -C ./example rev-parse HEAD` **returns a hash, and that hash is a trap.** It answers
+`5f7b5b1de4511eff4babdd367b8d5def5384a678`, which is *this* repository's HEAD. `./example` holds no
+`.git`, so git walks up to the enclosing repository and reports its commit. Recording that number
+would attribute a provenance the reference does not have.
 
-| Probe | Result |
-| :--- | :--- |
-| `git -C example/simply_hook_executor rev-parse --show-toplevel` | `/home/fallrik/.../simply_ip_vault` — resolves to the **parent** repo, not a nested one |
-| `.git` directory inside `example/simply_hook_executor/` | absent |
-| `.gitmodules` | absent — not a submodule |
-| `git ls-files example` | 0 files — untracked |
-| `.gitignore` | line 9: `example/*` — deliberately excluded |
-
-`./example` is an untracked, ignored working copy of the sibling project. The closest available markers are file timestamps and the reference's own notes:
-
-| Marker | Value |
-| :--- | :--- |
-| Newest source file (`src/db.rs`, `src/crypto.rs`) | 2026-08-02 00:18 |
-| Newest file of any kind (`AGENT_NOTES.MD`) | 2026-08-02 00:26 |
-| Directory mtimes (`src/`, `tests/`, `scripts/`) | 2026-08-02 12:01 — the tree was re-copied today |
-| Reference's own `AGENT_NOTES.MD` section markers | `## 2026-08-01 — Convergence pass (shared arbitrated architecture)`, `## Convergence Parity Check` |
-| This repository's HEAD | `f544ff406202e7969afcff80f8659b4b095c7fa5` — 2026-08-02 11:47:36 +0200 |
-
-### 0.2 Freshness verdict
-
-> ### ⚠ Reference freshness: UNVERIFIED — findings below may reflect an outdated `simply_ip_vault`
->
-> There is no commit, tag, or version marker in `./example` to compare against its upstream, so its currency cannot be established by any means available inside this repository. Its file content predates this repository's HEAD by roughly 11½ hours.
-
-Two observations temper that flag, and both are worth stating because they change how much weight the findings carry:
-
-- **The reference has demonstrably been refreshed since the previous cross-audit.** It now contains a dedicated `src/replay.rs` (227 lines) that did not exist when this repository's convergence pass was written, and its `AGENT_NOTES.MD` carries a completed *Convergence Parity Check*. The prior report's premise — that `./example` had gone stale — **no longer holds**. The reference has done its half of the arbitrated convergence.
-- **The directory mtimes (12:01 today) postdate this repository's HEAD (11:47 today)**, consistent with the tree having been re-copied after the convergence commit landed. That is suggestive, not probative — mtimes are not provenance.
-
-### 0.3 Correction: the two projects are transposed in the audit brief
-
-The brief describes `simply_ip_vault` as living in `./example` and `simply_hook_executor` as the current repository. **This is inverted**, and it was inverted in the two preceding briefs as well.
-
-| Location | `[package] name` | Distinguishing modules |
+| Probe | Result | Meaning |
 | :--- | :--- | :--- |
-| Repository root (`.`) | `simply_ip_vault` | `src/webhooks.rs`, `api::handle_ban`, `ip_record` entity |
-| `./example/simply_hook_executor/` | `simply_hook_executor` | `src/executor.rs`, `src/replay.rs`, `hook` entity |
+| `example/simply_hook_executor/.git` | absent | not an independent checkout |
+| `.gitmodules` | does not exist | not a submodule |
+| `git ls-files example \| wc -l` | `0` | untracked by this repo |
+| `.gitignore` line 9 | `example/*` | deliberately excluded |
 
-The mandated column headers are therefore preserved in **position** but corrected in **label**, so that no cell in this report is attributed to the wrong codebase. The left project column is always the reference in `./example`; the right project column is always the current repository.
+**No commit hash can be pinned.** Freshness is corroborated by mtime and by content instead.
+
+### 0.2 Corroboration — the reference is CURRENT
+
+| Artifact | Timestamp |
+| :--- | :--- |
+| `example/.../src/api.rs`, `src/middleware.rs` | 2026-08-02 17:13 |
+| `example/.../src/lib.rs`, `src/main.rs` | 2026-08-02 17:31 |
+| `example/.../Cargo.toml` | 2026-08-02 17:32 |
+| `example/.../src/config.rs` | 2026-08-02 17:33 |
+| `example/.../AGENT_NOTES.MD` | 2026-08-02 17:35 |
+| `example/.../src/` (directory) | 2026-08-02 18:46 |
+| this repo — `ee84e72` (ReplayGuard rewrite) | 2026-08-02 17:21 |
+| this repo — `40cb4f4` (legacy-crypto purge) | 2026-08-02 17:38 |
+| this repo — `5f7b5b1` (HEAD) | 2026-08-02 21:28 |
+
+The reference's newest content postdates `ee84e72` and falls within five minutes of `40cb4f4`.
+Content corroborates the timestamps independently, which matters more than the mtimes themselves:
+the reference's `AGENT_NOTES.MD` documents *its own* dead-code sweep (177 tests, 632/632 e2e), its
+`src/replay.rs` exists as a standalone module, and its `SecretCipher::open` is already fail-closed.
+All three are post-audit states that could not have been present in a stale copy.
+
+> **✅ Reference freshness: CURRENT** — corroborated by mtime and content, not pinned to a hash.
+> This supersedes the previous audit's `⚠ UNVERIFIED` flag, which was correct when written.
+>
+> HEAD has since moved to `5f7b5b1`, which touches `static/app.js` only (+1/−2) and changes nothing
+> in scope.
+
+### 0.3 Project-direction correction
+
+The brief states that `simply_ip_vault` "is in `./example`" and that `simply_hook_executor` is the
+current repository. **This is inverted**, per the package manifests:
+
+| Path | `Cargo.toml` `name` |
+| :--- | :--- |
+| `.` (this repository) | `simply_ip_vault` |
+| `./example/simply_hook_executor/` | `simply_hook_executor` |
+
+The mandated column *positions* are preserved so the table shape matches the brief; the *labels* are
+corrected so each cell describes the codebase it actually came from.
 
 ---
 
 ## 1. Proxy & IP middleware
 
-Files: `src/config.rs`, `src/middleware.rs` on both sides.
-
-| Aspect | `simply_hook_executor` (./example) | `simply_ip_vault` (this repo) | Assessment |
+| Aspect | `simply_ip_vault` — **this repo** (brief's col. 1) | `simply_hook_executor` — **`./example`** (brief's col. 2) | Assessment |
 | :--- | :--- | :--- | :--- |
-| `TRUSTED_PROXIES` entry kinds | `parse_trusted_proxies` → `ProxySpec::Network` \| `ProxySpec::Hostname`; bare address widened to `/32`/`/128`; malformed entry dropped with a warning | `parse_trusted_proxies` → `ProxyMatcher`, same two variants, same widening, same drop-with-warning | **Equivalent.** Both fail in the safe direction — a dropped entry is a proxy that is *not* trusted. |
-| Hostname → address resolution | `resolve_hostname` via `tokio::net::lookup_host((host, 0u16))`, each address through `normalize_ip` | `resolve_hostname`, same call, same normalization | **Equivalent.** |
-| Positive cache TTL | `TRUSTED_PROXY_DNS_TTL = 30s` | `POSITIVE_TTL = 30s` | **Equivalent.** Bounds how long a re-assigned container address stays trusted. |
-| Negative cache TTL | `TRUSTED_PROXY_DNS_NEGATIVE_TTL = 5s` | `NEGATIVE_TTL = 5s` | **Equivalent.** Both bound DNS traffic to one query per name per window, closing the "request rate becomes query rate" amplification path. |
-| Per-name vs. whole-set expiry | `HostnameEntry` per name in `ResolvedProxies.hosts`; `is_fresh` selects positive/negative TTL by the `resolved` flag | `HostnameState` per name in `ResolutionCache.hosts`; identical `is_fresh` | **Equivalent.** One failing name cannot drag healthy names into re-resolution on either side. |
-| Thundering-herd guard | `resolved()` re-checks `all_fresh` under the write lock before calling `refresh_stale` | `resolved()` takes the write lock and calls `refresh_locked`, which re-checks per-name freshness inside its loop | **Equivalent outcome**, different placement. Both collapse a burst arriving on an expired entry into a single lookup. |
-| Merged-snapshot rebuild | Rebuilt only `if changed` — i.e. only when a lookup actually ran | Rebuilt unconditionally at the end of every `refresh_locked` | **Reference marginally stronger.** The vault allocates a fresh `Vec` + `Arc` under the write lock even when no name was re-queried. Performance only; no trust decision changes. |
-| Empty answer vs. lookup error | Distinguished: `Ok(addrs)` yielding zero addresses logs its own warning and returns `resolved = false` | Collapsed: `resolved = !addresses.is_empty()` | **Reference marginally stronger.** Same trust outcome; the vault cannot distinguish NXDOMAIN from "resolved to nothing" in its logs. Diagnosability only. |
-| Boot-time priming | `prime_trusted_proxies` in `main.rs`, detached `tokio::spawn`, calls `prime()` with `force = true` | `TrustedProxies::prime_with_grace()`, detached `tokio::spawn`; `prime()` clears `cache.hosts` then refreshes | **Equivalent.** Both force a real lookup rather than reusing an answer a concurrent request just cached. |
-| Boot grace period | `TRUSTED_PROXY_BOOT_GRACE = 60s`, one loud re-check, never aborts startup | `BOOT_GRACE_PERIOD = 60s`, one loud re-check, never aborts startup | **Equivalent.** Both explicitly reject crash-looping: an unresolvable entry is fail-closed for that entry alone, service-wide availability is preserved. |
-| XFF trust precondition | `resolve_client_ip` returns `peer` verbatim unless `is_trusted(peer, trusted)` | Identical | **Equivalent.** This is the load-bearing control on both sides. |
-| XFF chain walk | `.split(',')` → `filter_map(parse)` → `map(normalize_ip)` → `.rev().find(\|ip\| !is_trusted(*ip, trusted))` | Identical construction | **Equivalent.** Right-to-left, skipping exactly the trusted hops, stopping at the first untrusted one. |
-| Chain exhausted / unparseable | Falls through to `X-Real-IP`, then to `peer` — never to an unvalidated claim | Identical | **Equivalent.** |
-| Hostname-shape validation | `is_hostname_like`: rejects `/`, `:`, non-alphanumeric edges, all-digits-and-dots, length > 253 | `is_plausible_hostname`: same predicate set | **Equivalent.** Both refuse `999.1.1.1` and `10.0.0.0/8x` as names rather than turning a botched CIDR into a lookup that silently never matches. |
-| `bound_ips` vs. master keys | `is_allowed = networks.is_empty() \|\| networks.iter().any(...)`; comment records that `is_master` once bypassed this and no longer does | Identical expression, identical recorded rationale | **Equivalent.** On both sides a populated `bound_ips` binds every key including master; empty is the only opt-out. |
-| `bound_ips` check position | After authentication — the `// ── Authorization ──` block, `middleware.rs:334` | After authentication *and* replay checking — `middleware.rs:254` | **Equivalent.** Both close the 401-vs-403 network-binding oracle. |
-| Dual-stack normalization | `normalize_ip` applied to the peer, every XFF hop, `X-Real-IP`, and resolved hostname addresses | Identical coverage | **Equivalent.** |
+| `resolve_client_ip` body | `config.rs:563` | `config.rs:416` | **Equivalent** — textually identical, line for line |
+| Trust gate | `if !is_trusted(peer, trusted) { return peer }` before any header read | identical | **Equivalent** — the load-bearing check; headers unreachable for an untrusted peer |
+| XFF chain walk | `.rev().find(\|ip\| !is_trusted(*ip, trusted))` | identical | **Equivalent** — right-to-left, skipping trusted hops |
+| All-trusted chain | falls through; never invents a client | identical | **Equivalent** |
+| `X-Real-IP` | honoured only from a trusted peer, only when XFF yielded nothing | identical | **Equivalent** |
+| IPv4-mapped normalization | `normalize_ip` on the peer and every hop | identical | **Equivalent** |
+| Positive DNS TTL | `POSITIVE_TTL = 30s` (`config.rs:97`) | `TRUSTED_PROXY_DNS_TTL = 30s` (`config.rs:23`) | **Equivalent** — names differ, values match |
+| Negative DNS TTL | `NEGATIVE_TTL = 5s` (`config.rs:108`) | `TRUSTED_PROXY_DNS_NEGATIVE_TTL = 5s` (`config.rs:38`) | **Equivalent** |
+| Boot grace period | `BOOT_GRACE_PERIOD = 60s`, private | `TRUSTED_PROXY_BOOT_GRACE = 60s`, `pub` | **Equivalent** behaviour; visibility differs only |
+| Negative-caching granularity | per-hostname (`HostnameState`) | per-hostname (`HostnameEntry`) | **Equivalent** — one bad name never drags healthy ones onto the short window |
+| Concurrent-resolution collapse | re-check under the write lock in `resolved()` | equivalent double-check | **Equivalent** — bounds DNS amplification across simultaneous requests |
+| `resolve_hostname` return shape | `Vec<IpNetwork>`; caller derives `resolved = !addresses.is_empty()` (`config.rs:468`) | `(Vec<IpNetwork>, bool)` | **Equivalent — previously misreported.** The peer returns `false` in *exactly* the empty cases, so the bool is `!networks.is_empty()` by construction. See §5.1 |
+| DNS-failure direction | empty ⇒ untrusted; never widens trust | identical | **Equivalent** — fails safe on both sides |
+| Malformed `TRUSTED_PROXIES` entry | dropped with a warning; startup continues | identical | **Equivalent** |
+| `bound_ips` on master keys | enforced, no `is_master` bypass (`middleware.rs:274`) | enforced, no bypass (`middleware.rs:439`) | **Equivalent** — both fixed the decorative-restriction bug |
+| `bound_ips` check position | after HMAC verification (`middleware.rs:257`) | after HMAC verification (`middleware.rs:421`) | **Equivalent** — closes the 403-vs-401 topology oracle |
+| Malformed CIDR in DB | `AppError::Internal` (500); never fail-open | identical | **Equivalent** |
+| Positive-TTL **expiry** test | **absent** — no test drives a positive entry to expiry | `a_successful_resolution_is_re_queried_once_its_positive_ttl_expires` | **`simply_hook_executor` stronger** — see §5.2 |
 
-**Prose.** This category is fully converged; the only two rows scored as differences are an allocation and a log message, neither of which changes a trust decision. Both services independently arrived at the same non-obvious structural choice — flattening the whole trusted set into one `Arc<Vec<IpNetwork>>` snapshot *before* walking the chain — and that choice is what makes a hostname-identified intermediate hop skippable. A per-entry `is_literal_network`-style test returns false for every hostname matcher and would silently report the inner proxy as the client in exactly the containerized topology that hostname support exists to serve.
+Both sides expose a test-only TTL builder, but only the peer's suite exercises the positive window's
+*expiry*. All three of our TTL tests pass a 30-second positive TTL, which cannot lapse inside a test.
 
 ---
 
 ## 2. RBAC & privilege-escalation guards
 
-Files: `src/api.rs` on both sides.
-
-| Aspect | `simply_hook_executor` (./example) | `simply_ip_vault` (this repo) | Assessment |
+| Aspect | `simply_ip_vault` — **this repo** | `simply_hook_executor` — **`./example`** | Assessment |
 | :--- | :--- | :--- | :--- |
-| Scopes master-only to grant | `require_master_to_grant_scopes` (`api.rs:343`): `is_master`, `can_manage_keys`, `can_manage_hooks` | `MASTER_ONLY_SCOPES` (`api.rs:183`): `is_master`, `can_manage_keys`, `can_create_groups`; `can_manage_webhooks` deliberately delegable | **Domain-appropriate, not a discrepancy.** Each side gates the scopes that are a *path back to* master authority in its own model. The vault documents why `can_manage_webhooks` is excluded: it confers nothing over keys or groups and is bounded by the caller's own group access. |
-| Idempotent re-submission of a held scope | Blocked — any `Some(true)` from a non-master is refused regardless of the target's current value | Allowed — `guard_scope_elevation` compares `requested` against the target's `held` array and refuses only `Some(true) && !current` | **Equivalent security; vault more ergonomic.** Re-asserting a scope the target already holds grants nothing. The reference's form is simpler to audit; the vault's supports a dashboard that PUTs every field. |
-| Revoking a scope | Explicitly permitted to any key manager — "removing authority is not an escalation" | Same rule, same stated rationale | **Equivalent.** |
-| `is_master` in the update payload | `UpdateApiKeyPayload` carries no `is_master` field; promotion via `PUT` is impossible | `UpdateApiKeyPayload` carries no `is_master` field; same | **Equivalent.** Both remove the escalation path at the type level rather than guarding it at runtime. |
-| Non-master acting on a master *target* | `require_master_to_administer(key, target, action)` — `if !target.is_master \|\| key.is_master { Ok }` | `guard_master_target(caller, target)` — `if target.is_master && !caller.is_master { Forbidden }` | **Equivalent** — contrapositive forms of the same predicate. |
-| Coverage of the master-target guard | 3 sites: `update_api_key` (2006), `delete_api_key` (2079), `rotate_api_key` (2129) | 4 sites: `delete_api_key` (1578), `update_api_key` (1621), `rotate_api_key` (1714), `rotate_signing_secret` (1771) | **Equivalent — full parity.** The vault's fourth site is its extra `POST /keys/{id}/rotate-secret` endpoint, which the reference does not have. Every path that returns credential material is covered on both sides. |
-| Self-granting of M:N permissions | `if !key.is_master && id == key.id` → `403` in `update_key_hook_permissions` (2204) | `if id == key.id && !key.is_master` → `403` in `update_key_group_permissions` (1828), with an explicit anti-ratchet rationale | **Equivalent.** Both require a second party for every self-affecting grant. |
-| M:N permissions on a master target | `if target_key.is_master` → `InvalidInput` (2195) | `if target_key.is_master` → `InvalidInput` (1815) | **Equivalent**, including the error class. |
-| Delegating access beyond your own | `require_manage(db, key, hook.id)` — boolean, you must manage the hook — plus `require_master_for_privileged_hook` for `run_as_user` hooks | `guard_delegated_group_grant` — **per verb**: `can_read`/`can_write`/`can_delete` each checked independently against the caller's own permission row | **Vault stronger in granularity.** The vault refuses a `can_read`-only holder granting `can_write`. In the reference's two-verb model the equivalent grant is lateral rather than escalating, so the practical gap is small — but the vault's shape survives adding a third verb and the reference's does not. |
-| Elevated-resource carve-out | `require_master_for_privileged_hook` — distributing rights over a `run_as_user` hook stays master-only even for a legitimate manager | No counterpart; the vault has no privilege-carrying resource analogous to `run_as_user` | **Reference-only surface, correctly handled.** Nothing to unify. |
-| Auto-created resource ownership | n/a — no auto-create path | Group auto-create grants the creator full read/write/delete first, so `guard_delegated_group_grant` finds a legitimate row without a special case | **Vault-only surface, correctly handled.** |
-| Base scope gate on key-admin routes | `!key.is_master && !key.can_manage_keys` → `403` on create/list/update/delete/rotate/permissions | Identical predicate on the same six route families | **Equivalent.** |
-| Self-deletion | `if id == key.id` → "Cannot delete yourself" (2073) | `if id == key.id` → "Cannot delete yourself" (1572) | **Equivalent.** |
-| Audit-log visibility | Master-only (2353) | Master-only — "Only master keys can view audit logs" (2597) | **Equivalent.** |
-
-**Prose.** Both codebases converged on the same three-layer model: a base scope gate, a guard on the *target* key's privilege, and a guard on what the caller may *hand out*. Both document the same historical bug that motivated the middle layer — rotation returns plaintext credential material, so an unguarded `POST /keys/{id}/rotate` against a master key is a one-request takeover that also locks out the legitimate holder. The one structural difference, granularity of the delegation guard, follows from the permission models differing (three verbs versus two) rather than from either side having overlooked something.
+| **Contested finding #1** — cross-tenant revocation | `revoke_key_group_permission` (`api.rs:1944`) resolves the caller's own grant via `caller_group_permission`, then applies `guard_delegated_group_grant(.., "revoke", ..)` against the *existing* grant's verbs | n/a — finding was against this repo | **CLOSED** — verified in source |
+| **Contested finding #2** — any-verb-grants-any-verb | n/a — finding was against the peer | `guard_delegated_hook_grant` (`api.rs:461`) tests `can_execute` and `can_manage` **independently** via `wanted && !holds` | **CLOSED** — verified in source |
+| Revocation authority scope | caller must hold each verb being removed | caller needs only `can_manage` on the hook (`require_manage`) | **`simply_ip_vault` stronger** — see §5.3 |
+| Ordering of `404` vs `403` on revoke | `NotFound` returned before the authority guard (`api.rs:1980` → `:1985`) | `delete_many` first; `404` derived from `rows_affected == 0` | **`simply_ip_vault` stronger** — peer's order is safe today but structurally fragile |
+| Self-revocation of own grants | blocked for non-master (`api.rs:1958`) | not blocked | **Equivalent in risk** — dropping your own access is de-escalation |
+| Self-**granting** of own permissions | blocked for non-master | blocked for non-master (`api.rs:2272`) | **Equivalent** |
+| Master-target guard | `guard_master_target` (`api.rs:225`) | `require_master_to_administer` (`api.rs:379`) | **Equivalent** — same predicate; peer additionally names the action |
+| — applied on `update` | ✅ (`api.rs:1630`) | ✅ (`api.rs:2077`) | **Equivalent** |
+| — applied on `delete` | ✅ (`api.rs:1587`) | ✅ (`api.rs:2150`) | **Equivalent** |
+| — applied on `rotate` | ✅ (`api.rs:1723`) | ✅ (`api.rs:2200`) | **Equivalent** — rotation returns the new plaintext secret, so this is the critical one |
+| Self-deletion | blocked | blocked | **Equivalent** |
+| `is_master` promotion via update | payload carries no `is_master` field | payload carries no `is_master` field | **Equivalent** — promotion unreachable by construction |
+| Master-only scope grants on create | `MASTER_ONLY_SCOPES` zip-check (`api.rs:208`) | `require_master_to_grant_scopes` (`api.rs:343`) | **Equivalent** — `can_manage_keys` is no longer transitively `is_master` |
+| Permission rows on a master target | refused as `InvalidInput` (`api.rs:1824`) | refused as `InvalidInput` (`api.rs:2266`) | **Equivalent** |
+| Entry gate on permission handlers | `!is_master && !can_manage_keys` ⇒ 403 | identical | **Equivalent** |
+| Audit logging of grant/revoke | `KEY_PERM_REVOKE` with actor, IP, target | identical vocabulary | **Equivalent** |
 
 ---
 
-## 3. Cryptography, HMAC & authentication posture
+## 3. Cryptography, HMAC, authentication posture & replay protection
 
-Files: `src/crypto.rs`, `src/middleware.rs`, plus `src/replay.rs` (reference) / `src/state.rs` (vault).
-
-| Aspect | `simply_hook_executor` (./example) | `simply_ip_vault` (this repo) | Assessment |
+| Aspect | `simply_ip_vault` — **this repo** | `simply_hook_executor` — **`./example`** | Assessment |
 | :--- | :--- | :--- | :--- |
-| **Authentication posture** | Per-key configurable: `HmacMode::CanonicalV1` \| `HmacMode::BodyOnly`; signature optional by default; `REQUIRE_SIGNED_REQUESTS` promotes it to mandatory; `X-Hub-Signature-256` honoured for `BodyOnly` keys only | Mandatory full-URI HMAC + timestamp + anti-replay on **every** key. No per-key mode, no environment switch, no opt-out route | **Intentional asymmetry — do not unify.** |
-| `X-Hub-Signature-256` acceptance | Accepted, and only in `BodyOnly` mode, so a `CanonicalV1` key cannot be downgraded by sending the other header name | Not accepted at all | **Intentional asymmetry — do not unify.** Follows directly from the posture row; the mode guard on the header name is the correct containment. |
-| At-rest AEAD | XChaCha20-Poly1305, 192-bit random nonce per operation | XChaCha20-Poly1305, 192-bit random nonce per operation | **Equivalent.** Both avoid the AES-GCM 96-bit birthday bound with no counter state to persist. |
-| Legacy ciphertext path | None — the daemon never shipped an AES-GCM format | `LEGACY_GCM_PREFIX = "aesgcm256:"`, **open-only**; `aes-gcm` retained as a read-only dependency; nothing in the crate writes it | **Not a weakness.** A migration obligation the reference does not carry. The path decrypts only, and the legacy key is derived as `SHA-256(raw hex env text)` — matching what wrote those rows. Worth deleting once no `aesgcm256:` rows remain. |
-| Cipher instantiation | Once in `main`, into `Arc<SecretCipher>`; `AppState::new` takes it as an explicit parameter so no caller can default into plaintext | Once via `SecretCipher::from_env()`, into `Arc<SecretCipher>` in `AppState` | **Equivalent.** Never rebuilt per request on either side. |
-| Fail-closed on a malformed key | `from_env` → `from_hex_key` → `CryptoError::InvalidKey`, propagated from `main` with `?`; empty/whitespace is "unset" (the documented plaintext fallback), anything else aborts | Identical semantics, identical env-var pair (`SIGNING_SECRET_KEY` / `VAULT_ENCRYPTION_KEY`, primary wins), identical empty-is-unset rule | **Equivalent.** Neither degrades to plaintext for an operator who set the variable. |
-| Position of the fail-closed check in startup | Cipher built *after* DB connect, pragmas, and migrations | Cipher built *before* DB connect | **Vault marginally stronger** — a mistyped key aborts before any database work is done. Cosmetic. |
-| Canonical signed string | `signature_base` → `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nRAW_BODY`, LF-joined, no trailing newline | `canonical_v1_payload` → `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`, byte-identical construction | **Equivalent.** Both delimit to defeat component-boundary shifting (`POST`+`/api/x` vs. `POS`+`T/api/x`). |
-| Signed target scope | `path_and_query()`, read through `OriginalUri` so `Router::nest("/api", ..)` prefix stripping does not break signatures | `signed_target()` → `path_and_query()` through `OriginalUri`, same rationale | **Equivalent.** Both cover the query string, closing the rewrite-a-captured-request hole (`?older_than_days=`, `?hard=true`, `?include_deleted=true`). |
-| Body-only / unsigned keys | `BodyOnly` signs the raw body alone and carries no timestamp; unsigned permitted unless `REQUIRE_SIGNED_REQUESTS` | Neither exists | **Intentional asymmetry — do not unify.** |
-| Constant-time signature comparison | `Mac::verify_slice` in `verify_signature`; chain documented as `verify_slice → CtOutput::eq → subtle::ConstantTimeEq::ct_eq` | `Mac::verify_slice` in `crypto::verify_signature`; same chain, same recorded prohibition on "simplifying" to `==` | **Equivalent.** Grep confirms no `==`/memcmp comparison against a secret, signature, digest, or MAC anywhere in either `src/`. |
-| Hex decoding before comparison | `hex::decode` on the header value, then `verify_slice` on the bytes — wrong-length tags rejected inside `verify_slice` | `hex::decode` on the header value, then `verify_slice` on the bytes | **Equivalent.** Both reject non-hex and wrong-width tags before any comparison occurs. |
-| Key lookup by `key_hash` | `Sha256(presented_key)` → `.filter(Column::KeyHash.eq(hash))` — an indexed DB lookup on a digest | Identical | **Equivalent, and correctly *not* constant-time.** This is a lookup keyed on a hash digest, not a comparison against a secret: the digest is derived from caller-supplied input and the query returns a row or nothing. No timing obligation applies, and neither side mistakenly applies one. |
-| Verification return shape | `verify_signature` returns `Result<Vec<u8>>` — the verified digest, handed straight to the replay guard | `verify_signature` returns `bool`; the middleware separately re-derives a replay token from the header text | **Reference stronger.** Returning the decoded digest keys the guard on canonical bytes *by construction* rather than by remembering to normalize the header a second time. |
-| Replay-guard key material | `SignatureId { key_id: Uuid, digest: Vec<u8> }` — raw bytes, so `sha256=AB…` and `sha256=ab…` cannot become two entries | `format!("{key_id}:{signature}")`, where `signature` is the header `.trim()`ed, `sha256=`-stripped, and `.to_ascii_lowercase()`d | **Equivalent in effect.** The vault's normalization is complete only because `hex::decode` inside `verify_signature` has already rejected non-canonical hex before the token is built — the property holds, but at a distance rather than by construction. |
-| Anti-replay: window | Symmetric ±`signature_max_age_seconds`, checked before the HMAC | Symmetric ±`MAX_TIMESTAMP_SKEW_SECS` (300), checked before the DB lookup | **Equivalent.** Both refuse forward-dated requests, which would otherwise stay replayable for the length of the skew. |
-| Anti-replay: window configurability | `SIGNATURE_MAX_AGE_SECONDS`, `.max(1)` at parse and clamped again to `[1, 3600]` in `ReplayGuard::new` | Hard-coded `const MAX_TIMESTAMP_SKEW_SECS: i64 = 300` | **Reference marginally stronger.** The vault's constant cannot be misconfigured at all, which is defensible for a locked-down service; the reference is tunable *and* a typo cannot disable the guard. |
-| Anti-replay: single-use tracking | `ReplayGuard::check_and_record(key_id, digest)`, `CanonicalV1` keys only | `ReplayGuard::observe(key_id, token, timestamp)`, every key | Both track `(key, signature)` pairs rather than merely bounding the window. The reference's `BodyOnly` exclusion is part of the **intentional asymmetry** — that mode carries no timestamp, so there is no window to be single-use within, and third-party senders redeliver on purpose. |
-| Ordering relative to HMAC | Recorded strictly **after** `verify_signature` succeeds | Recorded strictly **after** `crypto::verify_signature` returns `true` | **Equivalent.** Both document the same two reasons: unauthenticated map-filling, and burning a signature a legitimate client is about to send. |
-| Lock poisoning | Fails **closed** — `check_and_record` returns `false`, the request is rejected | Fails **closed** — `observe` returns `false`, the request is rejected | **Equivalent.** |
-| Replay-guard expiry clock | Monotonic `std::time::Instant`; each entry stores `now + window` | Wall-clock `chrono::Utc::now().timestamp()`; `retain` on `(now - ts).abs() <= 300` | **Reference stronger.** A backward NTP step on the vault evicts still-in-window entries early — and `.abs()` makes a forward step do the same — re-opening replay for signatures the freshness check may still accept. `Instant` is immune to clock adjustment. |
-| Replay-guard pruning cost | Amortized: `prune_if_due` sweeps at most once per `window / 4` | `seen.retain(...)` over the **entire map on every `observe()` call**, inside the global `std::sync::Mutex` | **Reference stronger.** The vault pays O(n) per authenticated request inside the lock every request must take — a throughput cliff that worsens precisely as traffic rises. |
-| Replay-guard capacity behaviour | `MAX_TRACKED_SIGNATURES = 250_000`; on overflow, prune expired entries, then **keep enforcing** and log a warning | `MAX_TRACKED_SIGNATURES = 100_000`; on overflow, `seen.clear()` — self-documented as *"Replay protection is degraded for the current window"* | **Reference materially stronger.** The vault's `clear()` makes every previously-accepted signature replayable at once, and because the map is process-global the flush is triggered by *any* key and affects *every* key. |
-| Timestamp check placement | After the key lookup, inside the signature branch; the error reports `off by {skew}s` | Before the key lookup; the error names the window but discloses no measured offset | **Vault marginally stronger on two axes.** An unauthenticated caller costs the vault no DB query and learns no clock offset. The reference's disclosure is post-bearer-auth, so its exposure is small. |
-| Plaintext storage mode | Supported with a loud startup warning; values hex-encoded so the secret is not a `grep`-able substring of a dump | Supported with a loud startup warning; same hex encoding | **Equivalent.** |
-| Secret redaction in `Debug` | `SecretCipher::Sealed(<redacted>)` | `SecretCipher` `Debug` impl redacts key material | **Equivalent.** |
-
-**Prose.** Everything outside the three posture-derived rows has converged, with one exception that is genuinely one-sided: the reference's dedicated `src/replay.rs` is a better implementation of the anti-replay guard than the vault's in-line `ReplayGuard` in `src/state.rs`, on three independent counts — clock source, pruning cost, and overflow behaviour. The overflow difference is the one that matters. Both maps are reachable only by a caller holding a valid signing secret, so neither is an unauthenticated attack surface; but the vault's response to pressure is to *drop the security property*, while the reference's is to keep enforcing and complain. Because the map is shared across all keys, one misbehaving or compromised client can flush the vault's guard for every other client.
+| **Authentication posture** | mandatory full-URI HMAC + anti-replay on **every** key; no per-key mode, no opt-out, no alternate signature header | per-key `HmacMode` (`CanonicalV1` / `BodyOnly`), `X-Hub-Signature-256` accepted in `BodyOnly` only, `BodyOnly` excluded from replay tracking, `REQUIRE_SIGNED_REQUESTS` promotes signing to mandatory | **Intentional asymmetry — do not unify** |
+| MAC comparison | `Mac::verify_slice` (`crypto.rs:165`) — the only comparison in the crate | `Mac::verify_slice` (`middleware.rs:195`) — the only one | **Equivalent** — constant-time via `CtOutput::eq` → `subtle::ct_eq` |
+| Non-constant-time comparison of secret material | none — no `==` against any secret, signature, digest or MAC | none | **Equivalent** |
+| `key_hash` lookup | indexed DB lookup keyed on a SHA-256 digest | identical | **Equivalent** — *not* a secret comparison; timing reveals only index behaviour |
+| Canonical string | `METHOD\nTARGET\nTIMESTAMP\nBODY`, LF-joined | identical (`signature_base`) | **Equivalent** |
+| Target component | `path_and_query()`, never `path()` (`middleware.rs:96`) | `path_and_query()`, never `path()` (`middleware.rs:362`) | **Equivalent** — query string covered on both |
+| `OriginalUri` under `nest()` | used, with a `parts.uri` fallback | used, with a `parts.uri` fallback | **Equivalent** — without it every signature would mismatch |
+| Signature header parsing | `sha256=` prefix **optional**; bare hex accepted (`crypto.rs:156`) | `sha256=` prefix **required** (`middleware.rs:182`) | **`simply_hook_executor` stronger** — see §5.4 |
+| Digest returned from verification | `Option<Vec<u8>>` — raw decoded bytes | `Result<Vec<u8>, AppError>` — raw decoded bytes | **Equivalent** — both normalize hex spelling by construction |
+| `open()` accepted formats | exactly `v1.plain.` and `v1.xchacha20poly1305.` (`crypto.rs:346`) | exactly `v1.plain.` and `v1.xchacha20poly1305.` (`crypto.rs:141`) | **Equivalent** — closed set matching what `seal()` emits |
+| Unrecognized prefix | `MalformedCiphertext` — **fail-closed** | `MalformedCiphertext` — **fail-closed** | **Equivalent** — neither returns an unprefixed value verbatim |
+| Legacy ciphertext format | none — `aesgcm256:` purged in `40cb4f4`, `aes-gcm` crate removed | none | **Equivalent** — neither carries a legacy format the other has dropped |
+| Sealed row with no key configured | `DecryptionFailed`, never silent passthrough | `DecryptionFailed` | **Equivalent** |
+| AEAD | XChaCha20-Poly1305, fresh 24-byte random nonce per seal | identical | **Equivalent** — 192-bit nonce, no counter state to persist |
+| Malformed encryption key at startup | hard error; never degrades to plaintext | hard error | **Equivalent** |
+| Decryption failure at request time | `500`, logged loudly — not `401` | `500`, logged loudly | **Equivalent** — an operator emergency must not read as a client error |
+| Replay clock source | `tokio::time::Instant` (monotonic) | `std::time::Instant` (monotonic) | **Equivalent** — both immune to NTP steps; ours is additionally pausable for deterministic tests |
+| Replay key | `SignatureId { key_id, digest: Vec<u8> }`, raw bytes | identical | **Equivalent** — cross-key collision and hex re-spelling both impossible |
+| Behaviour at capacity | sweep + warn, **never** `clear()`; map may grow | sweep + warn, **never** `clear()` | **Equivalent** — the `seen.clear()` defect is closed on both sides |
+| Capacity-sweep backoff | `CAPACITY_BACKOFF_DIVISOR = 16` — at most one sweep per window/16 while saturated | none — sweeps on **every request** while saturated (`replay.rs:143`) | **`simply_ip_vault` stronger** — see §5.5 |
+| Routine sweep strategy | interval, `PRUNE_INTERVAL_DIVISOR = 4` | interval, `PRUNE_INTERVAL_DIVISOR = 4` | **Equivalent** — amortized, not per-request `O(n)` |
+| Tracked-signature ceiling | `100_000` | `250_000` | **Equivalent** — both are runaway-client alarms, not attack controls |
+| Poisoned-lock behaviour | fails **closed** (rejects the request) | fails **closed** | **Equivalent** |
+| Window clamp | `clamp(1, 3600)` | `clamp(1, 3600)` | **Equivalent** — a config typo cannot disable the guard |
+| Record-after-verify ordering | recorded only after `verify_slice` passes | identical | **Equivalent** — avoids the DoS-against-the-client inversion |
+| `X-Timestamp` vs. API-key DB lookup | validated **before** the lookup (`middleware.rs:155`) | validated **before** the lookup (`middleware.rs:281`) | **Equivalent** — an unauthenticated caller cannot buy a query with a stale timestamp |
+| Authoritative window re-check | single unconditional check | `prevalidate_timestamp_header` is the fast path; authoritative check repeated in the `CanonicalV1` branch | **Equivalent** — the peer's duplication is required by its per-key posture |
+| Skew symmetry | `.abs()` — future-dated rejected too | `.abs()` | **Equivalent** |
+| Encryption-key env var | primary `VAULT_ENCRYPTION_KEY`, alias `SIGNING_SECRET_KEY` | primary `SIGNING_SECRET_KEY`, alias `VAULT_ENCRYPTION_KEY` | **Equivalent** — deliberate mirror; each service seals its own database |
+| `ReplayGuard::tracked()` | `#[cfg(test)]` — compiled out of release builds | `pub` | **`simply_ip_vault` marginally tighter** — no security impact |
+| `ReplayGuard::new()` | private; `Default` is the only production path | `pub` — takes the configurable window from `RuntimeConfig` | **Equivalent** — follows from the posture asymmetry |
+| Signature-buffer cap | `MAX_SIGNED_BODY_BYTES = crate::MAX_REQUEST_BODY_BYTES` | identical derivation | **Equivalent** — no parser-differential band |
 
 ---
 
 ## 4. Database configuration & edge cases
 
-Files: `src/main.rs`, `src/lib.rs`, `src/retention.rs`, plus `src/db.rs` (reference) / `src/state.rs` (vault).
-
-| Aspect | `simply_hook_executor` (./example) | `simply_ip_vault` (this repo) | Assessment |
+| Aspect | `simply_ip_vault` — **this repo** | `simply_hook_executor` — **`./example`** | Assessment |
 | :--- | :--- | :--- | :--- |
-| Pragma module location | Dedicated `src/db.rs` | `state::apply_sqlite_pragmas` | **Equivalent.** Organizational only. |
-| `journal_mode=WAL` | Issued, and the result **read back** and compared (`eq_ignore_ascii_case("wal")`) rather than inferred from a clean return | Issued, result read back and compared identically | **Equivalent.** Both know SQLite silently declines the switch for in-memory and read-only databases rather than erroring. |
-| `busy_timeout` | `5_000` ms via `execute_raw`; failure warned and swallowed | `5000` ms via `execute_raw`; failure warned and swallowed | **Equivalent**, including the documented note that `journal_mode` is persistent (database file header) while `busy_timeout` is per-connection, with SQLx supplying the pool-wide default. |
-| Non-fatality | `apply_sqlite_pragmas` returns `Result<(), DbErr>` — every internal failure is swallowed, but `main` still wraps the call in `if let Err(e)` | `apply_sqlite_pragmas` returns `()`; `main` calls it with no `?` | **Vault marginally stronger.** Non-fatality is guaranteed by the signature and cannot be undone by a future caller adding `?`. The reference relies on the caller remembering. |
-| Backend guard | `if db.get_database_backend() != DatabaseBackend::Sqlite { return }` — keyed on backend, not URL text | Identical | **Equivalent.** Keeps the SQL-agnostic rule intact once PostgreSQL is in play; there is no URL parsing to get wrong. |
-| Pragma test coverage | Three tests: a **file-backed** database asserting WAL actually engages *and* survives reconnection; an in-memory database asserting tolerance and continued usability; a backend-scoping test | One test (`sqlite_pragma_failures_never_stop_the_service`): in-memory tolerance and idempotent re-application | **Reference stronger.** The vault never verifies anywhere that WAL genuinely engages on a file-backed database, nor that it persists — so a regression that silently stopped applying WAL would pass the vault's suite unchanged. |
-| Retention window default | `DEFAULT_DELETED_HOOK_RETENTION_DAYS = 92` | `DEFAULT_RETENTION_DAYS = 92` | **Equivalent.** |
-| Retention window override | `DELETED_HOOK_RETENTION_DAYS` via `parse_or_warn`, then `.max(0)` | `IP_RETENTION_DAYS` via `retention_days_from_env`, warn-and-fall-back on a malformed value | **Equivalent.** Both treat a non-positive value as "keep forever", and neither lets a typo destroy history. |
-| Soft-delete purge predicate | `IsDeleted.eq(true)` ∧ `DeletedAt.is_not_null()` ∧ `DeletedAt.lt(threshold)` | `IsDeleted.eq(true)` ∧ `DeletedAt.is_not_null()` ∧ `DeletedAt.lt(threshold)` | **Equivalent.** Both carry the redundant `is_not_null` guard, so a row with an inconsistent flag pair is never purged. |
-| Retention worker shutdown | Own `mpsc` channel; `main` drops the sender and awaits the handle | Own `mpsc` channel; `main` drops the sender and awaits the handle | **Equivalent.** Neither cuts a sweep off mid-delete on SIGTERM. |
-| Separation of retention windows | `log_retention_days` and `deleted_hook_retention_days` governed independently, with a documented rationale | Single `IP_RETENTION_DAYS` — the vault has one soft-deleted entity | **Equivalent for the surface each has.** |
-| `DefaultBodyLimit` | `MAX_REQUEST_BODY_BYTES = 3 * 1024 * 1024`, one router-wide layer applied **outside** both `nest()` calls | `MAX_REQUEST_BODY_BYTES = 3 * 1024 * 1024`, one router-wide layer applied **outside** the `nest()` | **Equivalent.** Both cover the static fallback too, so the limit cannot be sidestepped by aiming at a route that never reaches the auth middleware. |
-| Per-route body-limit override | None | None | **Equivalent.** Both state explicitly that an exception would reintroduce the differential the constant exists to remove. |
-| Signature-buffering constant | `const MAX_SIGNED_BODY_BYTES: usize = crate::MAX_REQUEST_BODY_BYTES;` | `const MAX_SIGNED_BODY_BYTES: usize = crate::MAX_REQUEST_BODY_BYTES;` | **Equivalent — byte-identical derivation.** No band of sizes exists that one layer accepts and the other refuses. |
-| Bind-address resolution | `resolve_bind_addr` / `parse_bind_addr` — `BIND_HOST` over `HOST`, `PORT`, literal IPs only, lenient fallback, port `0` passed through | Identical pair, identical precedence and fallback rules | **Equivalent.** Both log from `listener.local_addr()` rather than the requested address, so `PORT=0` is reported truthfully. |
-| DNS-failure handling at boot | Covered in §1 — negative caching plus a 60s delayed re-check, never an abort | Covered in §1 — identical | **Equivalent.** |
-
-**Prose.** The only scored gap here is test coverage rather than behaviour: the two pragma implementations are functionally the same, but only the reference proves that WAL actually engages on a real file and survives reconnection. That matters more than it appears, because the entire vault suite runs on `sqlite::memory:`, where WAL legitimately cannot engage — so the vault's single test would still pass if the pragma stopped being issued altogether.
+| `journal_mode=WAL` issued | `state::apply_sqlite_pragmas` (`state.rs:58`) | `db::apply_sqlite_pragmas` (`db.rs:49`) | **Equivalent** — different module, same logic |
+| Failure handling | **non-fatal**; returns `()`, so no error channel exists | **non-fatal**; returns `Result`, swallowed by `if let Err` at `main.rs:239` | **Equivalent** — ours makes it unpropagatable by construction; peer's is explicit at the call site |
+| Mode read-back | reads `journal_mode` from the response row | reads `journal_mode` from the response row | **Equivalent** — SQLite declines silently, so a clean return proves nothing |
+| `busy_timeout` | `5000` ms | `5000` ms | **Equivalent** |
+| Backend guard | skips unless `DatabaseBackend::Sqlite` | identical | **Equivalent** — the one documented exception to the SQL-agnostic rule |
+| Applied before migrations | yes | yes | **Equivalent** — migration is the long write that would otherwise hit `SQLITE_BUSY` |
+| **File-backed WAL test** | `wal_engages_on_a_file_backed_database_and_survives_reconnection` (`tests/security_tests.rs:2591`) | `wal_and_busy_timeout_are_applied_to_a_file_backed_database` (`src/db.rs:106`) | **Equivalent** — both now test a real file, not only `sqlite::memory:` |
+| — asserts `journal_mode == wal` | ✅ | ✅ | **Equivalent** |
+| — asserts `busy_timeout == 5000` | ✅ | ✅ | **Equivalent** |
+| — asserts survival across reconnection | ✅ fresh pool, no re-apply | ✅ fresh connection | **Equivalent** — proves the setting lives in the file header |
+| — runs migrations under WAL | ✅ | ✗ | **`simply_ip_vault` marginally stronger** — proves usability, not just reporting |
+| — temp-directory cleanup | `tempfile::tempdir()` — RAII, survives a panic | `std::env::temp_dir()` + manual `remove_dir_all` | **`simply_ip_vault` stronger** — peer leaks a directory on test panic (hygiene, not security) |
+| In-memory graceful-decline test | `sqlite_pragma_failures_never_stop_the_service` — also serves a signed request afterwards | `a_database_that_cannot_use_wal_still_starts_and_works` | **Equivalent** — ours additionally proves the app still serves |
+| DNS failure ⇒ negative cache | 5s, per hostname | 5s, per hostname | **Equivalent** |
+| Boot-time delayed abort | `prime()` + 60s grace on a detached task | `prime_trusted_proxies` + 60s grace | **Equivalent** — a slow-starting proxy is not fatal |
+| `DefaultBodyLimit` | `3 * 1024 * 1024`, one router-wide layer set exactly once | `3 * 1024 * 1024`, set once | **Equivalent** |
+| Signature buffer derives from it | `= crate::MAX_REQUEST_BODY_BYTES` | `= crate::MAX_REQUEST_BODY_BYTES` | **Equivalent** — not an independently chosen number |
 
 ---
 
-## 5. Executive summary
+## 5. Notes a table cell cannot hold
 
-Across four categories this audit compared **73 aspect rows**: 17 on proxy and IP middleware, 14 on RBAC and privilege escalation, 26 on cryptography, HMAC and authentication posture, and 16 on database configuration and edge cases. Of these, **66 are equivalent or differ only cosmetically**, **3 are intentional asymmetries** — the per-key versus mandatory authentication posture, the `X-Hub-Signature-256` acceptance path, and the `BodyOnly` exclusion from replay tracking, all three of which follow from `simply_hook_executor`'s need to interoperate with third-party senders and none of which should be unified — and **4 are genuine discrepancies**, all of them on the `simply_ip_vault` side and concentrated in two places. Three concern the anti-replay guard: on capacity overflow the vault calls `seen.clear()` and self-documents the result as degraded replay protection, whereas the reference prunes, keeps enforcing, and warns — and because the map is process-global, one client's burst flushes the guard for every key; the vault expires entries against the wall clock rather than a monotonic `Instant`, so an NTP step evicts still-valid entries early; and it runs an O(n) `retain` over the whole map inside the global mutex on every authenticated request instead of amortizing the sweep. The fourth is test coverage: the vault never verifies that `journal_mode=WAL` actually engages on a file-backed database, only that failing to apply it is non-fatal. A follow-up convergence pass is warranted for the replay guard specifically — the reference's dedicated `src/replay.rs` is the better design on all three counts, and porting it wholesale (keyed on the raw digest returned by `verify_signature`, expiring on `Instant`, pruning on an interval, and refusing to flush under pressure) would close every one of them; the WAL test is worth adding in the same pass. No discrepancy was found on the reference side, and no exploitable unauthenticated path was found on either. **All findings are subject to the freshness flag in §0: `./example` carries no commit marker, so its currency relative to its own upstream cannot be verified from within this repository.**
+### 5.1 The previous audit's `resolve_hostname` divergence is retired as cosmetic
+
+It was recorded as an open divergence on diagnosability grounds. Reading both implementations side
+by side retires that claim: the peer returns `true` only when `!networks.is_empty()`, and `false` in
+both empty cases — the lookup error *and* the zero-address success. Ours computes
+`resolved = !addresses.is_empty()` at the call site. The tuple therefore carries **no information
+the scalar does not**, both feed the same positive/negative TTL split, and cache behaviour is
+identical. Nothing to port; the item should be struck from the divergence register rather than
+carried forward.
+
+### 5.2 The one new finding, and it is on our side
+
+Our TTL suite tests that a *negative* entry expires, and that a *positive* entry stays fresh
+alongside a failing one — but never that a positive entry **lapses**. That is the security-relevant
+direction: `POSITIVE_TTL` is the window during which a recreated container keeps its old address
+trusted, an address the orchestrator may already have reassigned. A positive entry that never
+expired would be a standing trust grant to whoever inherited that address, clearable only by a
+restart — and every current test would still pass. `with_ttls` already accepts a positive duration,
+so the test is writable without touching production code. The peer added exactly this test
+(`a_successful_resolution_is_re_queried_once_its_positive_ttl_expires`) in its most recent sweep,
+and mutation-checked it.
+
+### 5.3 Revocation authority: a defensible difference, not a defect
+
+Ours requires the caller to hold each verb it removes; the peer requires only `can_manage` on the
+hook. Under the peer's rule, a caller holding `can_manage` but not `can_execute` can destroy an
+`can_execute` grant it could not have created. That is an asymmetry, but not an escalation — the
+peer's own rationale (`api.rs:450`, `api.rs:2373`) argues that removing authority should never
+require a master, and it is coherent. Recorded as a difference in strictness; neither side is wrong.
+
+### 5.4 Bare-hex signatures
+
+Ours accepts `sha256=<hex>` *or* a bare `<hex>`; the peer requires the prefix. Not exploitable — the
+HMAC must still verify and `hex::decode` still rejects non-canonical spellings — but it is a laxer
+parse than the documented wire format, and laxity in a signature parser is worth removing on
+principle rather than after a reason appears.
+
+### 5.5 The capacity-sweep backoff is still worth porting back
+
+The peer's `prune_if_due` returns early only when `now < *next_prune && !over_capacity`. Once the map
+is saturated with entries that are all still live, `over_capacity` stays true, every request takes
+the sweep branch, and the full `retain` runs per request inside the global lock — freeing nothing and
+reinstating precisely the `O(n)`-per-request scan the module exists to remove. Ours bounds this to
+one sweep per window/16. The peer's higher ceiling (250k vs. 100k) makes the saturated state rarer
+but more expensive when reached. This was flagged in the previous audit and has not been picked up;
+it remains the clearest single improvement either codebase could take from the other.
+
+Both implementations also acquire the `seen` lock once per request purely to read `len()` for the
+capacity test. Hoisting that behind the schedule check would remove a lock acquisition from every
+authenticated request on both sides.
+
+---
+
+## 6. Executive summary
+
+**Eighty-three aspects were compared across four categories** — 18 proxy/IP, 16 RBAC, 32
+crypto/HMAC/replay, and 17 database/edge-case rows. **Seventy-four are equivalent**, one is the
+permanent intentional asymmetry (mandatory full-HMAC on `simply_ip_vault` versus per-key `HmacMode`
+on `simply_hook_executor` — recorded, not scored, and now subsuming the `X-Hub-Signature-256`
+acceptance path and the `BodyOnly` replay exclusion that the previous audit listed as separate
+asymmetries), and **eight are genuine differences in strictness — six favouring `simply_ip_vault`,
+two favouring `simply_hook_executor`. None is exploitable.** Both contested RBAC findings are
+**CLOSED**, verified by reading current source rather than trusting either side's commit message:
+`simply_ip_vault`'s `revoke_key_group_permission` now resolves the caller's own grant and re-uses the
+same per-verb delegation predicate as granting, with the `404` deliberately ordered ahead of the
+authority check so a nonexistent grant cannot become a `403` that confirms a group's existence to
+someone with no access to it; and `simply_hook_executor`'s `guard_delegated_hook_grant` now tests
+`can_execute` and `can_manage` independently, so holding one confers no right to grant the other.
+Every other patch the previous round claimed also holds up: the `seen.clear()` flush is gone from
+both replay guards, both expire entries against a monotonic clock, both `open()` implementations
+accept only the closed two-format set that `seal()` can produce — with no legacy prefix on either
+side and no fail-open passthrough — both validate `X-Timestamp` before the API-key lookup, both check
+`bound_ips` only after the HMAC has verified, and both now exercise WAL against a real file-backed
+database rather than only `sqlite::memory:`. Two items are worth acting on. The **new** one is a
+test-coverage gap on *our* side: nothing drives a positive DNS entry to expiry, so a `POSITIVE_TTL`
+that never lapsed — a standing trust grant to whoever inherits a recycled container address — would
+pass the suite unnoticed. The **carried-over** one is the peer's missing capacity-sweep backoff,
+which reinstates an `O(n)` scan per request while the replay map is saturated. Separately, the
+previous audit's `resolve_hostname` divergence is **retired as cosmetic**: the peer's `(Vec, bool)`
+return is `true` in exactly the non-empty cases, making it identical to the `!addresses.is_empty()`
+our caller already derives. Reference freshness is **CURRENT**, corroborated by mtime and by content
+rather than pinned to a hash, because `./example` is an untracked, ignored directory with no `.git`
+of its own — and `git -C ./example rev-parse HEAD` silently reports the *parent* repository's commit,
+a result to distrust rather than record.

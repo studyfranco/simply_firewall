@@ -3339,3 +3339,86 @@ Every other dependency and feature has at least one real consumer.
 
 No new drift. The two documented divergences are the pre-existing pair from Session 26
 (`apply_sqlite_pragmas` module/wording, and `resolve_hostname`'s tuple return).
+
+---
+
+## 2026-08-02 — Session 28: closing cross-audit (read-only, no source changes)
+
+Second read-only comparative audit against `./example/simply_hook_executor`, run as a *closing*
+pass: re-verify the two contested RBAC findings from Session 25 against current source rather than
+against Session 26/27's commit messages, and surface anything new. Output was
+`SECURITY_COMPARISON_REPORT.md` (rewritten) plus this entry. No file in `src/`, `tests/`, or
+`./example` was touched; `git status` showed only the report.
+
+### Reference freshness: CURRENT — and `rev-parse` is a trap here
+
+Session 25 had to flag `⚠ UNVERIFIED`. That flag is now retired. `./example` still carries no
+provenance marker (no `.git`, no `.gitmodules`, `git ls-files example` = 0, `.gitignore:9` =
+`example/*`), so no hash can be pinned — but mtimes place its newest content at 2026-08-02 17:13–18:46,
+which postdates `ee84e72` (17:21) and sits within five minutes of `40cb4f4` (17:38), and the content
+corroborates that independently: the peer's own `AGENT_NOTES.MD` documents its dead-code sweep, its
+`src/replay.rs` exists, and its `SecretCipher::open` is already fail-closed.
+
+**Worth recording for next time:** `git -C ./example rev-parse HEAD` *succeeds* and returns
+`5f7b5b1…` — this repository's own HEAD, because git walks up to the enclosing repo. It looks like a
+reference commit and is not one. Any future audit must corroborate rather than record that number.
+
+### Both contested findings are CLOSED
+
+| Finding | Verdict | Evidence |
+| :--- | :--- | :--- |
+| Our `revoke_key_group_permission` lacked a per-group / master-target check | **CLOSED** | `api.rs:1944` — `caller_group_permission` + `guard_delegated_group_grant(.., "revoke", ..)` against the existing grant's verbs, with `404` ordered ahead of the authority check |
+| Peer's grant handler let any verb grant any other | **CLOSED** | `api.rs:461` — `guard_delegated_hook_grant` tests `can_execute` and `can_manage` independently via `wanted && !holds` |
+
+Every other Session 26/27 claim also held up under inspection: `seen.clear()` is gone from both
+replay guards, both expire on a monotonic clock, both `open()` implementations accept only the closed
+two-format set with no legacy prefix and no fail-open passthrough, both validate `X-Timestamp` before
+the key lookup, both check `bound_ips` only after the HMAC verifies, and **both** now test WAL on a
+file-backed database.
+
+### Scoreboard
+
+83 rows (18 proxy/IP, 16 RBAC, 32 crypto/HMAC/replay, 17 DB) — 74 equivalent, 1 intentional
+asymmetry, 8 differences in strictness (6 favouring us, 2 favouring the peer), none exploitable.
+
+### Two things to act on later (neither authorized this session)
+
+1. **Our own gap — no positive-TTL expiry test.** `src/config.rs`'s TTL suite covers negative-entry
+   expiry and "a healthy entry stays fresh beside a failing one", but never drives a *positive* entry
+   to expiry. All three tests pass a 30s positive TTL, which cannot lapse inside a test — so
+   `is_fresh` returning unconditionally `true` for resolved entries would fail none of them. That is
+   the security-relevant direction: `POSITIVE_TTL` is the window in which a recreated container keeps
+   its **old** address trusted, an address the orchestrator may have reassigned. `with_ttls` already
+   accepts a positive duration, so this needs no production change. The peer added exactly this test
+   (`a_successful_resolution_is_re_queried_once_its_positive_ttl_expires`) and mutation-checked it.
+2. **`CAPACITY_BACKOFF_DIVISOR` still not ported back** to the peer (carried from Session 25/26).
+
+### Divergence register: `resolve_hostname` struck as cosmetic
+
+Session 26 registered the peer's `(Vec<IpNetwork>, bool)` return versus our `Vec<IpNetwork>` as a
+documented divergence on diagnosability grounds. **That was wrong, and the entry should be removed.**
+The peer returns `false` in *exactly* the empty cases — the lookup error and the zero-address success
+alike — so its bool is `!networks.is_empty()` by construction, which is precisely what our caller
+derives at `config.rs:468`. The tuple carries no information the scalar does not, and both feed the
+same positive/negative TTL split. `verify_convergence.sh` should drop it rather than keep explaining
+it, leaving one documented divergence (the `apply_sqlite_pragmas` module/wording split).
+
+### Smaller differences recorded but not scored as defects
+
+- **Bare-hex signatures.** Our `verify_signature` accepts `sha256=<hex>` *or* a bare `<hex>`
+  (`crypto.rs:156`); the peer requires the prefix. Not exploitable — the HMAC must still verify — but
+  laxer than the documented wire format.
+- **Revocation authority scope.** We require the caller to hold each verb being removed; the peer
+  requires only `can_manage` on the hook, so it can destroy a grant it could not create. The peer
+  argues de-escalation should never need a master, which is coherent. Difference in strictness, not a
+  defect on either side.
+- **Both** guards take the `seen` lock once per request purely to read `len()` for the capacity test.
+  Hoisting that behind the schedule check would remove a lock acquisition from every authenticated
+  request on both sides.
+
+### Process note
+
+A `cd example/simply_hook_executor` in one Bash call persisted into later calls and silently pointed
+`tail AGENT_NOTES.MD` and a `grep src/crypto.rs` at the *peer's* tree — the peer's notes read
+plausibly enough (they document a dead-code sweep too) that the mistake was caught only by the line
+count being 2110 instead of 3341. When auditing two trees side by side, use absolute paths.
