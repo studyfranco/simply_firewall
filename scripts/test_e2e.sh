@@ -21,7 +21,8 @@
 # is logged with a timestamp, method, full URL, color-coded status, and jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
-# Requires: curl, jq. Needs port 3000 free (the app's listen address is not configurable).
+# Requires: curl, jq. Needs port 3000 free (BIND_HOST/PORT configure the listen address;
+# this suite uses the default and boots its throwaway instances on higher ports).
 # Optional: python3 (only for live webhook-delivery verification in §13; that one section degrades
 # to a skip + warning without it, everything else is unaffected).
 # Exit code: 0 if every check passed, 1 otherwise.
@@ -135,11 +136,43 @@ print_response_body() {
 # no trailing newline, and no mangling of JSON bodies containing backslashes or leading dashes.
 # Usage: hmac_sign SECRET METHOD PATH TIMESTAMP BODY
 hmac_sign() {
-    local secret="$1" method="$2" path="$3" timestamp="$4" body="${5:-}"
-    local path_only="${path%%\?*}"
-    printf '%s\n%s\n%s\n%s' "$method" "$path_only" "$timestamp" "$body" \
+    local secret="$1" method="$2" target="$3" timestamp="$4" body="${5:-}"
+    # CANONICAL_V1 signs the **full request target**, query string included. Stripping it here (as
+    # this helper used to) would leave `?hard=true` and `?include_deleted=true` rewritable on an
+    # otherwise-valid signed request — and would make the tampering checks below pass vacuously.
+    printf '%s\n%s\n%s\n%s' "$method" "$target" "$timestamp" "$body" \
         | openssl dgst -sha256 -hmac "$secret" \
         | sed 's/^.*= //'
+}
+
+# Last X-Timestamp used per distinct request identity, so a repeated identical call gets a fresh
+# one rather than reproducing a signature the server has already accepted.
+declare -A LAST_SIGNED_AT
+
+# Returns an X-Timestamp for a request, guaranteed to differ from the last one used for the same
+# request identity.
+#
+# A signature covers method, target, timestamp and body and nothing else, so **issuing the same call
+# twice inside one wall-clock second reproduces the same signature**, which the server refuses as a
+# replay. That is correct behaviour and this suite must not disable it — but the script fires
+# hundreds of checks in a few seconds and legitimately repeats calls (list, mutate, list again), and
+# several checks differ only in an *unsigned* header such as X-Forwarded-For. So the timestamp is
+# advanced by one second per repeat of an identical call, which is exactly what elapsed time would
+# have given a real caller. Distinct calls are untouched, so the clock never drifts far from now and
+# the ±300s freshness window is unaffected.
+# The result is left in $SIGNED_TS rather than printed: `$(next_timestamp ...)` would run the
+# function in a subshell, where the update to LAST_SIGNED_AT is discarded the moment it returns —
+# which silently reduces this to a plain `date +%s` and lets every repeat collide again.
+# Usage: next_timestamp IDENTITY  ->  $SIGNED_TS
+next_timestamp() {
+    local identity="$1"
+    local now; now=$(date -u +%s)
+    local previous="${LAST_SIGNED_AT[$identity]:-0}"
+    if [ "$now" -le "$previous" ]; then
+        now=$((previous + 1))
+    fi
+    LAST_SIGNED_AT["$identity"]=$now
+    SIGNED_TS=$now
 }
 
 # Records the signing secret for a freshly minted key so subsequent api_call invocations using that
@@ -163,7 +196,16 @@ api_call() {
 
     # Anti-replay timestamp: always sent, even for the deliberately-unauthenticated checks, so those
     # still fail on the credential under test rather than on a missing X-Timestamp.
-    local timestamp; timestamp=$(date -u +%s)
+    #
+    # A signature covers method, target, timestamp and body and nothing else, so **issuing the same
+    # call twice inside one wall-clock second reproduces the same signature**, which the server now
+    # refuses as a replay. That is correct behaviour and this suite must not disable it — but this
+    # script fires hundreds of checks in a few seconds and legitimately repeats calls (list, mutate,
+    # list again). So the timestamp is advanced by one second per *repeat of an identical call*,
+    # which is precisely what elapsed time would have given a real caller. Distinct calls are
+    # untouched, so the clock never drifts far from now and the ±300s freshness window is unaffected.
+    next_timestamp "$method|$path|$api_key|$data"
+    local timestamp="$SIGNED_TS"
     args+=(-H "X-Timestamp: $timestamp")
 
     if [ -n "$api_key" ]; then
@@ -212,6 +254,20 @@ check_jq() {
     fi
 }
 
+# Compares two locally-computed values, for assertions that are not about an HTTP response at all —
+# a process exit status, a log line, the presence of a file. Usage:
+#   check_local ACTUAL EXPECTED "description"
+check_local() {
+    local actual="$1" expected="$2" description="$3"
+    if [ "$actual" == "$expected" ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $description" >&2
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (expected '$expected', got '$actual')" >&2
+    fi
+}
+
 # Usage: check_true "jq boolean expression producing true/false" "description"
 check_true() {
     local expr="$1" description="$2"
@@ -254,7 +310,7 @@ for bin in curl jq cargo openssl; do
 done
 
 if command -v fuser >/dev/null 2>&1 && fuser 3000/tcp >/dev/null 2>&1; then
-    err "Port 3000 is already in use (the app's listen address is not configurable)."
+    err "Port 3000 is already in use (this suite boots the main instance on the default port)."
     err "Stop whatever is bound to it and re-run this script."
     exit 1
 fi
@@ -281,13 +337,19 @@ fi
 log "Build succeeded."
 
 log_section "Boot"
+# 64 hex characters, as `openssl rand -hex 32` would produce. Fixed rather than random so a failed
+# run leaves a database the operator can still open with the same value.
+E2E_ENCRYPTION_KEY="0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0"
+
 log "Starting server against a fresh database at $DB_PATH"
 log "Using INITIAL_MASTER_KEY + INITIAL_MASTER_SIGNING_SECRET for deterministic bootstrap (no log-scraping needed)"
 # ALLOW_PRIVATE_WEBHOOKS=true: §13 targets a webhook at a loopback receiver to observe deliveries,
 # which SSRF protection would otherwise block by default. Every other webhook test in this script
 # targets a real public host, so this doesn't loosen anything they depend on.
-# VAULT_ENCRYPTION_KEY is set so the run exercises the AES-GCM-256 seal/open path for signing
-# secrets end to end, rather than the plaintext development fallback.
+# VAULT_ENCRYPTION_KEY is set so the run exercises the XChaCha20-Poly1305 seal/open path for
+# signing secrets end to end, rather than the plaintext development fallback. It MUST be exactly 64
+# hex characters: a malformed key now aborts startup instead of silently degrading to plaintext, and
+# §26 asserts exactly that by booting a throwaway instance with a bad one.
 # TRUSTED_PROXIES=localhost: curl connects over loopback, so declaring it a trusted proxy is what
 # lets the CIDR checks below use X-Forwarded-For to stand in for a client address — exactly as a
 # real reverse proxy would. Spelled as a *hostname* rather than 127.0.0.1 on purpose: that exercises
@@ -296,7 +358,7 @@ log "Using INITIAL_MASTER_KEY + INITIAL_MASTER_SIGNING_SECRET for deterministic 
 # deliberately NOT to 127.0.0.2, which §6b connects from to exercise the untrusted-peer path.
 DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MASTER_KEY" \
     INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
-    VAULT_ENCRYPTION_KEY="e2e-vault-encryption-passphrase" \
+    VAULT_ENCRYPTION_KEY="$E2E_ENCRYPTION_KEY" \
     ALLOW_PRIVATE_WEBHOOKS=true \
     TRUSTED_PROXIES="localhost" \
     "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$SERVER_LOG" 2>&1 &
@@ -363,7 +425,10 @@ raw_call() {
     print_response_body
 }
 
-NOW_TS=$(date -u +%s)
+# Routed through the shared clock: `GET /api/auth/me` as the master key has already been issued
+# earlier in this run, and an identical repeat within the same second is a replay by definition.
+next_timestamp "GET|/api/auth/me|$MASTER_KEY|"
+NOW_TS="$SIGNED_TS"
 VALID_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$NOW_TS" "")
 
 # Control: the three headers together authenticate.
@@ -391,7 +456,7 @@ check "401" "a wrong signature is rejected"
 # timestamp it sends, so only the freshness check can reject it.
 #
 # The two directions need different margins, because elapsed wall-clock time moves them oppositely:
-# a stale timestamp only gets staler while the script runs, so 301 can never drift back inside the
+# a stale timestamp only gets staler while the script runs, so it can never drift back inside the
 # window. A *future* timestamp decays toward it — at NOW+301, one second of elapsed time between
 # capturing NOW_TS and the server reading its own clock leaves a skew of 300, which is inside the
 # window and legitimately returns 200. Hence a fresh capture immediately before the call plus a
@@ -401,7 +466,10 @@ check "401" "a wrong signature is rejected"
 # `tests/security_tests.rs::attack_timestamp_forgery_outside_the_window_is_rejected_both_directions`,
 # where the request is handled in-process microseconds after the timestamp is chosen. E2E asserts
 # the behaviour, not the boundary.
-STALE_TS=$((NOW_TS - 301))
+# Captured fresh rather than derived from NOW_TS: `next_timestamp` may have pushed NOW_TS a second
+# or two ahead of the real clock to avoid a replay collision, and subtracting from an inflated base
+# would land inside the window and pass for the wrong reason.
+STALE_TS=$(( $(date -u +%s) - 360 ))
 STALE_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$STALE_TS" "")
 raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $STALE_TS" -H "X-Signature-256: $STALE_SIG"
 check "401" "a 301s-stale timestamp is rejected as a replay"
@@ -696,7 +764,13 @@ log_section "6b. X-Forwarded-For Spoofing From an Untrusted Peer"
 # --interface so the server sees a different TCP peer.
 call_from_interface() {
     local iface="$1" method="$2" path="$3" api_key="$4" xff="$5"
-    local timestamp; timestamp=$(date -u +%s)
+    # Same clock as api_call: these probes differ only in the (unsigned) X-Forwarded-For header, so
+    # without it the second would reproduce the first's signature and be refused as a replay.
+    # Deliberately the *same* identity key as api_call: --interface changes which source address
+    # curl binds, not a single byte of the signed material, so a call_from_interface and an
+    # api_call for the same method/path/key produce the same signature and must share one clock.
+    next_timestamp "$method|$path|$api_key|"
+    local timestamp="$SIGNED_TS"
     local secret="${SIGNING_SECRETS[$api_key]:-unregistered-key-has-no-signing-secret}"
     local args=(-s -o "$RESP_BODY_FILE" -w "%{http_code}" -X "$method" --interface "$iface")
     args+=(-H "X-API-Key: $api_key" -H "X-Timestamp: $timestamp")
@@ -1945,6 +2019,178 @@ check "204" "delete the privileged webhook"
 
 api_call DELETE "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY"
 check "204" "delete the hijack-target webhook"
+
+# ─────────────────────────────────────────────────────────────
+log_section "26. Convergence — Full-URI Signing, Anti-Replay & Fail-Closed Crypto"
+# ─────────────────────────────────────────────────────────────
+#
+# The three arbitrated decisions of the cross-service convergence pass, asserted against a live
+# server rather than in-process, because each one lives in the request pipeline where a unit test
+# cannot see the whole path.
+
+# --- Full-URI signature coverage -------------------------------------------------------------
+#
+# The query string is part of the signed target. Before it was, an on-path attacker who could not
+# forge a signature could still append `?hard=true` to a captured `DELETE /api/ips/{id}` and turn a
+# reversible soft delete into an irreversible purge — no secret required.
+
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.240","group_name":"convergence-group","cause":"full-uri signing"}'
+check "200" "#26 seed a record for the query-tampering checks"
+
+api_call GET "/api/ips?groups=convergence-group" "$MASTER_KEY"
+check "200" "#26 read the seeded record back"
+TAMPER_RECORD_ID=$(echo "$RESP_BODY" | jq -r '[.[] | select(.target_address == "198.51.100.240")][0].id')
+
+# Sign the bare path, send it with `?hard=true` bolted on — exactly the rewrite a proxy-level
+# attacker performs.
+next_timestamp "TAMPER|$TAMPER_RECORD_ID"
+TAMPER_TS="$SIGNED_TS"
+TAMPER_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "DELETE" "/api/ips/$TAMPER_RECORD_ID" "$TAMPER_TS" "")
+raw_call DELETE "/api/ips/$TAMPER_RECORD_ID?hard=true" \
+    -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $TAMPER_TS" -H "X-Signature-256: $TAMPER_SIG"
+check "401" "#26 a query string appended after signing breaks the signature"
+
+api_call GET "/api/ips?groups=convergence-group" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "198.51.100.240")] | length == 1' \
+    "#26 the record survived the rejected escalation"
+
+# The mirror image: a signature computed *with* a query is not valid without it, so a parameter
+# cannot be stripped either.
+next_timestamp "STRIPQ|convergence"
+STRIPQ_TS="$SIGNED_TS"
+STRIPQ_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/ips?include_deleted=true" "$STRIPQ_TS" "")
+raw_call GET "/api/ips" \
+    -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $STRIPQ_TS" -H "X-Signature-256: $STRIPQ_SIG"
+check "401" "#26 removing a signed query parameter also breaks the signature"
+
+# ...and a correctly signed query still authenticates, so the change did not simply break every
+# filtered read.
+api_call GET "/api/ips?groups=convergence-group&limit=5" "$MASTER_KEY"
+check "200" "#26 a correctly signed query string authenticates normally"
+
+# --- Anti-replay: signature reuse inside the window -------------------------------------------
+#
+# A freshness window bounds how *long* a captured request stays usable; it says nothing about using
+# it *twice*. Every field the signature covers is unchanged in a replay, so the HMAC verifies and
+# the timestamp check passes — only a record of what has already been accepted separates them.
+# `simply_ip_vault` is normally reached over plain HTTP on a LAN, so an authentic POST is readable
+# by anything on the path.
+
+next_timestamp "REPLAY|convergence"
+REPLAY_TS="$SIGNED_TS"
+REPLAY_BODY='{"target_address":"198.51.100.241","group_name":"convergence-group","cause":"replay probe"}'
+REPLAY_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/ban" "$REPLAY_TS" "$REPLAY_BODY")
+
+raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $REPLAY_TS" \
+    -H "X-Signature-256: $REPLAY_SIG" -H "Content-Type: application/json" -d "$REPLAY_BODY"
+check "200" "#26 the genuine signed request succeeds"
+
+# The identical bytes, resent. This is the intercepted-and-replayed request.
+raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $REPLAY_TS" \
+    -H "X-Signature-256: $REPLAY_SIG" -H "Content-Type: application/json" -d "$REPLAY_BODY"
+check "401" "#26 a byte-identical replay inside the window is rejected"
+check_true '.error | test("already been used")' \
+    "#26 the rejection names replay rather than looking like a signature failure"
+
+# A third attempt is refused too: the guard is not a one-shot latch that clears itself.
+raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $REPLAY_TS" \
+    -H "X-Signature-256: $REPLAY_SIG" -H "Content-Type: application/json" -d "$REPLAY_BODY"
+check "401" "#26 the replay stays rejected on further attempts"
+
+# ...while a freshly signed request from the same key is unaffected, proving the guard rejects
+# replays rather than simply burning the key after one use.
+api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"198.51.100.242","group_name":"convergence-group","cause":"fresh after replay"}'
+check "200" "#26 a freshly signed request from the same key still works"
+
+# --- Fail-closed cipher initialization --------------------------------------------------------
+#
+# A malformed VAULT_ENCRYPTION_KEY must abort startup, never degrade to writing signing secrets in
+# the clear. The previous implementation accepted any string and SHA-256'd it, so
+# `VAULT_ENCRYPTION_KEY=password` produced a key with the entropy of "password" and no signal that
+# anything was wrong. Booting a throwaway instance is the only way to assert a startup decision.
+
+BADKEY_PORT=$((3000 + 61))
+BADKEY_DB="$WORK_DIR/badkey.db"
+BADKEY_LOG="$WORK_DIR/badkey_server.log"
+
+log "Booting a throwaway instance with a malformed VAULT_ENCRYPTION_KEY (expected to refuse)..."
+DATABASE_URL="sqlite://$BADKEY_DB?mode=rwc" RUST_LOG=info \
+    VAULT_ENCRYPTION_KEY="not-a-64-hex-character-key" \
+    PORT="$BADKEY_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$BADKEY_LOG" 2>&1 &
+BADKEY_PID=$!
+
+# It must exit on its own, and quickly — the cipher is built before the listener binds.
+BADKEY_EXITED=0
+for _ in $(seq 1 40); do
+    if ! kill -0 "$BADKEY_PID" 2>/dev/null; then BADKEY_EXITED=1; break; fi
+    sleep 0.25
+done
+if [ "$BADKEY_EXITED" != "1" ]; then
+    kill "$BADKEY_PID" 2>/dev/null || true
+fi
+wait "$BADKEY_PID" 2>/dev/null || true
+
+check_local "$BADKEY_EXITED" "1" "#26 a malformed VAULT_ENCRYPTION_KEY aborts startup instead of degrading"
+if grep -qi "InvalidKey\|hex characters" "$BADKEY_LOG" 2>/dev/null; then
+    check_local "named" "named" "#26 the startup failure names the key as the reason"
+else
+    check_local "$(head -c 200 "$BADKEY_LOG" 2>/dev/null)" "named" "#26 the startup failure names the key as the reason"
+fi
+check_local "$([ -s "$BADKEY_DB" ] && echo created || echo absent)" "absent" \
+    "#26 no database is provisioned when the cipher is refused"
+
+# --- Negative DNS caching survives a dead hostname --------------------------------------------
+#
+# An unresolvable TRUSTED_PROXIES entry disables that entry only — never the service — and is
+# retried on a short negative TTL rather than re-queried per request. The live instance is already
+# proof of the first half in the healthy direction; this asserts the failing one.
+
+DEADNS_PORT=$((3000 + 62))
+DEADNS_DB="$WORK_DIR/deadns.db"
+DEADNS_LOG="$WORK_DIR/deadns_server.log"
+DEADNS_MASTER="e2e_deadns_master_key_for_testing_123456789"
+
+log "Booting an instance whose TRUSTED_PROXIES names an unresolvable host alongside a good one..."
+DATABASE_URL="sqlite://$DEADNS_DB?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$DEADNS_MASTER" \
+    INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
+    TRUSTED_PROXIES="this-host-does-not-exist.invalid,127.0.0.1" \
+    PORT="$DEADNS_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$DEADNS_LOG" 2>&1 &
+DEADNS_PID=$!
+
+DEADNS_READY=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$DEADNS_PID" 2>/dev/null; then break; fi
+    SC=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$DEADNS_PORT/api/ips" 2>/dev/null)
+    case "$SC" in 200|401|403|404) DEADNS_READY=1; break ;; esac
+    sleep 0.5
+done
+
+check_local "$DEADNS_READY" "1" "#26 an unresolvable TRUSTED_PROXIES entry does not stop the service"
+
+if [ "$DEADNS_READY" == "1" ]; then
+    # The good entry still works: 127.0.0.1 is trusted, so its forwarding header is honoured.
+    next_timestamp "DEADNS|auth"
+    DEADNS_TS="$SIGNED_TS"
+    DEADNS_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$DEADNS_TS" "")
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" \
+        -H "X-API-Key: $DEADNS_MASTER" -H "X-Timestamp: $DEADNS_TS" \
+        -H "X-Signature-256: $DEADNS_SIG" \
+        "http://127.0.0.1:$DEADNS_PORT/api/auth/me")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "#26 the surviving TRUSTED_PROXIES entries keep working"
+
+    if grep -q "did not resolve at startup" "$DEADNS_LOG" 2>/dev/null; then
+        check_local "logged" "logged" "#26 the unresolvable entry is reported by name at startup"
+    else
+        check_local "missing" "logged" "#26 the unresolvable entry is reported by name at startup"
+    fi
+fi
+
+kill "$DEADNS_PID" 2>/dev/null || true
+wait "$DEADNS_PID" 2>/dev/null || true
+
 
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2

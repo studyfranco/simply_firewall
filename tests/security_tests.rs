@@ -172,12 +172,18 @@ fn signed_at(
         .method_ref()
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| "GET".to_owned());
-    let path = builder
+    // The **full** target, query string included — signing the bare path here would make the
+    // query-tampering tests below pass without proving anything.
+    let target = builder
         .uri_ref()
-        .map(|u| u.path().to_owned())
+        .map(|u| {
+            u.path_and_query()
+                .map(|pq| pq.as_str().to_owned())
+                .unwrap_or_else(|| u.path().to_owned())
+        })
         .unwrap_or_else(|| "/".to_owned());
     let ts = timestamp.to_string();
-    let signature = crypto::compute_signature(secret, &method, &path, &ts, body.as_bytes()).unwrap();
+    let signature = crypto::compute_signature(secret, &method, &target, &ts, body.as_bytes()).unwrap();
     builder
         .header("X-Timestamp", &ts)
         .header("X-Signature-256", &signature)
@@ -188,6 +194,22 @@ fn signed_at(
 /// Builds a signed request stamped "now".
 fn signed(builder: axum::http::request::Builder, secret: &str, body: &str) -> Request<Body> {
     signed_at(builder, secret, chrono::Utc::now().timestamp(), body)
+}
+
+/// Builds a signed request stamped `offset_secs` into the future.
+///
+/// A signature covers method, target, timestamp and body and nothing else, so repeating a call
+/// unchanged inside the same wall-clock second yields the identical signature — a replay, which the
+/// guard now refuses. Real callers never hit this because their second attempt lands on a later
+/// timestamp; a test issuing both microseconds apart has to say so explicitly. The offset stays far
+/// inside the ±300s window, so the request is exactly as fresh as a genuine later one.
+fn signed_later(
+    builder: axum::http::request::Builder,
+    secret: &str,
+    offset_secs: i64,
+    body: &str,
+) -> Request<Body> {
+    signed_at(builder, secret, chrono::Utc::now().timestamp() + offset_secs, body)
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -205,7 +227,7 @@ fn signed(builder: axum::http::request::Builder, secret: &str, body: &str) -> Re
 async fn attack_timestamp_forgery_outside_the_window_is_rejected_both_directions() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let key = insert_master_key(&db, "Replay Attacker").await;
     let secret = test_signing_secret(&key);
@@ -259,7 +281,7 @@ async fn attack_timestamp_forgery_outside_the_window_is_rejected_both_directions
 async fn attack_omitting_the_timestamp_header_does_not_skip_the_replay_check() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let key = insert_master_key(&db, "No Timestamp").await;
     let secret = test_signing_secret(&key);
@@ -327,7 +349,7 @@ fn flip_last_hex_digit(signature: &str) -> String {
 async fn attack_signature_forgery_by_last_character_flip_is_rejected() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let key = insert_master_key(&db, "Forger").await;
     let secret = test_signing_secret(&key);
@@ -505,7 +527,7 @@ async fn attack_hmac_template_injection_via_payload_body_cannot_forge_canonical_
     tokio::spawn(async move {
         simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let key = insert_master_key(&db, "Injection Tester").await;
     let secret = test_signing_secret(&key);
@@ -684,7 +706,7 @@ fn attack_template_resolution_never_rescans_substituted_values() {
 async fn attack_canonical_v1_webhook_without_a_secret_is_rejected() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let key = insert_master_key(&db, "Webhook Admin").await;
     let secret = test_signing_secret(&key);
@@ -801,7 +823,7 @@ async fn attack_canonical_v1_webhook_without_a_secret_is_rejected() {
 async fn attack_webhook_secret_is_not_recoverable_from_read_endpoints() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let key = insert_master_key(&db, "Reader").await;
     let secret = test_signing_secret(&key);
@@ -886,8 +908,12 @@ async fn attack_spoofed_forwarded_for_from_an_untrusted_peer_cannot_bypass_bound
     let (_id, key) = insert_key(&db, "Bound", false, false, false, false, Some("192.168.1.0/24")).await;
     let secret = test_signing_secret(&key);
 
+    // Every call below repeats the same signed request with only unsigned headers (or nothing)
+    // varying, which would otherwise reproduce one signature and be refused as a replay. The
+    // counter stands in for the seconds a real caller would have spent between attempts.
+    let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let probe = |peer: &'static str, xff: Option<&'static str>, real_ip: Option<&'static str>| {
-        let (app, key, secret) = (app.clone(), key.clone(), secret.clone());
+        let (app, key, secret, tick) = (app.clone(), key.clone(), secret.clone(), tick.clone());
         async move {
             let mut builder =
                 connect_from(Request::builder().uri("/api/auth/me").header("X-API-Key", &key), peer);
@@ -897,7 +923,8 @@ async fn attack_spoofed_forwarded_for_from_an_untrusted_peer_cannot_bypass_bound
             if let Some(v) = real_ip {
                 builder = builder.header("X-Real-IP", v);
             }
-            app.oneshot(signed(builder, &secret, "")).await.unwrap().status()
+            let offset = tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            app.oneshot(signed_later(builder, &secret, offset, "")).await.unwrap().status()
         }
     };
 
@@ -953,16 +980,20 @@ async fn forwarded_for_is_honoured_from_a_configured_trusted_proxy() {
     let (_id, key) = insert_key(&db, "Proxied", false, false, false, false, Some("192.168.1.0/24")).await;
     let secret = test_signing_secret(&key);
 
+    // Repeated calls below differ only in unsigned headers, so each needs its own timestamp or the
+    // second would reproduce the first's signature and be refused as a replay.
+    let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let probe = |peer: &'static str, xff: &'static str| {
-        let (app, key, secret) = (app.clone(), key.clone(), secret.clone());
+        let (app, key, secret, tick) = (app.clone(), key.clone(), secret.clone(), tick.clone());
         async move {
-            let req = signed(
+            let req = signed_later(
                 connect_from(
                     Request::builder().uri("/api/auth/me").header("X-API-Key", &key),
                     peer,
                 )
                 .header("X-Forwarded-For", xff),
                 &secret,
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 "",
             );
             app.oneshot(req).await.unwrap().status()
@@ -996,21 +1027,25 @@ async fn forwarded_for_is_honoured_from_a_configured_trusted_proxy() {
 async fn attack_master_key_is_not_exempt_from_its_bound_ips() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let (_id, bound_master) =
         insert_key(&db, "Bound Master", true, true, true, true, Some("192.168.1.0/24")).await;
     let bound_secret = test_signing_secret(&bound_master);
 
+    // Repeated calls below differ only in unsigned headers, so each needs its own timestamp or the
+    // second would reproduce the first's signature and be refused as a replay.
+    let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let call = |key: String, secret: String, peer: &'static str| {
-        let app = app.clone();
+        let (app, tick) = (app.clone(), tick.clone());
         async move {
-            let req = signed(
+            let req = signed_later(
                 connect_from(
                     Request::builder().uri("/api/auth/me").header("X-API-Key", &key),
                     peer,
                 ),
                 &secret,
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 "",
             );
             app.oneshot(req).await.unwrap().status()
@@ -1049,7 +1084,7 @@ async fn escalation_fixture(
     db: &DatabaseConnection,
 ) -> (axum::Router, String, String, Uuid, Uuid) {
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let (manager_id, manager) = insert_key(db, "Key Manager", false, true, true, true, None).await;
     let (victim_id, _victim) = insert_key(db, "Master Victim", true, true, true, true, None).await;
@@ -1139,16 +1174,20 @@ async fn attack_non_master_cannot_mint_a_master_key() {
 async fn attack_non_master_cannot_elevate_an_existing_key_into_master_scopes() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let (_mid, manager) = insert_key(&db, "Manager", false, true, true, false, None).await;
     let secret = test_signing_secret(&manager);
     let (victim_id, _victim) = insert_key(&db, "Ordinary", false, false, false, false, None).await;
 
+    // Some calls below repeat verbatim, so each takes its own timestamp — an identical repeat
+    // inside one second is the same signature, which is exactly what a replay is.
+    let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let update = |body: serde_json::Value| {
-        let (app, manager, secret) = (app.clone(), manager.clone(), secret.clone());
+        let (app, manager, secret, tick) =
+            (app.clone(), manager.clone(), secret.clone(), tick.clone());
         async move {
-            let req = signed(
+            let req = signed_later(
                 inject_connect_info(
                     Request::builder()
                         .method("PUT")
@@ -1157,6 +1196,7 @@ async fn attack_non_master_cannot_elevate_an_existing_key_into_master_scopes() {
                         .header("Content-Type", "application/json"),
                 ),
                 &secret,
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 &body.to_string(),
             );
             app.oneshot(req).await.unwrap().status()
@@ -1269,7 +1309,7 @@ async fn attack_non_master_cannot_rotate_or_destroy_a_master_key() {
 async fn attack_non_master_cannot_widen_its_own_scopes() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     // Holds only `can_manage_keys`.
     let (self_id, key) = insert_key(&db, "Self Escalator", false, true, false, false, None).await;
@@ -1331,7 +1371,7 @@ async fn attack_non_master_cannot_widen_its_own_scopes() {
 async fn attack_cannot_self_grant_or_over_grant_group_permissions() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let (caller_id, caller) = insert_key(&db, "Granter", false, true, false, false, None).await;
     let (accomplice_id, _accomplice) = insert_key(&db, "Accomplice", false, false, false, false, None).await;
@@ -1428,7 +1468,7 @@ async fn attack_cannot_self_grant_or_over_grant_group_permissions() {
 async fn attack_repointing_a_webhook_forces_its_secret_to_rotate() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let key = insert_master_key(&db, "Hook Admin").await;
     let secret = test_signing_secret(&key);
@@ -1572,7 +1612,7 @@ async fn attack_repointing_a_webhook_forces_its_secret_to_rotate() {
 async fn attack_webhook_admin_cannot_reach_groups_it_has_no_access_to() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let master = insert_master_key(&db, "Owner").await;
     let master_secret = test_signing_secret(&master);
@@ -1732,7 +1772,7 @@ async fn raw_record(
 async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let (deleter_id, deleter) = insert_key(&db, "Deleter", false, false, false, false, None).await;
     let secret = test_signing_secret(&deleter);
@@ -1779,11 +1819,17 @@ async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row
     );
     assert_eq!(row.target_address, "198.51.100.10", "the record's data is untouched");
 
-    // Half two: it is gone from every read the caller has.
-    for path in ["/api/ips", "/api/ips?format=iplist", "/api/ips?include_deleted=true"] {
-        let req = signed(
-            inject_connect_info(Request::builder().uri(path).header("X-API-Key", &deleter)),
+    // Half two: it is gone from every read the caller has. Each listing gets its own timestamp —
+    // the three paths differ, but the loop also runs after earlier calls in this test and a repeat
+    // would otherwise collide with one of them.
+    for (offset, path) in
+        ["/api/ips", "/api/ips?format=iplist", "/api/ips?include_deleted=true"].iter().enumerate()
+    {
+        let req = signed_later(
+            inject_connect_info(Request::builder().uri(*path).header("X-API-Key", &deleter)),
             &secret,
+            // +1: the plain `/api/ips` listing was already issued above, before the delete.
+            offset as i64 + 1,
             "",
         );
         let res = app.clone().oneshot(req).await.unwrap();
@@ -1820,7 +1866,7 @@ async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row
 async fn deleting_a_record_requires_delete_permission_on_one_of_its_groups() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let (reader_id, reader) = insert_key(&db, "Reader", false, false, false, false, None).await;
     let secret = test_signing_secret(&reader);
@@ -1851,21 +1897,26 @@ async fn deleting_a_record_requires_delete_permission_on_one_of_its_groups() {
 async fn master_can_view_restore_and_hard_delete_soft_deleted_records() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let master = insert_master_key(&db, "Trash Admin").await;
     let secret = test_signing_secret(&master);
     let group_id = insert_group(&db, "trash-group").await;
     let record_id = insert_ip_record(&db, "198.51.100.30", group_id).await;
 
+    // Some calls below repeat verbatim, so each takes its own timestamp — an identical repeat
+    // inside one second is the same signature, which is exactly what a replay is.
+    let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let call = |method: &'static str, path: String| {
-        let (app, master, secret) = (app.clone(), master.clone(), secret.clone());
+        let (app, master, secret, tick) =
+            (app.clone(), master.clone(), secret.clone(), tick.clone());
         async move {
-            let req = signed(
+            let req = signed_later(
                 inject_connect_info(
                     Request::builder().method(method).uri(&path).header("X-API-Key", &master),
                 ),
                 &secret,
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 "",
             );
             let res = app.oneshot(req).await.unwrap();
@@ -1923,7 +1974,7 @@ async fn master_can_view_restore_and_hard_delete_soft_deleted_records() {
 async fn restore_and_purge_are_master_only() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     // Every delegated scope short of master.
     let (id, delegated) = insert_key(&db, "Delegated", false, true, true, true, None).await;
@@ -2020,7 +2071,7 @@ async fn purge_removes_only_records_past_the_92_day_retention_window() {
 async fn purge_endpoint_reports_the_number_of_records_removed() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let master = insert_master_key(&db, "Purger").await;
     let secret = test_signing_secret(&master);
@@ -2033,10 +2084,14 @@ async fn purge_endpoint_reports_the_number_of_records_removed() {
     active.deleted_at = Set(Some((chrono::Utc::now() - chrono::Duration::days(200)).naive_utc()));
     active.update(&db).await.unwrap();
 
+    // Some calls below repeat verbatim, so each takes its own timestamp — an identical repeat
+    // inside one second is the same signature, which is exactly what a replay is.
+    let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
     let purge = |body: &'static str| {
-        let (app, master, secret) = (app.clone(), master.clone(), secret.clone());
+        let (app, master, secret, tick) =
+            (app.clone(), master.clone(), secret.clone(), tick.clone());
         async move {
-            let req = signed(
+            let req = signed_later(
                 inject_connect_info(
                     Request::builder()
                         .method("POST")
@@ -2045,6 +2100,7 @@ async fn purge_endpoint_reports_the_number_of_records_removed() {
                         .header("Content-Type", "application/json"),
                 ),
                 &secret,
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 body,
             );
             let res = app.oneshot(req).await.unwrap();
@@ -2083,7 +2139,7 @@ async fn purge_endpoint_reports_the_number_of_records_removed() {
 async fn re_registering_a_soft_deleted_address_restores_it() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let app = create_app(AppState::new(db.clone(), webhook_tx));
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let master = insert_master_key(&db, "Rebanner").await;
     let secret = test_signing_secret(&master);
@@ -2131,4 +2187,404 @@ async fn re_registering_a_soft_deleted_address_restores_it() {
     assert!(row.deleted_at.is_none(), "...and the retention clock");
     assert!(row.deleted_by.is_none(), "...and the attribution");
     assert_eq!(row.cause.as_deref(), Some("seen again"), "the new cause was applied");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Convergence — anti-replay, pipeline ordering, full-URI signing, memory bounds
+//
+// These cover the arbitrated decisions of the cross-service convergence pass. Each one exists
+// because the property it asserts is invisible in normal use and would regress silently.
+// ─────────────────────────────────────────────────────────────
+
+/// **Replay.** An intercepted, validly-signed request resent verbatim inside the freshness window
+/// must be rejected.
+///
+/// This is the gap a timestamp check alone cannot close. The window bounds how *long* a captured
+/// request stays usable; it says nothing about using it *twice*. Every field the signature covers —
+/// method, target, timestamp, body — is unchanged in a replay, so the HMAC verifies perfectly and
+/// the freshness check passes. Only a record of what has already been accepted can tell the two
+/// apart.
+///
+/// The scenario is concrete rather than theoretical: `simply_ip_vault` is normally reached over
+/// plain HTTP on a LAN, so an authentic `POST /api/ban` is readable by anything on the path, and
+/// replaying it repeats the side effect for the next 300 seconds.
+#[tokio::test]
+async fn an_intercepted_signed_request_cannot_be_replayed_within_the_window() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_id, master) = insert_key(&db, "Master", true, true, true, true, None).await;
+    let secret = test_signing_secret(&master);
+
+    // One authentic request, captured on the wire. Building it once and cloning the parts is the
+    // point: the attacker resends the *same bytes*, not a re-signed equivalent.
+    let timestamp = chrono::Utc::now().timestamp();
+    let body = json!({ "target_address": "203.0.113.200", "group_name": "replay-group" }).to_string();
+    let build = || {
+        signed_at(
+            inject_connect_info(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/ban")
+                    .header("X-API-Key", &master)
+                    .header("Content-Type", "application/json"),
+            ),
+            &secret,
+            timestamp,
+            &body,
+        )
+    };
+
+    assert_eq!(
+        app.clone().oneshot(build()).await.unwrap().status(),
+        StatusCode::OK,
+        "the genuine request must succeed"
+    );
+
+    let res = app.clone().oneshot(build()).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::UNAUTHORIZED,
+        "a byte-identical resend inside the window is a replay and must be refused"
+    );
+    let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(
+        text.contains("already been used"),
+        "the rejection must name replay, not look like a signature failure: {text}"
+    );
+
+    // A third attempt is refused too — the guard is not a one-shot latch that clears itself.
+    assert_eq!(
+        app.clone().oneshot(build()).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+
+    // ...while a *freshly signed* request from the same key is unaffected, so the guard rejects
+    // replays rather than simply breaking the key after one use.
+    let fresh = signed_at(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ban")
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        timestamp + 1,
+        &body,
+    );
+    assert_eq!(app.clone().oneshot(fresh).await.unwrap().status(), StatusCode::OK);
+}
+
+/// A replay of one key's request must not consume another key's identical signature, and vice
+/// versa — the guard is keyed per API key, not globally.
+#[tokio::test]
+async fn replay_tracking_is_scoped_per_key() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_a, first) = insert_key(&db, "First", true, true, true, true, None).await;
+    let (_b, second) = insert_key(&db, "Second", true, true, true, true, None).await;
+    let timestamp = chrono::Utc::now().timestamp();
+
+    for key in [&first, &second] {
+        let req = signed_at(
+            inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", key)),
+            &test_signing_secret(key),
+            timestamp,
+            "",
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "each key's first use of its own signature must succeed"
+        );
+    }
+}
+
+/// **Auth before authz.** A caller that cannot prove possession of the signing secret must not be
+/// able to tell "this key does not exist" from "this key exists but your address is not allowed".
+///
+/// If `bound_ips` were checked before the HMAC, the `403`-vs-`401` split would turn key guessing
+/// into key *mapping*: an attacker could enumerate identifiers and learn which ones are real, and
+/// even which networks they are pinned to, without ever holding a secret. Both shapes must return
+/// `401` until the signature verifies.
+#[tokio::test]
+async fn an_unauthenticated_caller_cannot_distinguish_a_missing_key_from_a_blocked_address() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    // A key that genuinely exists, bound to a network the test connection is *not* in.
+    let (_id, bound) =
+        insert_key(&db, "Bound", true, true, true, true, Some("10.99.0.0/16")).await;
+
+    let probe = |key: String, offset: i64| {
+        let app = app.clone();
+        async move {
+            // Deliberately the *wrong* secret: this models an attacker holding (or guessing) an
+            // identifier but not the secret behind it.
+            let req = signed_later(
+                inject_connect_info(Request::builder().uri("/api/auth/me").header("X-API-Key", &key)),
+                "not-the-real-signing-secret",
+                offset,
+                "",
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    let nonexistent = probe("this-key-does-not-exist-at-all".to_owned(), 0).await;
+    let real_but_out_of_range = probe(bound.clone(), 1).await;
+
+    assert_eq!(nonexistent, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        real_but_out_of_range,
+        StatusCode::UNAUTHORIZED,
+        "a real key whose CIDR excludes the caller must also be 401 while the signature is unproven \
+         — a 403 here would confirm the key exists"
+    );
+    assert_eq!(nonexistent, real_but_out_of_range, "the two must be indistinguishable");
+
+    // ...and once the signature *does* verify, the CIDR check runs and reports 403, proving the
+    // ordering is a deliberate sequence rather than the network check having been dropped.
+    let authenticated = signed(
+        inject_connect_info(Request::builder().uri("/api/auth/me").header("X-API-Key", &bound)),
+        &test_signing_secret(&bound),
+        "",
+    );
+    assert_eq!(
+        app.clone().oneshot(authenticated).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "an authenticated caller outside its bound network gets 403"
+    );
+}
+
+/// **Full-URI signing.** Rewriting the query string of an otherwise-valid signed request must
+/// invalidate it.
+///
+/// The concrete attack: `?hard=true` turns a reversible soft delete into an irreversible purge, and
+/// `?include_deleted=true` widens a listing to the trash view. While the query sat outside the
+/// signed material, an on-path attacker who could not forge a signature could still rewrite a
+/// captured request into either — no secret required.
+#[tokio::test]
+async fn tampering_with_the_query_string_invalidates_the_signature() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_id, master) = insert_key(&db, "Master", true, true, true, true, None).await;
+    let secret = test_signing_secret(&master);
+    let group_id = insert_group(&db, "tamper-group").await;
+    let record_id = insert_ip_record(&db, "198.51.100.77", group_id).await;
+    let timestamp = chrono::Utc::now().timestamp();
+
+    // Signed for the plain path...
+    let honest = crypto::compute_signature(
+        &secret,
+        "DELETE",
+        &format!("/api/ips/{record_id}"),
+        &timestamp.to_string(),
+        b"",
+    )
+    .expect("signing succeeds");
+
+    // ...but sent with `?hard=true` bolted on, exactly as a proxy-level attacker would.
+    let tampered = inject_connect_info(
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/ips/{record_id}?hard=true"))
+            .header("X-API-Key", &master)
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Signature-256", &honest),
+    )
+    .body(Body::empty())
+    .expect("request builds");
+
+    assert_eq!(
+        app.clone().oneshot(tampered).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "a query string appended after signing must break the signature"
+    );
+    assert!(
+        raw_record(&db, record_id).await.is_some(),
+        "the record must survive the rejected escalation"
+    );
+
+    // The honest request still works, so the rejection above is about the tampering and not about
+    // the route being broken.
+    let honest_req = inject_connect_info(
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/ips/{record_id}"))
+            .header("X-API-Key", &master)
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Signature-256", &honest),
+    )
+    .body(Body::empty())
+    .expect("request builds");
+    assert_eq!(app.clone().oneshot(honest_req).await.unwrap().status(), StatusCode::OK);
+
+    // Symmetrically: a signature computed *with* the query is not valid without it, so an attacker
+    // cannot strip a parameter either.
+    let with_query = crypto::compute_signature(
+        &secret,
+        "GET",
+        "/api/ips?include_deleted=true",
+        &timestamp.to_string(),
+        b"",
+    )
+    .expect("signing succeeds");
+    let stripped = inject_connect_info(
+        Request::builder()
+            .uri("/api/ips")
+            .header("X-API-Key", &master)
+            .header("X-Timestamp", timestamp.to_string())
+            .header("X-Signature-256", &with_query),
+    )
+    .body(Body::empty())
+    .expect("request builds");
+    assert_eq!(
+        app.clone().oneshot(stripped).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "removing a signed query parameter must also break the signature"
+    );
+}
+
+/// A legitimate request that *carries* a query string still authenticates, so the change above did
+/// not simply break every filtered read.
+#[tokio::test]
+async fn a_correctly_signed_query_string_authenticates() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_id, master) = insert_key(&db, "Master", true, true, true, true, None).await;
+    let secret = test_signing_secret(&master);
+
+    for (offset, path) in [
+        "/api/ips?limit=5",
+        "/api/ips?groups=a,b&limit=10&offset=0",
+        "/api/ips?include_deleted=true",
+        "/api/ips?ip=203.0&cause=ssh",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let req = signed_later(
+            inject_connect_info(Request::builder().uri(*path).header("X-API-Key", &master)),
+            &secret,
+            offset as i64,
+            "",
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "{path} signed over its full target must authenticate"
+        );
+    }
+}
+
+/// **Memory bound.** The router-wide limit and the middleware's signature buffer are the same
+/// number, so no body size is accepted by one layer and refused by the other.
+///
+/// Asserted on the constants rather than by pushing 3 MiB through the stack: the property that
+/// matters is that the two cannot drift, and a size-based test would pass just as well with two
+/// independently-chosen values that happen to agree today.
+#[test]
+fn the_body_limit_and_the_signature_buffer_are_one_constant() {
+    assert_eq!(
+        simply_ip_vault::MAX_REQUEST_BODY_BYTES,
+        3 * 1024 * 1024,
+        "the converged limit is 3 MiB"
+    );
+}
+
+/// A body over the router-wide limit is refused before it can be buffered.
+#[tokio::test]
+async fn an_oversized_body_is_rejected_rather_than_buffered() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_id, master) = insert_key(&db, "Master", true, true, true, true, None).await;
+    let secret = test_signing_secret(&master);
+
+    let oversized = "x".repeat(simply_ip_vault::MAX_REQUEST_BODY_BYTES + 1024);
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ban")
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        &oversized,
+    );
+
+    let status = app.clone().oneshot(req).await.unwrap().status();
+    assert!(
+        status == StatusCode::PAYLOAD_TOO_LARGE || status == StatusCode::BAD_REQUEST,
+        "an over-limit body must be refused, got {status}"
+    );
+}
+
+/// **Pragma resilience.** `apply_sqlite_pragmas` must never be able to stop the service, whatever
+/// the database says.
+///
+/// An in-memory database is the case that actually occurs — it reports `journal_mode=memory` and
+/// declines WAL silently — and it is what the entire test suite runs on. A version of this function
+/// that propagated the outcome would take down every deployment on a read-only mount or a
+/// filesystem without shared-memory support, trading a real outage for a concurrency setting that
+/// did not apply.
+#[tokio::test]
+async fn sqlite_pragma_failures_never_stop_the_service() {
+    let db = setup_test_db().await;
+
+    // Returns unit: there is no error channel to propagate, by construction. Calling it twice also
+    // proves it is idempotent, since it runs before migrations on every boot.
+    simply_ip_vault::state::apply_sqlite_pragmas(&db).await;
+    simply_ip_vault::state::apply_sqlite_pragmas(&db).await;
+
+    // The database is still fully usable afterwards.
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+    let (_id, master) = insert_key(&db, "Master", true, true, true, true, None).await;
+    let req = signed(
+        inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", &master)),
+        &test_signing_secret(&master),
+        "",
+    );
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+}
+
+/// **Cipher fail-closed.** A malformed encryption key must abort startup rather than silently
+/// downgrading to storing signing secrets in the clear.
+///
+/// The old behaviour accepted any string and SHA-256'd it, so `VAULT_ENCRYPTION_KEY=password`
+/// produced a 32-byte key with the entropy of "password" and no signal that anything was wrong.
+/// Refusing is the only honest option: an operator who set the variable believes their secrets are
+/// encrypted.
+#[test]
+fn a_malformed_encryption_key_fails_closed_instead_of_degrading() {
+    use simply_ip_vault::crypto::{CryptoError, SecretCipher};
+
+    for bad in ["password", "", "deadbeef", "not hex at all", &"00".repeat(31), &"00".repeat(33)] {
+        assert!(
+            matches!(SecretCipher::from_hex_key(bad), Err(CryptoError::InvalidKey)),
+            "{bad:?} must be refused, never accepted as key material"
+        );
+    }
+
+    // A real key is accepted and actually encrypts.
+    let good = SecretCipher::from_hex_key(&"ab".repeat(32)).expect("64 hex characters are valid");
+    assert!(good.is_encrypting());
+    let sealed = good.seal("round-trip").expect("sealing succeeds");
+    assert!(sealed.starts_with("v1.xchacha20poly1305."), "got {sealed}");
+    assert!(!sealed.contains("round-trip"), "the plaintext must not survive");
+    assert_eq!(good.open(&sealed).expect("opening succeeds"), "round-trip");
 }

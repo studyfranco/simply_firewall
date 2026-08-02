@@ -24,6 +24,11 @@ rand = "0.10"
 thiserror = "2"
 dotenvy = "0.15"
 log = "0.4"
+# Primary AEAD for `signing_secret` at rest. XChaCha20's 192-bit nonce makes per-message random
+# nonces collision-safe without any counter state to persist — see `src/crypto.rs`.
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc", "getrandom"] }
+# Retained for the *read-only* legacy path: rows sealed as `aesgcm256:` by earlier versions must
+# stay openable. Nothing in this crate writes AES-GCM any more.
 aes-gcm = "0.11"
 
 [dev-dependencies]

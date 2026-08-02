@@ -73,6 +73,32 @@ fn signed(builder: axum::http::request::Builder, body: impl Into<String>) -> Req
     build_signed(builder, derived.as_deref(), body.into())
 }
 
+/// Like [`signed`], but stamped `offset_secs` into the future.
+///
+/// Exists because of the anti-replay guard. A signature covers method, target, timestamp and body —
+/// and nothing else — so **repeating a call unchanged within the same wall-clock second produces the
+/// identical signature, which is by definition a replay** and is now refused with `401`. Real
+/// clients never trip this: a retry, a poll, or a second ban of the same address lands on a later
+/// timestamp because time has actually passed. An in-process test issues both halves microseconds
+/// apart, so the elapsed second has to be stated rather than waited for.
+///
+/// Using this is therefore not a workaround for the guard — it is how a test models the passage of
+/// time that a real caller gets for free. `offset_secs` stays far inside the ±300s window, so the
+/// freshness check is unaffected and the request is exactly as valid as a genuine later one.
+fn signed_later(
+    builder: axum::http::request::Builder,
+    offset_secs: i64,
+    body: impl Into<String>,
+) -> Request<Body> {
+    let derived = builder
+        .headers_ref()
+        .and_then(|h| h.get("X-API-Key"))
+        .and_then(|v| v.to_str().ok())
+        .map(test_signing_secret);
+    let timestamp = (chrono::Utc::now().timestamp() + offset_secs).to_string();
+    build_signed_at(builder, derived.as_deref(), timestamp, body.into())
+}
+
 /// Builds a signed request using an explicitly supplied signing secret, for keys whose secret was
 /// generated server-side and read back out of a `POST /api/keys` or `/rotate` response.
 fn signed_with(
@@ -116,15 +142,21 @@ fn build_signed_at(
     timestamp: String,
     body: String,
 ) -> Request<Body> {
-    // Read method/path back off the builder so the signature always matches what is actually sent.
-    // The query string is deliberately excluded, mirroring `crypto::verify_signature`.
+    // Read method and target back off the builder so the signature always matches what is actually
+    // sent. The **full target** is signed, query string included, mirroring
+    // `crypto::verify_signature` — a helper that stripped the query would make every
+    // query-tampering test pass for the wrong reason.
     let method = builder
         .method_ref()
         .map(|m| m.as_str().to_owned())
         .unwrap_or_else(|| "GET".to_owned());
-    let path = builder
+    let target = builder
         .uri_ref()
-        .map(|u| u.path().to_owned())
+        .map(|u| {
+            u.path_and_query()
+                .map(|pq| pq.as_str().to_owned())
+                .unwrap_or_else(|| u.path().to_owned())
+        })
         .unwrap_or_else(|| "/".to_owned());
 
     let mut builder = builder.header("X-Timestamp", &timestamp);
@@ -132,7 +164,7 @@ fn build_signed_at(
         let signature = simply_ip_vault::crypto::compute_signature(
             secret,
             &method,
-            &path,
+            &target,
             &timestamp,
             body.as_bytes(),
         )
@@ -195,7 +227,9 @@ async fn test_auth_and_cidr_rejection() {
     assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     // 3. Valid CIDR (simulated via X-Forwarded-For) -> 200
-    let req = signed(inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", &plaintext).header("X-Forwarded-For", "192.168.1.1")), "");
+    // Signed a second later: only the *headers* differ from case 2, and headers are not signed, so
+    // an identical timestamp would make this the same signature — a replay, not a new request.
+    let req = signed_later(inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", &plaintext).header("X-Forwarded-For", "192.168.1.1")), 1, "");
     let response = app.clone().oneshot(req).await.unwrap();
     assert_eq!(response.status(), StatusCode::OK);
 }
@@ -204,7 +238,7 @@ async fn test_auth_and_cidr_rejection() {
 async fn test_tenant_isolation_mn_rbac() {
     let db = setup_test_db().await;
     let (webhook_tx, _) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     // Create a group
@@ -259,12 +293,13 @@ async fn test_tenant_isolation_mn_rbac() {
         created_at: Set(chrono::Utc::now().naive_utc()),
     }.insert(&db).await.unwrap();
 
-    // POST to Group A -> Should Work
-    let req = signed(inject_connect_info(Request::builder()
+    // POST to Group A -> Should Work. Byte-identical to the denied attempt above, so it is signed
+    // a second later — the shape a real client retrying after being granted access produces.
+    let req = signed_later(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &plaintext)
-        .header("Content-Type", "application/json")), json!({ "target_address": "8.8.8.8", "group_name": "Group A" }).to_string());
+        .header("Content-Type", "application/json")), 1, json!({ "target_address": "8.8.8.8", "group_name": "Group A" }).to_string());
     
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
@@ -274,7 +309,7 @@ async fn test_tenant_isolation_mn_rbac() {
 async fn test_auto_provisioning_on_group_creation() {
     let db = setup_test_db().await;
     let (webhook_tx, _) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
@@ -325,7 +360,7 @@ async fn test_auto_provisioning_on_group_creation() {
 async fn test_explicit_group_creation_grants_full_permissions_to_creator() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (key_id, plaintext) = insert_key(&db, "Group Creator", false, false, false, true).await;
@@ -362,7 +397,7 @@ async fn test_explicit_group_creation_grants_full_permissions_to_creator() {
 async fn test_rbac_denial_precedes_group_type_validation() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -397,7 +432,7 @@ async fn test_rbac_denial_precedes_group_type_validation() {
 async fn test_group_type_mismatch_rejected_with_exact_message_for_authorized_key() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -468,7 +503,7 @@ async fn test_group_type_mismatch_rejected_with_exact_message_for_authorized_key
 async fn test_explicit_key_group_manipulation() {
     let db = setup_test_db().await;
     let (webhook_tx, _) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let master_id = Uuid::new_v4();
@@ -543,7 +578,7 @@ async fn test_explicit_key_group_manipulation() {
 async fn test_multi_group_and_temporal_filtering() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
@@ -706,7 +741,7 @@ async fn test_webhook_hmac_signature_and_delivery() {
         simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
@@ -841,7 +876,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
         simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
@@ -954,7 +989,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
 async fn test_reban_into_same_group_does_not_500() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
@@ -1021,7 +1056,7 @@ async fn test_reban_into_same_group_does_not_500() {
 async fn test_create_webhook_rejects_invalid_url() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let key_id = Uuid::new_v4();
@@ -1122,7 +1157,7 @@ async fn insert_key(
 async fn test_key_creation_lifecycle() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1175,7 +1210,7 @@ async fn test_key_creation_lifecycle() {
 async fn test_group_permission_assignment_boundaries() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1235,12 +1270,12 @@ async fn test_group_permission_assignment_boundaries() {
         }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    // Key_B can now write to Group_X.
-    let req = signed(inject_connect_info(Request::builder()
+    // Key_B can now write to Group_X. Same request as the denied one above, retried a second later.
+    let req = signed_later(inject_connect_info(Request::builder()
         .method("POST")
         .uri("/api/ban")
         .header("X-API-Key", &key_b)
-        .header("Content-Type", "application/json")), json!({ "target_address": "203.0.113.2", "group_name": "Group_X" }).to_string());
+        .header("Content-Type", "application/json")), 1, json!({ "target_address": "203.0.113.2", "group_name": "Group_X" }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
 
@@ -1251,7 +1286,7 @@ async fn test_group_permission_assignment_boundaries() {
 async fn test_key_deletion_revokes_access_and_cascades_permissions() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1348,21 +1383,27 @@ async fn insert_key_with_bound_ips(db: &DatabaseConnection, name: &str, bound_ip
 async fn test_concurrent_burst_ban_requests() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
+    // Each task signs at a distinct second. Ten byte-identical signed requests would be ten copies
+    // of one signature, which the anti-replay guard refuses by design — and refusing them would
+    // make this a test of the guard rather than of the write race it exists to cover. Spreading the
+    // timestamps keeps every request cryptographically distinct while leaving them simultaneous on
+    // the wire, which is exactly the contention this test is about: ten writers, one
+    // (address, group) pair, no duplicate rows and no 500s.
     let mut handles = Vec::with_capacity(10);
-    for _ in 0..10 {
+    for offset in 0..10 {
         let app = app.clone();
         let master_key = master_key.clone();
         handles.push(tokio::spawn(async move {
-            let req = signed(inject_connect_info(Request::builder()
+            let req = signed_later(inject_connect_info(Request::builder()
                 .method("POST")
                 .uri("/api/ban")
                 .header("X-API-Key", &master_key)
-                .header("Content-Type", "application/json")), json!({
+                .header("Content-Type", "application/json")), offset, json!({
                     "target_address": "44.44.44.44",
                     "group_name": "burst-group",
                     "cause": "fail2ban burst"
@@ -1441,7 +1482,7 @@ async fn test_reverse_proxy_xff_extracts_rightmost_trusted_hop() {
 async fn test_cidr_and_ipv6_boundary_validation() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1504,7 +1545,7 @@ async fn test_normalize_ip_or_cidr_strips_single_host_prefixes_only() {
 async fn test_ban_deduplicates_slash_32_and_bare_ip_representations() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1596,7 +1637,7 @@ async fn test_webhook_dispatch_does_not_block_api_response() {
         simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1658,7 +1699,7 @@ async fn test_webhook_dispatch_does_not_block_api_response() {
 async fn test_delete_ip_accepts_query_or_json_body() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1703,7 +1744,7 @@ async fn test_delete_ip_accepts_query_or_json_body() {
 async fn test_group_identification_by_id_and_name_are_interchangeable() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1777,7 +1818,7 @@ async fn test_key_rotation_invalidates_old_secret() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1838,7 +1879,7 @@ async fn test_key_rotation_invalidates_old_secret() {
 async fn test_update_api_key_changes_take_effect_immediately() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1867,10 +1908,11 @@ async fn test_update_api_key_changes_take_effect_immediately() {
     assert_eq!(updated["bound_ips"], "0.0.0.0/0");
     assert_eq!(updated["can_manage_webhooks"], true);
 
-    // Now allowed, immediately, with the same (unrotated) secret.
-    let req = signed(inject_connect_info(Request::builder()
+    // Now allowed, immediately, with the same (unrotated) secret — retried a second later, since
+    // the denied attempt above was byte-identical.
+    let req = signed_later(inject_connect_info(Request::builder()
         .uri("/api/webhooks")
-        .header("X-API-Key", &target_key)), "");
+        .header("X-API-Key", &target_key)), 1, "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
 
@@ -1880,7 +1922,7 @@ async fn test_update_api_key_changes_take_effect_immediately() {
 async fn test_revoke_group_permission_by_name_and_by_id() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1913,11 +1955,12 @@ async fn test_revoke_group_permission_by_name_and_by_id() {
         .header("X-API-Key", &master_key)), "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 
-    // Revoking again is 404 — the grant is already gone.
-    let req = signed(inject_connect_info(Request::builder()
+    // Revoking again is 404 — the grant is already gone. Identical to the first revoke, so it is
+    // signed a second later rather than being refused as a replay before it reaches the handler.
+    let req = signed_later(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri("/api/keys/".to_owned() + &key_id.to_string() + "/permissions/revoke-by-name-group")
-        .header("X-API-Key", &master_key)), "");
+        .header("X-API-Key", &master_key)), 1, "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
 
     // The key can no longer read either group.
@@ -1937,7 +1980,7 @@ async fn test_revoke_group_permission_by_name_and_by_id() {
 async fn test_audit_log_query_returns_entries_after_mutations() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -1980,23 +2023,25 @@ async fn test_audit_log_query_returns_entries_after_mutations() {
 async fn test_create_duplicate_group_returns_conflict_not_500() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
-    let make_req = || {
-        signed(inject_connect_info(Request::builder()
+    // `offset` makes the second attempt a distinct signed request rather than a replay of the
+    // first. What is under test is a duplicate group *name*, which is unchanged.
+    let make_req = |offset: i64| {
+        signed_later(inject_connect_info(Request::builder()
             .method("POST")
             .uri("/api/groups")
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json")), json!({ "name": "duplicate-group-test" }).to_string())
+            .header("Content-Type", "application/json")), offset, json!({ "name": "duplicate-group-test" }).to_string())
     };
 
-    let res = app.clone().oneshot(make_req()).await.unwrap();
+    let res = app.clone().oneshot(make_req(0)).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
 
-    let res = app.clone().oneshot(make_req()).await.unwrap();
+    let res = app.clone().oneshot(make_req(1)).await.unwrap();
     assert_eq!(res.status(), StatusCode::CONFLICT, "duplicate group name must be 409, not 500");
 
     // Only one row actually exists — the failed second attempt didn't leave anything behind.
@@ -2016,7 +2061,7 @@ async fn test_create_duplicate_group_returns_conflict_not_500() {
 async fn test_group_permission_assignment_accepts_uuid_or_name_in_group_id_field() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -2073,7 +2118,7 @@ async fn test_group_permission_assignment_accepts_uuid_or_name_in_group_id_field
 async fn test_group_permission_write_or_delete_requires_read() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -2131,7 +2176,7 @@ async fn test_group_permission_write_or_delete_requires_read() {
 async fn test_multi_group_overlap_exposes_both_memberships_for_conflict_detection() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -2180,7 +2225,7 @@ async fn test_multi_group_overlap_exposes_both_memberships_for_conflict_detectio
 async fn test_group_permission_assignment_via_group_name_alongside_uuid() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -2257,7 +2302,7 @@ async fn test_group_permission_assignment_via_group_name_alongside_uuid() {
 async fn test_audit_log_pagination() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -2320,11 +2365,12 @@ async fn test_bound_ip_strictly_rejects_out_of_cidr_forwarded_address() {
     let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(parsed["error"], "Client IP not allowed");
 
-    // Sanity check: the same key from the bound address itself is let through.
-    let req = signed(inject_connect_info(Request::builder()
+    // Sanity check: the same key from the bound address itself is let through. Only the unsigned
+    // X-Forwarded-For header differs from the rejected call above, so this is stamped a second later.
+    let req = signed_later(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
         .header("X-API-Key", &restricted_key)
-        .header("X-Forwarded-For", "127.0.0.1")), "");
+        .header("X-Forwarded-For", "127.0.0.1")), 1, "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 }
 
@@ -2336,7 +2382,7 @@ async fn test_bound_ip_strictly_rejects_out_of_cidr_forwarded_address() {
 async fn test_list_ips_iplist_format_returns_deduplicated_address_list() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -2378,31 +2424,35 @@ async fn test_list_ips_iplist_format_returns_deduplicated_address_list() {
 async fn test_list_ips_orders_by_updated_at_descending() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
 
-    let ban = |addr: &'static str| {
-        signed(inject_connect_info(Request::builder()
+    // Both closures take a timestamp offset: this test issues the same ban twice and the same
+    // listing twice, and a repeat with an unchanged timestamp is a byte-identical signature that
+    // the anti-replay guard refuses. A real client re-registering an address gets the later
+    // timestamp from the clock; here it is stated explicitly.
+    let ban = |addr: &'static str, offset: i64| {
+        signed_later(inject_connect_info(Request::builder()
             .method("POST")
             .uri("/api/ban")
             .header("X-API-Key", &master_key)
-            .header("Content-Type", "application/json")), json!({ "target_address": addr, "group_name": "ordering-group" }).to_string())
+            .header("Content-Type", "application/json")), offset, json!({ "target_address": addr, "group_name": "ordering-group" }).to_string())
     };
 
     // Created in order A, B, C — freshly created, so C (most recent) should sort first.
     for addr in ["203.0.113.101", "203.0.113.102", "203.0.113.103"] {
-        assert_eq!(app.clone().oneshot(ban(addr)).await.unwrap().status(), StatusCode::OK);
+        assert_eq!(app.clone().oneshot(ban(addr, 0)).await.unwrap().status(), StatusCode::OK);
     }
 
-    let list = |app: &axum::Router, master_key: &str| {
+    let list = |app: &axum::Router, master_key: &str, offset: i64| {
         let app = app.clone();
         let master_key = master_key.to_owned();
         async move {
-            let req = signed(inject_connect_info(Request::builder()
+            let req = signed_later(inject_connect_info(Request::builder()
                 .uri("/api/ips?groups=ordering-group")
-                .header("X-API-Key", &master_key)), "");
+                .header("X-API-Key", &master_key)), offset, "");
             let res = app.oneshot(req).await.unwrap();
             assert_eq!(res.status(), StatusCode::OK);
             let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
@@ -2411,14 +2461,14 @@ async fn test_list_ips_orders_by_updated_at_descending() {
         }
     };
 
-    let addresses = list(&app, &master_key).await;
+    let addresses = list(&app, &master_key, 0).await;
     assert_eq!(addresses, vec!["203.0.113.103", "203.0.113.102", "203.0.113.101"], "most recently created sorts first");
 
     // Re-register the OLDEST one (.101) — it must now jump to the front, since its updated_at is
     // now the most recent of the three.
-    assert_eq!(app.clone().oneshot(ban("203.0.113.101")).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(app.clone().oneshot(ban("203.0.113.101", 1)).await.unwrap().status(), StatusCode::OK);
 
-    let addresses = list(&app, &master_key).await;
+    let addresses = list(&app, &master_key, 1).await;
     assert_eq!(addresses, vec!["203.0.113.101", "203.0.113.103", "203.0.113.102"], "re-registered record jumps to the front");
 }
 
@@ -2432,7 +2482,7 @@ async fn test_list_ips_orders_by_updated_at_descending() {
 async fn test_each_auth_header_is_individually_required() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_id, key) = insert_key(&db, "Signer", true, true, true, true).await;
@@ -2491,7 +2541,7 @@ async fn test_each_auth_header_is_individually_required() {
 async fn test_anti_replay_timestamp_window_is_enforced_in_both_directions() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_id, key) = insert_key(&db, "Replay", true, true, true, true).await;
@@ -2528,7 +2578,7 @@ async fn test_anti_replay_timestamp_window_is_enforced_in_both_directions() {
 async fn test_signature_binds_method_path_and_body() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_id, key) = insert_key(&db, "Binder", true, true, true, true).await;
@@ -2596,7 +2646,7 @@ async fn test_signature_binds_method_path_and_body() {
 async fn test_signature_must_match_the_looked_up_key() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_a_id, key_a) = insert_key(&db, "Key A", true, true, true, true).await;
@@ -2614,7 +2664,7 @@ async fn test_signature_must_match_the_looked_up_key() {
 async fn test_key_without_signing_secret_cannot_authenticate() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let plaintext = simply_ip_vault::api::generate_random_key();
@@ -2648,7 +2698,7 @@ async fn test_created_key_returns_a_usable_signing_secret() {
     let _guard = ENV_MUTATION_LOCK.lock().await;
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -2688,7 +2738,7 @@ async fn test_created_key_returns_a_usable_signing_secret() {
 async fn test_signing_secret_is_never_exposed_by_read_endpoints() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_id, key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -2707,17 +2757,22 @@ async fn test_signing_secret_is_never_exposed_by_read_endpoints() {
     }
 }
 
-/// With `VAULT_ENCRYPTION_KEY` set, a key created through the API stores its signing secret
+/// With an encrypting cipher configured, a key created through the API stores its signing secret
 /// encrypted at rest, yet still authenticates — proving the seal/open round trip is wired into the
 /// real request path, not just the crypto unit tests.
+///
+/// The cipher is now handed to `AppState` explicitly rather than read from the environment on every
+/// seal and open, so this test no longer needs `ENV_MUTATION_LOCK`: nothing here is process-global,
+/// and two cipher modes can be exercised concurrently in one process without racing.
 #[tokio::test]
 async fn test_signing_secret_is_encrypted_at_rest_when_vault_key_is_set() {
-    let _guard = ENV_MUTATION_LOCK.lock().await;
-    unsafe { std::env::set_var("VAULT_ENCRYPTION_KEY", "integration-test-passphrase") };
-
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let cipher = simply_ip_vault::crypto::SecretCipher::from_hex_key(
+        "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c4b5a69788796a5b4c3d2e1f0",
+    )
+    .expect("a 64-hex-character key is valid");
+    let state = AppState::with_parts(db.clone(), webhook_tx, Vec::new(), cipher);
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -2740,7 +2795,10 @@ async fn test_signing_secret_is_encrypted_at_rest_when_vault_key_is_set() {
             .eq(simply_ip_vault::api::hash_key(&new_key)))
         .one(&db).await.unwrap().unwrap()
         .signing_secret.unwrap();
-    assert!(stored.starts_with("aesgcm256:"), "stored secret must be sealed, got {stored}");
+    assert!(
+        stored.starts_with("v1.xchacha20poly1305."),
+        "stored secret must be sealed with XChaCha20-Poly1305, got {stored}"
+    );
     assert!(!stored.contains(&new_signing_secret), "plaintext secret must not survive in the DB");
 
     // And it still authenticates, so decryption happens transparently in the middleware.
@@ -2748,8 +2806,6 @@ async fn test_signing_secret_is_encrypted_at_rest_when_vault_key_is_set() {
         .uri("/api/auth/me")
         .header("X-API-Key", &new_key)), &new_signing_secret, "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
-
-    unsafe { std::env::remove_var("VAULT_ENCRYPTION_KEY") };
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2834,7 +2890,7 @@ async fn setup_webhook_fixture(
         simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_key_id, plaintext) = insert_key(&db, "Webhook Tester", true, true, true, true).await;
@@ -2984,7 +3040,7 @@ async fn test_body_only_signs_the_payload_alone_and_sends_no_timestamp() {
 async fn test_auth_mode_is_validated_and_exposed_in_listings() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_key_id, plaintext) = insert_key(&db, "Master", true, true, true, true).await;
@@ -3068,7 +3124,7 @@ async fn test_auth_mode_is_validated_and_exposed_in_listings() {
 async fn test_auth_mode_preconditions_are_enforced_at_creation() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_key_id, plaintext) = insert_key(&db, "Master", true, true, true, true).await;
@@ -3309,7 +3365,7 @@ async fn test_rotate_secret_swaps_only_the_signing_secret() {
 
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -3395,7 +3451,7 @@ async fn test_rotate_secret_recovers_a_key_with_no_signing_secret() {
 
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
@@ -3448,7 +3504,7 @@ async fn test_rotate_secret_authorization_and_audit_trail() {
 
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
-    let state = AppState::new(db.clone(), webhook_tx);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;

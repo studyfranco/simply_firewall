@@ -1442,7 +1442,7 @@ pub async fn create_api_key(
     let prefix = plaintext_key.chars().take(8).collect::<String>();
     // The signing secret is independent of the API key: leaking one must not compromise the other.
     let signing_secret = crate::crypto::generate_signing_secret();
-    let stored_signing_secret = crate::crypto::seal_signing_secret(&signing_secret)?;
+    let stored_signing_secret = state.cipher.seal(&signing_secret)?;
     let id = Uuid::new_v4();
     let now = Utc::now().naive_utc();
 
@@ -1718,7 +1718,7 @@ pub async fn rotate_api_key(
     let key_hash = hash_key(&plaintext_key);
     let prefix = plaintext_key.chars().take(8).collect::<String>();
     let signing_secret = crate::crypto::generate_signing_secret();
-    let stored_signing_secret = crate::crypto::seal_signing_secret(&signing_secret)?;
+    let stored_signing_secret = state.cipher.seal(&signing_secret)?;
 
     let mut active: api_key::ActiveModel = target.into();
     active.key_hash = Set(key_hash);
@@ -1773,7 +1773,7 @@ pub async fn rotate_signing_secret(
     let target_ref = format_key_reference(&target_name, id);
 
     let signing_secret = crate::crypto::generate_signing_secret();
-    let stored_signing_secret = crate::crypto::seal_signing_secret(&signing_secret)?;
+    let stored_signing_secret = state.cipher.seal(&signing_secret)?;
 
     // Only `signing_secret` (and the bookkeeping `updated_at`) is touched: `key_hash`, `prefix`,
     // `name`, `bound_ips` and every global scope are left untouched by construction, and the

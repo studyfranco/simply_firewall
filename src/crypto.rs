@@ -1,25 +1,26 @@
-//! Request signing (HMAC-SHA256) and signing-secret encryption at rest (AES-GCM-256).
+//! Request signing (HMAC-SHA256) and signing-secret encryption at rest (XChaCha20-Poly1305).
 //!
 //! Two distinct concerns live here, both keyed off an API key's `signing_secret`:
 //!
 //! 1. **Request authentication** — every `/api/*` call carries `X-API-Key` (identity lookup),
 //!    `X-Timestamp` (anti-replay) and `X-Signature-256` (proof of possession). The signature is an
-//!    HMAC-SHA256 over the **CANONICAL_V1** string `METHOD\nPATH\nTIMESTAMP\nRAW_BODY` using the
-//!    looked-up key's `signing_secret`. See [`compute_signature`] and [`verify_signature`].
+//!    HMAC-SHA256 over the **CANONICAL_V1** string `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY` using the
+//!    looked-up key's `signing_secret`, where `TARGET` is the **full request target including the
+//!    query string**. See [`compute_signature`] and [`verify_signature`].
 //!
 //!    The same canonical string is used for outbound `CANONICAL_V1` webhook dispatches
 //!    (`crate::webhooks`), so a `simply_ip_vault` instance can sign a request that another instance
 //!    — or `simply_hook_executor` — verifies with identical code.
 //! 2. **Secret confidentiality at rest** — unlike `key_hash` (a one-way hash), a `signing_secret`
-//!    must be recoverable verbatim to verify a signature, so it cannot be hashed. When
-//!    `VAULT_ENCRYPTION_KEY` is set it is therefore sealed with AES-GCM-256 before being written to
-//!    the database; without it, the secret is stored raw for zero-config local development. See
-//!    [`seal_signing_secret`] and [`open_signing_secret`].
+//!    must be recoverable verbatim to verify a signature, so it cannot be hashed. It is therefore
+//!    sealed with XChaCha20-Poly1305 under a key supplied out-of-band, so read access to the
+//!    database alone is not enough to forge signatures. See [`SecretCipher`].
 
-use aes_gcm::{
-    aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce,
-};
+// `aes_gcm` and `chacha20poly1305` re-export the same `aead` traits, so one import serves both
+// ciphers. The AES types are reached through the legacy read path only — see `open_legacy_gcm`.
+use aes_gcm::{Aes256Gcm, Nonce as GcmNonce};
+use chacha20poly1305::aead::{Aead, KeyInit};
+use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use rand::RngExt;
 use sha2::{Digest, Sha256};
@@ -32,22 +33,32 @@ use crate::error::AppError;
 /// badly skewed clock, which is indistinguishable from a replay and equally unsafe to trust). The
 /// window is deliberately symmetric — a timestamp too far in the *future* is just as suspect as one
 /// too far in the past, and allowing it would let a captured request be held and replayed later.
+///
+/// The window bounds *how long* a captured request stays usable; it does not stop it being used
+/// twice inside that window. [`crate::state::ReplayGuard`] closes that second gap.
 pub const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
 
 /// Name of the environment variable holding the master encryption key for `signing_secret` values.
 pub const ENCRYPTION_KEY_ENV: &str = "VAULT_ENCRYPTION_KEY";
 
-/// Marker prefixing every AES-GCM-256-sealed `signing_secret` in the database.
-///
-/// Its presence (not the mere fact that `VAULT_ENCRYPTION_KEY` happens to be set right now) is what
-/// decides whether a stored value needs decrypting. That makes the dev→prod transition
-/// non-destructive: rows written before encryption was enabled keep working, and rows written while
-/// it was enabled produce a clear error rather than silently returning ciphertext as if it were the
-/// secret if the key is later removed.
-const SEALED_PREFIX: &str = "aesgcm256:";
+/// Accepted alias for [`ENCRYPTION_KEY_ENV`], matching the name `simply_hook_executor` uses so one
+/// provisioning system can supply both services. [`ENCRYPTION_KEY_ENV`] wins when both are set.
+pub const ENCRYPTION_KEY_ENV_ALIAS: &str = "SIGNING_SECRET_KEY";
 
-/// AES-GCM standard nonce length, in bytes.
-const NONCE_LEN: usize = 12;
+/// Required encryption key width, in bytes.
+const KEY_LEN: usize = 32;
+/// XChaCha20-Poly1305 nonce width, in bytes (192 bits).
+const NONCE_LEN: usize = 24;
+
+/// Prefix marking a value stored without encryption.
+const PLAINTEXT_PREFIX: &str = "v1.plain.";
+/// Prefix marking a value sealed with XChaCha20-Poly1305.
+const SEALED_PREFIX: &str = "v1.xchacha20poly1305.";
+/// Prefix marking a value sealed by an earlier version with AES-GCM-256. Read-only: nothing writes
+/// this format any more.
+const LEGACY_GCM_PREFIX: &str = "aesgcm256:";
+/// AES-GCM nonce width, in bytes. Only used to open [`LEGACY_GCM_PREFIX`] values.
+const LEGACY_GCM_NONCE_LEN: usize = 12;
 
 /// Generates a fresh 32-byte HMAC signing secret, hex-encoded.
 ///
@@ -59,24 +70,27 @@ pub fn generate_signing_secret() -> String {
 }
 
 /// Builds the **CANONICAL_V1** byte string that gets signed:
-/// `METHOD\nPATH\nTIMESTAMP\nRAW_BODY`.
+/// `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`.
 ///
-/// The four fields are joined by a single `\n` (LF), exactly as specified in `AGENT.MD`. `method` is
-/// expected uppercase and `path` is the URL path *without* the query string — see
-/// [`verify_signature`] for why the query is excluded.
+/// The four fields are joined by a single `\n` (LF), with no trailing newline. `method` is expected
+/// uppercase. `target` is the request target **including the query string** when one is present —
+/// see [`verify_signature`] for why.
 ///
 /// The newline delimiter is what makes the encoding *unambiguous*: with plain concatenation, the
 /// pair `("POST", "/api/ban")` and `("POS", "T/api/ban")` produce identical bytes, so a signature
 /// over one is a valid signature over the other. A delimiter that cannot appear in a method or a URL
-/// path removes that whole class of boundary confusion. It is also the format
+/// target removes that whole class of boundary confusion. It is also the format
 /// `simply_hook_executor` speaks, so one canonical string now serves both the inbound API and
 /// outbound `CANONICAL_V1` webhook dispatches.
-pub fn canonical_v1_payload(method: &str, path: &str, timestamp: &str, body: &[u8]) -> Vec<u8> {
+///
+/// Outbound webhook templates (`webhook_configs.hmac_template`) build their own string and pass
+/// whatever `{path}` resolves to; this function does not care which of the two it is handed.
+pub fn canonical_v1_payload(method: &str, target: &str, timestamp: &str, body: &[u8]) -> Vec<u8> {
     let mut message =
-        Vec::with_capacity(method.len() + path.len() + timestamp.len() + body.len() + 3);
+        Vec::with_capacity(method.len() + target.len() + timestamp.len() + body.len() + 3);
     message.extend_from_slice(method.as_bytes());
     message.push(b'\n');
-    message.extend_from_slice(path.as_bytes());
+    message.extend_from_slice(target.as_bytes());
     message.push(b'\n');
     message.extend_from_slice(timestamp.as_bytes());
     message.push(b'\n');
@@ -92,7 +106,7 @@ pub fn canonical_v1_payload(method: &str, path: &str, timestamp: &str, body: &[u
 pub fn compute_signature(
     secret: &str,
     method: &str,
-    path: &str,
+    target: &str,
     timestamp: &str,
     body: &[u8],
 ) -> Result<String, AppError> {
@@ -100,27 +114,38 @@ pub fn compute_signature(
         tracing::error!("Failed to build HMAC from signing secret: {}", e);
         AppError::Internal
     })?;
-    mac.update(&canonical_v1_payload(method, path, timestamp, body));
+    mac.update(&canonical_v1_payload(method, target, timestamp, body));
     Ok(hex::encode(mac.finalize().into_bytes()))
 }
 
 /// Verifies a caller-supplied `X-Signature-256` against the expected HMAC.
 ///
-/// The comparison is constant-time (via `Mac::verify_slice`), so a caller cannot recover a valid
-/// signature byte-by-byte from response-timing differences.
+/// # Constant-time comparison
 ///
-/// `path` must be the URL path only — the query string is intentionally *not* part of the signed
-/// message. Signing it would mean any proxy that reorders, re-encodes, or appends query parameters
-/// (a routine thing for reverse proxies to do) silently invalidates otherwise-valid requests. The
-/// tradeoff is explicit and documented in `AGENT.MD`: query parameters on `/api/*` are read-only
-/// filters, while every mutating field travels in the signed body.
+/// The digest comparison goes through `Mac::verify_slice`, whose implementation chain is
+/// `Mac::verify_slice → CtOutput::eq → subtle::ConstantTimeEq::ct_eq`. It rejects a tag of the wrong
+/// length first — that leaks only the digest width, a public constant — and then compares all 32
+/// bytes in constant time. Comparing the hex strings with `==` instead would let an attacker recover
+/// a valid signature one byte at a time by measuring response latency, so this must never be
+/// "simplified" into an equality check on the decoded bytes or the hex text.
+///
+/// # Why the query string is covered
+///
+/// `target` is the **full request target**, query string included. An earlier revision signed the
+/// path alone, on the reasoning that reverse proxies reorder or append query parameters and that
+/// query parameters on `/api/*` were read-only filters. That second half stopped being true: `?hard=true`
+/// on `DELETE /api/ips/{id}` escalates a reversible soft delete into an irreversible purge, and
+/// `?include_deleted=true` widens `GET /api/ips` to the master trash view. With the query outside
+/// the signed material, an on-path attacker who cannot forge a signature could still rewrite a
+/// captured `DELETE /api/ips/{id}` into `…?hard=true` inside the replay window. Signing the whole
+/// target closes that; a proxy that rewrites query strings must now be configured not to.
 ///
 /// A `sha256=` prefix on `provided` is accepted and stripped, matching the format this project
 /// already uses for outbound webhook signatures, so one signing helper can serve both directions.
 pub fn verify_signature(
     secret: &str,
     method: &str,
-    path: &str,
+    target: &str,
     timestamp: &str,
     body: &[u8],
     provided: &str,
@@ -137,127 +162,243 @@ pub fn verify_signature(
     let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
         return false;
     };
-    mac.update(&canonical_v1_payload(method, path, timestamp, body));
+    mac.update(&canonical_v1_payload(method, target, timestamp, body));
     mac.verify_slice(&provided_bytes).is_ok()
 }
 
-/// Resolves the AES-GCM-256 key from `VAULT_ENCRYPTION_KEY`, or `None` when it is unset/empty.
-///
-/// The env var's value is SHA-256'd to derive exactly 32 bytes of key material rather than being
-/// required to *be* 32 raw bytes. This lets operators supply an arbitrary-length passphrase without
-/// a length-validation footgun, while still producing a full-width key. It is deterministic, so the
-/// same passphrase always decrypts the same database.
-fn encryption_key() -> Option<[u8; 32]> {
-    let configured = std::env::var(ENCRYPTION_KEY_ENV).ok()?;
-    if configured.is_empty() {
-        return None;
+/// Failure modes for building the cipher or opening a stored secret.
+#[derive(Debug, thiserror::Error)]
+pub enum CryptoError {
+    /// The configured encryption key is not exactly 64 hex characters.
+    #[error(
+        "{ENCRYPTION_KEY_ENV} must be exactly {} hex characters ({KEY_LEN} bytes); generate one \
+         with `openssl rand -hex {KEY_LEN}`",
+        KEY_LEN * 2
+    )]
+    InvalidKey,
+    /// The stored value is not in any recognized format.
+    #[error("Stored signing secret is malformed or was written by a newer version")]
+    MalformedCiphertext,
+    /// The ciphertext failed authentication — wrong key, or the row was tampered with.
+    #[error(
+        "Stored signing secret could not be decrypted. This usually means {ENCRYPTION_KEY_ENV} \
+         does not match the key the secret was written with"
+    )]
+    DecryptionFailed,
+    /// The cipher itself failed.
+    #[error("Encryption failed")]
+    EncryptionFailed,
+}
+
+impl From<CryptoError> for AppError {
+    /// Every decryption failure is an operator problem, never a caller problem, so it becomes a
+    /// generic `500` rather than anything a client could learn from.
+    fn from(e: CryptoError) -> Self {
+        tracing::error!("Signing-secret cipher error: {e}");
+        AppError::Internal
     }
-    let mut hasher = Sha256::new();
-    hasher.update(configured.as_bytes());
-    Some(hasher.finalize().into())
 }
 
-/// Reports whether signing secrets are being encrypted at rest, for startup logging.
-pub fn encryption_enabled() -> bool {
-    encryption_key().is_some()
-}
-
-/// Encrypts a `signing_secret` for storage, if `VAULT_ENCRYPTION_KEY` is configured.
+/// How recoverable secrets are protected at rest.
 ///
-/// Returns the value to write to `api_keys.signing_secret`: either
-/// `aesgcm256:<hex nonce><hex ciphertext||tag>`, or — when no encryption key is set — the plaintext
-/// unchanged, which is the documented zero-config development fallback.
-pub fn seal_signing_secret(plaintext: &str) -> Result<String, AppError> {
-    let Some(key_bytes) = encryption_key() else {
-        return Ok(plaintext.to_owned());
-    };
-
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| {
-        tracing::error!("Invalid AES-GCM key derived from {}: {}", ENCRYPTION_KEY_ENV, e);
-        AppError::Internal
-    })?;
-
-    // A fresh random nonce per message: GCM catastrophically loses confidentiality if a nonce is
-    // ever reused under the same key, so it is never derived from the plaintext or a counter.
-    let nonce_bytes: [u8; NONCE_LEN] = rand::rng().random();
-    let nonce = Nonce::from(nonce_bytes);
-
-    let ciphertext = cipher.encrypt(&nonce, plaintext.as_bytes()).map_err(|e| {
-        tracing::error!("Failed to encrypt signing secret: {}", e);
-        AppError::Internal
-    })?;
-
-    Ok(format!(
-        "{SEALED_PREFIX}{}{}",
-        hex::encode(nonce_bytes),
-        hex::encode(ciphertext)
-    ))
+/// Constructed **once** at startup and carried in [`crate::state::AppState`]. An earlier revision
+/// re-read `VAULT_ENCRYPTION_KEY` from the environment and re-derived the key on every seal and
+/// open — that is once per authenticated request, and it meant the key backing an authorization
+/// decision could change under a running process.
+pub enum SecretCipher {
+    /// No encryption key configured: secrets are stored hex-encoded but unencrypted.
+    ///
+    /// Kept as a supported mode so the daemon still runs with zero configuration, but it means
+    /// database confidentiality is the *only* thing protecting signing secrets.
+    Plaintext,
+    /// Secrets are sealed with XChaCha20-Poly1305 under the configured key.
+    ///
+    /// `legacy_gcm` is the AES-GCM-256 key derived the way earlier versions derived it — SHA-256 of
+    /// the raw environment value — so rows already written as `aesgcm256:` stay readable. It is
+    /// never used to write.
+    Sealed {
+        /// The cipher used for every new seal.
+        cipher: Box<XChaCha20Poly1305>,
+        /// Read-only key material for opening pre-existing AES-GCM rows.
+        legacy_gcm: [u8; KEY_LEN],
+    },
 }
 
-/// Recovers a `signing_secret` read from the database, decrypting it when it is sealed.
-///
-/// A value without the [`SEALED_PREFIX`] is returned as-is (raw development storage). A sealed value
-/// encountered while `VAULT_ENCRYPTION_KEY` is unset is a hard error, not a silent pass-through:
-/// handing ciphertext back as if it were the secret would make every signature check fail with a
-/// misleading `401` instead of surfacing the real misconfiguration.
-pub fn open_signing_secret(stored: &str) -> Result<String, AppError> {
-    let Some(sealed) = stored.strip_prefix(SEALED_PREFIX) else {
-        return Ok(stored.to_owned());
-    };
-
-    let Some(key_bytes) = encryption_key() else {
-        tracing::error!(
-            "Signing secret is encrypted at rest but {} is not set — cannot authenticate \
-             requests for this key. Restore the original encryption key.",
-            ENCRYPTION_KEY_ENV
-        );
-        return Err(AppError::Internal);
-    };
-
-    let raw = hex::decode(sealed).map_err(|e| {
-        tracing::error!("Malformed sealed signing secret (bad hex): {}", e);
-        AppError::Internal
-    })?;
-    if raw.len() <= NONCE_LEN {
-        tracing::error!("Malformed sealed signing secret: truncated payload");
-        return Err(AppError::Internal);
+impl std::fmt::Debug for SecretCipher {
+    /// Never renders key material, so a `{:?}` of application state cannot leak it into a log.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Plaintext => f.write_str("SecretCipher::Plaintext"),
+            Self::Sealed { .. } => f.write_str("SecretCipher::Sealed(<redacted>)"),
+        }
     }
-    let (nonce_bytes, ciphertext) = raw.split_at(NONCE_LEN);
+}
 
-    let cipher = Aes256Gcm::new_from_slice(&key_bytes).map_err(|e| {
-        tracing::error!("Invalid AES-GCM key derived from {}: {}", ENCRYPTION_KEY_ENV, e);
-        AppError::Internal
-    })?;
-    let nonce = Nonce::try_from(nonce_bytes).map_err(|e| {
-        tracing::error!("Invalid AES-GCM nonce in stored signing secret: {}", e);
-        AppError::Internal
-    })?;
+impl SecretCipher {
+    /// Builds the cipher from [`ENCRYPTION_KEY_ENV`] (or [`ENCRYPTION_KEY_ENV_ALIAS`]).
+    ///
+    /// A malformed key is a **hard error**, not a fallback to plaintext: an operator who set the
+    /// variable believes their secrets are encrypted, and silently writing them in the clear would
+    /// betray that belief at exactly the wrong moment. `main` propagates this, so the daemon refuses
+    /// to start rather than degrading quietly.
+    pub fn from_env() -> Result<Self, CryptoError> {
+        let configured = std::env::var(ENCRYPTION_KEY_ENV)
+            .ok()
+            .filter(|raw| !raw.trim().is_empty())
+            .or_else(|| {
+                std::env::var(ENCRYPTION_KEY_ENV_ALIAS)
+                    .ok()
+                    .filter(|raw| !raw.trim().is_empty())
+            });
 
-    let plaintext = cipher.decrypt(&nonce, ciphertext.as_ref()).map_err(|_| {
-        // Deliberately not logging the underlying AEAD error detail: for GCM a decryption failure
-        // is always "authentication tag mismatch", which means either the wrong
-        // VAULT_ENCRYPTION_KEY or a tampered row. Both need the same operator action.
-        tracing::error!(
-            "Failed to decrypt signing secret — wrong {} or tampered database row.",
-            ENCRYPTION_KEY_ENV
+        match configured {
+            Some(raw) => Self::from_hex_key(raw.trim()),
+            None => Ok(Self::Plaintext),
+        }
+    }
+
+    /// Builds a cipher from a hex-encoded 32-byte key.
+    ///
+    /// The legacy AES-GCM key is derived from the *raw hex text* rather than the decoded bytes,
+    /// because that is precisely what the previous implementation hashed. Keeping the same
+    /// `VAULT_ENCRYPTION_KEY` value therefore keeps existing `aesgcm256:` rows readable across the
+    /// upgrade — provided that value was already 64 hex characters. If it was a free-form
+    /// passphrase, startup now fails with [`CryptoError::InvalidKey`], which is the honest outcome:
+    /// an unbounded passphrase run through a single SHA-256 has whatever entropy the operator typed,
+    /// and the old code could not tell `openssl rand -hex 32` from `password`.
+    pub fn from_hex_key(hex_key: &str) -> Result<Self, CryptoError> {
+        let bytes = hex::decode(hex_key).map_err(|_| CryptoError::InvalidKey)?;
+        if bytes.len() != KEY_LEN {
+            return Err(CryptoError::InvalidKey);
+        }
+        let key = Key::try_from(bytes.as_slice()).map_err(|_| CryptoError::InvalidKey)?;
+
+        let mut hasher = Sha256::new();
+        hasher.update(hex_key.as_bytes());
+        let legacy_gcm: [u8; KEY_LEN] = hasher.finalize().into();
+
+        Ok(Self::Sealed {
+            cipher: Box::new(XChaCha20Poly1305::new(&key)),
+            legacy_gcm,
+        })
+    }
+
+    /// Whether secrets are actually being encrypted.
+    pub fn is_encrypting(&self) -> bool {
+        matches!(self, Self::Sealed { .. })
+    }
+
+    /// Encodes a secret for storage.
+    ///
+    /// Even the unencrypted mode hex-encodes, so the raw secret is never a substring of the stored
+    /// column and a casual `grep` of a database dump does not surface it.
+    pub fn seal(&self, plaintext: &str) -> Result<String, CryptoError> {
+        match self {
+            Self::Plaintext => Ok(format!("{PLAINTEXT_PREFIX}{}", hex::encode(plaintext))),
+            Self::Sealed { cipher, .. } => {
+                // A fresh random nonce per secret. XChaCha20's 192-bit nonce is wide enough that
+                // random generation is collision-safe with no counter state to persist — which is
+                // the whole reason for preferring it over AES-GCM's 96-bit nonce here.
+                let nonce_bytes: [u8; NONCE_LEN] = rand::rng().random();
+                let nonce = XNonce::from(nonce_bytes);
+                let ciphertext = cipher
+                    .encrypt(&nonce, plaintext.as_bytes())
+                    .map_err(|_| CryptoError::EncryptionFailed)?;
+                Ok(format!(
+                    "{SEALED_PREFIX}{}.{}",
+                    hex::encode(nonce_bytes),
+                    hex::encode(ciphertext)
+                ))
+            }
+        }
+    }
+
+    /// Recovers a secret from storage, in any format this project has ever written.
+    ///
+    /// Four shapes are accepted, and the order matters:
+    ///
+    /// 1. `v1.xchacha20poly1305.<nonce>.<ct>` — the current format.
+    /// 2. `v1.plain.<hex>` — the current unencrypted format.
+    /// 3. `aesgcm256:<nonce><ct>` — written by earlier versions; readable, never rewritten.
+    /// 4. Anything else — a bare secret from before any prefix existed, returned verbatim.
+    ///
+    /// Rows only move to the current format when the key is next rotated, which keeps the upgrade
+    /// non-destructive: no migration touches secret material, and a downgrade still reads
+    /// everything it wrote itself.
+    pub fn open(&self, stored: &str) -> Result<String, CryptoError> {
+        if let Some(encoded) = stored.strip_prefix(PLAINTEXT_PREFIX) {
+            let bytes = hex::decode(encoded).map_err(|_| CryptoError::MalformedCiphertext)?;
+            return String::from_utf8(bytes).map_err(|_| CryptoError::MalformedCiphertext);
+        }
+
+        if let Some(body) = stored.strip_prefix(SEALED_PREFIX) {
+            let (nonce_hex, ciphertext_hex) =
+                body.split_once('.').ok_or(CryptoError::MalformedCiphertext)?;
+            let nonce_bytes =
+                hex::decode(nonce_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
+            if nonce_bytes.len() != NONCE_LEN {
+                return Err(CryptoError::MalformedCiphertext);
+            }
+            let ciphertext =
+                hex::decode(ciphertext_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
+
+            let Self::Sealed { cipher, .. } = self else {
+                // A sealed row with no key configured. Reported as a key mismatch rather than as
+                // corruption, because the fix is to set VAULT_ENCRYPTION_KEY, and because handing
+                // ciphertext back as if it were the secret would surface as a misleading 401 on
+                // every request instead of the real misconfiguration.
+                return Err(CryptoError::DecryptionFailed);
+            };
+            let nonce =
+                XNonce::try_from(nonce_bytes.as_slice()).map_err(|_| CryptoError::MalformedCiphertext)?;
+            let plaintext = cipher
+                .decrypt(&nonce, ciphertext.as_ref())
+                .map_err(|_| CryptoError::DecryptionFailed)?;
+            return String::from_utf8(plaintext).map_err(|_| CryptoError::MalformedCiphertext);
+        }
+
+        if let Some(sealed) = stored.strip_prefix(LEGACY_GCM_PREFIX) {
+            return self.open_legacy_gcm(sealed);
+        }
+
+        // No recognized prefix: a bare secret written before any prefix existed.
+        Ok(stored.to_owned())
+    }
+
+    /// Opens an `aesgcm256:` value written by an earlier version.
+    ///
+    /// Exists solely so upgrading does not invalidate every key issued while AES-GCM was in use.
+    /// There is no corresponding write path.
+    fn open_legacy_gcm(&self, sealed: &str) -> Result<String, CryptoError> {
+        let Self::Sealed { legacy_gcm, .. } = self else {
+            return Err(CryptoError::DecryptionFailed);
+        };
+
+        let raw = hex::decode(sealed).map_err(|_| CryptoError::MalformedCiphertext)?;
+        if raw.len() <= LEGACY_GCM_NONCE_LEN {
+            return Err(CryptoError::MalformedCiphertext);
+        }
+        let (nonce_bytes, ciphertext) = raw.split_at(LEGACY_GCM_NONCE_LEN);
+
+        let cipher = Aes256Gcm::new_from_slice(legacy_gcm).map_err(|_| CryptoError::InvalidKey)?;
+        let nonce = GcmNonce::try_from(nonce_bytes).map_err(|_| CryptoError::MalformedCiphertext)?;
+        let plaintext = cipher
+            .decrypt(&nonce, ciphertext.as_ref())
+            .map_err(|_| CryptoError::DecryptionFailed)?;
+
+        tracing::debug!(
+            "Opened a legacy AES-GCM signing secret; it will move to XChaCha20-Poly1305 on the next \
+             rotation."
         );
-        AppError::Internal
-    })?;
-
-    String::from_utf8(plaintext).map_err(|e| {
-        tracing::error!("Decrypted signing secret is not valid UTF-8: {}", e);
-        AppError::Internal
-    })
+        String::from_utf8(plaintext).map_err(|_| CryptoError::MalformedCiphertext)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// `VAULT_ENCRYPTION_KEY` is process-wide state, so the two tests that mutate it must not run
-    /// concurrently on different libtest threads (`set_var` is `unsafe` precisely because
-    /// concurrent mutation is a data race).
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    const TEST_KEY: &str = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
 
     #[test]
     fn canonical_v1_payload_is_newline_delimited() {
@@ -301,6 +442,28 @@ mod tests {
         }
     }
 
+    /// The query string is part of the signed target, so tampering with it invalidates the
+    /// signature. This is the property that stops a captured `DELETE /api/ips/{id}` from being
+    /// rewritten into `…?hard=true` on the wire.
+    #[test]
+    fn the_query_string_is_covered_by_the_signature() {
+        let bare = compute_signature("secret", "DELETE", "/api/ips/42", "1700000000", b"");
+        let escalated =
+            compute_signature("secret", "DELETE", "/api/ips/42?hard=true", "1700000000", b"");
+        assert_ne!(bare.as_deref().ok(), escalated.as_deref().ok());
+
+        // Reordering or adding a filter is equally covered.
+        let listing = compute_signature("secret", "GET", "/api/ips?limit=10", "1700000000", b"");
+        let widened = compute_signature(
+            "secret",
+            "GET",
+            "/api/ips?limit=10&include_deleted=true",
+            "1700000000",
+            b"",
+        );
+        assert_ne!(listing.as_deref().ok(), widened.as_deref().ok());
+    }
+
     #[test]
     fn verify_accepts_valid_and_rejects_tampered() {
         let sig = compute_signature("s3cret", "POST", "/api/ban", "1700000000", b"body")
@@ -324,43 +487,185 @@ mod tests {
         assert!(!verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", ""));
     }
 
+    /// A tag of the wrong width must be rejected outright rather than compared against a truncated
+    /// expectation — the failure mode a hand-rolled comparison would introduce.
     #[test]
-    fn seal_is_a_no_op_without_an_encryption_key() {
-        let _guard = ENV_LOCK.lock();
-        unsafe { std::env::remove_var(ENCRYPTION_KEY_ENV) };
-
-        let sealed = seal_signing_secret("plain-secret").expect("no-op seal cannot fail");
-        assert_eq!(sealed, "plain-secret", "dev fallback stores the secret raw");
-        assert_eq!(
-            open_signing_secret(&sealed).ok().as_deref(),
-            Some("plain-secret")
-        );
+    fn tags_of_the_wrong_length_are_rejected() {
+        let sig = compute_signature("s3cret", "GET", "/api/ips", "1700000000", b"")
+            .expect("HMAC of a non-empty secret cannot fail");
+        for wrong in [&sig[..62], &sig[..2], "", &format!("{sig}00")] {
+            assert!(
+                !verify_signature("s3cret", "GET", "/api/ips", "1700000000", b"", wrong),
+                "a {}-character tag must be rejected",
+                wrong.len()
+            );
+        }
+        assert!(verify_signature("s3cret", "GET", "/api/ips", "1700000000", b"", &sig));
     }
 
     #[test]
-    fn seal_round_trips_and_is_randomized_when_a_key_is_set() {
-        let _guard = ENV_LOCK.lock();
-        unsafe { std::env::set_var(ENCRYPTION_KEY_ENV, "unit-test-passphrase") };
+    fn plaintext_mode_round_trips_without_exposing_the_secret() {
+        let cipher = SecretCipher::Plaintext;
+        assert!(!cipher.is_encrypting());
 
-        let sealed = seal_signing_secret("plain-secret").expect("seal with a valid key");
-        assert!(sealed.starts_with(SEALED_PREFIX), "sealed values are tagged");
-        assert!(!sealed.contains("plain-secret"), "plaintext must not survive");
+        let sealed = cipher.seal("s3cr3t").expect("sealing succeeds");
+        assert!(sealed.starts_with(PLAINTEXT_PREFIX));
+        // Even unencrypted storage is hex-encoded, so `grep` over a dump does not surface it.
+        assert!(!sealed.contains("s3cr3t"));
+        assert_eq!(cipher.open(&sealed).expect("opening succeeds"), "s3cr3t");
+    }
+
+    #[test]
+    fn sealed_mode_round_trips_and_hides_the_secret() {
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        assert!(cipher.is_encrypting());
+
+        let sealed = cipher.seal("s3cr3t").expect("sealing succeeds");
+        assert!(sealed.starts_with(SEALED_PREFIX));
+        assert!(!sealed.contains("s3cr3t"));
+        assert_eq!(cipher.open(&sealed).expect("opening succeeds"), "s3cr3t");
+    }
+
+    #[test]
+    fn each_seal_uses_a_fresh_nonce() {
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        let first = cipher.seal("same-input").expect("sealing succeeds");
+        let second = cipher.seal("same-input").expect("sealing succeeds");
+        assert_ne!(first, second, "identical plaintexts must not seal identically");
+        assert_eq!(cipher.open(&first).expect("opens"), cipher.open(&second).expect("opens"));
+    }
+
+    #[test]
+    fn a_wrong_key_cannot_open_a_sealed_secret() {
+        let writer = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        let other = SecretCipher::from_hex_key(
+            "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+        )
+        .expect("valid key");
+
+        let sealed = writer.seal("s3cr3t").expect("sealing succeeds");
+        assert!(matches!(other.open(&sealed), Err(CryptoError::DecryptionFailed)));
+        // Nor can a daemon that lost its key entirely.
+        assert!(matches!(
+            SecretCipher::Plaintext.open(&sealed),
+            Err(CryptoError::DecryptionFailed)
+        ));
+    }
+
+    #[test]
+    fn tampering_with_the_ciphertext_is_detected() {
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        let sealed = cipher.seal("s3cr3t").expect("sealing succeeds");
+
+        // Flip the final ciphertext nibble; Poly1305 authentication must reject it.
+        let mut chars: Vec<char> = sealed.chars().collect();
+        let last = chars.len() - 1;
+        chars[last] = if chars[last] == 'a' { 'b' } else { 'a' };
+        let tampered: String = chars.into_iter().collect();
+
+        assert!(matches!(cipher.open(&tampered), Err(CryptoError::DecryptionFailed)));
+    }
+
+    /// Fail closed at startup: a key that is not exactly 32 bytes of hex is an error, never a
+    /// silent downgrade to writing secrets in the clear.
+    #[test]
+    fn malformed_keys_are_rejected_rather_than_falling_back() {
+        for bad in [
+            "not-hex",
+            "00ff",                                                               // too short
+            "",                                                                   // empty
+            &format!("{TEST_KEY}00"),                                             // too long
+            "zz0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",   // bad nibble
+        ] {
+            assert!(
+                matches!(SecretCipher::from_hex_key(bad), Err(CryptoError::InvalidKey)),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(SecretCipher::from_hex_key(TEST_KEY).is_ok());
+    }
+
+    #[test]
+    fn malformed_stored_values_are_rejected() {
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        for malformed in [
+            "v1.xchacha20poly1305.nodot",
+            "v1.xchacha20poly1305.zz.zz",
+            "v1.xchacha20poly1305.00ff.aabb", // nonce too short
+            "v1.plain.zz",
+            "aesgcm256:zz",
+            "aesgcm256:00",
+        ] {
+            assert!(cipher.open(malformed).is_err(), "{malformed:?} should not open");
+        }
+    }
+
+    /// A row written before any prefix existed is a bare secret and must keep working, or every key
+    /// issued by the zero-config development path would stop authenticating on upgrade.
+    #[test]
+    fn an_unprefixed_legacy_row_is_read_verbatim() {
         assert_eq!(
-            open_signing_secret(&sealed).ok().as_deref(),
-            Some("plain-secret")
+            SecretCipher::Plaintext.open("bare-legacy-secret").expect("opens"),
+            "bare-legacy-secret"
+        );
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        assert_eq!(cipher.open("bare-legacy-secret").expect("opens"), "bare-legacy-secret");
+    }
+
+    /// The upgrade path that matters: a secret sealed by the previous AES-GCM implementation, under
+    /// the same `VAULT_ENCRYPTION_KEY`, must still open. Written here exactly as the old code wrote
+    /// it — SHA-256 of the raw env text as the key, 12-byte nonce, `aesgcm256:` prefix — so this
+    /// test would catch a change to the derivation that silently orphaned every existing row.
+    #[test]
+    fn a_legacy_aes_gcm_row_still_opens_under_the_same_key() {
+        let mut hasher = Sha256::new();
+        hasher.update(TEST_KEY.as_bytes());
+        let legacy_key: [u8; KEY_LEN] = hasher.finalize().into();
+
+        let legacy_cipher = Aes256Gcm::new_from_slice(&legacy_key).expect("valid AES key");
+        let nonce_bytes = [7u8; LEGACY_GCM_NONCE_LEN];
+        let nonce = GcmNonce::from(nonce_bytes);
+        let ciphertext = legacy_cipher
+            .encrypt(&nonce, b"issued-under-aes".as_ref())
+            .expect("legacy encryption succeeds");
+        let stored = format!(
+            "{LEGACY_GCM_PREFIX}{}{}",
+            hex::encode(nonce_bytes),
+            hex::encode(&ciphertext)
         );
 
-        // A fresh nonce per call means the same plaintext never seals to the same ciphertext.
-        let sealed_again = seal_signing_secret("plain-secret").expect("seal with a valid key");
-        assert_ne!(sealed, sealed_again);
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        assert_eq!(cipher.open(&stored).expect("legacy row opens"), "issued-under-aes");
 
-        // Tampering with the ciphertext must be caught by the GCM auth tag, not silently accepted.
-        let mut tampered = sealed.clone().into_bytes();
-        let last = tampered.len() - 1;
-        tampered[last] = if tampered[last] == b'a' { b'b' } else { b'a' };
-        let tampered = String::from_utf8(tampered).expect("hex stays ASCII");
-        assert!(open_signing_secret(&tampered).is_err());
+        // ...and a different key cannot open it, so the legacy path is not a bypass.
+        let other = SecretCipher::from_hex_key(
+            "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
+        )
+        .expect("valid key");
+        assert!(matches!(other.open(&stored), Err(CryptoError::DecryptionFailed)));
+        // Nor can a daemon with no key at all.
+        assert!(matches!(
+            SecretCipher::Plaintext.open(&stored),
+            Err(CryptoError::DecryptionFailed)
+        ));
+    }
 
-        unsafe { std::env::remove_var(ENCRYPTION_KEY_ENV) };
+    /// Nothing writes AES-GCM any more: a re-seal of a legacy value produces the current format.
+    #[test]
+    fn resealing_moves_a_legacy_value_to_xchacha20() {
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        let resealed = cipher.seal("issued-under-aes").expect("sealing succeeds");
+        assert!(resealed.starts_with(SEALED_PREFIX));
+        assert!(!resealed.starts_with(LEGACY_GCM_PREFIX));
+    }
+
+    /// `Debug` must never render key material — an `AppState` dump would otherwise leak it.
+    #[test]
+    fn debug_redacts_key_material() {
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        let rendered = format!("{cipher:?}");
+        assert!(rendered.contains("redacted"));
+        assert!(!rendered.contains(TEST_KEY));
+        assert_eq!(format!("{:?}", SecretCipher::Plaintext), "SecretCipher::Plaintext");
     }
 }

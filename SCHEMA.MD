@@ -54,7 +54,7 @@ Stores authentication tokens, global access rights, and CIDR network binding rul
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique identifier for the API key |
 | `name` | `String` | Not Null | Human-readable key description |
 | `key_hash` | `String` | Not Null, Unique | Argon2 / SHA-256 hash of the secret API key |
-| `signing_secret` | `Text` | Nullable | Per-key HMAC-SHA256 secret used to verify the `X-Signature-256` request header. Encrypted with AES-GCM-256 when `VAULT_ENCRYPTION_KEY` is set (stored as `aesgcm256:<hex nonce><hex ciphertext‖tag>`), stored raw otherwise. `NULL` only for keys created before this column existed — such keys cannot authenticate and must be rotated. Never returned by any read endpoint |
+| `signing_secret` | `Text` | Nullable | Per-key HMAC-SHA256 secret used to verify the `X-Signature-256` request header. Encrypted with XChaCha20-Poly1305 when `VAULT_ENCRYPTION_KEY` (alias `SIGNING_SECRET_KEY`, exactly 64 hex characters) is set, stored as `v1.xchacha20poly1305.<hex nonce>.<hex ciphertext‖tag>`; hex-encoded but unencrypted as `v1.plain.<hex>` otherwise. Two legacy shapes remain **readable and are never rewritten in place**: `aesgcm256:<hex nonce><hex ciphertext‖tag>` from the AES-GCM era, and an unprefixed bare secret from before any prefix existed — both move to the current format on the next rotation, so upgrading is non-destructive and no migration touches secret material. `NULL` only for keys created before this column existed — such keys cannot authenticate and must be rotated. Never returned by any read endpoint |
 | `prefix` | `String` | Not Null, Indexed | First 8 characters of key for display and fast lookup |
 | `is_master` | `Boolean` | Default: `false` | Bypasses all group permission checks |
 | `can_manage_keys` | `Boolean` | Default: `false` | Global privilege to create/edit/delete API keys |
@@ -71,6 +71,10 @@ the public `X-API-Key` (identity — never recoverable). `signing_secret` proves
 therefore **cannot** be hashed, since verifying an HMAC requires the secret verbatim; it is encrypted
 at rest instead. Both are returned exactly once, by `POST /api/keys` and `POST /api/keys/{id}/rotate`.
 `POST /api/keys/{id}/rotate` replaces both, so a compromised key leaves no working credential behind.
+The cipher protecting this column is built **once at startup** from `VAULT_ENCRYPTION_KEY` and
+carried in `AppState`; it is never re-derived per request. A malformed key aborts startup rather
+than silently falling back to plaintext.
+
 `POST /api/keys/{id}/rotate-secret` replaces **only** `signing_secret`, leaving `key_hash`, `prefix`,
 `name`, `bound_ips`, the global scope flags and every `api_key_group_permissions` row untouched — the
 narrow operation for routine hygiene, and the recovery path for a `NULL` `signing_secret`.

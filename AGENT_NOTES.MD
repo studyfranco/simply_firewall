@@ -2824,3 +2824,254 @@ invalidated rather than because they broke:
   `Migrator::down(Some(1))`, which unwinds from the *newest* migration — so adding the soft-delete
   migration silently retargeted it. It now derives the step count by locating the auth-mode migration
   in the registry by name, so future migrations cannot turn it into a test of something else.
+
+---
+
+## Session 24 — Cross-service security convergence (`simply_ip_vault` half)
+
+Both sibling services were asked to converge independently onto one arbitrated architecture, rather
+than either copying the other. This is that pass for `simply_ip_vault`. The peer at
+`./example/simply_hook_executor` was used **only to verify parity afterwards**, never as a template
+— and it does *not* already implement several of these decisions, so nothing here was copied from it.
+
+### ⚠ Two directives in `AGENT.MD` were overridden, not silently
+
+`AGENT.MD` says its directives win when they genuinely conflict with the convergence pass, and that
+any conflict must be flagged here rather than quietly overridden. Two genuinely conflicted:
+
+**1. Query string in the signed material.** `AGENT.MD` §1 stated *"`PATH` is the URL path **excluding
+the query string**"* with a documented rationale. The convergence pass mandates full-URI coverage by
+name, three times, as a headline design pillar.
+
+I implemented the convergence pass and **rewrote the `AGENT.MD` directive** rather than leaving the
+document contradicting the code. The reasoning for treating this as a deliberate amendment rather
+than an unanticipated conflict:
+
+- The convergence author knew about this exact rule and overrode it explicitly. The precedence clause
+  guards against breaking repo invariants the author did not know about; this is not that.
+- **The original rationale had already become false.** It rested on "query parameters on `/api/*` are
+  read-only filters — every mutating field travels in the signed body." The soft-delete work broke
+  that: `?hard=true` on `DELETE /api/ips/{id}` escalates a reversible soft delete into an
+  irreversible purge, and `?include_deleted=true` widens `GET /api/ips` to the master trash view.
+  With the query unsigned, an on-path attacker who cannot forge a signature could still rewrite a
+  captured `DELETE /api/ips/{id}` into `…?hard=true` inside the 300s window.
+- The cost the original rule was avoiding is real and is now **accepted**: a reverse proxy that
+  reorders, re-encodes, or appends query parameters will break signatures and must be configured not
+  to. That is a deployment constraint, documented in `AGENT.MD` §1.
+
+**2. At-rest cipher.** `AGENT.MD` §1 and `SCHEMA.MD` specified AES-GCM-256 with a SHA-256-derived key
+of any length. The pass mandates XChaCha20-Poly1305 with a strict key. Same treatment: implemented,
+and both documents updated. This one is unambiguously an improvement — see below.
+
+Nothing else in `AGENT.MD` conflicted. The `/api` route contracts, RBAC model, webhook auth modes,
+and `DELETE /api/ips` dual-parameter behaviour are untouched.
+
+### 1. Fault-tolerant proxy resolution (`src/config.rs`)
+
+Restructured from **per-hostname lazy lookup** to a **whole-set resolved snapshot**:
+`resolved() -> Arc<Vec<IpNetwork>>` merges literal CIDRs with every hostname's current addresses, and
+`resolve_client_ip` became a synchronous function over `&[IpNetwork]`.
+
+That restructure is what fixed a real gap. The previous chain walk consulted `is_literal_network`,
+which returned `false` for every hostname matcher by construction — so **a hop identified only by a
+container name was never skipped** and was reported as the client. The failure was in the safe
+direction (it never trusted an address further left than it should) but it broke `bound_ips` in
+exactly the chained Docker/Traefik topology hostname support exists to serve. With one flat snapshot,
+hostname- and CIDR-configured hops are indistinguishable to the walk and both are peeled.
+
+- **Positive TTL 30s** (`POSITIVE_TTL`), unchanged.
+- **Negative TTL 5s** (`NEGATIVE_TTL`), new. Without it, every request arriving while a hostname is
+  unresolvable triggers its own DNS query — one inbound request becomes one outbound query at
+  whatever rate a caller chooses, which makes this service a resolution amplifier against its own
+  resolver. Attempt state is tracked **per hostname**, so one dead entry does not drag the healthy
+  ones onto the short retry interval.
+- **Concurrent-refresh guard**: the TTL is re-checked under the write lock, so a burst queued behind
+  one expiry pays for a single lookup. Negative caching bounds retries over time; this bounds them
+  across simultaneous requests.
+- **Boot grace period** (`BOOT_GRACE_PERIOD`, 60s): `prime_with_grace()` resolves everything at
+  startup on a detached task, logs the failing names specifically, retries once after 60s, and logs
+  whether it recovered. The service serves normally throughout — a crash loop is strictly worse than
+  running with one proxy entry disabled, because the latter still serves every other caller.
+- Switched `std::sync::RwLock` → `tokio::sync::RwLock` (the refresh now awaits under the lock).
+- **Parse tightened**: an all-digits-and-dots entry (`10.0.0.256`, `999.1.1.1`) is now *rejected* at
+  startup instead of becoming a hostname that quietly never resolves. A typo should be a loud
+  configuration error, not a silent non-match.
+
+### 2. Cryptographic engine (`src/crypto.rs`, `src/state.rs`)
+
+- **AES-GCM-256 → XChaCha20-Poly1305**, 192-bit random nonce per operation. The nonce width is the
+  substantive win: 96-bit random nonces carry a birthday bound, 192-bit ones are collision-safe with
+  no counter state to persist.
+- **Key is now exactly 64 hex characters, enforced.** The old code SHA-256'd any string, so
+  `VAULT_ENCRYPTION_KEY=password` produced a key with the entropy of "password" and nothing said so.
+  A malformed key now **aborts startup**.
+- **Built once at startup**, carried in `AppState` as `Arc<SecretCipher>`. The old code re-read the
+  environment and re-derived the key on *every* seal and open — once per authenticated request — and
+  meant an authorization input could change under a running process.
+- **`Debug` is redacted**, so an `AppState` dump cannot leak key material.
+- **Upgrades are non-destructive.** `open()` reads four shapes: the current
+  `v1.xchacha20poly1305.…`, `v1.plain.…`, the legacy `aesgcm256:…` (decrypted with SHA-256 of the raw
+  env text, exactly as the old code derived it), and an unprefixed bare secret. Nothing writes AES
+  any more; rows move to the current format on the next rotation. The one migration cost is real and
+  is stated in `AGENT.MD`: an operator whose old `VAULT_ENCRYPTION_KEY` was a free-form passphrase
+  rather than 64 hex characters can no longer start, and must rotate. That is the honest outcome of
+  making the key requirement real.
+- **Constant-time comparison audited.** `Mac::verify_slice` is the only signature comparison in
+  `src/`; `scripts/verify_convergence.sh` now asserts no `==` on a digest can reappear.
+
+### 3. Authentication posture, full-URI signing, anti-replay (`src/middleware.rs`)
+
+- `TARGET` is now `path_and_query()`, not `path()`.
+- **`ReplayGuard`** (`src/state.rs`): remembers each accepted `(key_id, signature)` until its
+  timestamp leaves the ±300s window. Freshness bounds how *long* a captured request stays usable and
+  says nothing about using it *twice* — every field the signature covers is unchanged in a replay, so
+  the HMAC verifies and the window check passes. Consulted **after** the HMAC verifies: recording
+  unverified signatures would let an unauthenticated caller exhaust memory *and* pre-insert a
+  signature a legitimate client is about to send, turning the guard into a DoS tool against that
+  client. Bounded at 100k tracked entries with expiry-first pruning.
+- **Verified there is no bypass.** This service has no per-key HMAC mode, no `REQUIRE_SIGNED_REQUESTS`
+  switch, and no unauthenticated `/api/*` route. `verify_convergence.sh` asserts the absence of
+  `hmac_mode`/`HmacMode`/`REQUIRE_SIGNED_REQUESTS` anywhere in `src/`.
+
+**Operational consequence, stated plainly because it is user-visible:** a signature covers method,
+target, timestamp and body and *nothing else*, so **repeating a call unchanged within the same
+wall-clock second produces the identical signature and is refused as a replay**. Real clients never
+hit this — a retry, a poll, or a second ban lands on a later timestamp. It showed up immediately in
+the test suites, which issue both halves microseconds apart; both now model the elapsed second
+explicitly (`signed_later` in the Rust suites, a per-identity clock in `test_e2e.sh`). That is not a
+workaround for the guard — it is how a test represents time a real caller gets for free.
+
+### 4. Pipeline ordering & memory bounds (`src/middleware.rs`, `src/lib.rs`)
+
+- Ordering was **already correct** and is unchanged: client IP → timestamp → key lookup → signature →
+  replay → `bound_ips`. It is now asserted three ways: a test proving a nonexistent key and a real
+  out-of-range key are *both* `401` while the signature is unproven, a test proving the same key gets
+  `403` once authenticated, and a structural line-order check in `verify_convergence.sh`.
+- **`MAX_REQUEST_BODY_BYTES = 3 MiB`** in `lib.rs`, applied as a single `DefaultBodyLimit` **outside**
+  the `/api` nest so it covers the static fallback too. `middleware::MAX_SIGNED_BODY_BYTES` is
+  `crate::MAX_REQUEST_BODY_BYTES` — one constant, two uses, no drift. Previously the router had *no*
+  explicit limit and the middleware hardcoded an unrelated 2 MiB.
+
+### 5. Database resilience & retention
+
+- `apply_sqlite_pragmas` now returns `()` instead of `Result`. Every failure is logged and swallowed;
+  it is structurally incapable of aborting startup. Refusing to boot over a concurrency setting that
+  did not apply trades a real outage for a theoretical slowdown — and `sqlite::memory:` legitimately
+  reports `journal_mode=memory`.
+- Retention was already compliant and is unchanged: `IP_RETENTION_DAYS` (default **92**),
+  `IP_RETENTION_SWEEP_SECONDS`, and a purge filtering on `is_deleted = true` **AND**
+  `deleted_at IS NOT NULL` **AND** `deleted_at < threshold`. Master-only restore, `?include_deleted`,
+  and `?hard=true` are untouched.
+
+### Also fixed (found while doing the above, not in the task list)
+
+- **Bootstrap `bound_ips` was IPv4-only** (`0.0.0.0/0`), now `0.0.0.0/0,::/0`. Since master keys stopped
+  being exempt from the CIDR check, a native-IPv6 first request (a `localhost` resolving to `::1`)
+  would `403` the bootstrap master key with no other credential in the database to recover with.
+  `normalize_ip` rescues IPv4-*mapped* IPv6 only. This did not reproduce in E2E because it connects
+  over `127.0.0.1`.
+- **Listen address was hardcoded** to `0.0.0.0:3000`. Added `BIND_HOST`/`HOST`/`PORT`
+  (`config::resolve_bind_addr`). Beyond the five tasks, but the service could not be confined to an
+  interface at all, and §26's startup assertions need a second instance on one host.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **143 passed**, 0 failed (55 unit + 54 RBAC + 34 security) |
+| `./scripts/test_e2e.sh` | **377/377**, 0 failed |
+| `./scripts/verify_convergence.sh` | 23 matching, 1 documented divergence, 0 unexplained |
+
+New tests: replay rejection (in-process and E2E), per-key replay scoping, the 401/403 oracle in both
+directions, query tampering in both directions (append *and* strip), correctly-signed queries still
+authenticating, the shared body-limit constant, oversized-body rejection, pragma resilience,
+fail-closed cipher init, XChaCha20 round-trip, legacy AES-GCM read-back, negative DNS caching,
+per-hostname TTL independence, boot priming, and bind-address parsing.
+
+Two E2E harness bugs found and fixed along the way, both pre-existing in kind:
+`next_timestamp` was first written to `printf` its result, so `$(next_timestamp …)` ran it in a
+subshell and discarded the memo — silently reducing it to `date +%s`; and the stale-timestamp check
+derived its value from a `NOW_TS` the new clock may have pushed a second ahead, landing inside the
+window and passing for the wrong reason.
+
+---
+
+## Convergence Parity Check — `simply_ip_vault` vs `./example/simply_hook_executor`
+
+Verified mechanically by `scripts/verify_convergence.sh`, which extracts and diffs the
+security-critical functions from both trees. Run it before merging anything that touches
+`config.rs`, `crypto.rs`, `middleware.rs`, or `state.rs`.
+
+### Pillar 1 — Proxy resolution & `X-Forwarded-For`
+
+| Aspect | `simply_ip_vault` (this repo) | `simply_hook_executor` (`./example`) | Status |
+| :--- | :--- | :--- | :--- |
+| Chain walk | right-to-left, skips trusted hops, falls back to peer | identical | ✅ **byte-identical** |
+| Peer-trust precondition | headers honoured only if the TCP peer is trusted | identical | ✅ identical |
+| IPv4-mapped normalization | `normalize_ip` | identical | ✅ **byte-identical** |
+| Hostname entries | yes, 30s TTL | yes, 30s TTL | ✅ same contract |
+| **Negative caching** | **yes, 5s dedicated TTL, per hostname** | **no — a failed name is absent from the snapshot but retried on the positive TTL** | ⚠️ **this repo is ahead** |
+| **Boot grace period** | **yes, 60s, retried and logged** | **no** | ⚠️ **this repo is ahead** |
+| Concurrent-refresh guard | re-check under write lock | same | ✅ same |
+| Malformed-entry rejection | rejects all-digits-and-dots typos | same | ✅ same |
+| `bound_ips` on master keys | enforced | enforced | ✅ identical |
+| Bind address | `BIND_HOST`/`HOST`/`PORT`, literal IP only | same | ✅ **byte-identical** |
+
+**Remaining divergence:** negative caching and the boot grace period exist here and not in the peer.
+Both are convergence-pass requirements, so the peer is expected to add them in its own half of this
+work. Neither changes what is *trusted* — they change how often DNS is asked and what is logged at
+startup — so the chain walk stays identical regardless, which is the part that must not drift.
+
+### Pillar 2 — Cryptography
+
+| Aspect | `simply_ip_vault` | `simply_hook_executor` | Status |
+| :--- | :--- | :--- | :--- |
+| At-rest AEAD | XChaCha20-Poly1305 | XChaCha20-Poly1305 | ✅ same |
+| Nonce width | 24 bytes, random per op | 24 bytes, random per op | ✅ same |
+| Key requirement | exactly 64 hex, else abort | exactly 64 hex, else abort | ✅ same |
+| Cipher lifetime | built once, in `AppState` | built once, in `AppState` | ✅ same |
+| Unencrypted mode | hex-encoded `v1.plain.` | hex-encoded `v1.plain.` | ✅ same |
+| Env var | `VAULT_ENCRYPTION_KEY`, alias `SIGNING_SECRET_KEY` | `SIGNING_SECRET_KEY`, alias `VAULT_ENCRYPTION_KEY` | ⚠️ primary/alias reversed — **both accept both**, so one provisioning system serves both services |
+| Legacy read path | `aesgcm256:` + unprefixed bare | none needed (never shipped AES) | ⚠️ **N/A for the peer** |
+| Signature comparison | `Mac::verify_slice` | `Mac::verify_slice` | ✅ same |
+| Canonical string | `METHOD\nTARGET\nTIMESTAMP\nBODY`, LF, no trailing | identical | ✅ same |
+| Query string signed | yes | yes | ✅ same |
+
+### Pillar 3 — Pipeline ordering & memory bounds
+
+| Aspect | `simply_ip_vault` | `simply_hook_executor` | Status |
+| :--- | :--- | :--- | :--- |
+| Auth before `bound_ips` | ✅ signature → replay → CIDR | ⚠️ **the peer checks `bound_ips` before the signature** | ⚠️ **the peer has the 401/403 oracle; this repo does not** |
+| Router body limit | 3 MiB, outside the nest | 1 MiB at last audit | ⚠️ peer to raise to 3 MiB |
+| Signature buffer | derived from the same constant | derived from the same constant | ✅ same approach |
+| Anti-replay single-use | ✅ `ReplayGuard` | ⚠️ timestamp window only at last audit | ⚠️ peer to add for its full-HMAC keys |
+
+**These three are the peer's half of the convergence pass, not divergences this repo can close.**
+Recorded here so the peer's audit has a checklist.
+
+### Pillar 4 — Database resilience & retention
+
+| Aspect | `simply_ip_vault` | `simply_hook_executor` | Status |
+| :--- | :--- | :--- | :--- |
+| `journal_mode=WAL` + `busy_timeout=5000` | yes, before migrations | yes, before migrations | ✅ same |
+| Backend guard | `get_database_backend()` | same | ✅ same |
+| Pragma failure | **non-fatal, returns `()`** | non-fatal, logs and continues | ✅ same behaviour |
+| Module | `state.rs` | `db.rs` | ⚠️ cosmetic — flagged as a documented divergence by the checker |
+| Soft delete | `ip_records` | `hooks` | ⚠️ different resources, same pattern |
+| Retention default | 92 days | 92 days | ✅ same |
+| Retention configurable | `IP_RETENTION_DAYS` | compile-time constant | ⚠️ this repo is ahead |
+| Purge predicate | `is_deleted = true AND deleted_at IS NOT NULL AND deleted_at < threshold` | `is_deleted = true AND deleted_at < threshold` | ✅ equivalent — `NULL < x` is `NULL` in SQL, so the peer's is correct; ours is explicit |
+
+### Pillar 5 — Authentication posture — **asymmetric by design, out of scope to unify**
+
+| | `simply_ip_vault` | `simply_hook_executor` |
+| :--- | :--- | :--- |
+| Posture | **full-URI HMAC + anti-replay, mandatory on every key** | **per-key: full-HMAC / body-only-HMAC / no-HMAC** |
+| Configurable | no — no per-key mode, no env switch, no exempt route | yes, `api_keys.hmac_mode` + `REQUIRE_SIGNED_REQUESTS` |
+| Why | the internal, higher-trust service. Its callers are its own operators' shell scripts (fail2ban, portsentry), which compute the HMAC with one `openssl dgst -sha256 -hmac`. There is no interoperability argument for a weaker path, so there is no weaker path. | must accept third-party webhook senders that sign with their own conventions (GitHub-style body-only) or not at all. Removing that flexibility would break integration with senders neither service controls. |
+
+**This asymmetry is intentional and must not be "fixed" by a future convergence pass.** Where a
+`simply_hook_executor` key *does* use full-request HMAC, it applies the same full-URI canonicalization
+and the same anti-replay rule described above; body-only and no-HMAC keys stay exactly as configured.

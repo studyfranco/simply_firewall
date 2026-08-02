@@ -3,13 +3,35 @@
 //! This module provides the core API router, state, and webhook logic.
 
 use axum::{
-    routing::{delete, get, post, put},
     Router,
+    extract::DefaultBodyLimit,
+    routing::{delete, get, post, put},
 };
-use tower_http::services::ServeDir;
-use tower_http::trace::TraceLayer;
 use sea_orm::DatabaseConnection;
 use tokio::sync::mpsc;
+use tower_http::services::ServeDir;
+use tower_http::trace::TraceLayer;
+
+/// Hard ceiling on the size of any request body this service will buffer, in bytes (3 MiB).
+///
+/// **The single source of truth for both body limits.** It is applied as an explicit
+/// [`DefaultBodyLimit`] over the whole router *and* referenced by
+/// `middleware::MAX_SIGNED_BODY_BYTES`, so the two can never drift apart. Three reasons it is
+/// stated here rather than left implicit:
+///
+/// - **It is a security boundary, so it should be written down.** Every handler takes its payload
+///   as `Json<T>`, which buffers the whole body in memory before the handler runs — and the auth
+///   middleware buffers it earlier still, because the signature covers the raw bytes. Without a
+///   bound, an unauthenticated caller can force unbounded allocation.
+/// - **The two layers must agree exactly.** If the middleware's buffer were the larger of the two,
+///   a body between the limits would be fully read and HMAC'd only to be rejected by the extractor
+///   afterwards — paying the memory cost of a payload the service had already decided not to
+///   accept. Independently-chosen constants are how parser-differential bugs start.
+/// - **Axum's default is a default, not a guarantee.** Pinning it means a dependency upgrade cannot
+///   silently widen the exposure.
+///
+/// A body over the limit is rejected with `413 Payload Too Large` before it is read to completion.
+pub const MAX_REQUEST_BODY_BYTES: usize = 3 * 1024 * 1024;
 
 pub mod api;
 pub mod config;
@@ -69,19 +91,32 @@ pub fn create_app(state: AppState) -> Router {
     Router::new()
         .fallback_service(ServeDir::new("static"))
         .nest("/api", api_routes)
+        // Applied *outside* the nest so it covers `/api/*` and the static fallback alike. Inside,
+        // it would leave the SPA path — which never reaches the auth middleware — unbounded, and a
+        // limit that can be sidestepped by aiming at a different route is not a limit. No route
+        // overrides it: `DefaultBodyLimit` is set exactly once, here.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
-/// Helper to create AppState and background worker
-pub fn setup_state(db: DatabaseConnection) -> (AppState, mpsc::Sender<WebhookEvent>, tokio::task::JoinHandle<()>) {
+/// Helper to create AppState and background worker.
+///
+/// Fails when the configured `VAULT_ENCRYPTION_KEY` is malformed — see
+/// [`crypto::SecretCipher::from_env`]. That is deliberately not recoverable: falling back to
+/// plaintext would write signing secrets in the clear for an operator who believes they are
+/// encrypted.
+pub fn setup_state(
+    db: DatabaseConnection,
+) -> Result<(AppState, mpsc::Sender<WebhookEvent>, tokio::task::JoinHandle<()>), crypto::CryptoError>
+{
     let (tx, rx) = mpsc::channel::<WebhookEvent>(100);
     let db_worker = db.clone();
     let worker_handle = tokio::spawn(async move {
         webhooks::run_webhook_worker(db_worker, rx).await;
     });
 
-    let state = AppState::new(db, tx.clone());
+    let state = AppState::new(db, tx.clone())?;
 
-    (state, tx, worker_handle)
+    Ok((state, tx, worker_handle))
 }

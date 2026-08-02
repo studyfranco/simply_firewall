@@ -53,7 +53,10 @@ async fn shutdown_signal() {
 /// a normal deployment option, since a human-chosen, low-entropy secret defeats the point of
 /// generating a random 256-bit key. A warning is logged whenever it's used so it can't be enabled
 /// by accident in a real deployment without someone noticing in the logs.
-async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std::error::Error>> {
+async fn bootstrap_master_key(
+    db: &DatabaseConnection,
+    cipher: &simply_ip_vault::crypto::SecretCipher,
+) -> Result<(), Box<dyn std::error::Error>> {
     use entities::{api_key, prelude::ApiKey};
 
     let existing_master = ApiKey::find()
@@ -90,8 +93,14 @@ async fn bootstrap_master_key(db: &DatabaseConnection) -> Result<(), Box<dyn std
     };
 
     let key_hash = api::hash_key(&plaintext_key);
-    let stored_signing_secret = simply_ip_vault::crypto::seal_signing_secret(&signing_secret)?;
-    let bound_ip = std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0".to_owned());
+    let stored_signing_secret = cipher.seal(&signing_secret)?;
+    // Both families. Listing only `0.0.0.0/0` was harmless while master keys bypassed the CIDR
+    // check; now that they are held to it, an IPv4-only default locks an operator out of a
+    // dual-stack deployment on the very first request — `normalize_ip` rescues IPv4-*mapped* IPv6
+    // (`::ffff:a.b.c.d`), but a native IPv6 peer such as `::1` matches no IPv4 prefix at all, and
+    // there is no second credential in the database to recover with.
+    let bound_ip =
+        std::env::var("BOOTSTRAP_SUBNET").unwrap_or_else(|_| "0.0.0.0/0,::/0".to_owned());
 
     let prefix = plaintext_key.chars().take(8).collect::<String>();
     let now = chrono::Utc::now().naive_utc();
@@ -159,15 +168,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let db_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "sqlite://simply_ip_vault.db?mode=rwc".to_owned());
 
-    // Surfaced at boot because the two modes are indistinguishable from the API's behaviour: an
-    // operator who mistyped the env var would otherwise never learn that signing secrets are
-    // sitting in the database in plaintext.
-    if simply_ip_vault::crypto::encryption_enabled() {
-        tracing::info!("VAULT_ENCRYPTION_KEY is set: signing secrets are encrypted at rest (AES-GCM-256).");
+    // Built once, here, and carried in `AppState` from now on — never re-read per request.
+    //
+    // A malformed key stops startup rather than silently degrading to writing signing secrets in
+    // the clear. An operator who set `VAULT_ENCRYPTION_KEY` believes their secrets are encrypted,
+    // and the moment that belief is wrong is exactly the moment it must not be quiet.
+    let cipher = simply_ip_vault::crypto::SecretCipher::from_env()?;
+    if cipher.is_encrypting() {
+        tracing::info!(
+            "VAULT_ENCRYPTION_KEY is set: signing secrets are encrypted at rest \
+             (XChaCha20-Poly1305)."
+        );
     } else {
         tracing::warn!(
             "VAULT_ENCRYPTION_KEY is not set: API key signing secrets are stored UNENCRYPTED. \
-             This is the zero-config development default — set it for any real deployment."
+             Anyone who can read the database can forge request signatures. Generate a key with \
+             `openssl rand -hex 32` and set VAULT_ENCRYPTION_KEY to enable encryption at rest."
         );
     }
 
@@ -199,12 +215,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Before migrations: the migration itself writes, and should already benefit from WAL and the
     // busy timeout rather than being the one write that still takes an exclusive lock.
-    simply_ip_vault::state::apply_sqlite_pragmas(&db).await?;
+    //
+    // Never fatal — every failure inside is logged and swallowed. A concurrency pragma that could
+    // not be applied is a performance regression; refusing to boot over it would be an outage.
+    simply_ip_vault::state::apply_sqlite_pragmas(&db).await;
 
     tracing::info!("Running database migrations...");
     migration::Migrator::up(&db, None).await?;
 
-    bootstrap_master_key(&db).await?;
+    bootstrap_master_key(&db, &cipher).await?;
+
+    // Resolve every configured hostname once, now, so a typo is reported at boot rather than
+    // discovered as an unexplained 403 later. Detached and non-blocking: an unresolvable entry is
+    // retried after a grace period and disabled meanwhile, never a reason to refuse to start.
+    trusted_proxies.prime_with_grace();
 
     // Retention sweep for soft-deleted IP records. Its own shutdown channel, so it drains on
     // SIGTERM instead of being cancelled mid-delete.
@@ -214,14 +238,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         simply_ip_vault::retention::run_retention_worker(retention_db, retention_rx).await;
     });
 
-    let (state, tx, worker_handle) = setup_state(db);
+    let (state, tx, worker_handle) = setup_state(db)?;
 
     let app = create_app(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
-    tracing::info!("Simply IP Vault API listening on {}", addr);
-
+    let addr = simply_ip_vault::config::resolve_bind_addr();
     let listener = TcpListener::bind(addr).await?;
+    // Reported from the listener rather than from `addr`: with `PORT=0` the OS assigns an ephemeral
+    // port, and the requested address would then be a misleading thing to log.
+    let bound = listener.local_addr().unwrap_or(addr);
+    tracing::info!("Simply IP Vault API listening on http://{}", bound);
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<SocketAddr>(),
