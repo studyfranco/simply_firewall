@@ -119,7 +119,7 @@ async fn caller_group_permission(
         .map_err(AppError::DbError)
 }
 
-/// Enforces that a non-master cannot hand out access it does not itself hold.
+/// Enforces that a non-master cannot hand out — or take away — access it does not itself hold.
 ///
 /// `can_manage_keys` says the caller may administer keys; it says nothing about *which groups* it
 /// may hand out. Without this, a key scoped to one group could grant any other key — and, via a
@@ -128,10 +128,18 @@ async fn caller_group_permission(
 ///
 /// Each verb is checked independently against the caller's own row: holding `can_read` on a group
 /// does not confer the right to grant `can_write` on it.
+///
+/// `action` names the operation being guarded (`"grant"` / `"revoke"`) and appears verbatim in both
+/// the log line and the client-facing message. The same predicate governs both directions:
+/// [`revoke_key_group_permission`] passes the grant it is about to delete, so "may I remove this
+/// set?" is answered by exactly the rule that answers "may I confer this set?". A key that could
+/// revoke beyond its own access could disable another tenant's automation without ever holding a
+/// single permission on the group it acted against.
 fn guard_delegated_group_grant(
     caller: &api_key::Model,
     caller_perm: Option<&api_key_group_permission::Model>,
     group_name: &str,
+    action: &str,
     requested: &GroupPermInput,
 ) -> Result<(), AppError> {
     if caller.is_master {
@@ -140,7 +148,7 @@ fn guard_delegated_group_grant(
 
     let Some(held) = caller_perm else {
         return Err(AppError::Forbidden(format!(
-            "Permission denied: you have no access to group '{group_name}' and cannot grant it"
+            "Permission denied: you have no access to group '{group_name}' and cannot {action} it"
         )));
     };
 
@@ -150,16 +158,17 @@ fn guard_delegated_group_grant(
 
     if over_grants {
         tracing::warn!(
-            "Blocked privilege delegation: key {} attempted to grant permissions on group '{}' \
+            "Blocked privilege delegation: key {} attempted to {} permissions on group '{}' \
              exceeding its own (read={} write={} delete={})",
             caller.prefix,
+            action,
             group_name,
             held.can_read,
             held.can_write,
             held.can_delete
         );
         return Err(AppError::Forbidden(format!(
-            "Permission denied: you cannot grant permissions on group '{group_name}' beyond your own"
+            "Permission denied: you cannot {action} permissions on group '{group_name}' beyond your own"
         )));
     }
 
@@ -1867,7 +1876,7 @@ pub async fn update_key_group_permissions(
     // without a special case — that path grants the creator full read/write/delete first, so the
     // lookup below finds a row that legitimately permits the delegation.
     let caller_perm = caller_group_permission(&state.db, key.id, target_group_id).await?;
-    guard_delegated_group_grant(&key, caller_perm.as_ref(), &resolved_group_name, &payload)?;
+    guard_delegated_group_grant(&key, caller_perm.as_ref(), &resolved_group_name, "grant", &payload)?;
 
     let now = Utc::now().naive_utc();
     let perm_model = api_key_group_permission::ActiveModel {
@@ -1908,6 +1917,30 @@ pub async fn update_key_group_permissions(
 
 /// Handles DELETE /api/v1/keys/:id/permissions/:group_identifier — removes a key's permission
 /// mapping for a specific group. `group_identifier` may be either the group's UUID or its name.
+///
+/// # Revocation is bounded by the caller's own access, exactly as granting is
+///
+/// This handler used to check `can_manage_keys` and nothing else, which made it the mirror image of
+/// a hole [`guard_delegated_group_grant`] had already closed on the grant side: a non-master key
+/// manager scoped to one group could strip *any* key's access to *any* group in the system.
+///
+/// "Revocation only removes authority, so it cannot be an escalation" is the reasoning that leaves
+/// this ungated, and it is wrong for this service specifically. Removing authority **is** the
+/// attack: `simply_ip_vault` exists to keep `fail2ban`-style automation writing to shared banlists,
+/// so silently revoking the key that maintains another tenant's list stops that tenant's blocking —
+/// a denial-of-service that presents as "bans mysteriously stopped landing", with the cause several
+/// audit-log pages away from the symptom.
+///
+/// Two guards, both mirroring the grant path:
+///
+/// 1. **Self-targeting is refused outright** for non-masters. [`update_key_group_permissions`]
+///    already refuses it to remove a ratchet; allowing the same key to *drop* its own rows would
+///    leave a caller able to rewrite the record of what a master decided about it, which is the
+///    property that made self-targeting worth refusing in the first place.
+/// 2. **The caller must hold at least what it is removing.** The target's current row is fed to
+///    [`guard_delegated_group_grant`] as though it were being granted, so a caller holding only
+///    `can_read` on a group cannot strip a key's `can_write` on it — authority it does not itself
+///    possess. A caller with no row on the group at all is refused outright.
 pub async fn revoke_key_group_permission(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
@@ -1921,6 +1954,48 @@ pub async fn revoke_key_group_permission(
     let group = resolve_group_by_identifier(&state.db, &group_identifier)
         .await?
         .ok_or(AppError::NotFound)?;
+
+    if id == key.id && !key.is_master {
+        tracing::warn!(
+            "Blocked self-revocation: key {} attempted to drop its own permissions on group '{}'",
+            key.prefix,
+            group.name
+        );
+        return Err(AppError::Forbidden(
+            "A key cannot modify its own group permissions; ask a master key".to_owned(),
+        ));
+    }
+
+    // Read the grant before deleting it: the verbs being removed are what the caller must be
+    // entitled to remove, and a missing row is the `404` this endpoint has always returned.
+    let existing = api_key_group_permission::Entity::find()
+        .filter(
+            Condition::all()
+                .add(api_key_group_permission::Column::ApiKeyId.eq(id))
+                .add(api_key_group_permission::Column::GroupId.eq(group.id)),
+        )
+        .one(&state.db)
+        .await
+        .map_err(AppError::DbError)?
+        .ok_or(AppError::NotFound)?;
+
+    // Checked *after* the `404`, so a caller learns "no such grant" before it learns anything about
+    // its own standing — and before the guard below can turn a nonexistent grant into a `403` that
+    // would confirm the group exists to someone with no access to it.
+    let caller_perm = caller_group_permission(&state.db, key.id, group.id).await?;
+    guard_delegated_group_grant(
+        &key,
+        caller_perm.as_ref(),
+        &group.name,
+        "revoke",
+        &GroupPermInput {
+            group_id: None,
+            group_name: None,
+            can_read: existing.can_read,
+            can_write: existing.can_write,
+            can_delete: existing.can_delete,
+        },
+    )?;
 
     let result = api_key_group_permission::Entity::delete_many()
         .filter(

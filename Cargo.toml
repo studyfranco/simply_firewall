@@ -34,3 +34,10 @@ aes-gcm = "0.11"
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 axum = { version = "0.8", features = ["macros"] }
+# `test-util` unlocks the pausable clock (`tokio::time::pause`/`advance`). `src/replay.rs` expires
+# entries against `tokio::time::Instant`, so its window and sweep behaviour can be driven exactly
+# rather than by sleeping for real seconds in the test suite.
+tokio = { version = "1", features = ["full", "test-util"] }
+# Temporary directories for the file-backed SQLite tests. WAL cannot engage on `sqlite::memory:`,
+# so proving it engages at all — and persists across reconnection — needs a real file on disk.
+tempfile = "3"

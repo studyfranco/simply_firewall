@@ -35,7 +35,7 @@ use crate::error::AppError;
 /// too far in the past, and allowing it would let a captured request be held and replayed later.
 ///
 /// The window bounds *how long* a captured request stays usable; it does not stop it being used
-/// twice inside that window. [`crate::state::ReplayGuard`] closes that second gap.
+/// twice inside that window. [`crate::replay::ReplayGuard`] closes that second gap.
 pub const MAX_TIMESTAMP_SKEW_SECS: i64 = 300;
 
 /// Name of the environment variable holding the master encryption key for `signing_secret` values.
@@ -142,6 +142,17 @@ pub fn compute_signature(
 ///
 /// A `sha256=` prefix on `provided` is accepted and stripped, matching the format this project
 /// already uses for outbound webhook signatures, so one signing helper can serve both directions.
+///
+/// # Return value
+///
+/// `Some(digest)` on success, carrying the **raw decoded digest bytes**, and `None` on any failure
+/// (malformed hex, wrong tag width, wrong secret, tampered payload).
+///
+/// Returning the bytes rather than a bare `bool` is what lets [`crate::replay::ReplayGuard`] key on
+/// canonical material without re-parsing the header. It also normalizes spelling by construction:
+/// `sha256=AB…` and `sha256=ab…` are the same signature and decode to the same bytes, so they can
+/// never be recorded as two distinct single uses. The previous `bool` shape forced the middleware to
+/// re-derive a token from the header text, which upheld the same property only indirectly.
 pub fn verify_signature(
     secret: &str,
     method: &str,
@@ -149,21 +160,19 @@ pub fn verify_signature(
     timestamp: &str,
     body: &[u8],
     provided: &str,
-) -> bool {
+) -> Option<Vec<u8>> {
     let provided = provided
         .trim()
         .strip_prefix("sha256=")
         .unwrap_or(provided.trim());
 
-    let Ok(provided_bytes) = hex::decode(provided) else {
-        return false;
-    };
+    let provided_bytes = hex::decode(provided).ok()?;
 
-    let Ok(mut mac) = Hmac::<Sha256>::new_from_slice(secret.as_bytes()) else {
-        return false;
-    };
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(&canonical_v1_payload(method, target, timestamp, body));
-    mac.verify_slice(&provided_bytes).is_ok()
+    mac.verify_slice(&provided_bytes).ok()?;
+
+    Some(provided_bytes)
 }
 
 /// Failure modes for building the cipher or opening a stored secret.
@@ -313,18 +322,42 @@ impl SecretCipher {
         }
     }
 
-    /// Recovers a secret from storage, in any format this project has ever written.
+    /// Recovers a secret from storage.
     ///
-    /// Four shapes are accepted, and the order matters:
+    /// Exactly three shapes are accepted, and **anything else is an error**:
     ///
     /// 1. `v1.xchacha20poly1305.<nonce>.<ct>` — the current format.
     /// 2. `v1.plain.<hex>` — the current unencrypted format.
     /// 3. `aesgcm256:<nonce><ct>` — written by earlier versions; readable, never rewritten.
-    /// 4. Anything else — a bare secret from before any prefix existed, returned verbatim.
     ///
     /// Rows only move to the current format when the key is next rotated, which keeps the upgrade
-    /// non-destructive: no migration touches secret material, and a downgrade still reads
-    /// everything it wrote itself.
+    /// non-destructive: no migration touches secret material, and a downgrade still reads everything
+    /// it wrote itself.
+    ///
+    /// # Why an unprefixed value is now rejected
+    ///
+    /// A fourth shape used to be accepted: an unprefixed string was returned **verbatim**, on the
+    /// reasoning that it was a bare secret written before any prefix existed. That fallback was a
+    /// silent failure mode wearing a compatibility costume, because "no recognized prefix" is not
+    /// evidence of an old row — it is evidence of *nothing in particular*, and every other cause is
+    /// worse:
+    ///
+    /// - A `v1.plain.` or `v1.xchacha20poly1305.` value whose prefix was lost or corrupted — by a
+    ///   botched migration, a truncated column, a bad restore — would be fed to `Hmac::new_from_slice`
+    ///   as though the surviving hex text were the secret. Every request would then fail signature
+    ///   verification with `401`, pointing the operator at the *client* rather than at the row.
+    /// - A partially-written sealed value would be used as HMAC key material.
+    /// - Anything an attacker managed to write into the column through an unrelated defect would be
+    ///   accepted as a signing secret rather than refused.
+    ///
+    /// Returning [`CryptoError::MalformedCiphertext`] instead makes the failure loud and attributable:
+    /// it surfaces as a `500` with the row's identity in the log, which is what an operator needs to
+    /// see. The recovery path is `POST /api/keys/{id}/rotate-secret`, which is master-only and
+    /// replaces just the signing secret.
+    ///
+    /// **Upgrade note:** any deployment still holding an unprefixed bare secret must rotate that key's
+    /// secret before upgrading, or it stops authenticating. `AGENT.MD` §1 and `SCHEMA.MD` §1 both
+    /// previously documented the bare shape as readable and have been amended.
     pub fn open(&self, stored: &str) -> Result<String, CryptoError> {
         if let Some(encoded) = stored.strip_prefix(PLAINTEXT_PREFIX) {
             let bytes = hex::decode(encoded).map_err(|_| CryptoError::MalformedCiphertext)?;
@@ -361,8 +394,10 @@ impl SecretCipher {
             return self.open_legacy_gcm(sealed);
         }
 
-        // No recognized prefix: a bare secret written before any prefix existed.
-        Ok(stored.to_owned())
+        // Fail closed. See the "Why an unprefixed value is now rejected" note above: an unrecognized
+        // shape is not evidence of a pre-prefix row, and treating it as one turns a damaged column
+        // into silently-wrong HMAC key material.
+        Err(CryptoError::MalformedCiphertext)
     }
 
     /// Opens an `aesgcm256:` value written by an earlier version.
@@ -469,7 +504,7 @@ mod tests {
         let sig = compute_signature("s3cret", "POST", "/api/ban", "1700000000", b"body")
             .expect("HMAC of a non-empty secret cannot fail");
 
-        assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", &sig));
+        assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", &sig).is_some());
         // The `sha256=` prefix used by outbound webhook signatures is accepted too.
         assert!(verify_signature(
             "s3cret",
@@ -478,13 +513,13 @@ mod tests {
             "1700000000",
             b"body",
             &format!("sha256={sig}")
-        ));
+        ).is_some());
 
         // Wrong secret, mutated body, and non-hex garbage must all fail closed.
-        assert!(!verify_signature("other", "POST", "/api/ban", "1700000000", b"body", &sig));
-        assert!(!verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body!", &sig));
-        assert!(!verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", "zzz"));
-        assert!(!verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", ""));
+        assert!(verify_signature("other", "POST", "/api/ban", "1700000000", b"body", &sig).is_none());
+        assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body!", &sig).is_none());
+        assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", "zzz").is_none());
+        assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", "").is_none());
     }
 
     /// A tag of the wrong width must be rejected outright rather than compared against a truncated
@@ -495,12 +530,12 @@ mod tests {
             .expect("HMAC of a non-empty secret cannot fail");
         for wrong in [&sig[..62], &sig[..2], "", &format!("{sig}00")] {
             assert!(
-                !verify_signature("s3cret", "GET", "/api/ips", "1700000000", b"", wrong),
+                verify_signature("s3cret", "GET", "/api/ips", "1700000000", b"", wrong).is_none(),
                 "a {}-character tag must be rejected",
                 wrong.len()
             );
         }
-        assert!(verify_signature("s3cret", "GET", "/api/ips", "1700000000", b"", &sig));
+        assert!(verify_signature("s3cret", "GET", "/api/ips", "1700000000", b"", &sig).is_some());
     }
 
     #[test]
@@ -600,16 +635,28 @@ mod tests {
         }
     }
 
-    /// A row written before any prefix existed is a bare secret and must keep working, or every key
-    /// issued by the zero-config development path would stop authenticating on upgrade.
+    /// An unprefixed row is **refused**, reversing what this test used to assert.
+    ///
+    /// The old contract returned such a value verbatim, on the reasoning that it was a bare secret
+    /// written before any prefix existed. That traded a real failure mode for a hypothetical one: a
+    /// pre-prefix row is only one of the ways a value can arrive without a prefix, and every other
+    /// way — a truncated column, a botched migration, a partially-written seal, a value an attacker
+    /// wrote through an unrelated defect — ends with unknown bytes used as HMAC key material and no
+    /// signal that anything is wrong. Failing closed makes the damaged row say so.
+    ///
+    /// Operators still holding a bare secret must rotate it (`POST /api/keys/{id}/rotate-secret`)
+    /// before upgrading; `AGENT.MD` §1 and `SCHEMA.MD` §1 record that.
     #[test]
-    fn an_unprefixed_legacy_row_is_read_verbatim() {
-        assert_eq!(
-            SecretCipher::Plaintext.open("bare-legacy-secret").expect("opens"),
-            "bare-legacy-secret"
-        );
-        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
-        assert_eq!(cipher.open("bare-legacy-secret").expect("opens"), "bare-legacy-secret");
+    fn an_unprefixed_row_is_refused_rather_than_read_verbatim() {
+        for cipher in [SecretCipher::Plaintext, SecretCipher::from_hex_key(TEST_KEY).expect("valid key")] {
+            assert!(
+                matches!(cipher.open("bare-legacy-secret"), Err(CryptoError::MalformedCiphertext)),
+                "an unprefixed value must not be accepted as a signing secret"
+            );
+            // The empty column — the shape a failed write leaves behind — is refused on the same path
+            // rather than becoming an empty HMAC key, which would verify forgeable signatures.
+            assert!(matches!(cipher.open(""), Err(CryptoError::MalformedCiphertext)));
+        }
     }
 
     /// The upgrade path that matters: a secret sealed by the previous AES-GCM implementation, under

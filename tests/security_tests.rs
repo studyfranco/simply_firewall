@@ -64,6 +64,16 @@ fn test_signing_secret(api_key: &str) -> String {
     format!("signing-secret-for-{api_key}")
 }
 
+/// The same secret in the shape the database actually stores.
+///
+/// `SecretCipher::open` is strictly fail-closed as of the 2026-08-02 hardening pass: a stored value
+/// with no recognized prefix is a `MalformedCiphertext` error rather than a bare secret returned
+/// verbatim. Seeded rows must therefore carry a real storage prefix, exactly as `SecretCipher::seal`
+/// would have written it in the zero-config plaintext mode these suites run in.
+fn stored_signing_secret(api_key: &str) -> String {
+    format!("v1.plain.{}", hex::encode(test_signing_secret(api_key)))
+}
+
 /// Seeds an API key with explicit scopes and an optional `bound_ips`, returning `(id, plaintext)`.
 #[allow(clippy::too_many_arguments)]
 async fn insert_key(
@@ -80,7 +90,7 @@ async fn insert_key(
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(id),
         key_hash: Set(simply_ip_vault::api::hash_key(&plaintext)),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set(name.to_owned()),
         bound_ips: Set(bound_ips.map(str::to_owned)),
         is_master: Set(is_master),
@@ -142,7 +152,7 @@ async fn insert_master_key(db: &DatabaseConnection, name: &str) -> String {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(Uuid::new_v4()),
         key_hash: Set(simply_ip_vault::api::hash_key(&plaintext)),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set(name.to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -424,7 +434,7 @@ async fn attack_signature_forgery_by_last_character_flip_is_rejected() {
 fn attack_single_bit_signature_mutations_never_verify() {
     let (secret, method, path, ts, body) = ("s3cret", "POST", "/api/ban", "1700000000", b"payload");
     let authentic = crypto::compute_signature(secret, method, path, ts, body).unwrap();
-    assert!(crypto::verify_signature(secret, method, path, ts, body, &authentic));
+    assert!(crypto::verify_signature(secret, method, path, ts, body, &authentic).is_some());
 
     // Every single-character mutation across the whole 64-character signature must fail. This is
     // the exhaustive version of the "last character" attack.
@@ -438,7 +448,7 @@ fn attack_single_bit_signature_mutations_never_verify() {
             chars[pos] = replacement;
             let mutated: String = chars.iter().collect();
             assert!(
-                !crypto::verify_signature(secret, method, path, ts, body, &mutated),
+                crypto::verify_signature(secret, method, path, ts, body, &mutated).is_none(),
                 "mutating index {pos} to {replacement} must not verify"
             );
             chars[pos] = original;
@@ -634,7 +644,8 @@ async fn attack_hmac_template_injection_via_payload_body_cannot_forge_canonical_
         ("POST", "/api/fake", timestamp.as_str(), delivered_body.as_str()),
     ] {
         assert!(
-            !crypto::verify_signature(hook_secret, method, path, ts, body.as_bytes(), &signature),
+            crypto::verify_signature(hook_secret, method, path, ts, body.as_bytes(), &signature)
+                .is_none(),
             "the injected fields ({method} {path} @{ts}) must not verify against the real signature"
         );
     }
@@ -648,7 +659,8 @@ async fn attack_hmac_template_injection_via_payload_body_cannot_forge_canonical_
             &timestamp,
             delivered_body.as_bytes(),
             &signature,
-        ),
+        )
+        .is_some(),
         "the genuine canonical fields must verify"
     );
 
@@ -2560,6 +2572,148 @@ async fn sqlite_pragma_failures_never_stop_the_service() {
         "",
     );
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+}
+
+/// **WAL actually engages, and persists.** The pragma resilience test above proves only that a
+/// failure is survivable — and it runs on `sqlite::memory:`, where WAL legitimately *cannot* engage.
+/// So on its own it would pass unchanged if `apply_sqlite_pragmas` stopped issuing the pragma
+/// altogether, which is exactly the regression it looks like it is guarding against.
+///
+/// This one uses a real file, which is the only place the setting can take effect, and asserts the
+/// two properties the production reasoning depends on:
+///
+/// 1. `journal_mode` is genuinely `wal` and `busy_timeout` is genuinely 5000 after the call.
+/// 2. **WAL survives reconnection.** It is recorded in the database file header rather than being
+///    connection state, which is what makes applying it once at startup sufficient for every
+///    connection the pool opens later — and for every subsequent run of the service. If that were
+///    not true, a single pooled connection would be the only one benefiting and the whole
+///    "apply once at boot" design would be wrong.
+#[tokio::test]
+async fn wal_engages_on_a_file_backed_database_and_survives_reconnection() {
+    use sea_orm::{ConnectionTrait, Database, DatabaseBackend, Statement};
+
+    async fn pragma<T>(db: &sea_orm::DatabaseConnection, sql: &str, column: &str) -> T
+    where
+        T: sea_orm::TryGetable,
+    {
+        db.query_one_raw(Statement::from_string(DatabaseBackend::Sqlite, sql.to_owned()))
+            .await
+            .expect("pragma query succeeds")
+            .expect("pragma returns a row")
+            .try_get::<T>("", column)
+            .expect("pragma column has the expected type")
+    }
+
+    // `tempfile` rather than a fixed path: the suite runs tests in parallel, and two of them sharing
+    // one database file would produce exactly the lock contention this pragma exists to avoid.
+    let dir = tempfile::tempdir().expect("temp dir is creatable");
+    let path = dir.path().join("wal_probe.db");
+    let url = format!("sqlite://{}?mode=rwc", path.display());
+
+    let db = Database::connect(&url).await.expect("file-backed sqlite opens");
+    simply_ip_vault::state::apply_sqlite_pragmas(&db).await;
+
+    let mode: String = pragma(&db, "PRAGMA journal_mode;", "journal_mode").await;
+    assert_eq!(
+        mode.to_ascii_lowercase(),
+        "wal",
+        "WAL must be in force on a file-backed database, got {mode:?}"
+    );
+
+    let timeout: i32 = pragma(&db, "PRAGMA busy_timeout;", "timeout").await;
+    assert_eq!(timeout, 5000, "the busy timeout must be the configured 5000ms");
+
+    // Migrations still run against the WAL database, so the setting is not merely reported but
+    // actually usable for the writes the service performs at boot.
+    simply_ip_vault::migration::Migrator::up(&db, None).await.expect("migrations run under WAL");
+
+    // Reconnect with a completely fresh pool. Nothing re-applies the pragma here — if WAL were
+    // connection state rather than file state, this would come back `delete`.
+    drop(db);
+    let reopened = Database::connect(&url).await.expect("file-backed sqlite reopens");
+    let inherited: String = pragma(&reopened, "PRAGMA journal_mode;", "journal_mode").await;
+    assert_eq!(
+        inherited.to_ascii_lowercase(),
+        "wal",
+        "WAL is written to the file header and must survive reconnection, got {inherited:?}"
+    );
+
+    drop(reopened);
+}
+
+/// **Stored secrets are opened strictly, or not at all.** A value carrying no recognized prefix is a
+/// `MalformedCiphertext` error, never a bare secret handed back verbatim.
+///
+/// The removed fallback looked like backward compatibility and behaved like a silent failure. "No
+/// recognized prefix" is not evidence of a pre-prefix row; it is evidence of nothing, and the other
+/// causes are all worse. A `v1.plain.` value whose prefix was lost to a botched migration or a
+/// truncated column would have had its surviving hex text used as HMAC key material — turning a
+/// damaged row into a fleet of `401`s that point at the client instead of at the database.
+#[test]
+fn a_stored_secret_without_a_recognized_prefix_is_refused() {
+    use simply_ip_vault::crypto::{CryptoError, SecretCipher};
+
+    let key = "00".repeat(32);
+    for cipher in [
+        SecretCipher::Plaintext,
+        SecretCipher::from_hex_key(&key).expect("a 64-hex key is valid"),
+    ] {
+        for unprefixed in [
+            "signing-secret-for-legacy-key",       // the shape the old fallback accepted
+            "",                                    // an empty column
+            "deadbeef",                            // bare hex, indistinguishable from a stripped body
+            "v1.plain",                            // the prefix, truncated just short of its dot
+            "v1.xchacha20poly1305",                // likewise
+            "aesgcm256",                           // likewise
+            "V1.PLAIN.6162",                       // prefixes are matched exactly, not case-folded
+        ] {
+            assert!(
+                matches!(cipher.open(unprefixed), Err(CryptoError::MalformedCiphertext)),
+                "{unprefixed:?} must be refused rather than returned as a signing secret"
+            );
+        }
+
+        // ...while a correctly-prefixed value still round-trips, so the loop above is not passing
+        // simply because `open` rejects everything.
+        let sealed = cipher.seal("real-secret").expect("sealing succeeds");
+        assert_eq!(cipher.open(&sealed).expect("opening succeeds"), "real-secret");
+    }
+}
+
+/// The end-to-end consequence of the rule above: a key whose stored secret is unreadable cannot
+/// authenticate, and fails as an operator problem (`500`) rather than as a caller problem (`401`).
+///
+/// The distinction matters operationally. `401` tells an operator to go and look at the client, which
+/// is the one place the fault is not. `500` plus the row's prefix in the log points at the database.
+#[tokio::test]
+async fn a_key_whose_stored_secret_is_unreadable_cannot_authenticate() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (id, plaintext) = insert_key(&db, "Damaged", true, true, true, true, None).await;
+
+    // Simulate a row whose storage prefix was lost — a truncated column, a bad restore, a migration
+    // that rewrote the value without re-sealing it.
+    simply_ip_vault::entities::api_key::ActiveModel {
+        id: Set(id),
+        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        ..Default::default()
+    }
+    .update(&db)
+    .await
+    .expect("row updates");
+
+    let req = signed(
+        inject_connect_info(Request::builder().uri("/api/ips").header("X-API-Key", &plaintext)),
+        &test_signing_secret(&plaintext),
+        "",
+    );
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "an unreadable stored secret is an operator fault, not a failed authentication attempt"
+    );
 }
 
 /// **Cipher fail-closed.** A malformed encryption key must abort startup rather than silently

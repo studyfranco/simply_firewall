@@ -37,18 +37,22 @@ const MAX_SIGNED_BODY_BYTES: usize = crate::MAX_REQUEST_BODY_BYTES;
 #[derive(Clone, Copy, Debug)]
 pub struct ClientIp(pub std::net::IpAddr);
 
-/// Validates `X-Timestamp` against the server clock, returning the header's raw string for signing
-/// alongside the parsed value.
+/// Validates `X-Timestamp` against the server clock, returning the header's raw string for signing.
 ///
 /// The raw string — not a re-serialized integer — is what gets fed to the HMAC: the caller signed
 /// the exact bytes it sent, so normalizing (e.g. stripping a leading zero) would break otherwise
-/// valid requests. The parsed integer is returned too, because [`crate::state::ReplayGuard`] needs
-/// it to decide when the recorded signature may be forgotten.
+/// valid requests.
+///
+/// The parsed value is deliberately *not* returned. [`crate::replay::ReplayGuard`] used to need it
+/// to decide when a recorded signature could be forgotten; it now expires entries against the
+/// monotonic clock instead, so the caller-supplied timestamp no longer influences retention at all.
+/// That is the point of the change — a value an attacker controls should not be able to shorten how
+/// long its own signature is remembered.
 ///
 /// Failures are reported as `401 Unauthorized` rather than `400 Bad Request`: a missing, malformed,
 /// or stale timestamp is a failure to authenticate the request, and `AGENT.MD` specifies `401` for
 /// the anti-replay rejection specifically.
-fn validate_timestamp(headers: &axum::http::HeaderMap) -> Result<(String, i64), AppError> {
+fn validate_timestamp(headers: &axum::http::HeaderMap) -> Result<String, AppError> {
     let raw = headers
         .get("X-Timestamp")
         .and_then(|h| h.to_str().ok())
@@ -71,7 +75,7 @@ fn validate_timestamp(headers: &axum::http::HeaderMap) -> Result<(String, i64), 
         )));
     }
 
-    Ok((raw.to_owned(), supplied))
+    Ok(raw.to_owned())
 }
 
 /// The request target a signature is computed over: the path **plus the query string** when one is
@@ -148,7 +152,7 @@ pub async fn auth_middleware(
 
     // Freshness first: it needs no database round-trip, so a stale or absent timestamp is rejected
     // before an unauthenticated caller can cost us a query.
-    let (timestamp, timestamp_secs) = validate_timestamp(&headers)?;
+    let timestamp = validate_timestamp(&headers)?;
 
     let auth_header = req
         .headers()
@@ -207,14 +211,17 @@ pub async fn auth_middleware(
             AppError::InvalidInput("Request body unreadable or too large to sign".to_owned())
         })?;
 
-    if !crypto::verify_signature(
+    // On success this hands back the raw decoded digest, which is what the replay guard is keyed on.
+    // Taking the bytes from here rather than re-parsing the header means `sha256=AB…` and
+    // `sha256=ab…` cannot be recorded as two distinct single uses.
+    let Some(digest) = crypto::verify_signature(
         &signing_secret,
         &method,
         &target,
         &timestamp,
         &body_bytes,
         &provided_signature,
-    ) {
+    ) else {
         tracing::warn!(
             "Rejected request: invalid X-Signature-256 for key {} on {} {}",
             key_record.prefix,
@@ -222,7 +229,7 @@ pub async fn auth_middleware(
             target
         );
         return Err(AppError::Unauthorized("Invalid request signature".to_owned()));
-    }
+    };
 
     // Freshness proves the request is *recent*; it does not prove it is *new*. An attacker who
     // captured one authentic request — a mirrored packet on a plain-HTTP LAN link, a proxy access
@@ -233,12 +240,7 @@ pub async fn auth_middleware(
     // Deliberately *after* verification: recording unverified signatures would let an
     // unauthenticated caller both exhaust memory and pre-insert a signature a legitimate client is
     // about to send, turning the guard into a denial-of-service tool against that client.
-    let replay_token = provided_signature
-        .trim()
-        .strip_prefix("sha256=")
-        .unwrap_or(provided_signature.trim())
-        .to_ascii_lowercase();
-    if !state.replay.observe(key_record.id, &replay_token, timestamp_secs) {
+    if !state.replay.check_and_record(key_record.id, &digest) {
         tracing::warn!(
             "Rejected replay: X-Signature-256 for key {} on {} {} was already used within the \
              {MAX_TIMESTAMP_SKEW_SECS}s window",

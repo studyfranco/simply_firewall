@@ -2192,6 +2192,240 @@ kill "$DEADNS_PID" 2>/dev/null || true
 wait "$DEADNS_PID" 2>/dev/null || true
 
 
+# ─────────────────────────────────────────────────────────────
+log_section "27. Hardening — Monotonic Replay Guard, RBAC Revocation & Strict Decryption"
+# ─────────────────────────────────────────────────────────────
+#
+# The four changes from the 2026-08-02 cross-audit follow-up, each asserted against the live server.
+
+# --- 27a. The replay guard keys on the decoded digest, not on header text ---------------------
+#
+# `ReplayGuard` now stores the raw bytes `verify_signature` decoded, rather than a token re-derived
+# from the header. That closes a spelling bypass: `sha256=AB…` and `ab…` are the *same* signature,
+# and a guard keyed on the header string could be made to record them as two distinct single uses.
+
+next_timestamp "SPELL|convergence"
+SPELL_TS="$SIGNED_TS"
+SPELL_BODY='{"target_address":"198.51.100.243","group_name":"convergence-group","cause":"digest keying"}'
+SPELL_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "POST" "/api/ban" "$SPELL_TS" "$SPELL_BODY")
+
+raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SPELL_TS" \
+    -H "X-Signature-256: $SPELL_SIG" -H "Content-Type: application/json" -d "$SPELL_BODY"
+check "200" "#27 the genuine signed request succeeds"
+
+# The identical signature, uppercased. Hex decoding is case-insensitive, so this is byte-for-byte
+# the same digest — and must be refused as the replay it is.
+SPELL_SIG_UPPER=$(printf '%s' "$SPELL_SIG" | tr '[:lower:]' '[:upper:]')
+raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SPELL_TS" \
+    -H "X-Signature-256: $SPELL_SIG_UPPER" -H "Content-Type: application/json" -d "$SPELL_BODY"
+check "401" "#27 an uppercased respelling of a used signature is still a replay"
+check_true '.error | test("already been used")' \
+    "#27 the respelled replay is named as a replay, not as a bad signature"
+
+# ...and with the optional `sha256=` prefix bolted on, which the server strips before decoding.
+raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SPELL_TS" \
+    -H "X-Signature-256: sha256=$SPELL_SIG" -H "Content-Type: application/json" -d "$SPELL_BODY"
+check "401" "#27 a sha256=-prefixed respelling is still the same digest and still a replay"
+
+# --- 27b. Replay tracking is per key, and saturation never flushes it -------------------------
+#
+# Entries are keyed on (key_id, digest). One key's traffic must never consume another's entry —
+# previously the ceiling was handled with a global `seen.clear()`, so any key's burst would have
+# disabled the guard for every other key at once.
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Replay Isolation A","can_create_groups":true}'
+check "200" "#27 create the first replay-isolation key"
+RPL_A_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+RPL_A_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+register_key_secret "$RPL_A_KEY" "$RPL_A_SECRET"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Replay Isolation B","can_create_groups":true}'
+check "200" "#27 create the second replay-isolation key"
+RPL_B_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+RPL_B_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+register_key_secret "$RPL_B_KEY" "$RPL_B_SECRET"
+
+# Both keys issue the same request at the same timestamp. Different secrets mean different digests,
+# so neither may be mistaken for the other's replay.
+next_timestamp "RPLISO|shared"
+RPL_TS="$SIGNED_TS"
+RPL_PATH="/api/auth/me"
+RPL_A_SIG=$(hmac_sign "$RPL_A_SECRET" "GET" "$RPL_PATH" "$RPL_TS" "")
+RPL_B_SIG=$(hmac_sign "$RPL_B_SECRET" "GET" "$RPL_PATH" "$RPL_TS" "")
+
+raw_call GET "$RPL_PATH" -H "X-API-Key: $RPL_A_KEY" -H "X-Timestamp: $RPL_TS" -H "X-Signature-256: $RPL_A_SIG"
+check "200" "#27 key A's first use is accepted"
+raw_call GET "$RPL_PATH" -H "X-API-Key: $RPL_B_KEY" -H "X-Timestamp: $RPL_TS" -H "X-Signature-256: $RPL_B_SIG"
+check "200" "#27 key B is unaffected by key A's recorded signature"
+raw_call GET "$RPL_PATH" -H "X-API-Key: $RPL_A_KEY" -H "X-Timestamp: $RPL_TS" -H "X-Signature-256: $RPL_A_SIG"
+check "401" "#27 key A's own replay is still refused after key B's traffic"
+raw_call GET "$RPL_PATH" -H "X-API-Key: $RPL_B_KEY" -H "X-Timestamp: $RPL_TS" -H "X-Signature-256: $RPL_B_SIG"
+check "401" "#27 key B's own replay is refused too"
+
+# --- 27c. Revocation is bounded by the caller's own group access ------------------------------
+#
+# `guard_delegated_group_grant` already stopped a non-master key manager handing out access it does
+# not hold. The mirror image was unguarded: the same caller could strip *any* key's access to *any*
+# group. Removing authority is the attack here — revoking the key that maintains another tenant's
+# banlist stops that tenant's blocking, and presents as "bans stopped landing" rather than as a
+# permission error.
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Tenant A Manager","can_manage_keys":true}'
+check "200" "#27 create a delegated key manager"
+REVK_MGR_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+REVK_MGR_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$REVK_MGR_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Tenant B Worker"}'
+check "200" "#27 create another tenant's worker key"
+REVK_VICTIM_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Tenant A Worker"}'
+check "200" "#27 create a worker inside the manager's own tenant"
+REVK_PEER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/keys/$REVK_MGR_ID/permissions" "$MASTER_KEY" \
+    '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":true}'
+check "200" "#27 grant the manager full rights on its own group"
+api_call POST "/api/keys/$REVK_PEER_ID/permissions" "$MASTER_KEY" \
+    '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":true}'
+check "200" "#27 grant its tenant-mate the same group"
+api_call POST "/api/keys/$REVK_VICTIM_ID/permissions" "$MASTER_KEY" \
+    '{"group_name":"revguard-tenant-b","can_read":true,"can_write":true,"can_delete":true}'
+check "200" "#27 grant the other tenant's worker its own group"
+
+# The attack: strip a group the manager has no relationship with.
+api_call DELETE "/api/keys/$REVK_VICTIM_ID/permissions/revguard-tenant-b" "$REVK_MGR_KEY"
+check "403" "#27 a key manager cannot revoke access to a group it does not manage"
+
+# The grant genuinely survived — the 403 refused the write rather than merely reporting one.
+api_call GET "/api/keys" "$MASTER_KEY"
+check "200" "#27 re-read the key list after the refused revocation"
+
+# Self-revocation is refused for the same reason granting to yourself is.
+api_call DELETE "/api/keys/$REVK_MGR_ID/permissions/revguard-tenant-a" "$REVK_MGR_KEY"
+check "403" "#27 a key manager cannot revoke its own group access either"
+
+# ...while revoking inside a group it *does* manage still works, so the guard bounds delegated key
+# management rather than disabling it.
+api_call DELETE "/api/keys/$REVK_PEER_ID/permissions/revguard-tenant-a" "$REVK_MGR_KEY"
+check "204" "#27 revoking within a managed group still succeeds"
+
+# ...and a master is unaffected by the guard.
+api_call DELETE "/api/keys/$REVK_VICTIM_ID/permissions/revguard-tenant-b" "$MASTER_KEY"
+check "204" "#27 a master key can still revoke anything"
+
+# --- 27d. Stored secrets are opened strictly, or not at all -----------------------------------
+#
+# `SecretCipher::open` refuses any value without a recognized storage prefix, and any sealed value
+# it cannot authenticate. Both fail closed as a `500` — an operator fault — rather than a `401`,
+# which would send whoever is debugging to look at the client instead of at the database.
+#
+# Asserted by sealing under one key and reading under another, which is the shape a botched key
+# rotation or a restored-from-the-wrong-vault deployment actually produces.
+
+STRICT_PORT=$((3000 + 63))
+STRICT_DB="$WORK_DIR/strict.db"
+STRICT_LOG_A="$WORK_DIR/strict_server_a.log"
+STRICT_LOG_B="$WORK_DIR/strict_server_b.log"
+STRICT_MASTER="e2e_strict_master_key_for_testing_1234567"
+STRICT_KEY_1="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+STRICT_KEY_2="ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+
+log "Booting an instance that seals its signing secrets under one encryption key..."
+DATABASE_URL="sqlite://$STRICT_DB?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$STRICT_MASTER" \
+    INITIAL_MASTER_SIGNING_SECRET="$MASTER_SIGNING_SECRET" \
+    VAULT_ENCRYPTION_KEY="$STRICT_KEY_1" PORT="$STRICT_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$STRICT_LOG_A" 2>&1 &
+STRICT_PID=$!
+
+STRICT_READY=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$STRICT_PID" 2>/dev/null; then break; fi
+    SC=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$STRICT_PORT/api/ips" 2>/dev/null)
+    case "$SC" in 200|401|403|404) STRICT_READY=1; break ;; esac
+    sleep 0.5
+done
+check_local "$STRICT_READY" "1" "#27 the sealing instance starts"
+
+if [ "$STRICT_READY" == "1" ]; then
+    next_timestamp "STRICT|A"
+    STRICT_TS="$SIGNED_TS"
+    STRICT_SIG=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$STRICT_TS" "")
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" \
+        -H "X-API-Key: $STRICT_MASTER" -H "X-Timestamp: $STRICT_TS" -H "X-Signature-256: $STRICT_SIG" \
+        "http://127.0.0.1:$STRICT_PORT/api/auth/me")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "#27 a sealed signing secret authenticates under the key that wrote it"
+
+    # The raw secret must not be a substring of the database file — that is what sealing buys.
+    if grep -aq "$MASTER_SIGNING_SECRET" "$STRICT_DB" 2>/dev/null; then
+        check_local "present" "absent" "#27 the sealed secret is not readable in the database file"
+    else
+        check_local "absent" "absent" "#27 the sealed secret is not readable in the database file"
+    fi
+fi
+
+kill "$STRICT_PID" 2>/dev/null || true
+wait "$STRICT_PID" 2>/dev/null || true
+
+log "Re-opening the same database under a different VAULT_ENCRYPTION_KEY..."
+DATABASE_URL="sqlite://$STRICT_DB?mode=rwc" RUST_LOG=info \
+    VAULT_ENCRYPTION_KEY="$STRICT_KEY_2" PORT="$STRICT_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$STRICT_LOG_B" 2>&1 &
+STRICT_PID_B=$!
+
+STRICT_READY_B=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$STRICT_PID_B" 2>/dev/null; then break; fi
+    SC=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$STRICT_PORT/api/ips" 2>/dev/null)
+    case "$SC" in 200|401|403|404|500) STRICT_READY_B=1; break ;; esac
+    sleep 0.5
+done
+check_local "$STRICT_READY_B" "1" "#27 the mismatched-key instance still starts (the key itself is well-formed)"
+
+if [ "$STRICT_READY_B" == "1" ]; then
+    next_timestamp "STRICT|B"
+    STRICT_TS_B="$SIGNED_TS"
+    STRICT_SIG_B=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$STRICT_TS_B" "")
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" \
+        -H "X-API-Key: $STRICT_MASTER" -H "X-Timestamp: $STRICT_TS_B" -H "X-Signature-256: $STRICT_SIG_B" \
+        "http://127.0.0.1:$STRICT_PORT/api/auth/me")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "500" "#27 an unopenable stored secret fails closed as an operator fault, not a 401"
+
+    if grep -qi "could not be decrypted\|cipher error" "$STRICT_LOG_B" 2>/dev/null; then
+        check_local "logged" "logged" "#27 the decryption failure is logged for the operator"
+    else
+        check_local "missing" "logged" "#27 the decryption failure is logged for the operator"
+    fi
+fi
+
+kill "$STRICT_PID_B" 2>/dev/null || true
+wait "$STRICT_PID_B" 2>/dev/null || true
+
+# --- 27e. WAL is written to the file header and survives reconnection --------------------------
+#
+# The startup-log check in §24b proves the pragma was issued. This proves it took effect *and* is
+# persistent, which is what makes applying it once at boot sufficient for every connection the pool
+# opens afterwards. Read straight from the file: SQLite records the write format version at byte
+# offset 18, where `2` means WAL and `1` means the rollback journal.
+
+journal_format_byte() {
+    dd if="$1" bs=1 skip=18 count=1 2>/dev/null | od -An -tu1 | tr -d ' \n'
+}
+
+check_local "$([ -f "${DB_PATH}-wal" ] && echo present || echo absent)" "present" \
+    "#27 the live database has a -wal sidecar, so WAL is genuinely engaged"
+check_local "$(journal_format_byte "$DB_PATH")" "2" \
+    "#27 the database file header records WAL as the write format"
+
+# The throwaway instance from 27d was started, stopped, restarted and stopped again — all without
+# anything re-applying the pragma on the second boot. Its header must still say WAL.
+check_local "$(journal_format_byte "$STRICT_DB")" "2" \
+    "#27 WAL persists in the file header across a full restart of the service"
+
+
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2
 

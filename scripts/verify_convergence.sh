@@ -188,7 +188,12 @@ compare_fn "trusted-network membership" \
     "src/config.rs" "is_trusted"
 compare_fn "hostname resolution" \
     "src/config.rs" "resolve_hostname" \
-    "src/config.rs" "resolve_hostname"
+    "src/config.rs" "resolve_hostname" \
+    "same lookup, same fail-closed outcome; the peer returns (addresses, resolved) so it can log a
+     name that resolved to an empty answer differently from one that did not resolve at all, while
+     this service infers both from addresses.is_empty(). Trust behaviour is identical — an
+     unresolvable and an empty name are equally untrusted, and both are cached on the negative TTL.
+     Diagnosability only. Recorded 2026-08-02; adopting the peer's tuple is a candidate follow-up"
 compare_fn "bind-address parsing" \
     "src/config.rs" "parse_bind_addr" \
     "src/config.rs" "parse_bind_addr"
@@ -237,7 +242,20 @@ else
     DRIFT_COUNT=$((DRIFT_COUNT + 1))
 fi
 assert_present "anti-replay guard is consulted" \
-    "src/middleware.rs" "replay\.observe"
+    "src/middleware.rs" "replay\.check_and_record"
+# The guard now lives in its own module on both sides, and keys on the raw digest rather than on
+# header text. Monotonic expiry is the load-bearing part: wall-clock arithmetic let an NTP step
+# evict live entries, so a `chrono` call inside the guard is a regression, not a style choice.
+assert_present "anti-replay tracking has a dedicated module" \
+    "src/replay.rs" "pub struct ReplayGuard"
+assert_present "replay entries expire on the monotonic clock" \
+    "src/replay.rs" "use tokio::time::Instant"
+assert_absent "replay expiry does not consult the wall clock" \
+    "src/replay.rs" "chrono::Utc::now"
+assert_absent "a saturated replay guard is never flushed" \
+    "src/replay.rs" "seen.clear()"
+assert_present "replay entries are keyed on the raw digest" \
+    "src/replay.rs" "digest: Vec<u8>"
 assert_present "the full request target is signed" \
     "src/middleware.rs" "path_and_query"
 echo

@@ -40,6 +40,7 @@ pub mod entities;
 pub mod error;
 pub mod middleware;
 pub mod migration;
+pub mod replay;
 pub mod retention;
 pub mod state;
 pub mod webhooks;

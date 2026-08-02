@@ -3117,3 +3117,119 @@ every vault key vs. the peer's per-key `hmac_mode`), the peer's `X-Hub-Signature
 exclusion of `BODY_ONLY` keys from replay tracking are permanent architectural decisions recorded
 above, not gaps. Our `aesgcm256:` open-only legacy path is a migration obligation the peer does not
 have, not a weakness; it can be deleted once no such rows remain.
+
+---
+
+## 2026-08-02 — Session 26: hardening pass from the cross-audit findings
+
+Acts on the four discrepancies §5 of `SECURITY_COMPARISON_REPORT.md` recorded against this service.
+All four were on our side; three were in the anti-replay guard.
+
+### 1. `ReplayGuard` extracted to `src/replay.rs`, rebuilt on the monotonic clock
+
+Was: an inline struct in `src/state.rs` keyed on a lowercased hex *string*, expiring against
+`chrono::Utc::now()`, running `retain()` over the whole map on every request, and calling
+`seen.clear()` at the 100k ceiling.
+
+| Property | Before | Now |
+| :--- | :--- | :--- |
+| Location | `state::ReplayGuard` | `replay::ReplayGuard`, own module |
+| Key | `format!("{key_id}:{lowercased_hex}")` | `SignatureId { key_id, digest: Vec<u8> }` |
+| Expiry clock | `chrono::Utc::now()`, `(now - ts).abs()` | `tokio::time::Instant`, `now + window` |
+| Sweep | O(n) `retain` per request, in-lock | interval-based: window/4, or window/16 while saturated |
+| At capacity | `seen.clear()` — protection dropped | sweep, warn, **keep enforcing**; map may grow |
+| Shared as | `ReplayGuard` (Clone, `Arc` inside) | `Arc<ReplayGuard>` in `AppState` |
+
+The capacity change is the one that mattered. `clear()` made every signature accepted in the current
+window replayable at once, and because the map is process-global it was reachable by *any* key and
+affected *every* key — one client's burst disabled the guard for all of them. Over-retention costs
+memory; under-retention costs the security property, and only the first is fixable with hardware.
+
+The monotonic change closed a subtler hole: `.abs()` meant an NTP correction in **either** direction
+evicted still-valid entries. The caller-supplied `X-Timestamp` no longer influences retention at all,
+which is why `validate_timestamp` now returns just the raw string.
+
+**Knock-on:** `crypto::verify_signature` returns `Option<Vec<u8>>` (the decoded digest) instead of
+`bool`, so the guard is keyed on canonical bytes by construction rather than by the middleware
+remembering to re-normalize the header. `sha256=AB…` and `ab…` cannot become two single uses. E2E
+§27a asserts exactly that with an uppercased respelling of a spent signature.
+
+**Capacity-sweep backoff is ours, not the peer's.** `simply_hook_executor` re-sweeps on *every*
+request while saturated, which reinstates the per-request O(n) scan the amortization exists to
+remove. `CAPACITY_BACKOFF_DIVISOR` floors that at once per window/16 while still sweeping immediately
+the first time the ceiling is hit. Worth porting back.
+
+### 2. `revoke_key_group_permission` — the gap was real
+
+**Confirmed before patching, as instructed.** Both new tests failed against the unpatched handler
+with `204`, not `403`: a non-master `can_manage_keys` holder could strip any key's access to any
+group, and could rewrite its own permission rows by deleting them. Not a false positive.
+
+The handler checked `can_manage_keys` and nothing else — the exact mirror of a hole
+`guard_delegated_group_grant` had already closed on the grant side. "Revocation only removes
+authority so it cannot be escalation" is the reasoning that leaves it ungated, and it is wrong here:
+removing authority *is* the attack, because revoking the key that maintains another tenant's banlist
+stops that tenant's blocking and presents as "bans stopped landing".
+
+Now: self-targeting refused for non-masters (mirroring the grant path), then the target's *existing*
+row is fed to `guard_delegated_group_grant` as though it were being granted — so "may I remove this
+set?" is answered by the rule that answers "may I confer this set?". `guard_delegated_group_grant`
+gained an `action` parameter so its message reads correctly in both directions. Order is deliberate:
+the `404` for a nonexistent grant is returned *before* the authority check, so a `403` cannot confirm
+a group exists to a caller with no access to it.
+
+### 3. `SecretCipher::open` is strictly fail-closed
+
+The fourth accepted shape — unprefixed, returned verbatim — is gone; it is now
+`MalformedCiphertext`. **This contradicted `AGENT.MD` §1 and `SCHEMA.MD` §1, which both documented
+the bare shape as readable. Both were amended rather than silently overridden**, including the
+upgrade note: a deployment still holding a bare secret must run `POST /api/keys/{id}/rotate-secret`
+before upgrading or that key stops authenticating.
+
+The fallback looked like compatibility and behaved like a silent failure. "No recognized prefix"
+identifies a pre-prefix row only by assumption; a truncated column, a half-written seal, a botched
+migration and an attacker-written value all land on the same branch, and each ends with unknown bytes
+as HMAC key material. It also inverted the diagnosis — a damaged row produced `401`s pointing at the
+client. It is now a `500` with the row's prefix in the log.
+
+**Test-suite consequence:** both suites seeded raw `signing-secret-for-{key}` strings directly into
+the column. A `stored_signing_secret()` helper now wraps them as `v1.plain.<hex>` at the 14 seeding
+sites; `test_signing_secret()` still returns the raw value for signing. The unit test
+`an_unprefixed_legacy_row_is_read_verbatim` was replaced by
+`an_unprefixed_row_is_refused_rather_than_read_verbatim`.
+
+### 4. File-backed WAL coverage
+
+`sqlite_pragma_failures_never_stop_the_service` runs on `sqlite::memory:`, where WAL legitimately
+cannot engage — so it would have passed unchanged if the pragma stopped being issued at all. Added
+`wal_engages_on_a_file_backed_database_and_survives_reconnection` (`tempfile`): asserts
+`journal_mode == wal`, `busy_timeout == 5000`, that migrations run under WAL, and that a **fresh
+connection pool** on the same file still reports WAL with nothing re-applying the pragma. That last
+assertion is what justifies applying it once at boot.
+
+E2E §27e asserts the same from the filesystem, without `sqlite3` (unavailable here): the `-wal`
+sidecar exists, and byte 18 of the database header — SQLite's write-format version — reads `2`,
+including after a full stop/restart cycle.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **154 passed**, 0 failed (61 unit + 56 RBAC + 37 security) |
+| `./scripts/test_e2e.sh` | **407/407**, 0 failed |
+| `./scripts/verify_convergence.sh` | 27 matching, 2 documented divergences, 0 unexplained |
+
+New dev-dependencies: `tokio` with `test-util` (pausable clock for the replay tests — the whole point
+of `tokio::time::Instant` is that `advance()` can drive it) and `tempfile` (file-backed SQLite).
+
+### Recorded divergence, not fixed here
+
+`config::resolve_hostname` drifted from the peer's — **pre-existing at `f544ff4`**, caused by
+`./example` being refreshed after that commit, and verified as such by stashing this session's work
+and re-running the checker. The peer returns `(addresses, resolved)` so it can log "resolved to an
+empty answer" differently from "did not resolve"; we infer both from `addresses.is_empty()`. Trust
+behaviour is identical — both are equally untrusted and both cache on the negative TTL — so this is
+diagnosability only. Registered as a documented divergence in `scripts/verify_convergence.sh` rather
+than fixed, since it is outside this pass's scope. Candidate follow-up.

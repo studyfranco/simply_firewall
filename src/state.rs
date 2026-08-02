@@ -7,8 +7,7 @@
 //! under a running process (an environment variable re-read mid-flight, a cipher rebuilt from a key
 //! that may since have been edited) is one that cannot be reasoned about.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
@@ -16,7 +15,8 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::config::TrustedProxies;
-use crate::crypto::{MAX_TIMESTAMP_SKEW_SECS, SecretCipher};
+use crate::crypto::SecretCipher;
+use crate::replay::ReplayGuard;
 
 /// Milliseconds SQLite waits on a locked database before returning `SQLITE_BUSY`.
 const SQLITE_BUSY_TIMEOUT_MS: u32 = 5000;
@@ -97,94 +97,6 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) {
     }
 }
 
-/// Upper bound on how many signatures the [`ReplayGuard`] remembers at once.
-///
-/// Entries expire on their own after [`MAX_TIMESTAMP_SKEW_SECS`], so in steady state this is never
-/// reached — 300 seconds of traffic would have to exceed it. It exists as a backstop: an
-/// authenticated client issuing signed requests faster than that is either pathological or hostile,
-/// and unbounded growth in a map that lives for the process's lifetime is the wrong failure mode.
-/// On overflow the guard prunes expired entries first and, if that is not enough, clears the map —
-/// which loses replay protection for the current window rather than the service.
-const MAX_TRACKED_SIGNATURES: usize = 100_000;
-
-/// Rejects a validly-signed request that has already been seen inside the anti-replay window.
-///
-/// The timestamp window alone is necessary but not sufficient. It bounds *how long* a captured
-/// request stays usable; it says nothing about using it *twice*. An attacker who observes one
-/// authentic signed request — on a plain-HTTP LAN link, in a proxy log, in a mirrored packet
-/// capture — can resend it verbatim as many times as they like for the next 300 seconds, and every
-/// copy verifies because every field it covers is unchanged. For `POST /api/ban` that is a duplicate
-/// entry; for anything non-idempotent it is a repeated side effect the caller never asked for.
-///
-/// The guard remembers each accepted `(key, signature)` pair until its timestamp leaves the window,
-/// at which point the freshness check takes over and the entry is no longer needed. Both halves are
-/// required: the window bounds the memory the guard needs, and the guard closes the window's gap.
-///
-/// Cheap to clone — the map is shared behind an [`Arc`].
-///
-/// # Ordering
-///
-/// This must be consulted **after** the HMAC verifies, never before. Recording unverified
-/// signatures would let any unauthenticated caller fill the map with garbage (a memory-exhaustion
-/// path that needs no credentials) and, worse, pre-insert a signature it expects a legitimate client
-/// to send, turning the replay guard into a denial-of-service tool against that client.
-#[derive(Clone, Debug, Default)]
-pub struct ReplayGuard {
-    seen: Arc<Mutex<HashMap<String, i64>>>,
-}
-
-impl ReplayGuard {
-    /// Builds an empty guard.
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Records a freshly-verified signature, returning `false` if it had already been seen.
-    ///
-    /// `timestamp` is the request's own `X-Timestamp`, already validated to be inside the window;
-    /// it is what decides when the entry may be forgotten. Keying on the key id as well as the
-    /// signature keeps two keys' namespaces separate without relying on HMAC collision resistance
-    /// for a property that costs nothing to guarantee directly.
-    ///
-    /// A poisoned mutex is treated as "cannot prove this is fresh" and the request is rejected:
-    /// failing closed on a replay check is the only safe direction, and the condition means a thread
-    /// panicked while holding the map, which is not a state to keep authenticating through.
-    pub fn observe(&self, key_id: Uuid, signature: &str, timestamp: i64) -> bool {
-        let now = chrono::Utc::now().timestamp();
-        let Ok(mut seen) = self.seen.lock() else {
-            tracing::error!("Replay guard mutex poisoned; rejecting the request rather than \
-                             authenticating without replay protection.");
-            return false;
-        };
-
-        if seen.len() >= MAX_TRACKED_SIGNATURES {
-            tracing::warn!(
-                "Replay guard exceeded {MAX_TRACKED_SIGNATURES} tracked signatures within the \
-                 {MAX_TIMESTAMP_SKEW_SECS}s window; clearing it. Replay protection is degraded for \
-                 the current window."
-            );
-            seen.clear();
-        }
-
-        // `insert` returns the previous value, so a replay is precisely a `Some`.
-        let is_new = seen.insert(format!("{key_id}:{signature}"), timestamp).is_none();
-
-        // Amortized cleanup, run *after* the insert so it also drops the entry just added when that
-        // entry is itself outside the window. Such a request cannot be replayed successfully — the
-        // freshness check rejects it before this guard is ever consulted — so remembering it would
-        // be pure growth. The map therefore only ever retains in-window entries, which is what
-        // bounds it by the window rather than by uptime.
-        seen.retain(|_, ts| (now - *ts).abs() <= MAX_TIMESTAMP_SKEW_SECS);
-
-        is_new
-    }
-
-    /// How many signatures are currently remembered. Test-facing.
-    pub fn tracked(&self) -> usize {
-        self.seen.lock().map(|s| s.len()).unwrap_or(0)
-    }
-}
-
 /// Represents a webhook event triggered by the system
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WebhookEvent {
@@ -222,7 +134,11 @@ pub struct AppState {
     /// rebuild and must not be rebuilt per request.
     pub cipher: Arc<SecretCipher>,
     /// Signatures already accepted inside the current anti-replay window.
-    pub replay: ReplayGuard,
+    ///
+    /// Shared behind an [`Arc`] rather than cloned per handler: a per-clone guard would accept a
+    /// replay on any request served through a different clone, which is to say most of them. See
+    /// [`crate::replay`].
+    pub replay: Arc<ReplayGuard>,
 }
 
 impl AppState {
@@ -241,7 +157,7 @@ impl AppState {
             webhook_tx,
             trusted_proxies: TrustedProxies::from_env(),
             cipher: Arc::new(SecretCipher::from_env()?),
-            replay: ReplayGuard::new(),
+            replay: Arc::new(ReplayGuard::default()),
         })
     }
 
@@ -261,7 +177,7 @@ impl AppState {
             webhook_tx,
             trusted_proxies: TrustedProxies::new(trusted_proxies),
             cipher: Arc::new(cipher),
-            replay: ReplayGuard::new(),
+            replay: Arc::new(ReplayGuard::default()),
         }
     }
 
@@ -274,54 +190,5 @@ impl AppState {
         trusted_proxies: Vec<crate::config::ProxyMatcher>,
     ) -> Self {
         Self::with_parts(db, webhook_tx, trusted_proxies, SecretCipher::Plaintext)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_signature_is_accepted_once_and_refused_thereafter() {
-        let guard = ReplayGuard::new();
-        let key = Uuid::new_v4();
-        let now = chrono::Utc::now().timestamp();
-
-        assert!(guard.observe(key, "abc123", now), "the first use is fresh");
-        assert!(!guard.observe(key, "abc123", now), "the same signature is a replay");
-        assert!(!guard.observe(key, "abc123", now), "...and stays one");
-    }
-
-    #[test]
-    fn distinct_signatures_and_distinct_keys_do_not_collide() {
-        let guard = ReplayGuard::new();
-        let now = chrono::Utc::now().timestamp();
-        let (first, second) = (Uuid::new_v4(), Uuid::new_v4());
-
-        assert!(guard.observe(first, "sig-a", now));
-        assert!(guard.observe(first, "sig-b", now), "a different signature is independent");
-        assert!(
-            guard.observe(second, "sig-a", now),
-            "the same signature under a different key is a different request"
-        );
-    }
-
-    /// Entries leave the map once their timestamp is outside the window — at which point the
-    /// freshness check rejects them anyway, so remembering them would be pure memory growth.
-    #[test]
-    fn entries_outside_the_window_are_forgotten() {
-        let guard = ReplayGuard::new();
-        let key = Uuid::new_v4();
-        let now = chrono::Utc::now().timestamp();
-
-        assert!(guard.observe(key, "old", now - MAX_TIMESTAMP_SKEW_SECS - 1));
-        assert_eq!(guard.tracked(), 0, "an already-stale entry is pruned immediately");
-
-        assert!(guard.observe(key, "fresh", now));
-        assert_eq!(guard.tracked(), 1);
-        // A stale entry recorded alongside a fresh one does not keep the fresh one from being
-        // tracked, and does not itself survive.
-        assert!(guard.observe(key, "old", now - MAX_TIMESTAMP_SKEW_SECS - 1));
-        assert_eq!(guard.tracked(), 1);
     }
 }

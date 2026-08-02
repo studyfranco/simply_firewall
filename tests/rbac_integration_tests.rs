@@ -59,6 +59,16 @@ fn test_signing_secret(api_key: &str) -> String {
     format!("signing-secret-for-{api_key}")
 }
 
+/// The same secret in the shape the database actually stores.
+///
+/// `SecretCipher::open` is strictly fail-closed as of the 2026-08-02 hardening pass: a stored value
+/// with no recognized prefix is a `MalformedCiphertext` error rather than a bare secret returned
+/// verbatim. Seeded rows must therefore carry a real storage prefix, exactly as `SecretCipher::seal`
+/// would have written it in the zero-config plaintext mode these suites run in.
+fn stored_signing_secret(api_key: &str) -> String {
+    format!("v1.plain.{}", hex::encode(test_signing_secret(api_key)))
+}
+
 /// Builds a signed request, deriving the signing secret from the builder's own `X-API-Key` header.
 ///
 /// A builder carrying no `X-API-Key` still gets an `X-Timestamp` but no signature — exactly what the
@@ -201,7 +211,7 @@ async fn test_auth_and_cidr_rejection() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set("Test Key".to_owned()),
         bound_ips: Set(Some("192.168.1.1/32".to_owned())),
         is_master: Set(false),
@@ -258,7 +268,7 @@ async fn test_tenant_isolation_mn_rbac() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set("Tenant Key".to_owned()),
         bound_ips: Set(Some("0.0.0.0/0".to_owned())),
         is_master: Set(false),
@@ -319,7 +329,7 @@ async fn test_auto_provisioning_on_group_creation() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set("Creator Key".to_owned()),
         bound_ips: Set(Some("0.0.0.0/0".to_owned())),
         is_master: Set(false),
@@ -513,7 +523,7 @@ async fn test_explicit_key_group_manipulation() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(master_id),
         key_hash: Set(master_hash),
-        signing_secret: Set(Some(test_signing_secret(&master_plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&master_plaintext))),
         name: Set("System Master".to_owned()),
         bound_ips: Set(Some("0.0.0.0/0".to_owned())),
         is_master: Set(true), // CAN MANAGE KEYS
@@ -532,7 +542,7 @@ async fn test_explicit_key_group_manipulation() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(target_id),
         key_hash: Set(simply_ip_vault::api::hash_key("dummy")),
-        signing_secret: Set(Some(test_signing_secret("dummy"))),
+        signing_secret: Set(Some(stored_signing_secret("dummy"))),
         name: Set("Target Sub-Key".to_owned()),
         bound_ips: Set(Some("192.168.1.1/32".to_owned())),
         is_master: Set(false),
@@ -587,7 +597,7 @@ async fn test_multi_group_and_temporal_filtering() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set("Master".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -750,7 +760,7 @@ async fn test_webhook_hmac_signature_and_delivery() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set("Webhook Tester".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -885,7 +895,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set("Event Filter Tester".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -998,7 +1008,7 @@ async fn test_reban_into_same_group_does_not_500() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set("Master".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -1065,7 +1075,7 @@ async fn test_create_webhook_rejects_invalid_url() {
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(key_id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set("Master".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
@@ -1134,7 +1144,7 @@ async fn insert_key(
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set(name.to_owned()),
         bound_ips: Set(None),
         is_master: Set(is_master),
@@ -1355,7 +1365,7 @@ async fn insert_key_with_bound_ips(db: &DatabaseConnection, name: &str, bound_ip
     simply_ip_vault::entities::api_key::ActiveModel {
         id: Set(id),
         key_hash: Set(hash),
-        signing_secret: Set(Some(test_signing_secret(&plaintext))),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
         name: Set(name.to_owned()),
         bound_ips: Set(Some(bound_ips.to_owned())),
         is_master: Set(false),
@@ -1972,6 +1982,138 @@ async fn test_revoke_group_permission_by_name_and_by_id() {
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let items: Vec<serde_json::Value> = serde_json::from_slice(&body).unwrap();
     assert!(items.is_empty());
+}
+
+/// Revocation is bounded by the caller's own group access, exactly as granting is.
+///
+/// `guard_delegated_group_grant` has always stopped a non-master key manager from *handing out*
+/// access to a group it does not itself hold. The 2026-08-02 cross-audit found the mirror image
+/// unguarded: `revoke_key_group_permission` checked only `can_manage_keys` and then deleted the
+/// junction row, so the same caller could *strip* any key's access to any group in the system —
+/// including groups belonging to tenants it can neither read nor name.
+///
+/// That asymmetry is worth stating plainly, because "revocation only removes authority" is a
+/// tempting reason to leave it ungated and it is wrong here. Removing authority is exactly the
+/// attack: this service exists to keep `fail2ban`-style automation in sync, so quietly revoking the
+/// key that writes another tenant's banlist is a denial-of-service against that tenant's blocking,
+/// and it is invisible until someone notices bans have stopped landing.
+///
+/// Both halves are asserted together so neither can regress into the other's shape.
+#[tokio::test]
+async fn a_key_manager_cannot_revoke_access_to_a_group_it_does_not_manage() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    // The attacker: a legitimate key manager, scoped to its own tenant and nothing else.
+    let (attacker_id, attacker_key) = insert_key(&db, "Tenant A manager", false, true, false, false).await;
+    // The victim: another tenant's worker key.
+    let (victim_id, _victim_key) = insert_key(&db, "Tenant B worker", false, false, false, false).await;
+
+    // Master grants each key access to its own group.
+    for (holder, group_name) in [(attacker_id, "tenant-a-group"), (victim_id, "tenant-b-group")] {
+        let req = signed_later(inject_connect_info(Request::builder()
+            .method("POST")
+            .uri(format!("/api/keys/{holder}/permissions"))
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json")), 1, json!({
+                "group_name": group_name, "can_read": true, "can_write": true, "can_delete": true
+            }).to_string());
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    // The attack: strip the victim's access to a group the attacker has no relationship with.
+    let req = signed(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{victim_id}/permissions/tenant-b-group"))
+        .header("X-API-Key", &attacker_key)), "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "a key manager with no access to 'tenant-b-group' must not be able to revoke another key's"
+    );
+
+    // The grant is genuinely still there — the 403 refused the write rather than merely reporting one.
+    let surviving = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(victim_id))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(surviving.len(), 1, "the victim's grant must survive the refused revocation");
+
+    // ...while revocation inside the attacker's *own* group still works, so the guard bounds the
+    // operation rather than disabling delegated key management.
+    let (peer_id, _peer_key) = insert_key(&db, "Tenant A worker", false, false, false, false).await;
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{peer_id}/permissions"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json")), 2, json!({
+            "group_name": "tenant-a-group", "can_read": true, "can_write": true, "can_delete": true
+        }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{peer_id}/permissions/tenant-a-group"))
+        .header("X-API-Key", &attacker_key)), 3, "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "revoking within a group the caller does manage must still succeed"
+    );
+
+    // A master is unaffected by the guard and can still revoke anything.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{victim_id}/permissions/tenant-b-group"))
+        .header("X-API-Key", &master_key)), 4, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+}
+
+/// A key manager may not revoke its *own* group access either.
+///
+/// The grant path already refuses self-targeting outright (`update_key_group_permissions`), for an
+/// anti-ratchet reason. Revocation needs the same treatment for a narrower one: a caller that can
+/// rewrite its own permission rows is a caller whose recorded access no longer reflects what a
+/// master decided, and self-revocation is the half of that which looks harmless enough to be left in.
+#[tokio::test]
+async fn a_key_manager_cannot_revoke_its_own_group_access() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (manager_id, manager_key) = insert_key(&db, "Manager", false, true, false, false).await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{manager_id}/permissions"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json")), json!({
+            "group_name": "self-revoke-group", "can_read": true, "can_write": true, "can_delete": true
+        }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{manager_id}/permissions/self-revoke-group"))
+        .header("X-API-Key", &manager_key)), 1, "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "a non-master key must not rewrite its own group permission rows in either direction"
+    );
+
+    // A master may still revoke it, so the key is not stranded with an unremovable grant.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{manager_id}/permissions/self-revoke-group"))
+        .header("X-API-Key", &master_key)), 2, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 }
 
 /// `GET /api/audit-logs` is master-only and returns populated entries after mutations, filterable
@@ -2976,7 +3118,7 @@ async fn test_canonical_v1_webhook_sends_timestamp_and_canonical_signature() {
     // literally the function the inbound middleware calls.
     assert!(simply_ip_vault::crypto::verify_signature(
         secret, "POST", "/hook", &timestamp, delivered_body.as_bytes(), &signature,
-    ));
+    ).is_some());
 }
 
 /// `BODY_ONLY` must keep the legacy behaviour exactly: body-only HMAC, `sha256=` prefix, and **no**
