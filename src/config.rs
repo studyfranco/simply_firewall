@@ -760,6 +760,66 @@ mod tests {
         assert!(!Arc::ptr_eq(&first, &trusted.resolved().await), "a zero negative TTL re-resolves");
     }
 
+    /// ...and so does a *successful* one, which is the direction that actually carries risk.
+    ///
+    /// [`POSITIVE_TTL`] is the window during which a recreated container keeps its **old** address
+    /// trusted — an address the orchestrator may already have handed to something else. An entry
+    /// that never lapsed would be a standing grant to whoever inherited it, clearable only by
+    /// restarting the service. `AGENT.MD` accepts 30s precisely *because* it expires.
+    ///
+    /// Both halves are asserted, because each alone is too weak:
+    ///
+    /// - [`HostnameState::is_fresh`] is checked directly against a synthesized `attempted_at`, so
+    ///   the predicate is pinned with no dependence on wall-clock timing. The third assertion is the
+    ///   load-bearing one: a *resolved* entry must be governed by the positive TTL even when the
+    ///   negative TTL is enormous, which is what stops the two windows from being silently swapped.
+    /// - `resolved()` is then driven end to end, since `is_fresh` being correct buys nothing if the
+    ///   cache never consults it.
+    ///
+    /// The sleep is four times the TTL rather than a hair over it: this suite runs in parallel, and
+    /// a margin measured in whole multiples is what keeps the test from failing on a loaded machine.
+    #[tokio::test]
+    async fn a_successful_resolution_is_re_queried_once_its_positive_ttl_expires() {
+        const POSITIVE: Duration = Duration::from_millis(50);
+        const NEGATIVE: Duration = Duration::from_secs(5);
+
+        let fresh = HostnameState {
+            addresses: vec![IpNetwork::from(ip("127.0.0.1"))],
+            attempted_at: Instant::now(),
+            resolved: true,
+        };
+        assert!(fresh.is_fresh(POSITIVE, NEGATIVE), "an attempt made just now is reusable");
+
+        let lapsed = HostnameState {
+            attempted_at: Instant::now()
+                .checked_sub(POSITIVE)
+                .expect("the monotonic clock is older than the TTL"),
+            ..fresh.clone()
+        };
+        assert!(!lapsed.is_fresh(POSITIVE, NEGATIVE), "an attempt one full TTL old is stale");
+        assert!(
+            !lapsed.is_fresh(POSITIVE, Duration::from_secs(3600)),
+            "a resolved entry must expire on the positive TTL, never on the negative one"
+        );
+
+        // End to end: the cache must actually act on that.
+        let trusted = proxies("localhost").with_ttls(POSITIVE, NEGATIVE);
+        let first = trusted.resolved().await;
+        assert!(
+            !first.is_empty(),
+            "localhost must resolve, or this test would be exercising the negative path instead"
+        );
+
+        tokio::time::sleep(POSITIVE * 4).await;
+
+        // A new allocation means `refresh_locked` ran: `resolved()` hands back the *same* `Arc`
+        // whenever every entry is still fresh, so pointer inequality is the re-query.
+        assert!(
+            !Arc::ptr_eq(&first, &trusted.resolved().await),
+            "an expired positive entry must be looked up again rather than trusted indefinitely"
+        );
+    }
+
     /// A healthy name must not be dragged onto the short negative interval by an unhealthy one
     /// sharing the configuration — the reason attempt state is tracked per hostname.
     #[tokio::test]

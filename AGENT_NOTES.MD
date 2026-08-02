@@ -3422,3 +3422,75 @@ A `cd example/simply_hook_executor` in one Bash call persisted into later calls 
 `tail AGENT_NOTES.MD` and a `grep src/crypto.rs` at the *peer's* tree — the peer's notes read
 plausibly enough (they document a dead-code sweep too) that the mistake was caught only by the line
 count being 2110 instead of 3341. When auditing two trees side by side, use absolute paths.
+
+---
+
+## 2026-08-02 — Session 29: close the positive-TTL test gap found in Session 28
+
+Single-purpose session acting on the one new finding from the closing cross-audit. Production code
+is **unchanged** — `git diff --stat` is 60 insertions, 0 deletions, all inside
+`src/config.rs`'s `mod tests`.
+
+### The gap
+
+`src/config.rs` tested that a *negative* DNS entry expires
+(`a_negative_entry_expires_so_recovery_needs_no_restart`) and that a healthy entry is not dragged
+onto the negative interval by a failing sibling — but nothing drove a **positive** entry to expiry.
+All three existing TTL tests pass a 30-second positive TTL, which cannot lapse inside a test.
+
+That is the direction that carries the risk. `POSITIVE_TTL` is the window in which a recreated
+container keeps its **old** address trusted, an address the orchestrator may already have reassigned;
+an entry that never lapsed would be a standing trust grant to whoever inherited it, clearable only by
+restarting the service. `AGENT.MD` accepts 30s precisely *because* it expires.
+
+### New test: `a_successful_resolution_is_re_queried_once_its_positive_ttl_expires`
+
+Named for the file's established sentence-style convention rather than the `test_*` prefix the brief
+suggested — every other test in `src/config.rs` reads as an assertion of behaviour, and one outlier
+would be the odd one out. Placed between the negative-expiry test and the per-hostname isolation
+test, so the suite now reads: negative caching → negative expiry → **positive expiry** → per-name
+isolation.
+
+Two halves, because each alone is too weak:
+
+1. **`HostnameState::is_fresh` directly**, against a synthesized `attempted_at` built with
+   `Instant::now().checked_sub(POSITIVE)`. No wall-clock dependence at all. The third assertion is
+   the load-bearing one — a *resolved* entry must expire on the positive TTL even when the negative
+   TTL is set to an hour, which is what pins the two windows against being silently swapped.
+2. **`resolved()` end to end**, since a correct `is_fresh` buys nothing if the cache never consults
+   it. Pointer inequality on the returned `Arc` *is* the re-query signal: `resolved()` hands back the
+   same allocation whenever every entry is fresh, and `refresh_locked` builds a new one.
+
+`std::time::Instant` is what `config.rs` uses, so `tokio::time::pause()` would not have affected it —
+the end-to-end half needs a real sleep. It sleeps `POSITIVE * 4` (50ms TTL, 200ms sleep) rather than a
+hair over the TTL: this suite runs in parallel and a margin in whole multiples is what keeps it off a
+knife edge. It also asserts `!first.is_empty()` first, so a sandbox where `localhost` failed to
+resolve fails loudly instead of vacuously exercising the negative path.
+
+### Mutation-checked, not assumed
+
+Making `is_fresh` return `true` unconditionally for resolved entries — the exact regression the audit
+described — fails the new test and **passes all 26 pre-existing `config` tests**. That is the gap
+reproduced rather than argued, and it confirms the new test is the only thing holding the property.
+Reverted immediately; `grep MUTATION src/config.rs` is clean.
+
+Also run 35 times (30 solo, 5 as part of the full `config::tests` module) with zero failures, since a
+timing-dependent test that flakes is worse than no test.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **155 passed**, 0 failed (62 unit + 56 RBAC + 37 security; +1 unit) |
+| `./scripts/test_e2e.sh` | **407/407**, 0 failed |
+| `./scripts/verify_convergence.sh` | 27 matching, 2 documented divergences, **0 unexplained** |
+
+### Still outstanding from Session 28 (not in this session's scope)
+
+- `verify_convergence.sh` still registers `resolve_hostname` as a documented divergence. Session 28
+  established it is **cosmetic** — the peer's `(Vec, bool)` return is `true` in exactly the non-empty
+  cases, identical to the `!addresses.is_empty()` our caller derives — so the entry should be struck
+  rather than kept explained. Left alone here; it would change a script this task did not cover.
+- `CAPACITY_BACKOFF_DIVISOR` still not ported back to `simply_hook_executor`.
