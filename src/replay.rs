@@ -62,7 +62,7 @@ const CAPACITY_BACKOFF_DIVISOR: u32 = 16;
 /// Passing it does **not** disable the guard. The map is allowed to grow beyond this point rather
 /// than be flushed: over-retention costs memory, whereas under-retention costs the security
 /// property, and only one of those is recoverable by adding hardware.
-pub const MAX_TRACKED_SIGNATURES: usize = 100_000;
+const MAX_TRACKED_SIGNATURES: usize = 100_000;
 
 /// Identifies one accepted signature.
 ///
@@ -141,11 +141,12 @@ impl Default for ReplayGuard {
 impl ReplayGuard {
     /// Builds a guard remembering signatures for `window_seconds`.
     ///
-    /// The window is clamped into `[1, 3600]` rather than trusted. `simply_ip_vault` currently feeds
-    /// this the fixed [`crate::crypto::MAX_TIMESTAMP_SKEW_SECS`], so the clamp is dormant — but it
-    /// costs nothing and means the guard cannot be switched off, or turned into an unbounded
-    /// allocation, by whatever supplies the value later.
-    pub fn new(window_seconds: i64) -> Self {
+    /// Private: [`ReplayGuard::default`] is the only production constructor, and it supplies the
+    /// fixed [`crate::crypto::MAX_TIMESTAMP_SKEW_SECS`]. The window is still clamped into
+    /// `[1, 3600]` rather than trusted — the clamp is dormant at that call site, but it costs
+    /// nothing and keeps a future caller from switching the guard off, or turning the map into an
+    /// unbounded allocation, by passing a nonsensical window.
+    fn new(window_seconds: i64) -> Self {
         let window = Duration::from_secs(window_seconds.clamp(1, 3600) as u64);
         let prune_interval = window / PRUNE_INTERVAL_DIVISOR;
         let capacity_backoff = window / CAPACITY_BACKOFF_DIVISOR;
@@ -200,9 +201,13 @@ impl ReplayGuard {
         }
     }
 
-    /// How many signatures are currently remembered. Test-facing, so a suite can assert that expired
-    /// entries are actually released rather than merely ignored.
-    pub fn tracked(&self) -> usize {
+    /// How many signatures are currently remembered.
+    ///
+    /// Test-only, so a suite can assert that expired entries are actually *released* rather than
+    /// merely stopped from being honoured. Nothing in the request path needs it, so it is compiled
+    /// out of release builds rather than left as public surface no caller uses.
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
         self.seen.lock().map(|seen| seen.len()).unwrap_or(0)
     }
 

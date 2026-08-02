@@ -94,7 +94,7 @@ pub const TRUSTED_PROXIES_ENV: &str = "TRUSTED_PROXIES";
 /// this expires the old address is still trusted while the new one is not — the first is a (brief)
 /// over-trust of an address the orchestrator has probably already reassigned, the second a visible
 /// `403`. 30s keeps both windows small without turning every request into a DNS lookup.
-pub const POSITIVE_TTL: Duration = Duration::from_secs(30);
+const POSITIVE_TTL: Duration = Duration::from_secs(30);
 
 /// How long a *failed* resolution is remembered before being retried — negative caching.
 ///
@@ -105,7 +105,7 @@ pub const POSITIVE_TTL: Duration = Duration::from_secs(30);
 /// one inbound request becomes one outbound query, at whatever rate the caller chooses — which is a
 /// DoS both against the resolver and against this process's own latency. With it, the cost is
 /// bounded to one query per name per interval no matter how much traffic arrives.
-pub const NEGATIVE_TTL: Duration = Duration::from_secs(5);
+const NEGATIVE_TTL: Duration = Duration::from_secs(5);
 
 /// How long after boot an initially-unresolvable hostname is given before the failure is reported
 /// as persistent.
@@ -116,7 +116,7 @@ pub const NEGATIVE_TTL: Duration = Duration::from_secs(5);
 /// service that is up with one proxy entry disabled still serves every other caller correctly,
 /// while one that is down serves nobody. The entry stays untrusted for the duration (fail closed,
 /// for that entry only), and the outcome is logged either way.
-pub const BOOT_GRACE_PERIOD: Duration = Duration::from_secs(60);
+const BOOT_GRACE_PERIOD: Duration = Duration::from_secs(60);
 
 /// A `TRUSTED_PROXIES` entry: either a fixed network or a name resolved at request time.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -251,6 +251,7 @@ impl TrustedProxies {
 
     /// Overrides both DNS reuse windows. Test-facing: a suite cannot wait 30 seconds to observe
     /// that a re-resolution happened, nor 5 to observe that one was suppressed.
+    #[cfg(test)]
     pub fn with_ttls(mut self, positive: Duration, negative: Duration) -> Self {
         self.positive_ttl = positive;
         self.negative_ttl = negative;

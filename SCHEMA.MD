@@ -54,7 +54,7 @@ Stores authentication tokens, global access rights, and CIDR network binding rul
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique identifier for the API key |
 | `name` | `String` | Not Null | Human-readable key description |
 | `key_hash` | `String` | Not Null, Unique | Argon2 / SHA-256 hash of the secret API key |
-| `signing_secret` | `Text` | Nullable | Per-key HMAC-SHA256 secret used to verify the `X-Signature-256` request header. Encrypted with XChaCha20-Poly1305 when `VAULT_ENCRYPTION_KEY` (alias `SIGNING_SECRET_KEY`, exactly 64 hex characters) is set, stored as `v1.xchacha20poly1305.<hex nonce>.<hex ciphertext‖tag>`; hex-encoded but unencrypted as `v1.plain.<hex>` otherwise. One legacy shape remains **readable and is never rewritten in place**: `aesgcm256:<hex nonce><hex ciphertext‖tag>` from the AES-GCM era, which moves to the current format on the next rotation — so upgrading is non-destructive and no migration touches secret material. **Any value carrying none of those three prefixes is rejected** as `MalformedCiphertext` (`500`) rather than read verbatim; see the fail-closed note below. `NULL` only for keys created before this column existed — such keys cannot authenticate and must be rotated. Never returned by any read endpoint |
+| `signing_secret` | `Text` | Nullable | Per-key HMAC-SHA256 secret used to verify the `X-Signature-256` request header. Encrypted with XChaCha20-Poly1305 when `VAULT_ENCRYPTION_KEY` (alias `SIGNING_SECRET_KEY`, exactly 64 hex characters) is set, stored as `v1.xchacha20poly1305.<hex nonce>.<hex ciphertext‖tag>`; hex-encoded but unencrypted as `v1.plain.<hex>` otherwise. **Those two prefixes are the complete set** — any other value, including the retired `aesgcm256:` shape and an unprefixed bare secret, is rejected as `MalformedCiphertext` (`500`) rather than read; see the fail-closed note below. `NULL` only for keys created before this column existed — such keys cannot authenticate and must be rotated. Never returned by any read endpoint |
 | `prefix` | `String` | Not Null, Indexed | First 8 characters of key for display and fast lookup |
 | `is_master` | `Boolean` | Default: `false` | Bypasses all group permission checks |
 | `can_manage_keys` | `Boolean` | Default: `false` | Global privilege to create/edit/delete API keys |
@@ -75,14 +75,27 @@ The cipher protecting this column is built **once at startup** from `VAULT_ENCRY
 carried in `AppState`; it is never re-derived per request. A malformed key aborts startup rather
 than silently falling back to plaintext.
 
-*Fail-closed decryption (2026-08-02):* `SecretCipher::open` accepts exactly the three prefixes above
-and errors on everything else. An unprefixed value was previously returned verbatim as a
-pre-prefix-era compatibility path; that is gone, because "no recognized prefix" identifies a
-pre-prefix row only by assumption, while a truncated column, a half-written seal, a botched
-migration, or a value written through an unrelated defect all reach the same branch — and each of
-those ends with unknown bytes used as HMAC key material and nothing in the logs to say so. A
-deployment still holding a bare secret must run `POST /api/keys/{id}/rotate-secret` before
-upgrading, or that key stops authenticating.
+*Fail-closed decryption (2026-08-02):* `SecretCipher::open` accepts exactly the two prefixes above
+and errors on everything else. Two shapes were retired, in that order:
+
+1. An **unprefixed value** was previously returned verbatim as a pre-prefix-era compatibility path.
+   That is gone, because "no recognized prefix" identifies a pre-prefix row only by assumption, while
+   a truncated column, a half-written seal, a botched migration, or a value written through an
+   unrelated defect all reach the same branch — and each ends with unknown bytes used as HMAC key
+   material and nothing in the logs to say so.
+2. The **`aesgcm256:` read path** was a decrypt-only bridge for rows written before
+   XChaCha20-Poly1305, with no writer anywhere in the codebase. It has been removed along with the
+   `aes-gcm` dependency and the SHA-256-of-the-raw-env-text derivation that produced its key.
+
+A deployment still holding either shape must run `POST /api/keys/{id}/rotate-secret` (master-only)
+before upgrading, or that key stops authenticating with a `500`. Rotation touches only
+`signing_secret`, leaving `key_hash`, `prefix`, `name`, `bound_ips`, the scope flags and every
+`api_key_group_permissions` row intact. To find stragglers first:
+
+```sql
+SELECT id, name, prefix FROM api_keys
+WHERE signing_secret IS NOT NULL AND signing_secret NOT LIKE 'v1.%';
+```
 
 `POST /api/keys/{id}/rotate-secret` replaces **only** `signing_secret`, leaving `key_hash`, `prefix`,
 `name`, `bound_ips`, the global scope flags and every `api_key_group_permissions` row untouched — the

@@ -2664,8 +2664,12 @@ fn a_stored_secret_without_a_recognized_prefix_is_refused() {
             "deadbeef",                            // bare hex, indistinguishable from a stripped body
             "v1.plain",                            // the prefix, truncated just short of its dot
             "v1.xchacha20poly1305",                // likewise
-            "aesgcm256",                           // likewise
             "V1.PLAIN.6162",                       // prefixes are matched exactly, not case-folded
+            // The retired AES-GCM shape, spelled exactly as the old writer produced it: a 12-byte
+            // hex nonce followed by hex ciphertext‖tag. Reinstating the read path would make this
+            // value open again, which is the regression this entry exists to catch.
+            "aesgcm256:000102030405060708090a0b1122334455667788990011223344556677",
+            "aesgcm256",                           // and the bare prefix
         ] {
             assert!(
                 matches!(cipher.open(unprefixed), Err(CryptoError::MalformedCiphertext)),

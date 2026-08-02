@@ -3233,3 +3233,109 @@ empty answer" differently from "did not resolve"; we infer both from `addresses.
 behaviour is identical — both are equally untrusted and both cache on the negative TTL — so this is
 diagnosability only. Registered as a documented divergence in `scripts/verify_convergence.sh` rather
 than fixed, since it is outside this pass's scope. Candidate follow-up.
+
+---
+
+## 2026-08-02 — Session 27: cleanup pass (legacy crypto purge, dead code, dependencies)
+
+### 1. Legacy AES-GCM purged
+
+`aesgcm256:` was a decrypt-only bridge for rows written before XChaCha20-Poly1305. Nothing in the
+crate had written it since the convergence pass, so it kept a **second AEAD, a second nonce width,
+and a second key-derivation rule** compiled in to serve a format this service can no longer produce.
+That derivation was the awkward part: `from_hex_key` hashed the *raw hex text* with SHA-256 to
+reconstruct the old key, which is a different rule from the decoded-bytes key used for everything
+else — two key derivations in one constructor, one of them serving no writer.
+
+Removed:
+
+| Item | Was in |
+| :--- | :--- |
+| `LEGACY_GCM_PREFIX`, `LEGACY_GCM_NONCE_LEN` | `src/crypto.rs` |
+| `SecretCipher::open_legacy_gcm` | `src/crypto.rs` |
+| `Sealed { cipher, legacy_gcm }` → `Sealed(Box<XChaCha20Poly1305>)` | `src/crypto.rs` |
+| SHA-256-of-raw-env-text derivation in `from_hex_key` | `src/crypto.rs` |
+| `use aes_gcm::{Aes256Gcm, Nonce as GcmNonce}`; `Digest` from the `sha2` import | `src/crypto.rs` |
+| `aes-gcm = "0.11"` | `Cargo.toml` |
+| `a_legacy_aes_gcm_row_still_opens_under_the_same_key` | `src/crypto.rs` tests |
+| `resealing_moves_a_legacy_value_to_xchacha20` | replaced by `sealing_always_produces_a_currently_recognized_prefix` |
+
+`open()` now accepts exactly `v1.xchacha20poly1305.` and `v1.plain.` — the same two shapes `seal()`
+can produce, which is what makes it a **closed set** rather than a list that only grows.
+
+**Breaking, and the second retirement in two sessions.** `AGENT.MD` §1 and `SCHEMA.MD` §1 both
+documented `aesgcm256:` as readable; both were amended rather than silently overridden, and both now
+carry the straggler query:
+
+```sql
+SELECT id, name, prefix FROM api_keys
+WHERE signing_secret IS NOT NULL AND signing_secret NOT LIKE 'v1.%';
+```
+
+Any row that query returns must be rotated (`POST /api/keys/{id}/rotate-secret`, master-only) *before*
+deploying, or that key starts failing with `500`. Rotation touches only `signing_secret`.
+
+Two regression guards added, because the risk here is a well-meaning future re-add:
+`crypto::the_retired_aes_gcm_format_is_no_longer_readable` asserts a correctly-shaped `aesgcm256:`
+value is refused, and `a_stored_secret_without_a_recognized_prefix_is_refused` gained the same value
+to its table.
+
+### 2. Dead code audit — what was found, and what was not
+
+**No unused functions, fields, or imports existed to remove.** There is no `#[allow(dead_code)]` or
+`#[allow(unused)]` anywhere in `src/` or `tests/` (verified by grep), so the compiler's own analysis
+was already fully active and `cargo check --all-targets` was clean before this pass. The same
+applies to the "obsolete test helpers superseded by the new ReplayGuard/RBAC suites" — an unused
+private fn in an integration-test binary is a `dead_code` warning, and there were none.
+
+All `AppError` variants are live (`Conflict` has exactly one call site, in `api.rs`; the rest have
+3–39). All four `CryptoError` variants remain reachable after the AES-GCM removal — `InvalidKey` lost
+one use but is still `from_hex_key`'s error.
+
+What *was* dead was **public surface nothing outside its module used**. Tightened:
+
+| Item | Before | After | Reason |
+| :--- | :--- | :--- | :--- |
+| `replay::MAX_TRACKED_SIGNATURES` | `pub const` | private | internal ceiling |
+| `ReplayGuard::new` | `pub fn` | private | `default()` is the only production constructor |
+| `ReplayGuard::tracked` | `pub fn` | `#[cfg(test)] fn` | assertion-only; now compiled out of release builds |
+| `config::POSITIVE_TTL` / `NEGATIVE_TTL` / `BOOT_GRACE_PERIOD` | `pub const` | private | internal tuning constants |
+| `config::with_ttls` | `pub fn` | `#[cfg(test)] pub fn` | exists so a suite need not wait 30 real seconds |
+
+**Deliberately kept public:** `crypto::ENCRYPTION_KEY_ENV` and `ENCRYPTION_KEY_ENV_ALIAS`. Nothing
+outside `crypto.rs` references them today, but they are the same *kind* of thing as
+`config::TRUSTED_PROXIES_ENV`, which `main.rs` does consume. Privatizing one half of a coherent
+configuration-naming surface while the other half stays public would be a worse API than either
+choice on its own.
+
+### 3. Dependencies
+
+Audited with `#![warn(unused_crate_dependencies)]` (added temporarily to `lib.rs`, then reverted)
+plus a per-crate usage grep across `src/` and `tests/`.
+
+- **Removed `aes-gcm`** — sole consumer was the legacy path. Confirmed gone from `cargo tree` and
+  `Cargo.lock`.
+- **Removed the `axum` dev-dependency** (`features = ["macros"]`). No `#[debug_handler]` or other
+  macro use exists; `axum` is already a regular dependency and test targets see those, so the entry
+  only widened the feature set for nothing.
+- **`log` reported unused in the lib and kept** — the lint is per-crate and `src/main.rs` (a separate
+  target) uses `log::LevelFilter::Debug` for `sqlx_logging_level`. A false positive if acted on.
+- **`sea-orm`'s `sqlx-postgres` / `sqlx-mysql` kept and now annotated in `Cargo.toml`.** They look
+  unused because every test runs on SQLite, but `AGENT.MD` §Tech Stack requires the data layer to
+  stay SQL-agnostic and PostgreSQL-ready. Removing them would be the one "cleanup" here that
+  contradicts a mandatory directive.
+
+Every other dependency and feature has at least one real consumer.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **154 passed**, 0 failed (61 unit + 56 RBAC + 37 security) |
+| `./scripts/test_e2e.sh` | **407/407**, 0 failed |
+| `./scripts/verify_convergence.sh` | 27 matching, 2 documented divergences, **0 unexplained** |
+
+No new drift. The two documented divergences are the pre-existing pair from Session 26
+(`apply_sqlite_pragmas` module/wording, and `resolve_hostname`'s tuple return).

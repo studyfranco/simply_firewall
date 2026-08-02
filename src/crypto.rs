@@ -16,14 +16,11 @@
 //!    sealed with XChaCha20-Poly1305 under a key supplied out-of-band, so read access to the
 //!    database alone is not enough to forge signatures. See [`SecretCipher`].
 
-// `aes_gcm` and `chacha20poly1305` re-export the same `aead` traits, so one import serves both
-// ciphers. The AES types are reached through the legacy read path only — see `open_legacy_gcm`.
-use aes_gcm::{Aes256Gcm, Nonce as GcmNonce};
 use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{Key, XChaCha20Poly1305, XNonce};
 use hmac::{Hmac, Mac};
 use rand::RngExt;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use crate::error::AppError;
 
@@ -54,11 +51,6 @@ const NONCE_LEN: usize = 24;
 const PLAINTEXT_PREFIX: &str = "v1.plain.";
 /// Prefix marking a value sealed with XChaCha20-Poly1305.
 const SEALED_PREFIX: &str = "v1.xchacha20poly1305.";
-/// Prefix marking a value sealed by an earlier version with AES-GCM-256. Read-only: nothing writes
-/// this format any more.
-const LEGACY_GCM_PREFIX: &str = "aesgcm256:";
-/// AES-GCM nonce width, in bytes. Only used to open [`LEGACY_GCM_PREFIX`] values.
-const LEGACY_GCM_NONCE_LEN: usize = 12;
 
 /// Generates a fresh 32-byte HMAC signing secret, hex-encoded.
 ///
@@ -222,15 +214,9 @@ pub enum SecretCipher {
     Plaintext,
     /// Secrets are sealed with XChaCha20-Poly1305 under the configured key.
     ///
-    /// `legacy_gcm` is the AES-GCM-256 key derived the way earlier versions derived it — SHA-256 of
-    /// the raw environment value — so rows already written as `aesgcm256:` stay readable. It is
-    /// never used to write.
-    Sealed {
-        /// The cipher used for every new seal.
-        cipher: Box<XChaCha20Poly1305>,
-        /// Read-only key material for opening pre-existing AES-GCM rows.
-        legacy_gcm: [u8; KEY_LEN],
-    },
+    /// Boxed because `XChaCha20Poly1305` carries the expanded key schedule, which is large enough
+    /// that an unboxed variant would inflate every `SecretCipher` — including the `Plaintext` one.
+    Sealed(Box<XChaCha20Poly1305>),
 }
 
 impl std::fmt::Debug for SecretCipher {
@@ -238,7 +224,7 @@ impl std::fmt::Debug for SecretCipher {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Plaintext => f.write_str("SecretCipher::Plaintext"),
-            Self::Sealed { .. } => f.write_str("SecretCipher::Sealed(<redacted>)"),
+            Self::Sealed(_) => f.write_str("SecretCipher::Sealed(<redacted>)"),
         }
     }
 }
@@ -268,33 +254,24 @@ impl SecretCipher {
 
     /// Builds a cipher from a hex-encoded 32-byte key.
     ///
-    /// The legacy AES-GCM key is derived from the *raw hex text* rather than the decoded bytes,
-    /// because that is precisely what the previous implementation hashed. Keeping the same
-    /// `VAULT_ENCRYPTION_KEY` value therefore keeps existing `aesgcm256:` rows readable across the
-    /// upgrade — provided that value was already 64 hex characters. If it was a free-form
-    /// passphrase, startup now fails with [`CryptoError::InvalidKey`], which is the honest outcome:
-    /// an unbounded passphrase run through a single SHA-256 has whatever entropy the operator typed,
-    /// and the old code could not tell `openssl rand -hex 32` from `password`.
+    /// The key must be exactly 64 hex characters. A free-form passphrase is refused with
+    /// [`CryptoError::InvalidKey`] rather than stretched, which is the honest outcome: an earlier
+    /// implementation ran whatever it was given through a single SHA-256, so it could not tell
+    /// `openssl rand -hex 32` from `password` and reported neither.
     pub fn from_hex_key(hex_key: &str) -> Result<Self, CryptoError> {
         let bytes = hex::decode(hex_key).map_err(|_| CryptoError::InvalidKey)?;
         if bytes.len() != KEY_LEN {
             return Err(CryptoError::InvalidKey);
         }
+        // `TryFrom` rather than the deprecated `from_slice`: the length is already checked above,
+        // so this conversion cannot fail.
         let key = Key::try_from(bytes.as_slice()).map_err(|_| CryptoError::InvalidKey)?;
-
-        let mut hasher = Sha256::new();
-        hasher.update(hex_key.as_bytes());
-        let legacy_gcm: [u8; KEY_LEN] = hasher.finalize().into();
-
-        Ok(Self::Sealed {
-            cipher: Box::new(XChaCha20Poly1305::new(&key)),
-            legacy_gcm,
-        })
+        Ok(Self::Sealed(Box::new(XChaCha20Poly1305::new(&key))))
     }
 
     /// Whether secrets are actually being encrypted.
     pub fn is_encrypting(&self) -> bool {
-        matches!(self, Self::Sealed { .. })
+        matches!(self, Self::Sealed(_))
     }
 
     /// Encodes a secret for storage.
@@ -304,7 +281,7 @@ impl SecretCipher {
     pub fn seal(&self, plaintext: &str) -> Result<String, CryptoError> {
         match self {
             Self::Plaintext => Ok(format!("{PLAINTEXT_PREFIX}{}", hex::encode(plaintext))),
-            Self::Sealed { cipher, .. } => {
+            Self::Sealed(cipher) => {
                 // A fresh random nonce per secret. XChaCha20's 192-bit nonce is wide enough that
                 // random generation is collision-safe with no counter state to persist — which is
                 // the whole reason for preferring it over AES-GCM's 96-bit nonce here.
@@ -324,19 +301,17 @@ impl SecretCipher {
 
     /// Recovers a secret from storage.
     ///
-    /// Exactly three shapes are accepted, and **anything else is an error**:
+    /// Exactly two shapes are accepted, and **anything else is an error**:
     ///
-    /// 1. `v1.xchacha20poly1305.<nonce>.<ct>` — the current format.
-    /// 2. `v1.plain.<hex>` — the current unencrypted format.
-    /// 3. `aesgcm256:<nonce><ct>` — written by earlier versions; readable, never rewritten.
+    /// 1. `v1.xchacha20poly1305.<nonce>.<ct>` — the encrypted format.
+    /// 2. `v1.plain.<hex>` — the unencrypted format.
     ///
-    /// Rows only move to the current format when the key is next rotated, which keeps the upgrade
-    /// non-destructive: no migration touches secret material, and a downgrade still reads everything
-    /// it wrote itself.
+    /// These are precisely the two shapes [`SecretCipher::seal`] can produce, which is what lets this
+    /// be a closed set rather than a list that only ever grows.
     ///
-    /// # Why an unprefixed value is now rejected
+    /// # Why an unprefixed value is rejected
     ///
-    /// A fourth shape used to be accepted: an unprefixed string was returned **verbatim**, on the
+    /// A third shape used to be accepted: an unprefixed string was returned **verbatim**, on the
     /// reasoning that it was a bare secret written before any prefix existed. That fallback was a
     /// silent failure mode wearing a compatibility costume, because "no recognized prefix" is not
     /// evidence of an old row — it is evidence of *nothing in particular*, and every other cause is
@@ -355,9 +330,19 @@ impl SecretCipher {
     /// see. The recovery path is `POST /api/keys/{id}/rotate-secret`, which is master-only and
     /// replaces just the signing secret.
     ///
-    /// **Upgrade note:** any deployment still holding an unprefixed bare secret must rotate that key's
-    /// secret before upgrading, or it stops authenticating. `AGENT.MD` §1 and `SCHEMA.MD` §1 both
-    /// previously documented the bare shape as readable and have been amended.
+    /// # Why the AES-GCM path is gone
+    ///
+    /// `aesgcm256:<nonce><ct>` was readable here until the 2026-08-02 cleanup pass. It was a
+    /// decrypt-only bridge for rows written before XChaCha20-Poly1305, with no writer anywhere in
+    /// the crate — so it kept a second AEAD, a second nonce width, and a second key-derivation rule
+    /// (SHA-256 of the raw environment text, distinct from the decoded key used for everything else)
+    /// compiled in to serve a format this service can no longer produce. Retiring it removes the
+    /// `aes-gcm` dependency and reduces `SecretCipher::Sealed` to a single field.
+    ///
+    /// **Upgrade note:** any deployment still holding an unprefixed **or** an `aesgcm256:` secret must
+    /// rotate that key (`POST /api/keys/{id}/rotate-secret`, master-only) before upgrading, or it
+    /// stops authenticating with a `500`. `AGENT.MD` §1 and `SCHEMA.MD` §1 documented both shapes as
+    /// readable and have been amended, including the query for finding stragglers.
     pub fn open(&self, stored: &str) -> Result<String, CryptoError> {
         if let Some(encoded) = stored.strip_prefix(PLAINTEXT_PREFIX) {
             let bytes = hex::decode(encoded).map_err(|_| CryptoError::MalformedCiphertext)?;
@@ -375,7 +360,7 @@ impl SecretCipher {
             let ciphertext =
                 hex::decode(ciphertext_hex).map_err(|_| CryptoError::MalformedCiphertext)?;
 
-            let Self::Sealed { cipher, .. } = self else {
+            let Self::Sealed(cipher) = self else {
                 // A sealed row with no key configured. Reported as a key mismatch rather than as
                 // corruption, because the fix is to set VAULT_ENCRYPTION_KEY, and because handing
                 // ciphertext back as if it were the secret would surface as a misleading 401 on
@@ -390,42 +375,10 @@ impl SecretCipher {
             return String::from_utf8(plaintext).map_err(|_| CryptoError::MalformedCiphertext);
         }
 
-        if let Some(sealed) = stored.strip_prefix(LEGACY_GCM_PREFIX) {
-            return self.open_legacy_gcm(sealed);
-        }
-
         // Fail closed. See the "Why an unprefixed value is now rejected" note above: an unrecognized
         // shape is not evidence of a pre-prefix row, and treating it as one turns a damaged column
         // into silently-wrong HMAC key material.
         Err(CryptoError::MalformedCiphertext)
-    }
-
-    /// Opens an `aesgcm256:` value written by an earlier version.
-    ///
-    /// Exists solely so upgrading does not invalidate every key issued while AES-GCM was in use.
-    /// There is no corresponding write path.
-    fn open_legacy_gcm(&self, sealed: &str) -> Result<String, CryptoError> {
-        let Self::Sealed { legacy_gcm, .. } = self else {
-            return Err(CryptoError::DecryptionFailed);
-        };
-
-        let raw = hex::decode(sealed).map_err(|_| CryptoError::MalformedCiphertext)?;
-        if raw.len() <= LEGACY_GCM_NONCE_LEN {
-            return Err(CryptoError::MalformedCiphertext);
-        }
-        let (nonce_bytes, ciphertext) = raw.split_at(LEGACY_GCM_NONCE_LEN);
-
-        let cipher = Aes256Gcm::new_from_slice(legacy_gcm).map_err(|_| CryptoError::InvalidKey)?;
-        let nonce = GcmNonce::try_from(nonce_bytes).map_err(|_| CryptoError::MalformedCiphertext)?;
-        let plaintext = cipher
-            .decrypt(&nonce, ciphertext.as_ref())
-            .map_err(|_| CryptoError::DecryptionFailed)?;
-
-        tracing::debug!(
-            "Opened a legacy AES-GCM signing secret; it will move to XChaCha20-Poly1305 on the next \
-             rotation."
-        );
-        String::from_utf8(plaintext).map_err(|_| CryptoError::MalformedCiphertext)
     }
 }
 
@@ -628,8 +581,6 @@ mod tests {
             "v1.xchacha20poly1305.zz.zz",
             "v1.xchacha20poly1305.00ff.aabb", // nonce too short
             "v1.plain.zz",
-            "aesgcm256:zz",
-            "aesgcm256:00",
         ] {
             assert!(cipher.open(malformed).is_err(), "{malformed:?} should not open");
         }
@@ -659,51 +610,39 @@ mod tests {
         }
     }
 
-    /// The upgrade path that matters: a secret sealed by the previous AES-GCM implementation, under
-    /// the same `VAULT_ENCRYPTION_KEY`, must still open. Written here exactly as the old code wrote
-    /// it — SHA-256 of the raw env text as the key, 12-byte nonce, `aesgcm256:` prefix — so this
-    /// test would catch a change to the derivation that silently orphaned every existing row.
+    /// The retired AES-GCM format must stay unreadable.
+    ///
+    /// `aesgcm256:` was a decrypt-only bridge with no writer; it was removed in the 2026-08-02
+    /// cleanup pass along with the `aes-gcm` dependency. This asserts the negative directly, so
+    /// reinstating the branch — or accidentally widening `open` to a prefix-agnostic fallback —
+    /// fails here rather than silently restoring a second cipher's worth of attack surface.
     #[test]
-    fn a_legacy_aes_gcm_row_still_opens_under_the_same_key() {
-        let mut hasher = Sha256::new();
-        hasher.update(TEST_KEY.as_bytes());
-        let legacy_key: [u8; KEY_LEN] = hasher.finalize().into();
-
-        let legacy_cipher = Aes256Gcm::new_from_slice(&legacy_key).expect("valid AES key");
-        let nonce_bytes = [7u8; LEGACY_GCM_NONCE_LEN];
-        let nonce = GcmNonce::from(nonce_bytes);
-        let ciphertext = legacy_cipher
-            .encrypt(&nonce, b"issued-under-aes".as_ref())
-            .expect("legacy encryption succeeds");
+    fn the_retired_aes_gcm_format_is_no_longer_readable() {
         let stored = format!(
-            "{LEGACY_GCM_PREFIX}{}{}",
-            hex::encode(nonce_bytes),
-            hex::encode(&ciphertext)
+            "aesgcm256:{}{}",
+            hex::encode([7u8; 12]),
+            hex::encode([9u8; 32])
         );
-
-        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
-        assert_eq!(cipher.open(&stored).expect("legacy row opens"), "issued-under-aes");
-
-        // ...and a different key cannot open it, so the legacy path is not a bypass.
-        let other = SecretCipher::from_hex_key(
-            "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100",
-        )
-        .expect("valid key");
-        assert!(matches!(other.open(&stored), Err(CryptoError::DecryptionFailed)));
-        // Nor can a daemon with no key at all.
-        assert!(matches!(
-            SecretCipher::Plaintext.open(&stored),
-            Err(CryptoError::DecryptionFailed)
-        ));
+        for cipher in [SecretCipher::Plaintext, SecretCipher::from_hex_key(TEST_KEY).expect("valid key")] {
+            assert!(
+                matches!(cipher.open(&stored), Err(CryptoError::MalformedCiphertext)),
+                "an aesgcm256: row must be refused as malformed, not decrypted"
+            );
+        }
     }
 
-    /// Nothing writes AES-GCM any more: a re-seal of a legacy value produces the current format.
+    /// Sealing always produces the current format. The only two shapes that exist are the ones
+    /// `open` accepts, which is what lets that function be a closed set rather than a growing list.
     #[test]
-    fn resealing_moves_a_legacy_value_to_xchacha20() {
-        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
-        let resealed = cipher.seal("issued-under-aes").expect("sealing succeeds");
-        assert!(resealed.starts_with(SEALED_PREFIX));
-        assert!(!resealed.starts_with(LEGACY_GCM_PREFIX));
+    fn sealing_always_produces_a_currently_recognized_prefix() {
+        let sealed = SecretCipher::from_hex_key(TEST_KEY)
+            .expect("valid key")
+            .seal("s3cr3t")
+            .expect("sealing succeeds");
+        assert!(sealed.starts_with(SEALED_PREFIX));
+
+        let stored = SecretCipher::Plaintext.seal("s3cr3t").expect("sealing succeeds");
+        assert!(stored.starts_with(PLAINTEXT_PREFIX));
     }
 
     /// `Debug` must never render key material — an `AppState` dump would otherwise leak it.
