@@ -3075,3 +3075,45 @@ Recorded here so the peer's audit has a checklist.
 **This asymmetry is intentional and must not be "fixed" by a future convergence pass.** Where a
 `simply_hook_executor` key *does* use full-request HMAC, it applies the same full-URI canonicalization
 and the same anti-replay rule described above; body-only and no-HMAC keys stay exactly as configured.
+
+---
+
+## 2026-08-02 — Session 25: read-only cross-audit (no source changes)
+
+Strictly read-only comparative security audit against `./example/simply_hook_executor`. No file in
+`src/` or `./example` was touched; no commit was made. Output: `SECURITY_COMPARISON_REPORT.md`
+(replaces the 2026-08-01 edition committed as `ca6ecf4`, which predates both convergence passes).
+
+**Reference freshness — flagged UNVERIFIED.** `./example` is *not* a git checkout: no `.git`, no
+`.gitmodules`, zero files tracked by the parent repo, and `example/*` is in `.gitignore`. There is no
+commit hash to record. Closest markers: newest peer source mtime 2026-08-02 00:18, its `AGENT_NOTES.MD`
+00:26, directory mtimes 12:01 (i.e. the tree was re-copied after our HEAD `f544ff4` landed at 11:47).
+
+**Correction to a standing note.** The prior audit's conclusion that `./example` had gone stale
+**no longer holds**. The peer has completed its half of the arbitrated convergence: it now has a
+dedicated `src/replay.rs` (which did not exist when Session 24 was written), a completed
+*Convergence Parity Check* in its own notes, XChaCha20-Poly1305, full `path_and_query()` signing via
+`OriginalUri`, authenticate-then-authorize ordering, and `MAX_REQUEST_BODY_BYTES = 3 MiB` derived by
+its signature buffer. Any note in this file asserting the peer lacks a replay guard, or uses a 1 MiB
+body limit, or checks `bound_ips` before `verify_signature`, is stale — those were true of an older
+snapshot and are not true of the current one.
+
+**Result: 73 rows compared, 66 equivalent, 3 intentional asymmetries, 4 genuine discrepancies —
+all four on our side.** Three are in `ReplayGuard` (`src/state.rs`), one is test coverage:
+
+| # | Finding | Peer's approach |
+| :-- | :--- | :--- |
+| 1 | `observe()` calls `seen.clear()` at `MAX_TRACKED_SIGNATURES`, self-documented as degrading replay protection. The map is process-global, so any one key's burst flushes the guard for **every** key. | Prunes expired entries, then keeps enforcing and logs a warning. Never flushes. |
+| 2 | Entries expire on wall-clock `chrono::Utc::now()`; a backward NTP step (or, via `.abs()`, a forward one) evicts still-in-window entries early. | Monotonic `std::time::Instant`, immune to clock adjustment. |
+| 3 | `seen.retain(..)` runs over the whole map on **every** `observe()`, inside the global `Mutex` — O(n) per authenticated request. | `prune_if_due` sweeps at most once per `window / 4`. |
+| 4 | No test proves `journal_mode=WAL` actually engages. The suite is entirely `sqlite::memory:`, where WAL cannot engage, so the one pragma test would pass even if the pragma were never issued. | File-backed test asserting WAL engages *and* survives reconnection. |
+
+Recommended follow-up (not performed — this session was read-only): port the peer's `src/replay.rs`
+wholesale, keying on the raw digest returned from `verify_signature` rather than a re-derived hex
+token, and add a file-backed WAL test.
+
+**Not findings.** The authentication-posture asymmetry (mandatory full-URI HMAC + anti-replay on
+every vault key vs. the peer's per-key `hmac_mode`), the peer's `X-Hub-Signature-256` path, and its
+exclusion of `BODY_ONLY` keys from replay tracking are permanent architectural decisions recorded
+above, not gaps. Our `aesgcm256:` open-only legacy path is a migration obligation the peer does not
+have, not a weakness; it can be deleted once no such rows remain.
