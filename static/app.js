@@ -512,7 +512,6 @@ class FirewallClient {
     async apiFetch(endpoint, options = {}) {
         // The signature covers the path only, so strip any query string before signing while still
         // requesting the full URL. Mutating fields all travel in the (signed) body.
-        const [pathOnly] = endpoint.split('?');
         const method = (options.method || 'GET').toUpperCase();
         const rawBody = options.body ?? '';
         const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -528,7 +527,7 @@ class FirewallClient {
                 headers['X-Timestamp'] = timestamp;
                 headers['X-Signature-256'] = await this.signRequest(
                     method,
-                    `${this.signingBase}${pathOnly}`,
+                    `${this.signingBase}${endpoint}`,
                     timestamp,
                     rawBody
                 );
