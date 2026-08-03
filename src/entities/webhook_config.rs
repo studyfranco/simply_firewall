@@ -73,8 +73,8 @@ pub const DEFAULT_HMAC_TEMPLATE: &str = r"{method}\n{path}\n{timestamp}\n{body}"
 /// adding a future mode is a compiler-enforced exhaustive match instead of a hunt for `==` checks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AuthMode {
-    /// HMAC-SHA256 over the webhook's resolved `hmac_template`, sent as bare hex in
-    /// `X-Signature-256` alongside `X-Timestamp` and (when set) `X-API-Key`.
+    /// HMAC-SHA256 over the webhook's resolved `hmac_template`, sent as
+    /// `X-Signature-256: sha256=<hex>` alongside `X-Timestamp` and (when set) `X-API-Key`.
     ///
     /// With the default template this is byte-for-byte the construction the inbound API middleware
     /// verifies, which is what lets one `simply_ip_vault` instance dispatch directly into another's

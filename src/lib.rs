@@ -103,14 +103,17 @@ pub fn create_app(state: AppState) -> Router {
 
 /// Helper to create AppState and background worker.
 ///
-/// Fails when the configured `VAULT_ENCRYPTION_KEY` is malformed — see
-/// [`crypto::SecretCipher::from_env`]. That is deliberately not recoverable: falling back to
-/// plaintext would write signing secrets in the clear for an operator who believes they are
-/// encrypted.
+/// Fails when a security-relevant environment variable is malformed — a bad `VAULT_ENCRYPTION_KEY`
+/// (see [`crypto::SecretCipher::from_env`]) or a bad `TRUSTED_PROXIES` entry (see
+/// [`config::TrustedProxies::from_env`]). Neither is recoverable: the first would write signing
+/// secrets in the clear for an operator who believes they are encrypted, and the second would apply
+/// a trust boundary different from the one they configured.
 pub fn setup_state(
     db: DatabaseConnection,
-) -> Result<(AppState, mpsc::Sender<WebhookEvent>, tokio::task::JoinHandle<()>), crypto::CryptoError>
-{
+) -> Result<
+    (AppState, mpsc::Sender<WebhookEvent>, tokio::task::JoinHandle<()>),
+    state::StartupConfigError,
+> {
     let (tx, rx) = mpsc::channel::<WebhookEvent>(100);
     let db_worker = db.clone();
     let worker_handle = tokio::spawn(async move {

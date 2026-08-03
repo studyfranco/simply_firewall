@@ -3494,3 +3494,161 @@ timing-dependent test that flakes is worse than no test.
   cases, identical to the `!addresses.is_empty()` our caller derives — so the entry should be struck
   rather than kept explained. Left alone here; it would change a script this task did not cover.
 - `CAPACITY_BACKOFF_DIVISOR` still not ported back to `simply_hook_executor`.
+
+---
+
+## Session 30 — Strict trust-boundary validation, a mandatory `sha256=` prefix, and two closed test gaps
+
+Four tasks, all landed. Two are behaviour changes with a blast radius wider than the file they live
+in, and both are recorded here in full because the reasoning is the part that will not be obvious
+from the diff.
+
+### 1. A malformed `TRUSTED_PROXIES` entry now refuses to start
+
+`parse_trusted_proxies` returned `(Vec<ProxyMatcher>, Vec<String>)` — the good entries and the
+rejects — and `from_env` logged the rejects at `error!` and carried on with the rest. It now returns
+`Result<Vec<ProxyMatcher>, Vec<InvalidProxyEntry>>`, and `from_env` returns
+`Result<Self, InvalidTrustedProxies>` which `main` propagates.
+
+**Why this one setting aborts when every other malformed override falls back to a default.** A
+default bind port is unambiguous; "some subset of the proxies you listed" is not. `TRUSTED_PROXIES`
+names the peers permitted to rewrite the client address *every authorization decision is made
+against*, so dropping an entry silently leaves the boundary different from the one the operator
+wrote — and the symptom is a `403` on a CIDR-bound key, hours later, with one warn line as the only
+evidence. The mistake is nearly always one character (`10.0.0.0/8x`, `10.0.0.256`), which is exactly
+the class of error a trust boundary must not absorb quietly.
+
+**The split that makes the strictness safe.** The check is *purely syntactic*, so it can be this
+harsh without touching the transient case. A well-formed hostname that does not currently resolve is
+not an error at all: it keeps the `BOOT_GRACE_PERIOD`, keeps negative caching, and the service serves
+normally with that entry disabled. DNS is a runtime dependency that comes and goes, and a daemon that
+refuses to boot while it is away turns a brief resolver outage into a crash loop — strictly worse
+than running with one proxy untrusted. The two halves are tested adjacently, in `src/config.rs` and
+again as two neighbouring live-boot sections in `test_e2e.sh` §26, so the contrast is legible.
+
+Three supporting decisions:
+
+- **`hostname_rejection` returns the reason, not a bool.** The reason is the whole value of the check
+  to an operator: "not a valid hostname" sends them to the manual, "made only of digits and dots"
+  sends them to the typo. It also tightened the rule to the peer's: first and last characters must be
+  alphanumeric, which newly rejects a trailing `.` and a leading/trailing `_` that the old predicate
+  accepted. `simply_hook_executor::config::is_hostname_like` now has a byte-for-byte counterpart.
+- **Every bad entry is collected, not the first.** An operator who mistyped three lines needs one
+  restart to find all three. The e2e asserts both are named.
+- **`StartupConfigError`** (in `state.rs`) unifies this with the existing `CryptoError` path. Both
+  variants share the property that makes them fatal: each configures a security boundary whose only
+  alternative to aborting is silently applying a different one.
+
+The `FATAL:` line is emitted per entry, before the database is opened and long before
+`prime_with_grace` runs any DNS. Confirmed by hand — three entries, three lines, no `.db` created.
+
+### 2. The `sha256=` prefix is mandatory, inbound and outbound
+
+`verify_signature` did `strip_prefix("sha256=").unwrap_or(provided)` — both spellings accepted. It is
+now `strip_prefix(SIGNATURE_PREFIX)?`, and the `?` is the load-bearing character.
+
+**Why, given it bought compatibility for free.** Two reasons, neither of them urgent on its own:
+
+- **Agility.** The prefix names the algorithm. While `sha256` is the only value it can take, an
+  unlabelled digest is merely untidy; the day a second algorithm is offered, every bare digest
+  already in a log or a config becomes ambiguous, and the shim that disambiguates them is the
+  downgrade surface that makes algorithm confusion possible. Requiring the tag *now* makes adding a
+  second one a non-event.
+- **Convergence — and a live bug.** `simply_hook_executor` has always required the prefix. Our
+  outbound `CANONICAL_V1` webhook sent bare hex, and that mode exists specifically so a dispatch can
+  authenticate against another instance's `/api/*` route. So vault→executor dispatch was **already
+  broken** and nothing failed loudly, because the symptom is a rejected webhook rather than a
+  finding. Both directions now agree.
+
+**`compute_signature` returns the whole header value**, `sha256=<hex>`, not a bare digest. That is
+what makes "produce a signature" and "produce a valid header" the same operation — there is no longer
+a code path in this crate that emits a bare digest for a caller to send by mistake. It also meant
+almost every call site needed no change, since they all feed it straight into a header.
+
+Producers updated in lockstep, because a mandate with a producer left behind is an outage:
+`webhooks.rs` (`CANONICAL_V1`; `BODY_ONLY` already prefixed and now shares the constant),
+`static/app.js` (`signRequest` returns the full value), `scripts/test_e2e.sh` (`hmac_sign` likewise),
+plus `AGENT.MD`, `SCHEMA.MD`, `README.md` and the `AuthMode` doc comment. The middleware also gained a
+named `401` — `"X-Signature-256 must be formatted as sha256=<hex>"` — because the alternative is an
+operator staring at "Invalid request signature" while their HMAC is in fact correct. `crypto` remains
+the authority; that check is a diagnostic and is placed before the key lookup so a malformed request
+costs no query.
+
+**This is a wire-format change.** A hand-rolled caller (a `fail2ban` action, a shell script) sending
+a bare digest now gets `401`. The two copy-pasteable `call()` helpers were updated; the README's also
+had a stale `${path%%\?*}` that stripped the query string, which has been wrong since the full target
+became the signed material, so it was fixed in the same edit rather than left as a snippet that
+produces invalid signatures.
+
+### 3. Two test gaps closed
+
+- **`SecretCipher::from_env`** was never exercised directly. `from_hex_key` tests prove the *parser*
+  refuses a bad key; they say nothing about whether the environment reader propagates the refusal,
+  and the reader is where the dangerous alternative lives — one `.unwrap_or(Plaintext)` there turns
+  every one of those green tests into a silent downgrade. Both variable names are covered (the alias
+  exists so one provisioning system feeds both services, and an alias that failed open would be a
+  hole in the less-travelled path), plus a malformed primary that must **not** be rescued by a valid
+  alias, and the blank-string cases that must mean "unset" rather than "malformed".
+- **The HMAC mutation sweep** was character-level: it replaced each hex position with one of four
+  fixed digits, so it never distinguished the two nibbles of a byte. It now sweeps the decoded tag —
+  all 32 bytes × 8 bits = **256 single-bit forgeries** — plus every wrong width from empty to double.
+  That is the exhaustive statement of what the constant-time comparison buys.
+
+Both env-var suites (here and in `config.rs`) serialize on a module-local `Mutex` and restore the
+prior values, because the environment is process-global and this suite runs in parallel. Poisoning is
+recovered from rather than propagated, so one failing test does not cascade into four.
+
+### 4. `resolve_hostname` struck from the convergence report
+
+Session 28 established it was a false positive: the peer returns `false` in exactly the two empty
+cases, so its bool is `!networks.is_empty()` by construction — precisely what our caller derives.
+Keeping it listed cost something real, since a divergence report naming a difference that carries no
+behaviour trains its reader to skim, and the entries below it matter. Replaced with an assertion on
+the fail-closed outcome, which is the property a regression there would actually break. Two new
+assertions track the newly-shared prefix rule, including an `assert_absent` on the exact edit that
+would reintroduce the fallback. **2 documented divergences → 1; 28 → 30 matching.**
+
+### Mutation-checked — including one that caught a flaw in a test written this session
+
+Five mutations, each reverted immediately (`grep MUTATION src/` is clean):
+
+| Mutation | Result |
+| :--- | :--- |
+| `strip_prefix(...).unwrap_or(provided)` in `verify_signature` | `a_correct_digest_without_the_mandatory_tag_does_not_verify` FAILS |
+| middleware format check deleted **and** the above | `attack_signature_forgery_...` FAILS |
+| `parse_trusted_proxies` drops invalid entries instead of erroring | 3 config tests FAIL |
+| `hostname_rejection` reverted to the loose edge rule | 4 config tests FAIL |
+| `from_env` degrades to `Plaintext` on a bad key | `a_malformed_key_in_either_variable_...` FAILS |
+| `verify_slice` replaced by a 16-byte prefix compare | the bit sweep FAILS |
+
+The second row is the one worth recording. On the first attempt, disabling **both** enforcement
+layers left `security_tests` fully green — the HTTP-level bare-digest assertion was passing for the
+wrong reason. The control request at the top of that test had already consumed the digest, so the
+*replay guard* was issuing the `401`, not the format rule. Fixed by signing over a fresh timestamp
+that has never been accepted, and adding a positive control asserting the same signature *with* its
+tag returns `200`. Lesson: in a suite where the replay guard is active, any test reusing a signature
+already sent is at risk of asserting the wrong rejection — a bare `assert_eq!(status, 401)` does not
+say *which* rule fired.
+
+(Single-layer check: with only the middleware diagnostic removed, the test still passes — `crypto` is
+the authority and holds the line alone. Defence in depth confirmed rather than assumed.)
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **163 passed**, 0 failed (70 unit + 56 RBAC + 37 security; +8) |
+| `./scripts/test_e2e.sh` | **413/413**, 0 failed (+6) |
+| `./scripts/verify_convergence.sh` | 30 matching, **1** documented divergence, 0 unexplained |
+
+One e2e check needed repair rather than replacement: §27a uppercased the whole signature to prove
+`sha256=AB…` and `ab…` cannot be recorded as two distinct uses. Uppercasing now hits the
+case-sensitive tag and is refused for its format *before* the replay guard runs, so it would have
+passed while proving nothing. It now uppercases the digest alone.
+
+### Still outstanding
+
+- `CAPACITY_BACKOFF_DIVISOR` still not ported back to `simply_hook_executor` (carried from Sessions
+  25/26). Unchanged: it is a change to the peer tree, which is read-only from here.

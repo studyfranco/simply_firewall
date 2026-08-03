@@ -118,6 +118,53 @@ const NEGATIVE_TTL: Duration = Duration::from_secs(5);
 /// for that entry only), and the outcome is logged either way.
 const BOOT_GRACE_PERIOD: Duration = Duration::from_secs(60);
 
+/// A `TRUSTED_PROXIES` entry that is not a valid spelling of anything, and why.
+///
+/// Distinct from a hostname that merely fails to resolve *right now*: this is a value that can
+/// never become usable no matter what DNS does, so it is a configuration error rather than a
+/// transient one. See [`InvalidTrustedProxies`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidProxyEntry {
+    /// The entry exactly as written, so the operator can find it in their configuration.
+    pub entry: String,
+    /// Why it was refused, phrased to name the mistake rather than the rule.
+    pub reason: &'static str,
+}
+
+/// Startup refusal: at least one `TRUSTED_PROXIES` entry was syntactically impossible.
+///
+/// # Why this aborts rather than dropping the entry
+///
+/// Every other malformed override in this module falls back to a default, because the fallback is
+/// unambiguous and safe. This one is neither. `TRUSTED_PROXIES` is the list of peers permitted to
+/// *rewrite the client address every authorization decision is made against*, and an entry that
+/// cannot be parsed leaves that boundary in a state nobody has established:
+///
+/// - Silently dropping it fails **closed** for the entry itself, but the operator wrote it because
+///   they have a proxy there. Every request through that proxy is then attributed to the proxy's own
+///   address, so a CIDR-bound key gets `403` — an outage whose cause is one `warn!` line in a log
+///   nobody reads until the incident.
+/// - The mistake is usually one character (`10.0.0.0/8x`, `10.0.0.256`), and a one-character typo
+///   silently changing which network is trusted is precisely the class of error a trust boundary
+///   must not absorb quietly.
+///
+/// Refusing to start converts both into a loud, immediate, unmissable failure at the only moment the
+/// operator is watching. It is safe to be this strict *because* the check is purely syntactic: a
+/// hostname that is well-formed but currently unresolvable is not an error here at all — it keeps
+/// the [`BOOT_GRACE_PERIOD`] path, because DNS being down is a transient condition and crash-looping
+/// through it would be strictly worse than serving with one entry disabled.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{} invalid {TRUSTED_PROXIES_ENV} entr{}: {}",
+    entries.len(),
+    if entries.len() == 1 { "y" } else { "ies" },
+    entries.iter().map(|e| format!("{:?} ({})", e.entry, e.reason)).collect::<Vec<_>>().join("; ")
+)]
+pub struct InvalidTrustedProxies {
+    /// Every rejected entry, so one restart surfaces all of the typos rather than the first.
+    pub entries: Vec<InvalidProxyEntry>,
+}
+
 /// A `TRUSTED_PROXIES` entry: either a fixed network or a name resolved at request time.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxyMatcher {
@@ -229,24 +276,35 @@ impl TrustedProxies {
         }
     }
 
-    /// Reads and parses [`TRUSTED_PROXIES_ENV`], warning about entries that could not be parsed.
-    pub fn from_env() -> Self {
+    /// Reads and parses [`TRUSTED_PROXIES_ENV`], refusing to build if any entry is malformed.
+    ///
+    /// Every rejected entry is logged on its own `FATAL:` line before the error is returned, because
+    /// the error travels up to `main` and is printed once: an operator with three typos should see
+    /// three lines naming three entries, not one line naming the first. This runs before any DNS
+    /// resolution or grace-period logic — the check is syntactic, so there is nothing to wait for.
+    ///
+    /// An **unset** variable is not an error. That is the zero-configuration case, and it means
+    /// "trust nothing", which is the safe posture rather than an ambiguous one.
+    pub fn from_env() -> Result<Self, InvalidTrustedProxies> {
         let Ok(raw) = std::env::var(TRUSTED_PROXIES_ENV) else {
-            return Self::default();
+            return Ok(Self::default());
         };
 
-        let (matchers, rejected) = parse_trusted_proxies(&raw);
-        if !rejected.is_empty() {
-            tracing::error!(
-                "Ignoring {} unusable {} entr{}: {:?}. These hosts will NOT be trusted to set \
-                 X-Forwarded-For.",
-                rejected.len(),
-                TRUSTED_PROXIES_ENV,
-                if rejected.len() == 1 { "y" } else { "ies" },
-                rejected
-            );
+        match parse_trusted_proxies(&raw) {
+            Ok(matchers) => Ok(Self::new(matchers)),
+            Err(entries) => {
+                for invalid in &entries {
+                    tracing::error!(
+                        "FATAL: {} entry '{}' is not a valid IP address, CIDR range, or hostname \
+                         ({}). Refusing to start with an ambiguous trust boundary.",
+                        TRUSTED_PROXIES_ENV,
+                        invalid.entry,
+                        invalid.reason
+                    );
+                }
+                Err(InvalidTrustedProxies { entries })
+            }
         }
-        Self::new(matchers)
     }
 
     /// Overrides both DNS reuse windows. Test-facing: a suite cannot wait 30 seconds to observe
@@ -458,36 +516,46 @@ async fn resolve_hostname(hostname: &str) -> Vec<IpNetwork> {
     }
 }
 
-/// Parses a `TRUSTED_PROXIES` value into matchers, returning the entries that were unusable.
+/// Parses a `TRUSTED_PROXIES` value into matchers, or reports every entry that is unusable.
 ///
 /// Three spellings are accepted, tried in order: a CIDR range (`172.16.0.0/12`), a bare address
 /// (`127.0.0.1`, promoted to a single-host network so nobody has to remember `/32`), and otherwise
 /// a hostname (`traefik`) resolved at request time.
 ///
-/// A malformed entry is dropped with a warning rather than aborting startup. The failure mode is
-/// deliberately the safe one: a dropped entry means a proxy is *not* trusted, so requests through it
-/// are evaluated against its own address instead of a header it forwarded.
-pub fn parse_trusted_proxies(raw: &str) -> (Vec<ProxyMatcher>, Vec<String>) {
+/// Anything else is a **hard error** rather than a dropped entry — see [`InvalidTrustedProxies`] for
+/// why a trust boundary is the one setting in this module that must not degrade quietly. Every bad
+/// entry is collected rather than the first, so an operator fixing a mistyped list needs one restart
+/// and not one per typo.
+///
+/// The check is purely syntactic and does no I/O: a well-formed hostname is accepted here whether or
+/// not it currently resolves, which is what keeps a DNS outage from becoming a refusal to boot.
+pub fn parse_trusted_proxies(raw: &str) -> Result<Vec<ProxyMatcher>, Vec<InvalidProxyEntry>> {
     let mut matchers = Vec::new();
-    let mut rejected = Vec::new();
+    let mut invalid = Vec::new();
 
     for entry in raw.split(',').map(str::trim).filter(|e| !e.is_empty()) {
         if let Ok(net) = entry.parse::<IpNetwork>() {
             matchers.push(ProxyMatcher::Network(net));
         } else if let Ok(addr) = entry.parse::<IpAddr>() {
             matchers.push(ProxyMatcher::Network(IpNetwork::from(addr)));
-        } else if is_plausible_hostname(entry) {
-            matchers.push(ProxyMatcher::Hostname(entry.to_owned()));
         } else {
-            rejected.push(entry.to_owned());
+            match hostname_rejection(entry) {
+                None => matchers.push(ProxyMatcher::Hostname(entry.to_owned())),
+                Some(reason) => {
+                    invalid.push(InvalidProxyEntry { entry: entry.to_owned(), reason });
+                }
+            }
         }
     }
 
-    (matchers, rejected)
+    if invalid.is_empty() { Ok(matchers) } else { Err(invalid) }
 }
 
-/// Whether `entry` could be a DNS name, so obvious garbage is rejected at startup rather than
-/// becoming a name that quietly never resolves.
+/// Why `entry` cannot be a DNS name, or `None` when it is shaped like one.
+///
+/// Returns the *reason* rather than a bool because the reason is the entire value of this check to
+/// an operator: "not a valid hostname" sends them to the manual, "made only of digits and dots"
+/// sends them to the typo.
 ///
 /// Deliberately strict about the two shapes that are *nearly* addresses. An entry reaching this
 /// point already failed to parse as an address and as a CIDR, and the ways that happens are a typo
@@ -499,19 +567,40 @@ pub fn parse_trusted_proxies(raw: &str) -> (Vec<ProxyMatcher>, Vec<String>) {
 /// - Anything made only of digits and dots is refused for the same reason: `10.0.0.256` is a
 ///   mistyped IPv4 literal, not a hostname, and treating it as one would hide the typo behind a
 ///   perfectly quiet non-match.
-fn is_plausible_hostname(entry: &str) -> bool {
-    if entry.is_empty() || entry.len() > 253 {
-        return false;
+/// - The first and last characters must be alphanumeric. That is stricter than the RFC, which
+///   permits a trailing `.` to mark a fully-qualified name, and the strictness is the point: a
+///   trailing separator is far more often a stray comma-splice or a copy-paste artefact than a
+///   deliberate root anchor, and `tokio::net::lookup_host` treats `proxy.` and `proxy` identically
+///   anyway. This is byte-for-byte the rule `simply_hook_executor::config::is_hostname_like`
+///   applies, so both services refuse exactly the same set.
+fn hostname_rejection(entry: &str) -> Option<&'static str> {
+    if entry.is_empty() {
+        return Some("empty");
     }
-    if entry.starts_with('-') || entry.starts_with('.') || entry.ends_with('-') {
-        return false;
+    if entry.len() > 253 {
+        return Some("longer than the 253-character limit on a DNS name");
+    }
+    if entry.contains('/') || entry.contains(':') {
+        return Some(
+            "contains '/' or ':', which appear only in CIDR and IPv6 syntax, so this is a \
+             malformed address rather than a hostname",
+        );
+    }
+    let bytes = entry.as_bytes();
+    let edges_are_alphanumeric = bytes
+        .first()
+        .zip(bytes.last())
+        .is_some_and(|(first, last)| first.is_ascii_alphanumeric() && last.is_ascii_alphanumeric());
+    if !edges_are_alphanumeric {
+        return Some("a hostname must begin and end with a letter or a digit");
     }
     if entry.chars().all(|c| c.is_ascii_digit() || c == '.') {
-        return false;
+        return Some("made only of digits and dots, so this is a malformed IPv4 literal");
     }
-    entry
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+    if !entry.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_') {
+        return Some("contains characters that cannot appear in a DNS name");
+    }
+    None
 }
 
 /// Normalizes an IPv4-mapped IPv6 address (`::ffff:192.168.1.1`) down to its plain IPv4 form.
@@ -617,15 +706,22 @@ mod tests {
     }
 
     fn proxies(entries: &str) -> TrustedProxies {
-        let (matchers, rejected) = parse_trusted_proxies(entries);
-        assert!(rejected.is_empty(), "fixture entries must all be usable: {rejected:?}");
-        TrustedProxies::new(matchers)
+        TrustedProxies::new(parse(entries))
+    }
+
+    /// Parses entries a fixture asserts are all valid.
+    fn parse(entries: &str) -> Vec<ProxyMatcher> {
+        parse_trusted_proxies(entries).expect("fixture entries must all be usable")
+    }
+
+    /// The entries a malformed configuration reports, in order.
+    fn rejections(entries: &str) -> Vec<InvalidProxyEntry> {
+        parse_trusted_proxies(entries).expect_err("these entries must be refused")
     }
 
     /// The literal networks in a parsed configuration, for assertions about parsing itself.
     fn only_networks(entries: &str) -> Vec<IpNetwork> {
-        parse_trusted_proxies(entries)
-            .0
+        parse(entries)
             .into_iter()
             .filter_map(|m| match m {
                 ProxyMatcher::Network(n) => Some(n),
@@ -648,34 +744,75 @@ mod tests {
 
     #[test]
     fn entries_are_classified_as_network_or_hostname_and_garbage_is_rejected() {
-        let (matchers, rejected) = parse_trusted_proxies("10.0.0.0/8, traefik, proxy.internal");
-        assert!(rejected.is_empty(), "all three are usable spellings");
         assert_eq!(
-            matchers,
+            parse("10.0.0.0/8, traefik, proxy.internal"),
             vec![
                 ProxyMatcher::Network("10.0.0.0/8".parse().expect("valid CIDR")),
                 ProxyMatcher::Hostname("traefik".to_owned()),
                 ProxyMatcher::Hostname("proxy.internal".to_owned()),
-            ]
+            ],
+            "all three are usable spellings"
         );
 
         // A near-miss CIDR must NOT be quietly demoted to a hostname: the `/` makes it impossible
         // as a DNS name, so it surfaces as a configuration error instead of a silent non-match.
-        let (matchers, rejected) = parse_trusted_proxies("10.0.0.0/99, 10.0.0.0/8");
-        assert_eq!(rejected, vec!["10.0.0.0/99".to_owned()]);
-        assert_eq!(matchers.len(), 1, "only the well-formed CIDR is kept");
+        let refused = rejections("10.0.0.0/99, 10.0.0.0/8");
+        assert_eq!(refused.len(), 1, "the well-formed entry alongside it is not an error");
+        assert_eq!(refused[0].entry, "10.0.0.0/99");
 
         // Nor may a mistyped IPv4 literal become a hostname — the same reasoning, and the case the
         // peer service already rejected while this one did not.
         for typo in ["999.1.1.1", "10.0.0.256", "1.2.3.4.5", "10..0.1"] {
-            let (matchers, rejected) = parse_trusted_proxies(typo);
-            assert!(matchers.is_empty(), "{typo:?} must not become a matcher");
-            assert_eq!(rejected, vec![typo.to_owned()], "{typo:?} must be reported");
+            let refused = rejections(typo);
+            assert_eq!(refused.len(), 1, "{typo:?} must be reported exactly once");
+            assert_eq!(refused[0].entry, typo);
         }
 
-        // Other impossible shapes.
-        let (_, rejected) = parse_trusted_proxies("-leading, trailing-, .dotted, has space");
-        assert_eq!(rejected.len(), 4);
+        // Other impossible shapes, including the two the strict edge rule adds: a trailing `.` and
+        // a leading `_`, both of which the older predicate accepted as names.
+        let refused = rejections("-leading, trailing-, .dotted, has space, trailing.dot., _under");
+        assert_eq!(
+            refused.iter().map(|r| r.entry.as_str()).collect::<Vec<_>>(),
+            ["-leading", "trailing-", ".dotted", "has space", "trailing.dot.", "_under"],
+            "every bad entry is collected, so one restart surfaces all of the typos"
+        );
+    }
+
+    /// A rejection has to say *which* mistake was made, because that is the whole difference between
+    /// an operator finding a typo and an operator reading the manual.
+    #[test]
+    fn a_rejected_entry_names_the_mistake_rather_than_the_rule() {
+        let cases = [
+            ("10.0.0.0/8x", "CIDR and IPv6 syntax"),
+            ("10.0.0.256", "malformed IPv4 literal"),
+            ("proxy.internal.", "begin and end with a letter or a digit"),
+            ("pro xy", "cannot appear in a DNS name"),
+        ];
+        for (entry, expected) in cases {
+            let refused = rejections(entry);
+            assert!(
+                refused[0].reason.contains(expected),
+                "{entry:?} was refused for {:?}, which does not mention {expected:?}",
+                refused[0].reason
+            );
+        }
+
+        // A 254-character label is over the DNS limit and must say so rather than falling through
+        // to the character check, which it would also pass.
+        let too_long = "a".repeat(254);
+        assert!(rejections(&too_long)[0].reason.contains("253-character"));
+    }
+
+    /// The strict edge rule is the one behaviour shared byte-for-byte with the peer service, so it
+    /// gets its own test rather than being asserted only through `parse_trusted_proxies`.
+    #[test]
+    fn hostname_syntax_matches_the_peer_services_rule() {
+        for name in ["traefik", "proxy.internal", "a", "x1-y2.example.com", "under_score.local"] {
+            assert!(hostname_rejection(name).is_none(), "{name:?} must be accepted");
+        }
+        for name in ["proxy.", "-proxy", "proxy-", ".proxy", "_proxy", "proxy_", "10.0.0.0/8"] {
+            assert!(hostname_rejection(name).is_some(), "{name:?} must be refused");
+        }
     }
 
     #[test]
@@ -1027,5 +1164,111 @@ mod tests {
         let trusted = only_networks("10.0.0.0/8");
         let hdrs = headers(&[("X-Forwarded-For", "::ffff:203.0.113.50")]);
         assert_eq!(resolve_client_ip(ip("::ffff:10.0.0.1"), &hdrs, &trusted), ip("203.0.113.50"));
+    }
+
+    /// Serializes the tests that read [`TRUSTED_PROXIES_ENV`].
+    ///
+    /// The environment is process-global and this suite runs in parallel, so two tests setting the
+    /// same variable would interleave. Poisoning is recovered from rather than propagated: one
+    /// failing test must not cascade into "the other four also failed", which hides the real cause.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `body` with [`TRUSTED_PROXIES_ENV`] set to `value` (or unset when `None`), restoring
+    /// whatever was there before.
+    fn with_trusted_proxies_env<T>(value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let previous = std::env::var(TRUSTED_PROXIES_ENV).ok();
+
+        // SAFETY: `ENV_LOCK` is held for the whole body, and every test in this module that touches
+        // this variable goes through this helper, so no other thread reads or writes it meanwhile.
+        // The restore below runs on the success path; a panicking `body` aborts the test process's
+        // view of this variable only, and the next test sets it again before reading.
+        unsafe {
+            match value {
+                Some(raw) => std::env::set_var(TRUSTED_PROXIES_ENV, raw),
+                None => std::env::remove_var(TRUSTED_PROXIES_ENV),
+            }
+        }
+
+        let outcome = body();
+
+        // SAFETY: as above — still under `ENV_LOCK`.
+        unsafe {
+            match previous {
+                Some(raw) => std::env::set_var(TRUSTED_PROXIES_ENV, raw),
+                None => std::env::remove_var(TRUSTED_PROXIES_ENV),
+            }
+        }
+        outcome
+    }
+
+    /// A syntactically impossible entry must stop the daemon **before** anything else happens.
+    ///
+    /// This is the abort half of the split that gives this module its shape. `from_env` is the exact
+    /// call `main` makes, and in `main` it sits ahead of the database connection and far ahead of
+    /// `prime_with_grace`, so an `Err` here *is* the refusal to start — there is no later stage that
+    /// could decide to carry on with a partial list.
+    ///
+    /// Every bad entry must come back, not just the first: an operator who mistyped three lines
+    /// should need one restart to find all three.
+    #[test]
+    fn a_malformed_entry_refuses_to_build_the_trust_boundary_at_all() {
+        let err = with_trusted_proxies_env(Some("10.0.0.0/99, 127.0.0.1, proxy., !nope"), || {
+            TrustedProxies::from_env().expect_err("a malformed entry must abort")
+        });
+
+        assert_eq!(
+            err.entries.iter().map(|e| e.entry.as_str()).collect::<Vec<_>>(),
+            ["10.0.0.0/99", "proxy.", "!nope"],
+            "all three bad entries are reported, and the good one is not"
+        );
+
+        // The `Display` an operator actually sees has to carry the entries and their reasons; an
+        // error that only says "invalid configuration" would send them back to the logs.
+        let rendered = err.to_string();
+        assert!(rendered.contains("10.0.0.0/99"), "the rendered error names the entry: {rendered}");
+        assert!(rendered.contains("CIDR"), "...and why it was refused: {rendered}");
+    }
+
+    /// ...whereas a name that is merely *unresolvable* is not a configuration error at all.
+    ///
+    /// This is the other half, and the one that has to keep working: DNS is a runtime dependency
+    /// that goes away and comes back, and a daemon that refuses to boot while it is away turns a
+    /// brief resolver outage into a crash loop — strictly worse than serving with one proxy entry
+    /// disabled. `.invalid` is reserved by RFC 2606 precisely so it can never resolve.
+    ///
+    /// `prime` is what `prime_with_grace` calls, so driving it directly asserts the grace path's
+    /// substance — the name is *kept*, reported as failing, and left for the next retry — without
+    /// waiting out the 60-second timer.
+    #[tokio::test]
+    async fn an_unresolvable_hostname_is_kept_and_left_to_the_grace_period() {
+        let trusted =
+            with_trusted_proxies_env(Some("127.0.0.1, definitely-not-a-real-host.invalid"), || {
+                TrustedProxies::from_env().expect("valid syntax must build even when DNS fails")
+            });
+
+        assert_eq!(trusted.matchers().len(), 2, "the unresolvable name is kept as a matcher");
+
+        let failed = trusted.prime().await;
+        assert_eq!(
+            failed,
+            vec!["definitely-not-a-real-host.invalid".to_owned()],
+            "it is reported as failing, which is what the grace-period retry acts on"
+        );
+
+        // Failing to resolve must not disturb the entries that did: the literal is still trusted,
+        // and the dead name simply contributes no addresses.
+        let resolved = trusted.resolved().await;
+        assert!(is_trusted(ip("127.0.0.1"), &resolved), "the literal entry is unaffected");
+        assert_eq!(resolved.len(), 1, "the dead name contributes nothing rather than everything");
+    }
+
+    /// An unset variable is the zero-configuration case, not a malformed one.
+    #[test]
+    fn an_unset_variable_trusts_nothing_without_complaining() {
+        let trusted = with_trusted_proxies_env(None, || {
+            TrustedProxies::from_env().expect("unset is not an error")
+        });
+        assert!(trusted.is_empty(), "unset means trust nothing");
     }
 }

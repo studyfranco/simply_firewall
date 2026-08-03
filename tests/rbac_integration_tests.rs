@@ -35,7 +35,8 @@ fn proxied_state(
     AppState::with_trusted_proxies(
         db.clone(),
         webhook_tx,
-        simply_ip_vault::config::parse_trusted_proxies("127.0.0.1").0,
+        simply_ip_vault::config::parse_trusted_proxies("127.0.0.1")
+            .expect("the loopback literal is a valid entry"),
     )
 }
 
@@ -3105,8 +3106,12 @@ async fn test_canonical_v1_webhook_sends_timestamp_and_canonical_signature() {
     let skew = (chrono::Utc::now().timestamp() - parsed).abs();
     assert!(skew < 300, "X-Timestamp should be current, was {skew}s off");
 
-    // Bare hex, not the `sha256=` prefix BODY_ONLY uses — byte-identical to what the API produces.
-    assert!(!signature.starts_with("sha256="), "CANONICAL_V1 sends bare hex, got {signature}");
+    // `sha256=`-prefixed, byte-identical to what `compute_signature` produces and to what the
+    // inbound middleware now requires — which is what makes vault-to-vault dispatch work at all.
+    assert!(
+        signature.starts_with(simply_ip_vault::crypto::SIGNATURE_PREFIX),
+        "CANONICAL_V1 must send the mandatory sha256= prefix, got {signature}"
+    );
 
     let expected = simply_ip_vault::crypto::compute_signature(
         secret, "POST", "/hook", &timestamp, delivered_body.as_bytes(),

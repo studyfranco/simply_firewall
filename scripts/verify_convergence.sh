@@ -186,17 +186,23 @@ compare_fn "IPv4-mapped normalization" \
 compare_fn "trusted-network membership" \
     "src/config.rs" "is_trusted" \
     "src/config.rs" "is_trusted"
-compare_fn "hostname resolution" \
-    "src/config.rs" "resolve_hostname" \
-    "src/config.rs" "resolve_hostname" \
-    "same lookup, same fail-closed outcome; the peer returns (addresses, resolved) so it can log a
-     name that resolved to an empty answer differently from one that did not resolve at all, while
-     this service infers both from addresses.is_empty(). Trust behaviour is identical — an
-     unresolvable and an empty name are equally untrusted, and both are cached on the negative TTL.
-     Diagnosability only. Recorded 2026-08-02; adopting the peer's tuple is a candidate follow-up"
 compare_fn "bind-address parsing" \
     "src/config.rs" "parse_bind_addr" \
     "src/config.rs" "parse_bind_addr"
+# `resolve_hostname` is deliberately NOT diffed here, and this note is the reason.
+#
+# It was tracked as a documented divergence until 2026-08-03 because the return shapes differ: the
+# peer hands back `(Vec<IpNetwork>, bool)` where this service returns `Vec<IpNetwork>`. Reading both
+# retired that as a false positive. The peer returns `false` in exactly the two empty cases — a
+# lookup error, and a success with zero addresses — so its bool is `!networks.is_empty()` by
+# construction, which is precisely what this service's caller derives at the call site. There is no
+# state either function can be in that the other cannot express.
+#
+# Keeping it listed cost something real: a divergence report that names a difference carrying no
+# behaviour trains its reader to skim, and the entries below it are ones that genuinely matter. The
+# fail-closed outcome — the property a regression here would actually break — is asserted instead.
+assert_present "an unresolvable hostname is logged and trusted with nothing (fail closed)" \
+    "src/config.rs" "Could not resolve TRUSTED_PROXIES hostname"
 assert_present "negative DNS caching is configured" \
     "src/config.rs" "NEGATIVE_TTL"
 assert_present "boot grace period for unresolvable names" \
@@ -213,6 +219,15 @@ assert_present "constant-time signature comparison" \
     "src/crypto.rs" "verify_slice"
 assert_present "the encryption key is length-checked, not hashed into shape" \
     "src/crypto.rs" "KEY_LEN"
+# Both services require `X-Signature-256: sha256=<hex>` and reject a bare digest. This service
+# accepted either spelling until 2026-08-03, which meant a request it would take was one the peer
+# would refuse — a difference that surfaces as a broken dispatch rather than as a finding. The `?`
+# is the load-bearing character: `strip_prefix(...).unwrap_or(provided)` is the exact edit that
+# reintroduces the fallback, and it looks like a tidy-up rather than a downgrade.
+assert_present "the sha256= prefix is mandatory, not stripped-if-present" \
+    "src/crypto.rs" 'strip_prefix\(SIGNATURE_PREFIX\)\?'
+assert_absent "no bare-hex signature fallback" \
+    'strip_prefix\("sha256="\)[[:space:]]*\.unwrap_or'
 # The whole point of the constant-time comparison is undone by one `==` on a digest, and that is an
 # easy edit for someone "simplifying" the code. There is no legitimate reason for either spelling to
 # reappear, so this is an absolute prohibition rather than a comparison.

@@ -191,7 +191,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // trusted proxies configured, a deployment that *is* behind a reverse proxy will reject every
     // request from a CIDR-bound key with 403, because every request appears to come from the proxy.
     // That is the safe direction to fail, but only if the operator is told why.
-    let trusted_proxies = simply_ip_vault::config::TrustedProxies::from_env();
+    //
+    // A *malformed* entry, by contrast, is fatal: `from_env` logs one `FATAL:` line per bad entry
+    // and returns here, before the database is opened and long before `prime_with_grace` runs any
+    // DNS. The check is purely syntactic, so a hostname that is merely unresolvable right now is not
+    // affected — that keeps the grace period, because DNS being briefly down must not crash-loop the
+    // daemon.
+    let trusted_proxies = simply_ip_vault::config::TrustedProxies::from_env()?;
     if trusted_proxies.is_empty() {
         tracing::warn!(
             "{} is not set: X-Forwarded-For and X-Real-IP are IGNORED and every key is matched \

@@ -304,13 +304,19 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
                         }
                     };
                     mac.update(payload.as_bytes());
-                    Some(format!("sha256={}", hex::encode(mac.finalize().into_bytes())))
+                    Some(format!(
+                        "{}{}",
+                        crate::crypto::SIGNATURE_PREFIX,
+                        hex::encode(mac.finalize().into_bytes())
+                    ))
                 }
                 // CANONICAL_V1: sign the resolved hmac_template and send the timestamp alongside,
-                // so the receiver can run its own anti-replay check. The signature is bare hex —
-                // with the default template, byte-identical to what the inbound API middleware
-                // produces — so a dispatch can authenticate directly against another instance's
-                // /api/* route.
+                // so the receiver can run its own anti-replay check. Prefixed `sha256=`, exactly
+                // like BODY_ONLY above and exactly like what the inbound API middleware now
+                // requires — that is the whole point of this mode: with the default template the
+                // header is byte-identical to one `crypto::compute_signature` would produce, so a
+                // dispatch authenticates directly against another instance's /api/* route (and
+                // against `simply_hook_executor`, which has always required the prefix).
                 AuthMode::CanonicalV1 => {
                     let timestamp = chrono::Utc::now().timestamp().to_string();
                     // The path is taken from the target URL; a URL that failed to parse cannot be
@@ -338,7 +344,11 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
                     if let Ok(hv) = HeaderValue::from_str(&timestamp) {
                         headers.insert("X-Timestamp", hv);
                     }
-                    Some(hex::encode(mac.finalize().into_bytes()))
+                    Some(format!(
+                        "{}{}",
+                        crate::crypto::SIGNATURE_PREFIX,
+                        hex::encode(mac.finalize().into_bytes())
+                    ))
                 }
                 // No signature to compute: the key header above (API_KEY_ONLY) or nothing at all
                 // (NONE) is the whole credential.

@@ -114,6 +114,23 @@ pub struct WebhookEvent {
     pub cause: Option<String>,
 }
 
+/// A security-relevant environment variable was malformed, so the daemon must not start.
+///
+/// Both variants share one property that makes them fatal rather than recoverable: each configures a
+/// *security boundary*, and for each the only alternative to aborting is to silently apply a
+/// boundary different from the one the operator wrote. Everything else this service reads from the
+/// environment — the bind address, the port — falls back to a documented default, because a default
+/// listen port is unambiguous in a way that "some subset of your trusted proxies" is not.
+#[derive(Debug, thiserror::Error)]
+pub enum StartupConfigError {
+    /// `VAULT_ENCRYPTION_KEY` (or its alias) is not a usable key.
+    #[error(transparent)]
+    EncryptionKey(#[from] crate::crypto::CryptoError),
+    /// At least one `TRUSTED_PROXIES` entry is not a valid address, CIDR, or hostname.
+    #[error(transparent)]
+    TrustedProxies(#[from] crate::config::InvalidTrustedProxies),
+}
+
 /// Global application state shared across handlers
 #[derive(Clone)]
 pub struct AppState {
@@ -144,18 +161,23 @@ pub struct AppState {
 impl AppState {
     /// Builds state with the trusted-proxy list and cipher read from the environment.
     ///
-    /// Returns an error if the configured encryption key is malformed — see
-    /// [`SecretCipher::from_env`]. That failure is deliberately not recoverable here: falling back
-    /// to plaintext would write signing secrets in the clear for an operator who believes they are
-    /// encrypted.
+    /// Returns an error if either security-relevant variable is malformed, and neither failure is
+    /// recoverable here:
+    ///
+    /// - A bad `VAULT_ENCRYPTION_KEY` — see [`SecretCipher::from_env`] — because falling back to
+    ///   plaintext would write signing secrets in the clear for an operator who believes they are
+    ///   encrypted.
+    /// - A bad `TRUSTED_PROXIES` entry — see [`crate::config::InvalidTrustedProxies`] — because
+    ///   dropping it silently leaves the set of peers allowed to rewrite the client address
+    ///   different from the set the operator wrote down.
     pub fn new(
         db: DatabaseConnection,
         webhook_tx: mpsc::Sender<WebhookEvent>,
-    ) -> Result<Self, crate::crypto::CryptoError> {
+    ) -> Result<Self, StartupConfigError> {
         Ok(Self {
             db,
             webhook_tx,
-            trusted_proxies: TrustedProxies::from_env(),
+            trusted_proxies: TrustedProxies::from_env()?,
             cipher: Arc::new(SecretCipher::from_env()?),
             replay: Arc::new(ReplayGuard::default()),
         })

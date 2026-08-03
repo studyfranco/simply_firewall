@@ -484,8 +484,12 @@ class FirewallClient {
     }
 
     /**
-     * Computes the hex X-Signature-256 over the CANONICAL_V1 string
+     * Computes the full X-Signature-256 header value over the CANONICAL_V1 string
      * `METHOD\nPATH\nTIMESTAMP\nRAW_BODY`.
+     *
+     * Returns `sha256=<hex>`, not a bare digest: the server requires the prefix and rejects an
+     * unlabelled digest with 401. Returning the whole header value here (rather than prefixing at
+     * the call site) keeps the two from drifting apart.
      *
      * `path` must exclude the query string, matching the server's `crypto::verify_signature`.
      *
@@ -498,12 +502,12 @@ class FirewallClient {
         const message = encoder.encode(`${method}\n${path}\n${timestamp}\n${body}`);
 
         if (!FirewallClient.hasWebCrypto()) {
-            return bytesToHex(hmacSha256Bytes(encoder.encode(this.signingSecret), message));
+            return `sha256=${bytesToHex(hmacSha256Bytes(encoder.encode(this.signingSecret), message))}`;
         }
 
         const key = await this.getHmacKey();
         const digest = await crypto.subtle.sign('HMAC', key, message);
-        return bytesToHex(new Uint8Array(digest));
+        return `sha256=${bytesToHex(new Uint8Array(digest))}`;
     }
 
     // ───────────────────────────────────────────────────────

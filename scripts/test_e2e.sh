@@ -124,12 +124,13 @@ print_response_body() {
     fi
 }
 
-# Computes the hex HMAC-SHA256 the server expects in X-Signature-256, over the CANONICAL_V1 string
-# METHOD\nPATH\nTIMESTAMP\nRAW_BODY (the four fields joined by single LFs, no trailing newline).
+# Computes the full X-Signature-256 header value the server expects — `sha256=<hex>` over the
+# CANONICAL_V1 string METHOD\nPATH\nTIMESTAMP\nRAW_BODY (the four fields joined by single LFs, no
+# trailing newline).
 #
-# The query string is stripped from PATH before signing, matching the server's
-# `crypto::verify_signature` — it signs the URL path only, so that reverse proxies are free to
-# rewrite query parameters without invalidating otherwise-valid requests.
+# The `sha256=` prefix is part of the return value rather than something each call site appends,
+# because the server now *requires* it and a helper that returned a bare digest would put a
+# 401-producing footgun behind every one of the several hundred checks below.
 #
 # `printf` with an explicit `%s\n%s\n%s\n%s` format (rather than `echo`, or interpolating "\n" into
 # a single string) is what makes the delimiters real newlines and keeps the message byte-exact:
@@ -140,9 +141,9 @@ hmac_sign() {
     # CANONICAL_V1 signs the **full request target**, query string included. Stripping it here (as
     # this helper used to) would leave `?hard=true` and `?include_deleted=true` rewritable on an
     # otherwise-valid signed request — and would make the tampering checks below pass vacuously.
-    printf '%s\n%s\n%s\n%s' "$method" "$target" "$timestamp" "$body" \
+    printf 'sha256=%s' "$(printf '%s\n%s\n%s\n%s' "$method" "$target" "$timestamp" "$body" \
         | openssl dgst -sha256 -hmac "$secret" \
-        | sed 's/^.*= //'
+        | sed 's/^.*= //')"
 }
 
 # Last X-Timestamp used per distinct request identity, so a repeated identical call gets a fresh
@@ -525,28 +526,43 @@ check "401" "CANONICAL_V1: omitting X-Timestamp on a signed GET is rejected"
 raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp;" -H "X-Signature-256: $VALID_SIG"
 check "401" "CANONICAL_V1: an empty X-Timestamp is rejected"
 
+# The digest alone, without the mandatory `sha256=` tag. Every mutation below is applied to this and
+# re-tagged, so each one tests the digest comparison rather than accidentally tripping the format
+# check — a distinction that matters now that an untagged value is refused outright.
+VALID_HEX="${VALID_SIG#sha256=}"
+
 # Signature forgery: flip only the final hex digit, keeping 64 valid hex characters so the request
 # reaches the constant-time MAC comparison instead of failing early in hex decoding.
-FORGED_SIG="${VALID_SIG%?}"
-case "${VALID_SIG: -1}" in
-    0) FORGED_SIG="${FORGED_SIG}1" ;;
-    *) FORGED_SIG="${FORGED_SIG}0" ;;
+FORGED_HEX="${VALID_HEX%?}"
+case "${VALID_HEX: -1}" in
+    0) FORGED_HEX="${FORGED_HEX}1" ;;
+    *) FORGED_HEX="${FORGED_HEX}0" ;;
 esac
-raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: $FORGED_SIG"
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: sha256=$FORGED_HEX"
 check "401" "a signature differing only in its last character is rejected"
 
 # ...and the first character, so no position of the digest goes uncompared.
-FIRST_FLIPPED="0${VALID_SIG:1}"
-[ "${VALID_SIG:0:1}" == "0" ] && FIRST_FLIPPED="1${VALID_SIG:1}"
-raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: $FIRST_FLIPPED"
+FIRST_FLIPPED="0${VALID_HEX:1}"
+[ "${VALID_HEX:0:1}" == "0" ] && FIRST_FLIPPED="1${VALID_HEX:1}"
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: sha256=$FIRST_FLIPPED"
 check "401" "a signature differing only in its first character is rejected"
 
 # A truncated signature sharing a valid prefix must not pass a length-agnostic comparison.
-raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: ${VALID_SIG:0:32}"
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: sha256=${VALID_HEX:0:32}"
 check "401" "a truncated signature with a valid prefix is rejected"
 
-raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: ${VALID_SIG}00"
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: sha256=${VALID_HEX}00"
 check "401" "an over-long signature with a valid prefix is rejected"
+
+# The `sha256=` tag is mandatory, so the *correct* digest sent bare must still be refused. This is
+# the one check where the HMAC is genuinely valid and only the framing is wrong: it fails only if
+# the bare-hex fallback comes back, which no digest-mutation check above could ever detect.
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: $VALID_HEX"
+check "401" "a valid digest without the sha256= prefix is rejected"
+
+# Neither may a different algorithm tag be honoured over the same digest.
+raw_call GET "/api/auth/me" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $NOW_TS" -H "X-Signature-256: sha512=$VALID_HEX"
+check "401" "a signature tagged with a different algorithm is rejected"
 
 # The signing secret must never come back from a read endpoint.
 api_call GET "/api/keys" "$MASTER_KEY"
@@ -1497,15 +1513,17 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
             echo -e "$(ts)   ${RED}✗ FAIL${RESET} canonical signature mismatch (got '$HOOK_SIG', expected '$EXPECTED_SIG')" >&2
         fi
 
-        # Bare hex, unlike BODY_ONLY's `sha256=` prefix — identical to what the API itself emits.
+        # `sha256=`-prefixed, exactly like BODY_ONLY and exactly like what the API itself now
+        # requires inbound. This is the property that lets a dispatch authenticate directly against
+        # another instance's /api/* route: a bare digest would be refused with 401 there.
         case "$HOOK_SIG" in
             sha256=*)
-                FAIL_COUNT=$((FAIL_COUNT + 1))
-                echo -e "$(ts)   ${RED}✗ FAIL${RESET} CANONICAL_V1 signature should be bare hex, not sha256=-prefixed" >&2
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} CANONICAL_V1 sends a sha256=-prefixed signature" >&2
                 ;;
             *)
-                PASS_COUNT=$((PASS_COUNT + 1))
-                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} CANONICAL_V1 sends a bare hex signature" >&2
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} CANONICAL_V1 signature must carry the mandatory sha256= prefix" >&2
                 ;;
         esac
     else
@@ -2191,6 +2209,53 @@ fi
 kill "$DEADNS_PID" 2>/dev/null || true
 wait "$DEADNS_PID" 2>/dev/null || true
 
+# --- ...but a malformed TRUSTED_PROXIES entry aborts startup ----------------------------------
+#
+# The exact counterpart of the block above, and the reason the two sit together: an *unresolvable*
+# name is transient and must not stop the service, while a *syntactically impossible* one can never
+# become valid and must. Dropping it silently would leave the set of peers allowed to rewrite the
+# client address different from the set the operator wrote down — and the symptom is a 403 on a
+# CIDR-bound key, hours later, with one warn line as the only evidence.
+#
+# `10.0.0.0/99` is the archetype: one character from a valid CIDR, impossible as a DNS name.
+
+BADPROXY_PORT=$((3000 + 63))
+BADPROXY_DB="$WORK_DIR/badproxy.db"
+BADPROXY_LOG="$WORK_DIR/badproxy_server.log"
+
+log "Booting a throwaway instance with a malformed TRUSTED_PROXIES entry (expected to refuse)..."
+DATABASE_URL="sqlite://$BADPROXY_DB?mode=rwc" RUST_LOG=info \
+    TRUSTED_PROXIES="127.0.0.1,10.0.0.0/99,proxy." \
+    PORT="$BADPROXY_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$BADPROXY_LOG" 2>&1 &
+BADPROXY_PID=$!
+
+BADPROXY_EXITED=0
+for _ in $(seq 1 40); do
+    if ! kill -0 "$BADPROXY_PID" 2>/dev/null; then BADPROXY_EXITED=1; break; fi
+    sleep 0.25
+done
+if [ "$BADPROXY_EXITED" != "1" ]; then
+    kill "$BADPROXY_PID" 2>/dev/null || true
+fi
+wait "$BADPROXY_PID" 2>/dev/null || true
+
+check_local "$BADPROXY_EXITED" "1" "#26 a malformed TRUSTED_PROXIES entry aborts startup"
+if grep -q "FATAL: TRUSTED_PROXIES entry '10.0.0.0/99'" "$BADPROXY_LOG" 2>/dev/null; then
+    check_local "named" "named" "#26 the refusal names the offending entry"
+else
+    check_local "$(head -c 300 "$BADPROXY_LOG" 2>/dev/null)" "named" "#26 the refusal names the offending entry"
+fi
+# Both bad entries, not just the first: one restart has to surface every typo in the list.
+if grep -q "FATAL: TRUSTED_PROXIES entry 'proxy.'" "$BADPROXY_LOG" 2>/dev/null; then
+    check_local "both" "both" "#26 every malformed entry is reported, not just the first"
+else
+    check_local "first-only" "both" "#26 every malformed entry is reported, not just the first"
+fi
+# The abort must precede everything else — no database, no listener, no DNS.
+check_local "$([ -s "$BADPROXY_DB" ] && echo created || echo absent)" "absent" \
+    "#26 no database is provisioned when the trust boundary is ambiguous"
+
 
 # ─────────────────────────────────────────────────────────────
 log_section "27. Hardening — Monotonic Replay Guard, RBAC Revocation & Strict Decryption"
@@ -2213,9 +2278,13 @@ raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SPELL_TS"
     -H "X-Signature-256: $SPELL_SIG" -H "Content-Type: application/json" -d "$SPELL_BODY"
 check "200" "#27 the genuine signed request succeeds"
 
-# The identical signature, uppercased. Hex decoding is case-insensitive, so this is byte-for-byte
-# the same digest — and must be refused as the replay it is.
-SPELL_SIG_UPPER=$(printf '%s' "$SPELL_SIG" | tr '[:lower:]' '[:upper:]')
+# The identical signature with its **digest** uppercased. Hex decoding is case-insensitive, so this
+# is byte-for-byte the same digest — and must be refused as the replay it is.
+#
+# The `sha256=` tag is left alone deliberately. It is a fixed literal matched case-sensitively (as on
+# the peer service), so uppercasing it too would be refused for its format before the replay guard
+# ever ran, and this check would pass while proving nothing about digest keying.
+SPELL_SIG_UPPER="sha256=$(printf '%s' "${SPELL_SIG#sha256=}" | tr '[:lower:]' '[:upper:]')"
 raw_call POST "/api/ban" -H "X-API-Key: $MASTER_KEY" -H "X-Timestamp: $SPELL_TS" \
     -H "X-Signature-256: $SPELL_SIG_UPPER" -H "Content-Type: application/json" -d "$SPELL_BODY"
 check "401" "#27 an uppercased respelling of a used signature is still a replay"

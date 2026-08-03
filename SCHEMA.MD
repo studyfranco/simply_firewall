@@ -197,7 +197,7 @@ Defines HTTP endpoints to notify when IP events occur within a specific group.
 
 | `auth_mode` | Signed message | Headers dispatched | Requires |
 | :--- | :--- | :--- | :--- |
-| `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: <bare hex>`, `X-Timestamp`, and `X-API-Key` when `api_key` is set | `secret_token` |
+| `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: sha256=<hex>`, `X-Timestamp`, and `X-API-Key` when `api_key` is set | `secret_token` |
 | `BODY_ONLY` | `RAW_BODY` | `X-Signature-256: sha256=<hex>` | `secret_token` |
 | `API_KEY_ONLY` | *(none)* | `X-API-Key` | `api_key` |
 | `NONE` | *(none)* | *(none)* | — |

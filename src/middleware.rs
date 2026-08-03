@@ -104,9 +104,10 @@ fn signed_target(parts: &axum::http::request::Parts) -> String {
 /// - `X-API-Key` — the plaintext key, used only to look up the key record by its SHA-256 hash.
 /// - `X-Timestamp` — current UTC Unix time in seconds; must be within
 ///   [`MAX_TIMESTAMP_SKEW_SECS`] of the server's clock or the request is rejected as a replay.
-/// - `X-Signature-256` — hex HMAC-SHA256 over `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`, keyed with the
-///   looked-up key's `signing_secret`, where `TARGET` is the full request target **including the
-///   query string**.
+/// - `X-Signature-256` — `sha256=<hex>`, an HMAC-SHA256 over `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`
+///   keyed with the looked-up key's `signing_secret`, where `TARGET` is the full request target
+///   **including the query string**. The `sha256=` prefix is **required**; a bare hex digest is
+///   rejected. See [`crypto::verify_signature`].
 ///
 /// This is **unconditional for every key**. There is no per-key mode, no `REQUIRE_SIGNED_REQUESTS`
 /// switch, and no route that opts out — `simply_ip_vault` is the internal, higher-trust half of the
@@ -165,6 +166,20 @@ pub async fn auth_middleware(
         .and_then(|h| h.to_str().ok())
         .map(|s| s.to_owned())
         .ok_or_else(|| AppError::Unauthorized("Missing X-Signature-256 header".to_owned()))?;
+
+    // A malformed *shape* is worth naming, because the alternative is an operator staring at
+    // "Invalid request signature" while their HMAC is in fact correct. `crypto::verify_signature`
+    // enforces this too and is the authority — this check exists only so the 401 is diagnosable, and
+    // it must stay a pure string test on a value the caller already sent us. It reveals nothing: the
+    // header format is public, and the answer does not depend on the key, the secret, or the body.
+    //
+    // Placed before the key lookup for the same reason `validate_timestamp` is: a request that
+    // cannot be well-formed should not cost a database round-trip.
+    if !provided_signature.trim().starts_with(crypto::SIGNATURE_PREFIX) {
+        return Err(AppError::Unauthorized(
+            "X-Signature-256 must be formatted as sha256=<hex>".to_owned(),
+        ));
+    }
 
     // Hash the provided key
     let mut hasher = Sha256::new();

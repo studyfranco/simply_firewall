@@ -90,7 +90,20 @@ pub fn canonical_v1_payload(method: &str, target: &str, timestamp: &str, body: &
     message
 }
 
-/// Computes the hex-encoded HMAC-SHA256 request signature for `X-Signature-256`.
+/// The mandatory algorithm tag on every `X-Signature-256` value, inbound and outbound.
+///
+/// Not decoration and not an accommodation for GitHub-style receivers: it is the one part of the
+/// header that says *what the hex means*. See [`verify_signature`] for why a bare digest is refused.
+pub const SIGNATURE_PREFIX: &str = "sha256=";
+
+/// Computes the `X-Signature-256` header value: [`SIGNATURE_PREFIX`] followed by the hex-encoded
+/// HMAC-SHA256 over the CANONICAL_V1 string.
+///
+/// Returns the **whole header value**, prefix included, rather than a bare digest. That is what
+/// makes "produce a signature" and "produce a valid header" the same operation, so a caller cannot
+/// build one without the other: the output of this function feeds straight into
+/// [`verify_signature`], and there is no code path in this crate that emits a bare hex digest for a
+/// caller to accidentally send.
 ///
 /// Infallible in practice: `Hmac` accepts keys of any length, so the only error path is a
 /// `secret` that cannot be used as HMAC key material at all, which is reported as
@@ -107,7 +120,7 @@ pub fn compute_signature(
         AppError::Internal
     })?;
     mac.update(&canonical_v1_payload(method, target, timestamp, body));
-    Ok(hex::encode(mac.finalize().into_bytes()))
+    Ok(format!("{SIGNATURE_PREFIX}{}", hex::encode(mac.finalize().into_bytes())))
 }
 
 /// Verifies a caller-supplied `X-Signature-256` against the expected HMAC.
@@ -132,13 +145,33 @@ pub fn compute_signature(
 /// captured `DELETE /api/ips/{id}` into `…?hard=true` inside the replay window. Signing the whole
 /// target closes that; a proxy that rewrites query strings must now be configured not to.
 ///
-/// A `sha256=` prefix on `provided` is accepted and stripped, matching the format this project
-/// already uses for outbound webhook signatures, so one signing helper can serve both directions.
+/// # Why the `sha256=` prefix is mandatory
+///
+/// `provided` must be exactly [`SIGNATURE_PREFIX`] followed by hex. A bare digest — 64 valid hex
+/// characters with no tag — is refused, and that is a deliberate tightening of an earlier revision
+/// which accepted both spellings.
+///
+/// The prefix names the algorithm, and an unlabelled digest is a field whose meaning depends on
+/// something outside itself. Accepting both shapes cost more than it bought:
+///
+/// - **Agility.** The day a second algorithm is offered, every stored, logged, or transcribed bare
+///   digest becomes ambiguous, and the compatibility shim needed to disambiguate them is exactly the
+///   downgrade surface that makes algorithm confusion possible. Requiring the tag *now*, while
+///   `sha256` is the only value it can take, is what makes adding a second one a non-event.
+/// - **Convergence.** `simply_hook_executor` has always required the prefix, and the two services
+///   authenticate to each other. Accepting a shape the peer rejects meant a request this service
+///   would take was one the peer would refuse — a difference that shows up as a broken dispatch
+///   rather than as a security finding, and so goes unnoticed until it breaks.
+/// - **Cost.** None: `compute_signature` emits the prefix, so every caller using this crate's own
+///   helper was already sending it.
+///
+/// This is a wire-format requirement, so a caller that hand-rolls the header (a `fail2ban` action, a
+/// shell script) must send `X-Signature-256: sha256=<hex>` and not `<hex>` alone.
 ///
 /// # Return value
 ///
 /// `Some(digest)` on success, carrying the **raw decoded digest bytes**, and `None` on any failure
-/// (malformed hex, wrong tag width, wrong secret, tampered payload).
+/// (missing prefix, malformed hex, wrong tag width, wrong secret, tampered payload).
 ///
 /// Returning the bytes rather than a bare `bool` is what lets [`crate::replay::ReplayGuard`] key on
 /// canonical material without re-parsing the header. It also normalizes spelling by construction:
@@ -153,12 +186,9 @@ pub fn verify_signature(
     body: &[u8],
     provided: &str,
 ) -> Option<Vec<u8>> {
-    let provided = provided
-        .trim()
-        .strip_prefix("sha256=")
-        .unwrap_or(provided.trim());
-
-    let provided_bytes = hex::decode(provided).ok()?;
+    // The prefix is required, not merely tolerated: `strip_prefix` returning `None` ends the
+    // verification here rather than falling back to treating the whole value as hex.
+    let provided_bytes = hex::decode(provided.trim().strip_prefix(SIGNATURE_PREFIX)?.trim()).ok()?;
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).ok()?;
     mac.update(&canonical_v1_payload(method, target, timestamp, body));
@@ -457,16 +487,15 @@ mod tests {
         let sig = compute_signature("s3cret", "POST", "/api/ban", "1700000000", b"body")
             .expect("HMAC of a non-empty secret cannot fail");
 
+        assert!(sig.starts_with(SIGNATURE_PREFIX), "the computed value is a complete header value");
         assert!(verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", &sig).is_some());
-        // The `sha256=` prefix used by outbound webhook signatures is accepted too.
-        assert!(verify_signature(
-            "s3cret",
-            "POST",
-            "/api/ban",
-            "1700000000",
-            b"body",
-            &format!("sha256={sig}")
-        ).is_some());
+
+        // Surrounding whitespace is tolerated on either side of the tag: a header value that picked
+        // up a stray space is a transport artefact, not a forgery attempt.
+        assert!(
+            verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", &format!("  {sig} "))
+                .is_some()
+        );
 
         // Wrong secret, mutated body, and non-hex garbage must all fail closed.
         assert!(verify_signature("other", "POST", "/api/ban", "1700000000", b"body", &sig).is_none());
@@ -477,18 +506,65 @@ mod tests {
 
     /// A tag of the wrong width must be rejected outright rather than compared against a truncated
     /// expectation — the failure mode a hand-rolled comparison would introduce.
+    ///
+    /// Every case keeps the `sha256=` tag and varies only the digest, so each one exercises the
+    /// width check rather than the format check.
     #[test]
     fn tags_of_the_wrong_length_are_rejected() {
         let sig = compute_signature("s3cret", "GET", "/api/ips", "1700000000", b"")
             .expect("HMAC of a non-empty secret cannot fail");
-        for wrong in [&sig[..62], &sig[..2], "", &format!("{sig}00")] {
+        let digest = sig.strip_prefix(SIGNATURE_PREFIX).expect("compute_signature emits the tag");
+
+        for wrong in [&digest[..62], &digest[..2], "", &format!("{digest}00")] {
             assert!(
-                verify_signature("s3cret", "GET", "/api/ips", "1700000000", b"", wrong).is_none(),
-                "a {}-character tag must be rejected",
+                verify_signature(
+                    "s3cret",
+                    "GET",
+                    "/api/ips",
+                    "1700000000",
+                    b"",
+                    &format!("{SIGNATURE_PREFIX}{wrong}")
+                )
+                .is_none(),
+                "a {}-character digest must be rejected",
                 wrong.len()
             );
         }
         assert!(verify_signature("s3cret", "GET", "/api/ips", "1700000000", b"", &sig).is_some());
+    }
+
+    /// The `sha256=` tag is mandatory: a **correct** digest sent bare must not verify.
+    ///
+    /// This is the case no digest-mutation test can reach. Every other rejection here is about the
+    /// bytes being wrong; this one is about a caller that computed the right bytes and framed them
+    /// the old way, which is precisely what a reintroduced fallback would silently start accepting.
+    #[test]
+    fn a_correct_digest_without_the_mandatory_tag_does_not_verify() {
+        let sig = compute_signature("s3cret", "POST", "/api/ban", "1700000000", b"body")
+            .expect("HMAC of a non-empty secret cannot fail");
+        let digest = sig.strip_prefix(SIGNATURE_PREFIX).expect("compute_signature emits the tag");
+
+        assert_eq!(digest.len(), 64, "the bare form is a full-width, otherwise-valid digest");
+        assert!(
+            verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", digest).is_none(),
+            "a bare hex digest must be refused no matter how correct it is"
+        );
+
+        // Nor may any other tag stand in for it — including ones that merely contain it, which is
+        // what a `contains`-based check instead of `strip_prefix` would let through.
+        for framing in [
+            format!("sha512={digest}"),
+            format!("SHA256={digest}"),
+            format!("x-sha256={digest}"),
+            format!("sha256:{digest}"),
+            format!("sha256 {digest}"),
+        ] {
+            assert!(
+                verify_signature("s3cret", "POST", "/api/ban", "1700000000", b"body", &framing)
+                    .is_none(),
+                "{framing:?} must not be accepted as a signature"
+            );
+        }
     }
 
     #[test]
@@ -571,6 +647,112 @@ mod tests {
             );
         }
         assert!(SecretCipher::from_hex_key(TEST_KEY).is_ok());
+    }
+
+    /// Serializes the tests that read the two encryption-key variables.
+    ///
+    /// They are process-global and this suite runs in parallel, so without this two tests setting
+    /// different keys would interleave and each would occasionally observe the other's. Poisoning is
+    /// recovered from rather than propagated: one failing test must not cascade into four.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Runs `body` with both key variables set as given (`None` meaning unset), restoring whatever
+    /// was there before.
+    fn with_key_env<T>(
+        primary: Option<&str>,
+        alias: Option<&str>,
+        body: impl FnOnce() -> T,
+    ) -> T {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved: Vec<(&str, Option<String>)> = [ENCRYPTION_KEY_ENV, ENCRYPTION_KEY_ENV_ALIAS]
+            .into_iter()
+            .map(|name| (name, std::env::var(name).ok()))
+            .collect();
+
+        // SAFETY: `ENV_LOCK` is held across the whole body, and every test touching these two
+        // variables goes through this helper, so no other thread reads or writes them meanwhile.
+        unsafe {
+            for (name, value) in [(ENCRYPTION_KEY_ENV, primary), (ENCRYPTION_KEY_ENV_ALIAS, alias)] {
+                match value {
+                    Some(raw) => std::env::set_var(name, raw),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+
+        let outcome = body();
+
+        // SAFETY: as above — still under `ENV_LOCK`.
+        unsafe {
+            for (name, value) in saved {
+                match value {
+                    Some(raw) => std::env::set_var(name, raw),
+                    None => std::env::remove_var(name),
+                }
+            }
+        }
+        outcome
+    }
+
+    /// The same fail-closed rule as [`malformed_keys_are_rejected_rather_than_falling_back`], but
+    /// through `from_env` — the call `AppState::new` actually makes at startup.
+    ///
+    /// Testing `from_hex_key` proves the *parser* refuses a bad key. It says nothing about whether
+    /// the environment reader propagates that refusal, and the reader is where the dangerous
+    /// alternative lives: a `.unwrap_or(Plaintext)` or an `.ok()` there would turn every rejection
+    /// above into a silent downgrade, with all of those tests still green. Both variable names are
+    /// exercised, because the alias exists precisely so one provisioning system can feed both
+    /// services and an alias that failed open would be a hole in the less-travelled path.
+    #[test]
+    fn a_malformed_key_in_either_variable_refuses_to_build_the_cipher() {
+        for bad in ["not-hex", "00ff", &format!("{TEST_KEY}00"), "password"] {
+            assert!(
+                matches!(with_key_env(Some(bad), None, SecretCipher::from_env), Err(CryptoError::InvalidKey)),
+                "{ENCRYPTION_KEY_ENV}={bad:?} must abort rather than degrade to plaintext"
+            );
+            assert!(
+                matches!(with_key_env(None, Some(bad), SecretCipher::from_env), Err(CryptoError::InvalidKey)),
+                "{ENCRYPTION_KEY_ENV_ALIAS}={bad:?} must abort rather than degrade to plaintext"
+            );
+        }
+
+        // A bad *primary* must not be rescued by a good alias: the primary wins when both are set,
+        // and "wins" has to mean its failure wins too. Falling through to the alias here would let a
+        // typo in the documented variable be masked by a stale value in the compatibility one.
+        assert!(
+            matches!(
+                with_key_env(Some("not-hex"), Some(TEST_KEY), SecretCipher::from_env),
+                Err(CryptoError::InvalidKey)
+            ),
+            "a malformed primary key must not fall through to the alias"
+        );
+    }
+
+    /// The other half: the shapes `from_env` must accept, so the test above cannot pass by refusing
+    /// everything.
+    #[test]
+    fn from_env_resolves_the_primary_the_alias_and_the_unset_case() {
+        let sealed = with_key_env(Some(TEST_KEY), None, SecretCipher::from_env)
+            .expect("a valid primary key builds");
+        assert!(sealed.is_encrypting(), "a configured key means secrets are encrypted");
+
+        let via_alias = with_key_env(None, Some(TEST_KEY), SecretCipher::from_env)
+            .expect("a valid alias key builds");
+        assert!(via_alias.is_encrypting(), "the alias is a full equivalent, not a partial one");
+
+        // Unset — and set-but-blank, which is what an unpopulated `.env` template or a
+        // `VAULT_ENCRYPTION_KEY=` line produces — is the zero-configuration case, not an error.
+        for blank in [None, Some(""), Some("   ")] {
+            let plaintext = with_key_env(blank, None, SecretCipher::from_env)
+                .expect("no key configured is not an error");
+            assert!(!plaintext.is_encrypting(), "{blank:?} must mean plaintext, not a failure");
+        }
+
+        // A blank primary alongside a real alias must use the alias rather than being treated as
+        // "the primary is set", which is the bug the `.filter(|raw| !raw.trim().is_empty())` guards.
+        let fallback = with_key_env(Some(""), Some(TEST_KEY), SecretCipher::from_env)
+            .expect("a blank primary falls through to the alias");
+        assert!(fallback.is_encrypting(), "a blank primary must not mask a configured alias");
     }
 
     #[test]

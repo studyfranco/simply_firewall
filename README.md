@@ -121,7 +121,7 @@ enough:
 | :--- | :--- |
 | `X-API-Key` | The plaintext key. Identifies which key record to look up. |
 | `X-Timestamp` | Current UTC Unix time in seconds. Rejected if more than **300s** from the server's clock, in either direction (anti-replay). |
-| `X-Signature-256` | Hex HMAC-SHA256 of the **CANONICAL_V1** string `METHOD\nPATH\nTIMESTAMP\nRAW_BODY` — the four fields joined by single newlines, no trailing newline — keyed with the key's **signing secret**. `PATH` excludes the query string. |
+| `X-Signature-256` | `sha256=<hex>` — HMAC-SHA256 of the **CANONICAL_V1** string `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY`, the four fields joined by single newlines with no trailing newline, keyed with the key's **signing secret**. `TARGET` is the full request target, **query string included**. The `sha256=` prefix is mandatory: a bare hex digest is rejected with `401`. |
 
 The signing secret is issued alongside the key by `POST /api/keys` and `POST /api/keys/{id}/rotate`
 and is shown **once** — it is never returned by any read endpoint. See the `call()` helper under
@@ -154,7 +154,7 @@ Each webhook chooses how it authenticates to its receiver, via `auth_mode` on `P
 
 | Mode | Signed message | Headers sent | Use for |
 | :--- | :--- | :--- | :--- |
-| `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: <bare hex>`, `X-Timestamp`, and `X-API-Key` if set | Another `simply_ip_vault` instance, or `simply_hook_executor`. |
+| `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: sha256=<hex>`, `X-Timestamp`, and `X-API-Key` if set | Another `simply_ip_vault` instance, or `simply_hook_executor`. |
 | `BODY_ONLY` | the raw body | `X-Signature-256: sha256=<hex>` | Generic third-party receivers (GitHub-style consumers). |
 | `API_KEY_ONLY` | *(none)* | `X-API-Key` | APIs whose only credential is a bearer-style key. |
 | `NONE` | *(none)* | *(none)* | Receivers authenticated by network position, or by something in `headers_json`. |
@@ -203,12 +203,12 @@ SECRET="<SIGNING_SECRET>"     # shown once, when the key is created or rotated
 call() {
   local method="$1" path="$2" body="${3:-}"
   local ts; ts=$(date -u +%s)
-  # The query string is stripped before signing, but still sent.
   # CANONICAL_V1: real newlines between the four fields, none at the end.
-  local sig; sig=$(printf '%s\n%s\n%s\n%s' "$method" "${path%%\?*}" "$ts" "$body" \
+  # The FULL path is signed, query string included — do not strip it.
+  local sig; sig=$(printf '%s\n%s\n%s\n%s' "$method" "$path" "$ts" "$body" \
                    | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.*= //')
   curl -sS -X "$method" \
-    -H "X-API-Key: $KEY" -H "X-Timestamp: $ts" -H "X-Signature-256: $sig" \
+    -H "X-API-Key: $KEY" -H "X-Timestamp: $ts" -H "X-Signature-256: sha256=$sig" \
     ${body:+-H "Content-Type: application/json" -d "$body"} \
     "http://localhost:3000$path"
 }

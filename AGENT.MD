@@ -43,7 +43,7 @@ To keep this context clean and modular, responsibilities are split across three 
   | :--- | :--- |
   | `X-API-Key` | The plaintext key. Used **only** to look up the key record (by SHA-256 of its value). Identity, not proof. |
   | `X-Timestamp` | Current UTC Unix time in **seconds**. |
-  | `X-Signature-256` | Hex HMAC-SHA256 over the **CANONICAL_V1** string (below), keyed with the key's `signing_secret`. A `sha256=` prefix is accepted and stripped. |
+  | `X-Signature-256` | `sha256=<hex>` — HMAC-SHA256 over the **CANONICAL_V1** string (below), keyed with the key's `signing_secret`. The `sha256=` prefix is **mandatory**; a bare hex digest is rejected with `401`. |
 
   - **CANONICAL_V1 signed string:** `METHOD\nTARGET\nTIMESTAMP\nRAW_BODY` — the four parts joined by a single `\n` (LF), with **no trailing newline**. `METHOD` is uppercase; `TARGET` is the full request target **including the query string** when one is present; `RAW_BODY` is the exact request body bytes (empty when there is no body).
   - **Why a delimiter:** plain concatenation is ambiguous — `("POST", "/api/ban")` and `("POS", "T/api/ban")` produce identical bytes, so a signature over one authenticates the other. `\n` cannot appear in a method or a URL path, so it eliminates that class of boundary confusion. This is also the format `simply_hook_executor` speaks, so a single canonical string serves the inbound API and outbound `CANONICAL_V1` webhooks alike.
@@ -105,7 +105,7 @@ To keep this context clean and modular, responsibilities are split across three 
 
   | Mode | Signed message | Headers sent |
   | :--- | :--- | :--- |
-  | `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: <bare hex>`, `X-Timestamp`, plus `X-API-Key` when `api_key` is set |
+  | `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: sha256=<hex>`, `X-Timestamp`, plus `X-API-Key` when `api_key` is set |
   | `BODY_ONLY` | `RAW_BODY` only | `X-Signature-256: sha256=<hex>` |
   | `API_KEY_ONLY` | *(none)* | `X-API-Key` |
   | `NONE` | *(none)* | *(none)* |
@@ -157,7 +157,7 @@ To keep this context clean and modular, responsibilities are split across three 
 - **Coverage Mandatory Requirements:**
   1. **Positive RBAC:** Authorized keys successfully read/write allowed groups.
   2. **Negative RBAC:** Unauthorized attempts MUST return HTTP `403 Forbidden`.
-  3. **Webhook Signatures:** Mock HTTP endpoints (e.g., via Tokio task) verifying payload delivery and HMAC `X-Signature-256` validity — for **every** `auth_mode`: `CANONICAL_V1` (bare hex + `X-Timestamp`), `BODY_ONLY` (`sha256=` prefix, no timestamp), `API_KEY_ONLY` and `NONE` (asserting the *absence* of signature headers, not merely delivery). A custom `hmac_template` with a hardcoded path must be verified positively (the template's path validates) **and** negatively (the `target_url`-derived path does not), or the assertion passes for the wrong reason.
+  3. **Webhook Signatures:** Mock HTTP endpoints (e.g., via Tokio task) verifying payload delivery and HMAC `X-Signature-256` validity — for **every** `auth_mode`: `CANONICAL_V1` (`sha256=` prefix + `X-Timestamp`), `BODY_ONLY` (`sha256=` prefix, no timestamp), `API_KEY_ONLY` and `NONE` (asserting the *absence* of signature headers, not merely delivery). A custom `hmac_template` with a hardcoded path must be verified positively (the template's path validates) **and** negatively (the `target_url`-derived path does not), or the assertion passes for the wrong reason.
   4. **Multi-Group & Temporal Querying:** Validate `GET /api/ips` with group filters and `max_age`/`since` constraints.
   5. **Request Authentication (HMAC):** each of the three auth headers is individually mandatory (`401` when any is dropped — in particular the pre-HMAC "key + timestamp only" shape); the anti-replay window is enforced symmetrically at ±300s using *correctly signed* stale/future timestamps, so the rejection provably comes from the freshness check and not the HMAC; and the signature binds method, path, and body (replaying an authentic signature over a tampered body, or onto a different route, MUST fail).
   6. **Signing Secret Handling:** a `NULL` `signing_secret` fails closed; `signing_secret` never appears in any read endpoint's response; and with `VAULT_ENCRYPTION_KEY` set, the stored value is ciphertext yet still authenticates (round trip through the real request path).
@@ -181,7 +181,7 @@ call() {
   local sig; sig=$(printf '%s\n%s\n%s\n%s' "$method" "$path" "$ts" "$body" \
                    | openssl dgst -sha256 -hmac "$SECRET" | sed 's/^.*= //')
   curl -sS -X "$method" \
-    -H "X-API-Key: $KEY" -H "X-Timestamp: $ts" -H "X-Signature-256: $sig" \
+    -H "X-API-Key: $KEY" -H "X-Timestamp: $ts" -H "X-Signature-256: sha256=$sig" \
     ${body:+-H "Content-Type: application/json" -d "$body"} \
     "http://localhost:3000$path"
 }

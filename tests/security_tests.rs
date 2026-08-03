@@ -53,9 +53,8 @@ fn connect_from(req: axum::http::request::Builder, peer: &str) -> axum::http::re
 
 /// Parses a `TRUSTED_PROXIES`-style string into the matcher list `AppState` carries.
 fn trusted(entries: &str) -> Vec<simply_ip_vault::config::ProxyMatcher> {
-    let (networks, rejected) = simply_ip_vault::config::parse_trusted_proxies(entries);
-    assert!(rejected.is_empty(), "test fixture must use valid proxy entries");
-    networks
+    simply_ip_vault::config::parse_trusted_proxies(entries)
+        .expect("test fixture must use valid proxy entries")
 }
 
 /// Test-only convention mirroring the RBAC suite: a seeded key's signing secret is derived from its
@@ -366,7 +365,15 @@ async fn attack_signature_forgery_by_last_character_flip_is_rejected() {
     let now = chrono::Utc::now().timestamp().to_string();
 
     let authentic = crypto::compute_signature(&secret, "GET", "/api/auth/me", &now, b"").unwrap();
-    assert_eq!(authentic.len(), 64, "HMAC-SHA256 hex is 64 characters");
+    // Mutations are applied to the digest and re-tagged, so every case below reaches the MAC
+    // comparison instead of being turned away by the `sha256=` format check — which would make the
+    // whole test pass for a reason that has nothing to do with what it is probing.
+    let digest = authentic
+        .strip_prefix(crypto::SIGNATURE_PREFIX)
+        .expect("compute_signature emits the mandatory tag")
+        .to_owned();
+    assert_eq!(digest.len(), 64, "HMAC-SHA256 hex is 64 characters");
+    let tagged = |digest: &str| format!("{}{digest}", crypto::SIGNATURE_PREFIX);
 
     let send = |sig: String| {
         let (app, key, now) = (app.clone(), key.clone(), now.clone());
@@ -388,27 +395,23 @@ async fn attack_signature_forgery_by_last_character_flip_is_rejected() {
     assert_eq!(send(authentic.clone()).await, StatusCode::OK);
 
     // The attack: exactly one character different, still 64 valid hex digits.
-    let forged = flip_last_hex_digit(&authentic);
-    assert_ne!(forged, authentic);
-    assert_eq!(forged.len(), authentic.len());
+    let forged = flip_last_hex_digit(&digest);
+    assert_ne!(forged, digest);
+    assert_eq!(forged.len(), digest.len());
+    assert_eq!(forged[..63], digest[..63], "the forgery must differ *only* in the final character");
     assert_eq!(
-        forged[..63],
-        authentic[..63],
-        "the forgery must differ *only* in the final character"
-    );
-    assert_eq!(
-        send(forged).await,
+        send(tagged(&forged)).await,
         StatusCode::UNAUTHORIZED,
         "a signature differing by one trailing character must be rejected"
     );
 
     // The same must hold at the other end and in the middle — no position is unchecked.
     for pos in [0usize, 1, 31, 32, 62] {
-        let mut chars: Vec<char> = authentic.chars().collect();
+        let mut chars: Vec<char> = digest.chars().collect();
         chars[pos] = if chars[pos] == '0' { '1' } else { '0' };
         let mutated: String = chars.into_iter().collect();
         assert_eq!(
-            send(mutated).await,
+            send(tagged(&mutated)).await,
             StatusCode::UNAUTHORIZED,
             "a signature differing at index {pos} must be rejected"
         );
@@ -416,44 +419,125 @@ async fn attack_signature_forgery_by_last_character_flip_is_rejected() {
 
     // A correct-prefix-but-truncated signature must not be accepted by a length-agnostic compare.
     assert_eq!(
-        send(authentic[..32].to_owned()).await,
+        send(tagged(&digest[..32])).await,
         StatusCode::UNAUTHORIZED,
         "a truncated signature sharing a valid prefix must be rejected"
     );
     // ...nor an over-long one that merely starts with the correct value.
     assert_eq!(
-        send(format!("{authentic}00")).await,
+        send(tagged(&format!("{digest}00"))).await,
         StatusCode::UNAUTHORIZED,
         "an over-long signature with a valid prefix must be rejected"
+    );
+
+    // And the digest sent bare — correct bytes, missing tag — is refused over HTTP with 401, not
+    // merely inside `verify_signature`. This is the mandated end-to-end check on the format rule.
+    //
+    // It must be a signature that has **never been accepted**, which is why it is signed over a
+    // fresh timestamp rather than reusing `digest`. Reusing it would make the replay guard the thing
+    // doing the rejecting — the control request at the top of this test already consumed that
+    // digest — and the check would then report 401 just as loudly with the format rule deleted.
+    // Verified by mutation: with both the `crypto` and middleware checks removed, this fails.
+    let unused_now = (chrono::Utc::now().timestamp() - 7).to_string();
+    let unused = crypto::compute_signature(&secret, "GET", "/api/auth/me", &unused_now, b"").unwrap();
+    let unused_digest = unused
+        .strip_prefix(crypto::SIGNATURE_PREFIX)
+        .expect("compute_signature emits the mandatory tag")
+        .to_owned();
+
+    let send_at = |sig: String, ts: String| {
+        let (app, key) = (app.clone(), key.clone());
+        async move {
+            let req = inject_connect_info(
+                Request::builder()
+                    .uri("/api/auth/me")
+                    .header("X-API-Key", &key)
+                    .header("X-Timestamp", &ts)
+                    .header("X-Signature-256", &sig),
+            )
+            .body(Body::empty())
+            .unwrap();
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    assert_eq!(
+        send_at(unused_digest, unused_now.clone()).await,
+        StatusCode::UNAUTHORIZED,
+        "a valid hex signature missing the sha256= prefix must be rejected with 401"
+    );
+    // Control: the very same signature *with* the tag is accepted, proving the rejection above is
+    // the missing prefix and not a stale timestamp or an exhausted key.
+    assert_eq!(
+        send_at(unused, unused_now).await,
+        StatusCode::OK,
+        "the same signature with its sha256= tag must authenticate"
     );
 }
 
 /// The library-level equivalent, asserting the same property directly on `verify_signature` so a
 /// regression is localized to `crypto` rather than only surfacing through the HTTP stack.
+///
+/// # Why bits and not characters
+///
+/// An earlier version of this test mutated hex *characters*, which is a coarser instrument than it
+/// looks: it replaced each position with one of four fixed digits, so it never distinguished the two
+/// nibbles of a byte and never covered the other eleven values a nibble can take. This sweeps the
+/// **decoded tag**: all 32 bytes × 8 bits = 256 single-bit forgeries, each one re-encoded and sent
+/// through the real entry point. Every one must fail.
+///
+/// That is the exhaustive statement of what a constant-time comparison buys. A comparison that
+/// short-circuits, that compares a prefix, that stops at a word boundary, or that folds bytes
+/// together before comparing would each accept *some* single-bit change — and each would still pass
+/// a spot-check of the first, middle, and last positions.
+///
+/// The wrong-length cases are the other half. `Mac::verify_slice` rejects a mismatched width before
+/// comparing anything, which is correct and leaks only the digest width (a public constant); this
+/// asserts it happens rather than assuming it, across every length from empty to double.
 #[test]
 fn attack_single_bit_signature_mutations_never_verify() {
     let (secret, method, path, ts, body) = ("s3cret", "POST", "/api/ban", "1700000000", b"payload");
     let authentic = crypto::compute_signature(secret, method, path, ts, body).unwrap();
-    assert!(crypto::verify_signature(secret, method, path, ts, body, &authentic).is_some());
+    let tag = hex::decode(
+        authentic.strip_prefix(crypto::SIGNATURE_PREFIX).expect("the mandatory tag is present"),
+    )
+    .expect("the digest is hex");
 
-    // Every single-character mutation across the whole 64-character signature must fail. This is
-    // the exhaustive version of the "last character" attack.
-    for pos in 0..authentic.len() {
-        let mut chars: Vec<char> = authentic.chars().collect();
-        for replacement in ['0', '1', 'a', 'f'] {
-            if chars[pos] == replacement {
-                continue;
-            }
-            let original = chars[pos];
-            chars[pos] = replacement;
-            let mutated: String = chars.iter().collect();
+    assert_eq!(tag.len(), 32, "HMAC-SHA256 produces a 32-byte tag");
+    assert!(
+        crypto::verify_signature(secret, method, path, ts, body, &authentic).is_some(),
+        "control: the unmodified signature verifies"
+    );
+
+    let verify = |tag: &[u8]| {
+        let framed = format!("{}{}", crypto::SIGNATURE_PREFIX, hex::encode(tag));
+        crypto::verify_signature(secret, method, path, ts, body, &framed)
+    };
+
+    // All 256 single-bit forgeries.
+    for byte in 0..tag.len() {
+        for bit in 0..8u32 {
+            let mut forged = tag.clone();
+            forged[byte] ^= 1 << bit;
             assert!(
-                crypto::verify_signature(secret, method, path, ts, body, &mutated).is_none(),
-                "mutating index {pos} to {replacement} must not verify"
+                verify(&forged).is_none(),
+                "flipping bit {bit} of byte {byte} must not verify"
             );
-            chars[pos] = original;
         }
     }
+
+    // Every wrong width, including the empty tag and the doubled one. A truncation that happens to
+    // share a prefix with the real tag is the case a length-agnostic compare would accept.
+    for len in (0..=64).filter(|len| *len != 32) {
+        let mut wrong = tag.clone();
+        wrong.resize(len, 0);
+        assert!(verify(&wrong).is_none(), "a {len}-byte tag must be rejected on width alone");
+    }
+
+    // ...and the untruncated tag with trailing bytes appended, which shares all 32 correct bytes.
+    let mut extended = tag.clone();
+    extended.extend_from_slice(&[0u8; 8]);
+    assert!(verify(&extended).is_none(), "a tag that merely starts correct must be rejected");
 }
 
 // ─────────────────────────────────────────────────────────────
