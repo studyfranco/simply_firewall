@@ -2331,13 +2331,16 @@ check "401" "#27 key A's own replay is still refused after key B's traffic"
 raw_call GET "$RPL_PATH" -H "X-API-Key: $RPL_B_KEY" -H "X-Timestamp: $RPL_TS" -H "X-Signature-256: $RPL_B_SIG"
 check "401" "#27 key B's own replay is refused too"
 
-# --- 27c. Revocation is bounded by the caller's own group access ------------------------------
+# --- 27c. Revocation is bounded by the group, not by the verb ---------------------------------
 #
-# `guard_delegated_group_grant` already stopped a non-master key manager handing out access it does
-# not hold. The mirror image was unguarded: the same caller could strip *any* key's access to *any*
-# group. Removing authority is the attack here — revoking the key that maintains another tenant's
-# banlist stops that tenant's blocking, and presents as "bans stopped landing" rather than as a
-# permission error.
+# Managing a group is the whole authority test for removing permissions on it: a caller that manages
+# the group may remove any verb from any key's row, including its own, without holding the verbs it
+# removes. Matches `simply_hook_executor`, where `can_manage` over a hook confers exactly this.
+#
+# The bound that remains is *which groups* the caller can reach, and it is the one that matters:
+# removing authority raises nobody, but revoking the key that maintains another tenant's banlist
+# stops that tenant's blocking, and presents as "bans stopped landing" rather than as a permission
+# error. That is an integrity concern, answered by the entry gate below.
 
 api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Tenant A Manager","can_manage_keys":true}'
 check "200" "#27 create a delegated key manager"
@@ -2352,6 +2355,10 @@ REVK_VICTIM_ID=$(echo "$RESP_BODY" | jq -r '.id')
 api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Tenant A Worker"}'
 check "200" "#27 create a worker inside the manager's own tenant"
 REVK_PEER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+# Its own credentials are needed further down, to prove a master's re-grant genuinely restores access
+# rather than merely returning 200.
+REVK_PEER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+register_key_secret "$REVK_PEER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
 api_call POST "/api/keys/$REVK_MGR_ID/permissions" "$MASTER_KEY" \
     '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":true}'
@@ -2371,18 +2378,52 @@ check "403" "#27 a key manager cannot revoke access to a group it does not manag
 api_call GET "/api/keys" "$MASTER_KEY"
 check "200" "#27 re-read the key list after the refused revocation"
 
-# Self-revocation is refused for the same reason granting to yourself is.
-api_call DELETE "/api/keys/$REVK_MGR_ID/permissions/revguard-tenant-a" "$REVK_MGR_KEY"
-check "403" "#27 a key manager cannot revoke its own group access either"
-
-# ...while revoking inside a group it *does* manage still works, so the guard bounds delegated key
+# ...while revoking inside a group it *does* manage works, so the guard bounds delegated key
 # management rather than disabling it.
 api_call DELETE "/api/keys/$REVK_PEER_ID/permissions/revguard-tenant-a" "$REVK_MGR_KEY"
 check "204" "#27 revoking within a managed group still succeeds"
 
-# ...and a master is unaffected by the guard.
+# A master is unaffected by the guard.
 api_call DELETE "/api/keys/$REVK_VICTIM_ID/permissions/revguard-tenant-b" "$MASTER_KEY"
 check "204" "#27 a master key can still revoke anything"
+
+# Self-revocation is permitted: a manager may surrender its own access to a group it manages. The
+# block this replaces stopped only the least-privilege action, since the widening direction is
+# refused by the per-verb grant check regardless of who the target is.
+api_call POST "/api/keys/$REVK_MGR_ID/permissions" "$REVK_MGR_KEY" \
+    '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":false}'
+check "200" "#27 a manager may reduce its own row on a group it manages"
+
+api_call DELETE "/api/keys/$REVK_MGR_ID/permissions/revguard-tenant-a" "$REVK_MGR_KEY"
+check "204" "#27 a manager may revoke its own group access"
+
+# ...and having surrendered it, the manager is outside the entry gate like anyone else. This is what
+# keeps self-revocation a one-way door rather than a way to re-enter on your own authority.
+api_call POST "/api/keys/$REVK_PEER_ID/permissions" "$REVK_MGR_KEY" \
+    '{"group_name":"revguard-tenant-a","can_read":true,"can_write":false,"can_delete":false}'
+check "403" "#27 a manager cannot re-grant itself into a group it surrendered"
+
+# --- 27c-bis. An ungoverned group stays visible and recoverable by a master --------------------
+#
+# `revguard-tenant-a` now has no permission rows at all: the peer's was revoked and the manager
+# surrendered its own. That state is only reachable because self-revocation is allowed, and it is
+# the counterpart safeguard — a master's view must never be assembled from a table the master has no
+# rows in, or the group would vanish at exactly this moment and be recoverable only by hand.
+
+api_call GET "/api/groups" "$MASTER_KEY"
+check "200" "#27 a master can still list groups after the last manager left"
+check_true '[.[] | select(.name == "revguard-tenant-a")] | length == 1' \
+    "#27 the ungoverned group is still listed for a master"
+
+api_call GET "/api/ips?group_name=revguard-tenant-a" "$MASTER_KEY"
+check "200" "#27 a master can still view an ungoverned group's records"
+
+api_call POST "/api/keys/$REVK_PEER_ID/permissions" "$MASTER_KEY" \
+    '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":true}'
+check "200" "#27 a master can put an ungoverned group back under management"
+
+api_call GET "/api/ips?group_name=revguard-tenant-a" "$REVK_PEER_KEY"
+check "200" "#27 the restored manager can reach the group again"
 
 # --- 27d. Stored secrets are opened strictly, or not at all -----------------------------------
 #

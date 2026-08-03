@@ -3652,3 +3652,121 @@ passed while proving nothing. It now uppercases the digest alone.
 
 - `CAPACITY_BACKOFF_DIVISOR` still not ported back to `simply_hook_executor` (carried from Sessions
   25/26). Unchanged: it is a change to the peer tree, which is read-only from here.
+
+---
+
+## Session 31 — Revoke-Authority Convergence
+
+The RBAC revoke-authority decision was taken on `simply_hook_executor` in an earlier pass and never
+applied here; Sessions 28–30 recorded the difference as a *design* difference rather than an
+outstanding task, so it sat unresolved. Settled now, in the peer's direction.
+
+### The converged rule
+
+**`can_manage` over a resource confers full authority over its permissions**, including removing any
+verb from any key's row — the caller's own included — without holding the verbs being removed.
+
+Mapped onto this service's schema: `api_key_group_permissions` has no `can_manage` column, so
+"manages this group" is spelled `can_manage_keys` (global) **plus a row on the group**. That pairing
+is now factored out as `guard_group_administration`, which `guard_delegated_group_grant` calls first
+and `revoke_key_group_permission` calls alone. `simply_hook_executor` expresses the same authority as
+a single flag and applies it identically (`require_manage` on its revoke path, no per-verb test).
+
+### Why the stricter model was relaxed rather than kept
+
+The rule it replaces required the caller to hold each verb it removed, and refused self-targeting
+outright. Both came from Session 26's cross-audit and both were defensible when written; neither
+survives being asked *which* property it protects.
+
+**Per-verb revocation conflated two controls.** Guarding a grant per verb is **anti-escalation**:
+conferring `can_write` while holding only `can_read` manufactures authority that did not previously
+exist anywhere. Removing `can_write` manufactures nothing — after the operation no key in the system
+holds more than before, the caller least of all. What removal genuinely threatens is **integrity**:
+stripping the credential another tenant's `fail2ban` writes with stops that tenant's blocking, and
+the symptom ("bans stopped landing") sits several audit-log pages from the cause. But that threat is
+a function of *which groups* a caller can reach, not of which verbs it holds inside them — and the
+entry gate answers it exactly, confining every revocation to groups the caller already manages. The
+per-verb test bought no additional containment on top of that, while producing a genuinely strange
+shape: **a grant you were trusted to create could be one you were forbidden to undo.**
+
+**The self-targeting block was guarding a ratchet that could not turn.** Its stated rationale was:
+grant yourself what you already hold, then use the fresh row as the basis for widening.
+`guard_delegated_group_grant` compares a self-directed request against the caller's *own* row — which
+*is* the row being written — so the result can never exceed what was already held. Every self-directed
+call is a reduction or a no-op by construction. With escalation unreachable, the block's only effect
+was to forbid a manager from dropping its own access: the least-privilege action, made to require a
+master.
+
+Worth noting that `guard_scope_elevation` — the global-scope sibling — already documented exactly
+this principle in its own doc comment ("Revoking is always allowed — removing authority is not
+escalation") and always behaved this way for `is_master` / `can_manage_keys` / `can_create_groups`.
+The group-permission path was the inconsistent one, not the peer.
+
+### The asymmetry this closed
+
+`over_grants` tests `requested && !held`, so a verb being set to **false** was never examined. The
+general update endpoint therefore *already* allowed a read-only manager to strip a key's
+`can_write` — while the dedicated revoke endpoint refused the same caller the same removal. Two
+spellings of "reduce this row", governed by two different rules that disagreed. Both now run through
+the same gate, and a regression test asserts each spelling separately.
+
+### The counterpart safeguard: ungoverned groups
+
+Allowing self-revocation makes a new state reachable: **a group with no permission rows at all**,
+after its last manager surrenders access. If a master's view were assembled from
+`api_key_group_permissions`, such a group would vanish from every endpoint at that moment,
+recoverable only by direct database access — precisely what an admin API exists to prevent.
+
+Verified rather than assumed, and it already held: `list_ip_groups` and `list_ips` both branch on
+`is_master` *before* consulting the permission table, and both group resolvers query `ip_groups`
+directly with no permission join. **No production fix was needed for task 2** — but it is now pinned
+by a test that drives the group into the ungoverned state through the new revoke rule and asserts a
+master can still list it, view its records, and re-grant on it, plus an e2e counterpart that ends by
+confirming the restored manager can reach the group again.
+
+### Mutation-checked
+
+| Mutation | Result |
+| :--- | :--- |
+| `guard_group_administration` always returns `Ok` (entry gate deleted) | 3 tests FAIL across both suites |
+| `list_ip_groups` filters by permission rows for masters too | 2 tests FAIL, including the ungoverned-group test |
+
+The first is the one that matters: it confirms the relaxation did not quietly become "revocation is
+unguarded". The entry gate is now the *only* thing standing between a delegated key manager and every
+group in the system, so a test suite that passed without it would have meant the containment argument
+above was resting on nothing.
+
+### Tests changed rather than added
+
+Three assertions tested the retired contract and were rewritten in place, not deleted:
+
+- `a_key_manager_cannot_revoke_its_own_group_access` → `a_group_manager_may_revoke_and_reduce_its_own_access`,
+  which asserts the inverse *and* that widening back is still refused, so it cannot pass by
+  self-targeting having become unguarded rather than bounded.
+- `attack_cannot_self_grant_or_over_grant_group_permissions` (security suite) — the "self-granting is
+  refused outright" case became "self-*widening* is refused, self-reduction is allowed". The
+  reduction assertion had to move to the end of the test: it mutates the caller's own row, and every
+  earlier assertion depends on that row still carrying `can_write`.
+- e2e §27c — the self-revocation check flipped from `403` to `204`, and was reordered after the
+  managed-group revocation for the same dependency reason.
+
+`a_key_manager_cannot_revoke_access_to_a_group_it_does_not_manage` needed **no** change: the entry
+gate is what it was always really asserting.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **165 passed**, 0 failed (70 unit + 58 RBAC + 37 security; +2) |
+| `./scripts/test_e2e.sh` | **420/420**, 0 failed (+7) |
+| `./scripts/verify_convergence.sh` | 30 matching, 1 documented divergence, 0 unexplained |
+
+`AGENT.MD` §2 was amended in the same commit — it documented the per-verb rule and the outright
+self-targeting refusal, and would otherwise have contradicted the code.
+
+### Still outstanding
+
+- `CAPACITY_BACKOFF_DIVISOR` still not ported back to `simply_hook_executor` (carried from Sessions
+  25/26/30). Unchanged: it is a change to the peer tree, which is read-only from here.

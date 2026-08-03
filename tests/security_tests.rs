@@ -1503,11 +1503,13 @@ async fn attack_cannot_self_grant_or_over_grant_group_permissions() {
         }
     };
 
-    // Self-granting is refused outright, even for a group the caller can already read.
+    // Self-targeting is bounded rather than blocked: the request is compared against the caller's
+    // own row, which is the row being written, so it can never widen. Asking for `can_delete` — the
+    // one verb the caller does not hold on its own group — is the escalation direction and fails.
     assert_eq!(
-        post(caller_id, own_group, true, false, false).await,
+        post(caller_id, own_group, true, true, true).await,
         StatusCode::FORBIDDEN,
-        "a key must not modify its own group permissions"
+        "a key must not widen its own group permissions"
     );
     assert_eq!(
         post(caller_id, foreign_group, true, false, false).await,
@@ -1547,6 +1549,23 @@ async fn attack_cannot_self_grant_or_over_grant_group_permissions() {
         .unwrap();
     assert_eq!(perms.len(), 1, "only the one legitimate grant landed");
     assert!(perms[0].can_read && perms[0].can_write && !perms[0].can_delete);
+
+    // Last, because it mutates the caller's own row and everything above depends on it: reducing
+    // your own access is permitted. It is the same authority the dedicated revoke endpoint confers,
+    // reached through this one, and removing a verb cannot raise anyone above where they already
+    // were — the caller least of all.
+    assert_eq!(
+        post(caller_id, own_group, true, false, false).await,
+        StatusCode::OK,
+        "a key may drop a verb from its own row on a group it manages"
+    );
+    let own = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(caller_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the caller still has a row");
+    assert!(own.can_read && !own.can_write, "the self-directed change was a genuine reduction");
 }
 
 // ─────────────────────────────────────────────────────────────

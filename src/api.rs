@@ -119,22 +119,56 @@ async fn caller_group_permission(
         .map_err(AppError::DbError)
 }
 
-/// Enforces that a non-master cannot hand out — or take away — access it does not itself hold.
+/// The entry gate for administering *any* key's permissions on one group: the caller must itself
+/// hold a grant on that group.
 ///
 /// `can_manage_keys` says the caller may administer keys; it says nothing about *which groups* it
-/// may hand out. Without this, a key scoped to one group could grant any other key — and, via a
-/// second key it controls, itself — full read/write/delete on every group in the system, which
-/// makes per-group RBAC advisory rather than enforced.
+/// may reach. Without this, a key scoped to one group could rewrite every other key's access to
+/// every group in the system, which makes per-group RBAC advisory rather than enforced. This service
+/// has no `can_manage` column on `api_key_group_permissions`, so "manages this group" is spelled
+/// `can_manage_keys` (checked by the handler) **plus a row here** — the same authority
+/// `simply_hook_executor` expresses as a single `can_manage` flag.
 ///
-/// Each verb is checked independently against the caller's own row: holding `can_read` on a group
-/// does not confer the right to grant `can_write` on it.
+/// `action` names the operation being guarded (`"grant"` / `"revoke"`) and appears verbatim in the
+/// client-facing message, which is otherwise identical between the two paths so a caller probing
+/// them cannot tell which check refused it.
 ///
-/// `action` names the operation being guarded (`"grant"` / `"revoke"`) and appears verbatim in both
-/// the log line and the client-facing message. The same predicate governs both directions:
-/// [`revoke_key_group_permission`] passes the grant it is about to delete, so "may I remove this
-/// set?" is answered by exactly the rule that answers "may I confer this set?". A key that could
-/// revoke beyond its own access could disable another tenant's automation without ever holding a
-/// single permission on the group it acted against.
+/// This is the **whole** authority test for revocation, and only the first half for granting — see
+/// [`guard_delegated_group_grant`] for why the two differ.
+fn guard_group_administration(
+    caller: &api_key::Model,
+    caller_perm: Option<&api_key_group_permission::Model>,
+    group_name: &str,
+    action: &str,
+) -> Result<(), AppError> {
+    if caller.is_master || caller_perm.is_some() {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(format!(
+        "Permission denied: you have no access to group '{group_name}' and cannot {action} it"
+    )))
+}
+
+/// Enforces that a non-master cannot hand out access it does not itself hold.
+///
+/// Layered on [`guard_group_administration`]: managing the group is necessary to touch its grants at
+/// all, and *additionally* each verb being conferred is checked independently against the caller's
+/// own row — holding `can_read` on a group does not confer the right to grant `can_write` on it.
+///
+/// # Only the granting direction is checked per verb
+///
+/// `over_grants` tests `requested && !held`, so a verb being set to **false** is never examined.
+/// Reducing a permission therefore needs no proof of authority over the verb removed, and that
+/// asymmetry with granting is deliberate: conferring a verb can raise someone's authority above the
+/// caller's own, and removing one cannot raise anyone's at all. The dedicated revoke path applies
+/// the same rule by calling the entry gate alone, so "revoke the row" and "update the row to a lower
+/// value" are governed identically rather than by two rules that happen to disagree.
+///
+/// The integrity concern that once argued for a per-verb revocation check — a key manager stripping
+/// the credential another tenant's `fail2ban` writes with — is answered by the entry gate, which is
+/// what confines the damage to groups the caller already manages. See
+/// [`revoke_key_group_permission`].
 fn guard_delegated_group_grant(
     caller: &api_key::Model,
     caller_perm: Option<&api_key_group_permission::Model>,
@@ -142,14 +176,15 @@ fn guard_delegated_group_grant(
     action: &str,
     requested: &GroupPermInput,
 ) -> Result<(), AppError> {
+    guard_group_administration(caller, caller_perm, group_name, action)?;
+
     if caller.is_master {
         return Ok(());
     }
 
+    // Guaranteed `Some` by the gate above, which refuses a non-master with no row.
     let Some(held) = caller_perm else {
-        return Err(AppError::Forbidden(format!(
-            "Permission denied: you have no access to group '{group_name}' and cannot {action} it"
-        )));
+        return Ok(());
     };
 
     let over_grants = (requested.can_read && !held.can_read)
@@ -1825,24 +1860,16 @@ pub async fn update_key_group_permissions(
         return Err(AppError::InvalidInput("Cannot configure M:N permissions on a master key".to_owned()));
     }
 
-    // Self-granting is refused outright for non-masters, rather than merely bounded by the
-    // "cannot grant what you don't hold" rule below. The two are not equivalent: the check below
-    // compares against the grants the caller holds *at this instant*, so a caller allowed to
-    // target itself could ratchet — grant itself `can_read` on a group it can already read, then
-    // use that row as the basis for widening to `can_write`, and so on. Requiring a second party
-    // for every self-affecting change removes the ratchet entirely.
+    // Self-targeting is permitted, and is bounded rather than blocked. `guard_delegated_group_grant`
+    // below compares the request against the caller's *own* row — which, when the caller is the
+    // target, is the very row being written — so the result can never exceed what was already held.
+    // A self-directed call is therefore always a reduction or a no-op, which is the same authority
+    // the dedicated revoke path grants, reached through the other endpoint.
     //
-    // A master key is exempt: it already has unconditional access to every group, so a grant to
-    // itself changes nothing it could not already do.
-    if id == key.id && !key.is_master {
-        tracing::warn!(
-            "Blocked self-granting: key {} attempted to modify its own group permissions",
-            key.prefix
-        );
-        return Err(AppError::Forbidden(
-            "A key cannot modify its own group permissions; ask a master key".to_owned(),
-        ));
-    }
+    // An earlier revision refused this outright to prevent a ratchet: grant yourself what you
+    // already hold, then widen from the fresh row. The ratchet was never reachable — widening is
+    // exactly what the per-verb check refuses — so the block only stopped a manager from dropping
+    // its own access, which is the one self-directed change nobody needs protecting from.
 
     if (payload.can_write || payload.can_delete) && !payload.can_read {
         return Err(AppError::InvalidInput(
@@ -1918,29 +1945,40 @@ pub async fn update_key_group_permissions(
 /// Handles DELETE /api/v1/keys/:id/permissions/:group_identifier — removes a key's permission
 /// mapping for a specific group. `group_identifier` may be either the group's UUID or its name.
 ///
-/// # Revocation is bounded by the caller's own access, exactly as granting is
+/// # Managing the group is the whole authority test
 ///
-/// This handler used to check `can_manage_keys` and nothing else, which made it the mirror image of
-/// a hole [`guard_delegated_group_grant`] had already closed on the grant side: a non-master key
-/// manager scoped to one group could strip *any* key's access to *any* group in the system.
+/// A caller that manages this group — master, or `can_manage_keys` plus a grant of its own on it —
+/// may remove **any** verb from **any** key's row on it, including its own, without holding the
+/// verbs being removed. This matches `simply_hook_executor`, where `can_manage` over a hook confers
+/// exactly this.
 ///
-/// "Revocation only removes authority, so it cannot be an escalation" is the reasoning that leaves
-/// this ungated, and it is wrong for this service specifically. Removing authority **is** the
-/// attack: `simply_ip_vault` exists to keep `fail2ban`-style automation writing to shared banlists,
-/// so silently revoking the key that maintains another tenant's list stops that tenant's blocking —
-/// a denial-of-service that presents as "bans mysteriously stopped landing", with the cause several
-/// audit-log pages away from the symptom.
+/// # Why the stricter rule this replaces was relaxed
 ///
-/// Two guards, both mirroring the grant path:
+/// An earlier revision required the caller to hold each verb it removed, and refused self-targeting
+/// outright. Both were dropped, for different reasons.
 ///
-/// 1. **Self-targeting is refused outright** for non-masters. [`update_key_group_permissions`]
-///    already refuses it to remove a ratchet; allowing the same key to *drop* its own rows would
-///    leave a caller able to rewrite the record of what a master decided about it, which is the
-///    property that made self-targeting worth refusing in the first place.
-/// 2. **The caller must hold at least what it is removing.** The target's current row is fed to
-///    [`guard_delegated_group_grant`] as though it were being granted, so a caller holding only
-///    `can_read` on a group cannot strip a key's `can_write` on it — authority it does not itself
-///    possess. A caller with no row on the group at all is refused outright.
+/// **Per-verb revocation** conflated two controls. Guarding a *grant* per verb is an anti-escalation
+/// control: conferring `can_write` when you hold only `can_read` manufactures authority that did not
+/// exist. Removing `can_write` manufactures nothing — no key anywhere ends up with more access than
+/// before, including the caller. What removal genuinely threatens is **integrity**: this service
+/// keeps `fail2ban`-style automation writing to shared banlists, so stripping the key that maintains
+/// another tenant's list stops that tenant's blocking, and the symptom ("bans stopped landing") sits
+/// several audit-log pages from the cause. That threat is answered by *which groups* a caller can
+/// reach, not by which verbs it holds within them — and the entry gate answers it exactly, confining
+/// every revocation to groups the caller already manages. The per-verb test bought no additional
+/// containment while producing a genuinely strange shape: a grant you were trusted to create could
+/// be one you were forbidden to undo.
+///
+/// **Self-targeting** was refused to prevent a ratchet — grant yourself what you already hold, then
+/// use the fresh row to widen. The ratchet does not exist:
+/// [`guard_delegated_group_grant`] compares a self-directed request against the caller's *own* row,
+/// which is the very row being written, so the result can never exceed what was already held. With
+/// escalation impossible, all the block did was forbid a manager from dropping its own access —
+/// making the least-privilege action require a master.
+///
+/// The counterpart safeguard is that a master's view never depends on a permission row existing, so
+/// a group whose last manager revokes itself stays visible and re-grantable rather than becoming
+/// invisible. See [`list_ip_groups`].
 pub async fn revoke_key_group_permission(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
@@ -1955,47 +1993,16 @@ pub async fn revoke_key_group_permission(
         .await?
         .ok_or(AppError::NotFound)?;
 
-    if id == key.id && !key.is_master {
-        tracing::warn!(
-            "Blocked self-revocation: key {} attempted to drop its own permissions on group '{}'",
-            key.prefix,
-            group.name
-        );
-        return Err(AppError::Forbidden(
-            "A key cannot modify its own group permissions; ask a master key".to_owned(),
-        ));
+    // A missing grant is the `404` this endpoint has always returned, and it is established before
+    // the authority check below so a caller learns "no such grant" before it learns anything about
+    // its own standing — and so a nonexistent grant cannot become a `403` that confirms the group
+    // exists to someone with no access to it.
+    if caller_group_permission(&state.db, id, group.id).await?.is_none() {
+        return Err(AppError::NotFound);
     }
 
-    // Read the grant before deleting it: the verbs being removed are what the caller must be
-    // entitled to remove, and a missing row is the `404` this endpoint has always returned.
-    let existing = api_key_group_permission::Entity::find()
-        .filter(
-            Condition::all()
-                .add(api_key_group_permission::Column::ApiKeyId.eq(id))
-                .add(api_key_group_permission::Column::GroupId.eq(group.id)),
-        )
-        .one(&state.db)
-        .await
-        .map_err(AppError::DbError)?
-        .ok_or(AppError::NotFound)?;
-
-    // Checked *after* the `404`, so a caller learns "no such grant" before it learns anything about
-    // its own standing — and before the guard below can turn a nonexistent grant into a `403` that
-    // would confirm the group exists to someone with no access to it.
     let caller_perm = caller_group_permission(&state.db, key.id, group.id).await?;
-    guard_delegated_group_grant(
-        &key,
-        caller_perm.as_ref(),
-        &group.name,
-        "revoke",
-        &GroupPermInput {
-            group_id: None,
-            group_name: None,
-            can_read: existing.can_read,
-            can_write: existing.can_write,
-            can_delete: existing.can_delete,
-        },
-    )?;
+    guard_group_administration(&key, caller_perm.as_ref(), &group.name, "revoke")?;
 
     let result = api_key_group_permission::Entity::delete_many()
         .filter(

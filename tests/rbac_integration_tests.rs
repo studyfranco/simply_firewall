@@ -2074,14 +2074,126 @@ async fn a_key_manager_cannot_revoke_access_to_a_group_it_does_not_manage() {
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 }
 
-/// A key manager may not revoke its *own* group access either.
+/// Managing a group confers authority to remove **any** verb from it, held or not.
 ///
-/// The grant path already refuses self-targeting outright (`update_key_group_permissions`), for an
-/// anti-ratchet reason. Revocation needs the same treatment for a narrower one: a caller that can
-/// rewrite its own permission rows is a caller whose recorded access no longer reflects what a
-/// master decided, and self-revocation is the half of that which looks harmless enough to be left in.
+/// This is the converged rule, matching `simply_hook_executor`, and it replaces a stricter one that
+/// required the caller to hold each verb it removed. The distinction it rests on: guarding a *grant*
+/// per verb stops authority being manufactured, while removing a verb manufactures nothing — nobody,
+/// the caller included, ends up with more access than before. What removal actually threatens is
+/// another tenant's automation, and that is answered by *which groups* the caller can reach — the
+/// entry gate asserted in `a_key_manager_cannot_revoke_access_to_a_group_it_does_not_manage`.
+///
+/// Both spellings of "reduce" are asserted here, because they used to disagree: the dedicated revoke
+/// endpoint refused what an update-to-a-lower-value allowed.
 #[tokio::test]
-async fn a_key_manager_cannot_revoke_its_own_group_access() {
+async fn a_group_manager_may_remove_verbs_it_does_not_hold_itself() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    // Read-only on the group, but a key manager: under the old rule this could not strip a verb it
+    // did not hold, which made a grant it was trusted to create one it was forbidden to undo.
+    let (manager_id, manager_key) = insert_key(&db, "Reader manager", false, true, false, false).await;
+    let (worker_id, _worker_key) = insert_key(&db, "Worker", false, false, false, false).await;
+
+    let grant = |holder: Uuid, verbs: serde_json::Value, nth: i64| {
+        let (app, master_key) = (app.clone(), master_key.clone());
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("POST")
+                .uri(format!("/api/keys/{holder}/permissions"))
+                .header("X-API-Key", &master_key)
+                .header("Content-Type", "application/json")), nth, verbs.to_string());
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    assert_eq!(
+        grant(manager_id, json!({
+            "group_name": "shared-group", "can_read": true, "can_write": false, "can_delete": false
+        }), 1).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        grant(worker_id, json!({
+            "group_name": "shared-group", "can_read": true, "can_write": true, "can_delete": true
+        }), 2).await,
+        StatusCode::OK
+    );
+
+    // Spelling one: reduce the worker's row through the general update endpoint. This path already
+    // permitted it — `over_grants` only inspects verbs being set to true — and is the behaviour the
+    // revoke path is now aligned with.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{worker_id}/permissions"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 3, json!({
+            "group_name": "shared-group", "can_read": true, "can_write": false, "can_delete": false
+        }).to_string());
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "a read-only manager may strip write/delete by updating the row to a lower value"
+    );
+
+    let reduced = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(worker_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the worker's row survives, reduced");
+    assert!(reduced.can_read, "the verb the manager holds is untouched");
+    assert!(!reduced.can_write && !reduced.can_delete, "the verbs it does not hold were removed");
+
+    // Spelling two: the dedicated revoke endpoint, on a row that still carried delete. Under the old
+    // rule this was the 403 that made the two paths disagree.
+    assert_eq!(
+        grant(worker_id, json!({
+            "group_name": "shared-group", "can_read": true, "can_write": true, "can_delete": true
+        }), 4).await,
+        StatusCode::OK
+    );
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{worker_id}/permissions/shared-group"))
+        .header("X-API-Key", &manager_key)), 5, "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "the same removal must succeed through the dedicated endpoint too"
+    );
+
+    // Granting is still bounded per verb — the relaxation is one-directional, and a test that did
+    // not assert this would be consistent with the guard having been deleted outright.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{worker_id}/permissions"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 6, json!({
+            "group_name": "shared-group", "can_read": true, "can_write": true, "can_delete": false
+        }).to_string());
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "a read-only manager still cannot confer can_write it does not hold"
+    );
+}
+
+/// A manager may revoke its **own** access to a group it manages.
+///
+/// The block this replaces existed to prevent a ratchet — grant yourself what you already hold, then
+/// widen from the fresh row. The ratchet was never reachable: `guard_delegated_group_grant` compares
+/// a self-directed request against the caller's own row, which is the row being written, so the
+/// result can never exceed what was already held. All the block achieved was making the
+/// least-privilege action — dropping your own access — require a master.
+///
+/// Asserted through both endpoints, and the escalation direction is asserted to still fail, so this
+/// cannot pass by self-targeting having become unguarded rather than bounded.
+#[tokio::test]
+async fn a_group_manager_may_revoke_and_reduce_its_own_access() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
     let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
@@ -2099,22 +2211,180 @@ async fn a_key_manager_cannot_revoke_its_own_group_access() {
         }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
+    // Self-reduction through the update endpoint: drop your own delete.
     let req = signed_later(inject_connect_info(Request::builder()
-        .method("DELETE")
-        .uri(format!("/api/keys/{manager_id}/permissions/self-revoke-group"))
-        .header("X-API-Key", &manager_key)), 1, "");
+        .method("POST")
+        .uri(format!("/api/keys/{manager_id}/permissions"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 1, json!({
+            "group_name": "self-revoke-group", "can_read": true, "can_write": true, "can_delete": false
+        }).to_string());
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "a manager may reduce its own row on a group it manages"
+    );
+
+    // ...but not widen it back. This is the bound that makes self-targeting safe to allow at all.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{manager_id}/permissions"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 2, json!({
+            "group_name": "self-revoke-group", "can_read": true, "can_write": true, "can_delete": true
+        }).to_string());
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
         StatusCode::FORBIDDEN,
-        "a non-master key must not rewrite its own group permission rows in either direction"
+        "a manager must not restore a verb it just dropped — self-targeting is bounded, not free"
     );
 
-    // A master may still revoke it, so the key is not stranded with an unremovable grant.
+    // Self-revocation through the dedicated endpoint: surrender the group entirely.
     let req = signed_later(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri(format!("/api/keys/{manager_id}/permissions/self-revoke-group"))
-        .header("X-API-Key", &master_key)), 2, "");
+        .header("X-API-Key", &manager_key)), 3, "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "a manager may drop its own access to a group it manages"
+    );
+
+    let remaining = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(manager_id))
+        .all(&db)
+        .await
+        .unwrap();
+    assert!(remaining.is_empty(), "the row is genuinely gone, not merely reported as removed");
+
+    // Having surrendered the group, the manager is now outside the entry gate like anyone else.
+    let (other_id, _other_key) = insert_key(&db, "Other", false, false, false, false).await;
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{other_id}/permissions"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 4, json!({
+            "group_name": "self-revoke-group", "can_read": true, "can_write": false, "can_delete": false
+        }).to_string());
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "self-revocation is a one-way door: the manager cannot re-grant itself back in"
+    );
+}
+
+/// A group with no permission rows at all must stay visible and manageable by a master.
+///
+/// This is the counterpart safeguard to self-revocation. Now that the last manager of a group can
+/// drop its own access, a group can reach a state where **no key holds any row on it**. If a
+/// master's view were assembled from `api_key_group_permissions`, such a group would vanish from
+/// every endpoint at that moment — recoverable only by someone with direct database access, which
+/// is precisely the situation an admin API exists to avoid.
+///
+/// It does not vanish, because every read path branches on `is_master` *before* consulting the
+/// permission table rather than filtering by a row the master never has. This asserts that end to
+/// end, through the state the new revoke rule makes reachable.
+#[tokio::test]
+async fn a_group_left_ungoverned_by_self_revocation_stays_visible_to_a_master() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state);
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (manager_id, manager_key) = insert_key(&db, "Sole manager", false, true, false, false).await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{manager_id}/permissions"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json")), json!({
+            "group_name": "orphaned-group", "can_read": true, "can_write": true, "can_delete": true
+        }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // Put an address in it, so "view" has something to be wrong about.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 1, json!({
+            "target_address": "203.0.113.77", "group_name": "orphaned-group", "cause": "before orphaning"
+        }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // The last manager surrenders the group. Nothing governs it now.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{manager_id}/permissions/orphaned-group"))
+        .header("X-API-Key", &manager_key)), 2, "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+
+    let rows = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .all(&db)
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "precondition: the group is genuinely ungoverned");
+
+    // 1. The master can still LIST it.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/groups")
+        .header("X-API-Key", &master_key)), 3, "");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let groups: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let listed: Vec<&str> =
+        groups.as_array().unwrap().iter().filter_map(|g| g["name"].as_str()).collect();
+    assert!(
+        listed.contains(&"orphaned-group"),
+        "an ungoverned group must not disappear from the master's listing: {listed:?}"
+    );
+
+    // 2. The master can still VIEW its contents.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/ips?group_name=orphaned-group")
+        .header("X-API-Key", &master_key)), 4, "");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ips: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let addresses: Vec<&str> =
+        ips.as_array().unwrap().iter().filter_map(|r| r["target_address"].as_str()).collect();
+    assert!(
+        addresses.contains(&"203.0.113.77"),
+        "the master must still see the ungoverned group's records: {addresses:?}"
+    );
+
+    // 3. The master can still RE-GRANT on it, so the group is recoverable through the API.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{manager_id}/permissions"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json")), 5, json!({
+            "group_name": "orphaned-group", "can_read": true, "can_write": true, "can_delete": true
+        }).to_string());
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "a master must be able to put a group back under management"
+    );
+
+    // ...and the re-grant is real: the manager can reach the group again.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/ips?group_name=orphaned-group")
+        .header("X-API-Key", &manager_key)), 6, "");
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ips: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(ips.as_array().unwrap().len(), 1, "the restored manager sees the group again");
 }
 
 /// `GET /api/audit-logs` is master-only and returns populated entries after mutations, filterable
