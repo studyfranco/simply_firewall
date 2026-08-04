@@ -47,6 +47,10 @@
 
     <!-- Main Dashboard Container -->
     <div id="dashboard-container" class="container hidden">
+      <!-- Header and tabs travel together as one sticky unit so the tab bar stays reachable while
+           the page scrolls, and the whole unit retracts on scroll-down to give the table its space
+           back. See `bindStickyTopBar()` in app.js. -->
+      <div id="top-bar" class="top-bar">
         <header class="header">
             <div class="logo">
                 <div class="logo-icon"></div>
@@ -66,6 +70,7 @@
             <button class="tab-btn" data-tab="webhooks" id="webhooks-tab-btn" role="tab" aria-selected="false">Webhooks</button>
             <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
+      </div>
 
         <!-- ═══════════════════════════════════════════════ -->
         <!-- TAB: IP Records                                 -->
@@ -103,8 +108,18 @@
                 <!-- Primary action sits immediately above the table, opposite the batch actions. -->
                 <div class="table-toolbar">
                     <button type="button" id="open-manage-ip" class="btn btn-primary">+ Add IP / Grant Access</button>
-                    <div class="batch-actions hidden">
-                        <button type="button" id="delete-selected-ips" class="btn btn-batch-delete" disabled>Delete Selected</button>
+                    <div class="toolbar-right">
+                        <label for="page-size" class="page-size-label">Rows</label>
+                        <select id="page-size" class="input-field select-field page-size-select"
+                                title="Rows per page — Auto fits the table to the window">
+                            <option value="10">10</option>
+                            <option value="25">25</option>
+                            <option value="50">50</option>
+                            <option value="auto" selected>Auto</option>
+                        </select>
+                        <div class="batch-actions hidden">
+                            <button type="button" id="delete-selected-ips" class="btn btn-batch-delete" disabled>Delete Selected</button>
+                        </div>
                     </div>
                 </div>
 
@@ -381,8 +396,17 @@
                             </div>
                             <div class="form-group" id="webhook-api-key-group">
                                 <label for="webhook-api-key">API Key</label>
-                                <input type="password" id="webhook-api-key" placeholder="Sent as X-API-Key" class="input-field" autocomplete="off">
-                                <small class="field-hint">Credential for the <em>receiving</em> system. Stored as given, never shown again.</small>
+                                <div class="input-pair">
+                                    <input type="text" id="webhook-api-key-header" class="input-field font-mono header-name-input"
+                                           value="X-API-Key" placeholder="X-API-Key" autocomplete="off"
+                                           aria-label="Header name for the API key">
+                                    <input type="password" id="webhook-api-key" placeholder="Credential value" class="input-field" autocomplete="off">
+                                </div>
+                                <small class="field-hint">
+                                    Credential for the <em>receiving</em> system. Stored as given, never shown again.
+                                    Rename the header if the receiver expects something other than
+                                    <code>X-API-Key</code>.
+                                </small>
                             </div>
                         </div>
 
@@ -402,8 +426,17 @@
                              read better adjacent than stacked full-width. -->
                         <div class="compact-grid">
                             <div class="form-group">
-                                <label for="webhook-headers">Custom Headers (JSON)</label>
-                                <textarea id="webhook-headers" placeholder='{"Authorization": "Bearer token"}' class="input-field font-mono" rows="3"></textarea>
+                                <label id="webhook-headers-label">Custom Headers</label>
+                                <!-- Rows are built by JS (renderHeaderRows). Always present, in every
+                                     auth mode, so a receiver that wants its signature or credential
+                                     under a non-standard name can be accommodated without the form
+                                     needing a field for each possibility. -->
+                                <div id="webhook-headers-list" class="kv-editor" role="group"
+                                     aria-labelledby="webhook-headers-label"></div>
+                                <button type="button" id="webhook-headers-add" class="btn btn-secondary btn-sm mt-2">+ Add Header</button>
+                                <small class="field-hint">
+                                    Sent verbatim on every dispatch. Rows with an empty name are ignored.
+                                </small>
                             </div>
                             <div class="form-group">
                                 <label for="webhook-template">Payload Template <span>*</span></label>

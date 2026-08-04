@@ -138,6 +138,9 @@ async fn grant(
         can_read: Set(read),
         can_write: Set(write),
         can_delete: Set(del),
+        // The administrative flag is off unless a test asks for it explicitly — the security suite
+        // is about the read/write/delete surface.
+        can_manage: Set(false),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
     .insert(db)

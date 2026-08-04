@@ -21,6 +21,13 @@ pub struct Model {
     pub can_write: bool,
     /// Permission to remove IPs from this group. Implies `can_read`.
     pub can_delete: bool,
+    /// Permission to administer *this group's* permission rows.
+    ///
+    /// Resource-scoped counterpart to the global `api_keys.can_manage_keys`, and deliberately
+    /// narrower than it: this satisfies the **revoke** path only. Granting or widening a verb still
+    /// requires `can_manage_keys`, because conferring authority must not be delegable by a right
+    /// that is itself scoped to one group. See `AGENT.MD` §2.
+    pub can_manage: bool,
     /// Assignment timestamp.
     pub created_at: DateTime,
 }

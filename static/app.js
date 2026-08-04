@@ -250,6 +250,17 @@ class PagedCache {
         this._visible = null;    // memoized filter result, invalidated whenever items change
     }
 
+    // Changes how many rows a local page holds, keeping the user roughly where they were: the
+    // first row currently on screen stays on screen. Snapping back to page 1 on every resize would
+    // make the "Auto" size unusable, since a window drag fires this repeatedly.
+    setPageSize(size) {
+        const next = Math.max(1, Math.floor(size));
+        if (next === this.pageSize) return;
+        const firstVisible = this.localPage * this.pageSize;
+        this.pageSize = next;
+        this.localPage = Math.floor(firstVisible / next);
+    }
+
     // An optional client-side predicate applied on top of whatever the server returned. Used for
     // bounds the API has no parameter for — currently the date range's upper bound. Everything
     // below (page count, slicing, next/prev availability) works off the filtered view, so a
@@ -432,7 +443,11 @@ class FirewallClient {
             // delimiter-based encoding of (address, group) pairs.
             selectedIpIds: new Set(),
             selectedGroupIds: new Set(),
-            selectedKeyIds: new Set()
+            selectedKeyIds: new Set(),
+            // Custom webhook headers as [{name, value}], owned here rather than read back out of
+            // the DOM — see renderHeaderRows(). Survives auth-mode switches by construction: the
+            // editor sits outside every mode-dependent group, so nothing hides or clears it.
+            webhookHeaders: []
         };
 
         // IP records and audit logs are both large, append-only lists — fetched from the server
@@ -817,6 +832,10 @@ class FirewallClient {
             await this.ipCache.loadFirstChunk();
             this.renderIpTable();
             this.updatePaginationUI();
+            // After the first render, and not before: "Auto" sizes itself by measuring a real row,
+            // which only exists once something has been drawn. Re-renders internally if the
+            // measurement disagrees with the current page size.
+            this.syncIpTableViewport();
         } catch(e) {}
     }
 
@@ -1296,6 +1315,99 @@ class FirewallClient {
         this.updatePaginationUI();
     }
 
+    // ───────────────────────────────────────────────────────
+    // Responsive table sizing
+    // ───────────────────────────────────────────────────────
+
+    // Rows per page: a fixed 10/25/50, or "auto" — as many as the table's current height fits.
+    ///
+    // Auto measures rather than guesses. A rendered row is the authority on row height, because it
+    // reflects the actual font, padding and zoom level; the constant is only the fallback for the
+    // very first render, before any row exists to measure.
+    resolveIpPageSize() {
+        const choice = document.getElementById('page-size').value;
+        if (choice !== 'auto') return parseInt(choice, 10);
+
+        const scroller = document.querySelector('#tab-firewall .table-scroll');
+        const head = scroller?.querySelector('thead');
+        const row = scroller?.querySelector('tbody tr');
+
+        const available = (scroller?.clientHeight || 0) - (head?.offsetHeight || 0);
+        const rowHeight = row?.offsetHeight || 38;
+        if (available <= 0 || rowHeight <= 0) return 15;
+
+        // Clamped: below 5 the pager churns, and above 100 the point of paginating is lost.
+        return Math.max(5, Math.min(100, Math.floor(available / rowHeight)));
+    }
+
+    // Recomputes the table's height budget from the viewport and re-paginates to match.
+    ///
+    // The budget is "everything below the table's top edge, less room for the pagination bar" —
+    // derived from a live `getBoundingClientRect()` rather than a hardcoded offset, so it stays
+    // correct as the filter bar wraps to more lines on a narrow window or the top bar retracts.
+    syncIpTableViewport() {
+        const scroller = document.querySelector('#tab-firewall .table-scroll');
+        if (!scroller) return;
+
+        const top = scroller.getBoundingClientRect().top;
+        // Reserve for the pagination row plus the card's bottom padding.
+        const reserved = 120;
+        const budget = Math.max(220, window.innerHeight - top - reserved);
+        scroller.style.setProperty('--table-max-h', `${Math.round(budget)}px`);
+
+        const size = this.resolveIpPageSize();
+        if (size !== this.ipCache.pageSize) {
+            this.ipCache.setPageSize(size);
+            this.renderIpTable();
+            this.updatePaginationUI();
+        }
+    }
+
+    // Retracts the header/tab bar while scrolling down and restores it on the way up.
+    ///
+    // The shift distance is measured into a CSS custom property instead of hardcoded: the tab row
+    // wraps to two lines on a narrow window, and a fixed offset would then leave the bar half on
+    // screen. `passive: true` keeps the listener off the scroll-blocking path.
+    bindStickyTopBar() {
+        const bar = document.getElementById('top-bar');
+        if (!bar) return;
+
+        let lastY = window.scrollY;
+        let ticking = false;
+
+        const apply = () => {
+            const y = window.scrollY;
+            bar.style.setProperty('--top-bar-shift', `${bar.offsetHeight}px`);
+            bar.classList.toggle('stuck', y > 4);
+
+            // The threshold is the bar's own height: retracting before the user has scrolled past it
+            // would yank content upward while they are still reading the top of the page.
+            const past = y > bar.offsetHeight;
+            if (!past) {
+                bar.classList.remove('collapsed');
+            } else if (y > lastY + 4) {
+                bar.classList.add('collapsed');
+            } else if (y < lastY - 4) {
+                bar.classList.remove('collapsed');
+            }
+            // The 4px deadband absorbs the sub-pixel jitter a trackpad produces at rest, which
+            // would otherwise flap the bar open and shut without the user scrolling at all.
+            lastY = y;
+            this.syncIpTableViewport();
+            ticking = false;
+        };
+
+        const onScroll = () => {
+            if (ticking) return;
+            ticking = true;
+            window.requestAnimationFrame(apply);
+        };
+
+        window.addEventListener('scroll', onScroll, { passive: true });
+        window.addEventListener('resize', () => this.syncIpTableViewport());
+        apply();
+    }
+
     renderAuditLogsTable() {
         const tbody = document.getElementById('audit-logs-table-body');
         const rows = this.auditCache.currentPageItems;
@@ -1701,6 +1813,76 @@ class FirewallClient {
             FirewallClient.AUTH_MODE_HINTS[mode] || '';
     }
 
+    // ───────────────────────────────────────────────────────
+    // Webhook custom headers — key/value editor
+    // ───────────────────────────────────────────────────────
+
+    // Renders the header rows from `this.state.webhookHeaders`.
+    //
+    // State lives in the array, not in the DOM: rebuilding rows from the DOM on every add/remove
+    // would lose whatever the user had half-typed in another row, and "delete row 2" would have to
+    // be expressed as an index into live inputs. Each input writes straight back into the array on
+    // `input`, so the array is always current and re-rendering is safe at any moment.
+    renderHeaderRows() {
+        const list = document.getElementById('webhook-headers-list');
+        const rows = this.state.webhookHeaders;
+
+        if (rows.length === 0) {
+            list.innerHTML = '<p class="kv-empty">No custom headers.</p>';
+            return;
+        }
+
+        list.innerHTML = rows.map((row, i) => `
+            <div class="kv-row" data-index="${i}">
+                <input type="text" class="input-field font-mono kv-name" placeholder="Header-Name"
+                       value="${escapeHtml(row.name)}" autocomplete="off" aria-label="Header name">
+                <input type="text" class="input-field font-mono kv-value" placeholder="value"
+                       value="${escapeHtml(row.value)}" autocomplete="off" aria-label="Header value">
+                <button type="button" class="kv-remove" data-index="${i}" title="Remove this header"
+                        aria-label="Remove header">&times;</button>
+            </div>
+        `).join('');
+
+        list.querySelectorAll('.kv-row').forEach(rowEl => {
+            const i = Number(rowEl.dataset.index);
+            rowEl.querySelector('.kv-name').addEventListener('input', (ev) => {
+                this.state.webhookHeaders[i].name = ev.target.value;
+            });
+            rowEl.querySelector('.kv-value').addEventListener('input', (ev) => {
+                this.state.webhookHeaders[i].value = ev.target.value;
+            });
+        });
+        list.querySelectorAll('.kv-remove').forEach(btn => {
+            btn.addEventListener('click', () => {
+                this.state.webhookHeaders.splice(Number(btn.dataset.index), 1);
+                this.renderHeaderRows();
+            });
+        });
+    }
+
+    addHeaderRow(name = '', value = '') {
+        this.state.webhookHeaders.push({ name, value });
+        this.renderHeaderRows();
+        // Focus the row just added, so "+ Add Header" leaves the cursor where typing continues.
+        const inputs = document.querySelectorAll('#webhook-headers-list .kv-name');
+        inputs[inputs.length - 1]?.focus();
+    }
+
+    // The editor's rows as a plain object, ready to be extended and stringified.
+    //
+    // Rows with a blank name are dropped rather than rejected: an empty row is what "+ Add Header"
+    // produces, and a user who adds one and changes their mind should not have to delete it before
+    // the form will submit. Later rows win on a duplicate name, matching how the `HashMap` the
+    // dispatcher deserializes into resolves it.
+    headerMap() {
+        const map = {};
+        for (const { name, value } of this.state.webhookHeaders) {
+            const key = name.trim();
+            if (key) map[key] = value;
+        }
+        return map;
+    }
+
     async createWebhook(e) {
         e.preventDefault();
 
@@ -1723,11 +1905,14 @@ class FirewallClient {
         const events = checkedEvents.length === Object.keys(eventKeys).length ? null : checkedEvents.join(',');
 
         const authMode = document.getElementById('webhook-auth-mode').value;
+        // Built from the editor's state, then possibly extended below with a renamed credential
+        // header.
+        const headers = this.headerMap();
+
         const payload = {
             name: document.getElementById('webhook-name').value,
             target_url: document.getElementById('webhook-url').value,
             group_id: groupId,
-            headers_json: document.getElementById('webhook-headers').value || null,
             payload_template: document.getElementById('webhook-template').value,
             auth_mode: authMode,
             events
@@ -1739,15 +1924,34 @@ class FirewallClient {
             payload.secret_token = document.getElementById('webhook-secret').value;
         }
         if (authMode === 'CANONICAL_V1' || authMode === 'API_KEY_ONLY') {
-            payload.api_key = document.getElementById('webhook-api-key').value || null;
+            const credential = document.getElementById('webhook-api-key').value;
+            const headerName = document.getElementById('webhook-api-key-header').value.trim();
+
+            // The dispatcher emits the `api_key` field under the fixed name `X-API-Key`, so a
+            // different name has to travel as an ordinary custom header instead. Both routes end up
+            // as one header on the wire; only the field carrying it differs.
+            if (credential && headerName && headerName.toLowerCase() !== 'x-api-key') {
+                headers[headerName] = credential;
+                payload.api_key = null;
+            } else {
+                payload.api_key = credential || null;
+            }
         }
         if (authMode === 'CANONICAL_V1') {
             payload.hmac_template = document.getElementById('webhook-hmac-template').value;
         }
 
+        payload.headers_json = Object.keys(headers).length > 0 ? JSON.stringify(headers) : null;
+
         try {
             await this.apiFetch('/webhooks', { method: 'POST', body: JSON.stringify(payload) });
             document.getElementById('form-create-webhook').reset();
+            // `reset()` does not reach the header editor (its rows are JS-owned, not form fields),
+            // so it is cleared explicitly — otherwise the next webhook would silently inherit the
+            // previous one's headers.
+            this.state.webhookHeaders = [];
+            this.renderHeaderRows();
+            document.getElementById('webhook-api-key-header').value = 'X-API-Key';
             // reset() restores the select's default (CANONICAL_V1); re-sync so the fields on screen
             // match it again.
             this.syncWebhookAuthFields();
@@ -1792,8 +1996,19 @@ class FirewallClient {
         });
 
         const authModeSelect = document.getElementById('webhook-auth-mode');
+        // Switching modes only shows and hides fields — it never clears a value, and the header
+        // editor is outside every mode-dependent group, so headers entered under one mode are still
+        // there under the next. The payload builder is what decides which fields actually get sent.
         authModeSelect.addEventListener('change', () => this.syncWebhookAuthFields());
         this.syncWebhookAuthFields();
+
+        // Custom header editor.
+        document.getElementById('webhook-headers-add').addEventListener('click', () => this.addHeaderRow());
+        this.renderHeaderRows();
+
+        // Table sizing: the selector and the sticky top bar both feed the same recompute.
+        document.getElementById('page-size').addEventListener('change', () => this.syncIpTableViewport());
+        this.bindStickyTopBar();
 
         document.getElementById('logout-btn').addEventListener('click', () => this.logout());
         document.getElementById('refresh-btn').addEventListener('click', () => this.loadInitialData());

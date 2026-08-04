@@ -40,3 +40,11 @@ tokio = { version = "1", features = ["full", "test-util"] }
 # Temporary directories for the file-backed SQLite tests. WAL cannot engage on `sqlite::memory:`,
 # so proving it engages at all — and persists across reconnection — needs a real file on disk.
 tempfile = "3"
+# A real ECMAScript parser for `tests/frontend_syntax_test.rs`. `static/` is served from disk by
+# `ServeDir` and is never compiled, so nothing else in the build can see a syntax error in it — a
+# broken `app.js` shipped green through `cargo test` and the whole e2e suite once already.
+# Deliberately a *parser* and not an engine: the file references `document` and `localStorage`, so
+# executing it would fail for reasons that have nothing to do with syntax.
+oxc_allocator = "0.90"
+oxc_parser = "0.90"
+oxc_span = "0.90"

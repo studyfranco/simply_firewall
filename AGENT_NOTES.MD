@@ -3984,3 +3984,165 @@ Note that `cargo test` and the e2e suite passed on the broken commit too, and al
 `static/` is served from disk by `ServeDir` and never parsed by anything in the Rust test path. No
 existing gate in this repo can see a front-end syntax error — which is why the parser check has to be
 run explicitly whenever `static/*.js` changes.
+
+---
+
+## Session 34 — Revoke-Authority Convergence, refined: a resource-scoped `can_manage`
+
+**This section refines Session 31's "Revoke-Authority Convergence" rather than replacing it.** Session
+31's conclusion stands unchanged: removing a permission cannot raise anyone's authority, so it does
+not need the same proof-of-authority as granting one. What that session left in place — because there
+was no column to express anything narrower — is what this one fixes.
+
+### What was still wrong after Session 31
+
+Session 31 wrote that "manages this group" is spelled `can_manage_keys` **plus a row on the group**,
+and noted that `simply_hook_executor` expresses the same thing as a single `can_manage` flag. That
+was an accurate description of a compromise, not of a good design. The consequence:
+
+> The smallest delegation the system could express was far larger than the one anyone wanted. To let
+> somebody take a verb away from one key on one group, you had to give them `can_manage_keys` — a
+> **system-wide** scope reaching every key and every group in the installation. The entry gate then
+> clawed most of that back for group operations, but the flag itself remained on the key, and it
+> unlocks far more than group permissions.
+
+`api_key_group_permissions.can_manage` is that delegation at the size it was actually wanted.
+
+### Why revoke gets the narrower gate and grant does not
+
+This is the load-bearing asymmetry, and it follows directly from Session 31's own reasoning:
+
+- **Granting can raise authority.** Conferring `can_write` on a key that lacked it creates access
+  that did not previously exist anywhere. A right scoped to one group must not be able to do that,
+  or the scoping is defeated by the very thing it scopes: hold `can_manage` on group A, mint yourself
+  a grant, and the boundary was decorative. Granting therefore still requires global
+  `can_manage_keys`, plus the entry gate, plus the per-verb ceiling.
+- **Revoking cannot.** After a revocation no key in the system holds more than before, the caller
+  included. The threat is **integrity** — stripping the credential another tenant's `fail2ban` writes
+  with — and that threat is bounded by *which group* the caller can reach. A resource-scoped flag
+  expresses exactly that bound, and expresses it more precisely than a global scope ever could.
+
+`can_manage` is itself treated as a verb on the grant path, so a `can_manage_keys` holder cannot mint
+group administrators unless it holds `can_manage` on that group already. Without that, the flag would
+spread outward from whoever a master originally trusted with it.
+
+### Classification is by effect, not by route
+
+`update_key_group_permissions` expresses both directions, so the rule is chosen per request rather
+than per endpoint: `widens_permissions()` compares the payload against the **target's** current row
+(a different question from `guard_delegated_group_grant`'s "does this exceed the *caller's* own?"),
+and a request that adds no verb is a revocation reached through the update endpoint. Creating a row
+counts as a grant regardless of contents — a scoped flag must not be able to mint rows.
+
+A no-op re-submission is therefore *not* a grant, which caught a bug in the first draft of
+`grant_and_revoke_authority_differs_by_caller_class`: it asserted "scoped caller cannot grant" against
+a payload identical to the row already stored, so it would have passed with the check deleted. The
+test now attempts a genuine widening, and the closure takes a `write` flag to make the distinction
+explicit at each call site.
+
+### Information disclosure kept intact
+
+Both handlers opened with a `can_manage_keys` check *before* any lookup, so a caller with no authority
+learned nothing about what exists. Per-group authority cannot be evaluated without resolving the
+group first, which would have moved that refusal after a 404 and let an unauthorized key enumerate
+group names. `holds_any_group_manage()` restores the original ordering: one indexed query answering
+"does this caller administer *anything*", run where the old flag check ran. The precise per-group test
+still happens afterwards.
+
+Master visibility over ungoverned groups was re-verified rather than assumed. It holds for the same
+structural reason as before — every master read path branches on `is_master` *before* touching
+`api_key_group_permissions` — and there is now a second test driving a group into that state through
+the scoped path, because a group can now be orphaned by a key holding no global scope at all.
+
+### Migration
+
+Additive, `NOT NULL DEFAULT false`, no backfill. Every existing row becomes `can_manage = false`,
+which is exactly the authority it had before the migration ran, and existing `can_manage_keys` holders
+are unaffected because their path does not consult the column. Auto-provisioning on group creation
+still confers read/write/delete and **not** `can_manage`: creating a group should not silently make
+you an administrator of other keys' access to it.
+
+---
+
+## Session 34 (cont.) — JS syntax checking inside `cargo test`
+
+`tests/frontend_syntax_test.rs` parses `static/app.js` with `oxc_parser` and fails the build on any
+syntax error. This closes the gap Session 33 documented and could not close from inside the repo:
+`static/` is served from disk by `ServeDir` and is compiled by nothing, so a broken `app.js` passed
+`cargo check`, `cargo clippy`, `cargo test` **and** all 420 e2e checks while the dashboard was
+completely dead in the browser.
+
+A *parser*, not an engine, and deliberately: executing the file would fail on `document`,
+`localStorage` and `crypto.subtle`, and separating "not valid JavaScript" from "needs a DOM" would
+mean pattern-matching error strings.
+
+Three tests, and the second is the one that matters:
+
+1. `app_js_has_no_syntax_errors` — the check itself.
+2. `the_syntax_check_rejects_the_defect_it_exists_to_catch` — feeds the parser the exact shipped
+   defect (a backtick inside a template literal) and asserts it is rejected. A guard that has never
+   been shown to fail is not evidence of anything, and without this a future refactor could neuter
+   the first test silently.
+3. `the_checked_file_is_where_the_test_thinks_it_is` — a wrong path would otherwise read as success.
+
+Verified end to end by checking out the broken `4bdadf0` version of `app.js` and running `cargo test`:
+`app_js_has_no_syntax_errors ... FAILED`, naming the line. Restored, it passes.
+
+Scope: syntax only. A typo'd identifier, a wrong selector or a dead event wiring all parse cleanly.
+It closes "the file cannot load at all", which is the failure that takes the whole dashboard down at
+once.
+
+---
+
+## Session 34 (cont.) — UI: responsive table height and key/value headers
+
+**Rows per page (10 / 25 / 50 / Auto).** `PagedCache.setPageSize()` keeps the first visible row on
+screen across a change rather than snapping to page 1 — with "Auto" bound to window size, a resize
+fires this repeatedly and snapping would make it unusable. "Auto" *measures* a rendered row rather
+than assuming a height, so it stays correct across font size and zoom; the constant is only the
+first-render fallback. Clamped to 5–100.
+
+**Sticky top bar.** Header and tab nav became one sticky unit that retracts on scroll-down and
+returns on scroll-up. Three details worth keeping:
+
+- The retraction distance is measured into `--top-bar-shift` at runtime, not hardcoded — the tab row
+  wraps to two lines on a narrow window, and a fixed offset would leave the bar half on screen.
+- A 4px deadband on the direction test. Trackpads emit sub-pixel scroll jitter at rest, which
+  otherwise flaps the bar open and shut without the user scrolling.
+- The panels translate with the bar, or retracting it would leave a gap where it used to be instead
+  of handing the space to the table.
+
+Table height is `--table-max-h`, computed from a live `getBoundingClientRect()` rather than a fixed
+offset, so it stays right as the filter bar wraps or the top bar retracts.
+
+**Webhook headers: key/value editor.** The raw JSON textarea is gone. Row state lives in
+`state.webhookHeaders`, not in the DOM: rebuilding from the DOM would lose half-typed input in other
+rows on every add/remove. Blank-named rows are dropped at serialize time rather than rejected, since
+an empty row is exactly what "+ Add Header" produces.
+
+Mode switching is non-destructive by construction — the editor sits outside every mode-dependent
+group, so nothing hides or clears it, and `syncWebhookAuthFields` only toggles visibility. The
+payload builder decides what actually gets sent.
+
+**API-key header name — and the half that could not be delivered.** The credential's header name is
+now editable, defaulting to `X-API-Key`. When it differs, the value is serialized into `headers_json`
+under the chosen name and `api_key` is sent as null; when it matches, the existing `api_key` field is
+used. Both produce one header on the wire.
+
+**Custom *signature* header names were not delivered.** `src/webhooks.rs` emits the computed HMAC
+under a hardcoded `X-Signature-256` (and the timestamp under `X-Timestamp`), and that file is not in
+this task's target list. Renaming where a *computed* value is emitted cannot be done from the
+frontend — unlike the API key, whose value is known to the client and can therefore travel as an
+ordinary custom header. Users can add any additional headers they like in any mode, including
+`BODY_ONLY`; what remains unavailable is renaming the signature header itself. Closing that needs a
+`webhook_configs` column and a change to the dispatcher.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **172 passed**, 0 failed (70 unit + 62 RBAC + 37 security + 3 frontend syntax) |
+| `./scripts/test_e2e.sh` | 420/420 |
+| Migration | applies additively; existing rows default to `can_manage = false` |

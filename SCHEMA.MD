@@ -117,7 +117,7 @@ Logical collections of IP rules (e.g. `fail2ban`, `sshd`, `vpn_whitelist`).
 ---
 
 ### 3. `api_key_group_permissions` (M:N Junction Table)
-Maps fine-grained read, write, and delete permissions per API key and per IP group.
+Maps fine-grained read, write, delete, and administrative permissions per API key and per IP group.
 
 | Field | Type | Attributes | Description |
 | :--- | :--- | :--- | :--- |
@@ -127,10 +127,22 @@ Maps fine-grained read, write, and delete permissions per API key and per IP gro
 | `can_read` | `Boolean` | Default: `true` | Permission to view IPs within this group |
 | `can_write` | `Boolean` | Default: `false` | Permission to add/update IPs in this group |
 | `can_delete` | `Boolean` | Default: `false` | Permission to remove IPs from this group |
+| `can_manage` | `Boolean` | Not Null, Default: `false` | Permission to administer **this group's** permission rows. Resource-scoped counterpart to the global `api_keys.can_manage_keys`, and deliberately narrower: it satisfies the **revoke** path only. Granting or widening a verb still requires `can_manage_keys` — see `AGENT.MD` §2. Never auto-provisioned: creating a group confers read/write/delete and not this |
 | `created_at` | `DateTimeUtc` | Not Null | Assignment timestamp |
 
 *Constraints & Indexes:*
 - Unique Index: `(api_key_id, group_id)`
+
+*Authority summary* — the two columns that grant authority over this table are not interchangeable:
+
+| Action | Global `can_manage_keys` | Per-group `can_manage` |
+| :--- | :--- | :--- |
+| Create a permission row, or add/widen a verb on one | ✅ (plus a row on the group, and only up to the verbs the caller itself holds) | ❌ |
+| Remove a verb, lower a row, or delete a row | ✅ (plus a row on the group) | ✅ (on that group only) |
+
+Removing a permission cannot raise anyone's authority, so it is safe behind a resource-scoped flag;
+conferring one can, so it stays behind the global scope. `can_manage` is itself treated as a verb on
+the grant path, so it cannot be conferred by a caller that does not already hold it.
 
 ---
 

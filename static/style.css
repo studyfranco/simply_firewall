@@ -954,6 +954,51 @@ body {
     min-width: 2.25rem;
 }
 
+/* ─── Sticky Top Bar ────────────────────────────────────── */
+
+/* Header and tab nav as one sticky unit. The background is opaque and the horizontal padding is
+   negative-margined out to the container's edges, so rows scrolling underneath are covered rather
+   than showing through. */
+.top-bar {
+    position: sticky;
+    top: 0;
+    z-index: 30;
+    background-color: var(--bg-main);
+    margin: -2rem -2rem 0;
+    padding: 2rem 2rem 0;
+    transition: transform var(--transition-base), box-shadow var(--transition-base);
+}
+
+/* Scrolled down: the whole unit slides up by its own height, measured at runtime into
+   `--top-bar-shift` (a fixed value would be wrong the moment the tab row wraps to two lines).
+   Retracting rather than `display: none` keeps it one transform away from returning, so scrolling
+   up reveals it instantly instead of reflowing the page. */
+.top-bar.collapsed {
+    transform: translateY(calc(-1 * var(--top-bar-shift, 0px)));
+}
+
+/* Once anything has scrolled under it, the bar earns a shadow to sit visually above the content. */
+.top-bar.stuck {
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+/* The panels have to climb by the same amount, or retracting the bar would leave a gap where it
+   used to be instead of handing the space to the table. */
+.tab-panel {
+    transition: transform var(--transition-base);
+}
+
+.top-bar.collapsed ~ .tab-panel {
+    transform: translateY(calc(-1 * var(--top-bar-shift, 0px)));
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .top-bar,
+    .tab-panel {
+        transition: none;
+    }
+}
+
 /* ─── Table Toolbar & Date Range ────────────────────────── */
 
 /* The primary action sits left, batch actions right, directly above the table. */
@@ -968,6 +1013,99 @@ body {
 
 .table-toolbar .batch-actions {
     margin: 0;
+}
+
+.toolbar-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+}
+
+.page-size-label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+}
+
+.page-size-select {
+    width: auto;
+    flex: 0 0 auto;
+    min-width: 5.5rem;
+    padding: 0.4rem 0.5rem;
+    font-size: 0.82rem;
+}
+
+/* Height is driven by `--table-max-h`, recomputed from the viewport on resize and whenever the top
+   bar retracts. The 60vh fallback is what applies before the first measurement (and if JS is
+   disabled), so the table is never unbounded. */
+.table-scroll {
+    max-height: var(--table-max-h, 60vh);
+}
+
+/* ─── Key/Value Editor ──────────────────────────────────── */
+
+.kv-editor {
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+}
+
+/* Name, value, remove — the name column narrower than the value, since header names are short and
+   predictable while values are tokens. */
+.kv-row {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(0, 3fr) auto;
+    gap: 0.4rem;
+    align-items: center;
+}
+
+.kv-row .input-field {
+    padding: 0.4rem 0.55rem;
+    font-size: 0.82rem;
+}
+
+.kv-remove {
+    flex: 0 0 auto;
+    padding: 0.3rem 0.55rem;
+    background: none;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text-muted);
+    font-size: 1rem;
+    line-height: 1;
+    cursor: pointer;
+    transition: color var(--transition-fast), border-color var(--transition-fast);
+}
+
+.kv-remove:hover {
+    color: var(--danger);
+    border-color: var(--danger);
+}
+
+.kv-remove:focus-visible {
+    outline: 2px solid var(--highlight);
+    outline-offset: 1px;
+}
+
+.kv-empty {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    font-style: italic;
+    padding: 0.3rem 0;
+}
+
+/* A header name beside its value: the name is the narrower of the two. */
+.input-pair {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr);
+    gap: 0.4rem;
+}
+
+.header-name-input {
+    font-size: 0.82rem;
 }
 
 .date-range {

@@ -124,17 +124,11 @@ async fn caller_group_permission(
 ///
 /// `can_manage_keys` says the caller may administer keys; it says nothing about *which groups* it
 /// may reach. Without this, a key scoped to one group could rewrite every other key's access to
-/// every group in the system, which makes per-group RBAC advisory rather than enforced. This service
-/// has no `can_manage` column on `api_key_group_permissions`, so "manages this group" is spelled
-/// `can_manage_keys` (checked by the handler) **plus a row here** — the same authority
-/// `simply_hook_executor` expresses as a single `can_manage` flag.
+/// every group in the system, which makes per-group RBAC advisory rather than enforced.
 ///
 /// `action` names the operation being guarded (`"grant"` / `"revoke"`) and appears verbatim in the
 /// client-facing message, which is otherwise identical between the two paths so a caller probing
 /// them cannot tell which check refused it.
-///
-/// This is the **whole** authority test for revocation, and only the first half for granting — see
-/// [`guard_delegated_group_grant`] for why the two differ.
 fn guard_group_administration(
     caller: &api_key::Model,
     caller_perm: Option<&api_key_group_permission::Model>,
@@ -150,11 +144,100 @@ fn guard_group_administration(
     )))
 }
 
+/// The authority test for **removing** access: global `can_manage_keys`, or `can_manage` on this
+/// specific group.
+///
+/// Two routes to the same operation, and the second is the point of the column. `can_manage_keys` is
+/// system-wide — it reaches every key and every group — so before `can_manage` existed, delegating
+/// "you may take a verb away from one key on one group" meant handing over authority across the
+/// entire installation. `can_manage` is that delegation at the size it was actually wanted.
+///
+/// # Why revoking gets the narrower gate and granting does not
+///
+/// Removing a verb cannot raise anyone's authority: after the operation no key in the system holds
+/// more than before, the caller included. What it threatens is **integrity** — stripping the
+/// credential another tenant's `fail2ban` writes with stops that tenant's blocking — and that threat
+/// is bounded by *which group* the caller can reach, which is exactly what a resource-scoped flag
+/// expresses. Granting is the opposite: conferring a verb can raise authority above the caller's
+/// own, so it must stay behind the global flag. A resource-scoped right that could mint new grants
+/// would be a way to escalate out of the resource it is scoped to.
+///
+/// The `can_manage_keys` route still requires the entry gate (a row on the group), because that flag
+/// on its own says nothing about which groups the caller may reach. The `can_manage` route needs no
+/// separate entry gate: holding the flag *is* holding a row.
+fn guard_group_revocation(
+    caller: &api_key::Model,
+    caller_perm: Option<&api_key_group_permission::Model>,
+    group_name: &str,
+) -> Result<(), AppError> {
+    if caller.is_master || caller_perm.is_some_and(|p| p.can_manage) {
+        return Ok(());
+    }
+
+    if caller.can_manage_keys {
+        return guard_group_administration(caller, caller_perm, group_name, "revoke");
+    }
+
+    Err(AppError::Forbidden(format!(
+        "Permission denied: you have no access to group '{group_name}' and cannot revoke it"
+    )))
+}
+
+/// Whether the caller holds administrative authority over group grants **anywhere**.
+///
+/// A cheap pre-gate, run before any group is resolved so that a caller with no administrative
+/// standing at all is refused without learning whether a group or a grant exists. Before
+/// `can_manage` existed, the handlers could answer this from `can_manage_keys` alone with no query;
+/// now that per-group authority is a second route in, the question needs one indexed lookup — but it
+/// has to stay ahead of the group lookup, or the 403 would start depending on what exists.
+async fn holds_any_group_manage(
+    db: &sea_orm::DatabaseConnection,
+    key_id: Uuid,
+) -> Result<bool, AppError> {
+    api_key_group_permission::Entity::find()
+        .filter(
+            Condition::all()
+                .add(api_key_group_permission::Column::ApiKeyId.eq(key_id))
+                .add(api_key_group_permission::Column::CanManage.eq(true)),
+        )
+        .one(db)
+        .await
+        .map(|found| found.is_some())
+        .map_err(AppError::DbError)
+}
+
+/// Whether `requested` would give the target any verb it does not already hold.
+///
+/// This is the question that decides **which gate applies** to an update, and it is deliberately
+/// asked against the *target's* current row rather than the caller's: "does this raise anyone's
+/// authority?" is a different question from "does this exceed the caller's own?" (the latter is
+/// [`guard_delegated_group_grant`]'s anti-escalation check, which still applies to grants).
+///
+/// A row that does not exist yet counts as a grant regardless of its contents, matching `AGENT.MD`
+/// §2 — creating a permission row is an act of conferral even when the verbs start empty, and a
+/// resource-scoped `can_manage` must not be able to mint rows.
+fn widens_permissions(
+    requested: &GroupPermInput,
+    target_perm: Option<&api_key_group_permission::Model>,
+) -> bool {
+    let Some(held) = target_perm else {
+        return true;
+    };
+    (requested.can_read && !held.can_read)
+        || (requested.can_write && !held.can_write)
+        || (requested.can_delete && !held.can_delete)
+        || (requested.can_manage && !held.can_manage)
+}
+
 /// Enforces that a non-master cannot hand out access it does not itself hold.
 ///
 /// Layered on [`guard_group_administration`]: managing the group is necessary to touch its grants at
 /// all, and *additionally* each verb being conferred is checked independently against the caller's
 /// own row — holding `can_read` on a group does not confer the right to grant `can_write` on it.
+///
+/// Reaching this at all requires global `can_manage_keys`; the caller's per-group `can_manage` does
+/// **not** admit a caller to the grant path. See [`guard_group_revocation`] for why the two
+/// directions are gated differently.
 ///
 /// # Only the granting direction is checked per verb
 ///
@@ -162,8 +245,8 @@ fn guard_group_administration(
 /// Reducing a permission therefore needs no proof of authority over the verb removed, and that
 /// asymmetry with granting is deliberate: conferring a verb can raise someone's authority above the
 /// caller's own, and removing one cannot raise anyone's at all. The dedicated revoke path applies
-/// the same rule by calling the entry gate alone, so "revoke the row" and "update the row to a lower
-/// value" are governed identically rather than by two rules that happen to disagree.
+/// the same rule, so "revoke the row" and "update the row to a lower value" are governed identically
+/// rather than by two rules that happen to disagree.
 ///
 /// The integrity concern that once argued for a per-verb revocation check — a key manager stripping
 /// the credential another tenant's `fail2ban` writes with — is answered by the entry gate, which is
@@ -189,7 +272,11 @@ fn guard_delegated_group_grant(
 
     let over_grants = (requested.can_read && !held.can_read)
         || (requested.can_write && !held.can_write)
-        || (requested.can_delete && !held.can_delete);
+        || (requested.can_delete && !held.can_delete)
+        // `can_manage` is a verb like any other here: a caller may only confer the administrative
+        // right over a group if it holds that right itself, which is what stops the flag from
+        // propagating outward from whoever a master originally trusted with it.
+        || (requested.can_manage && !held.can_manage);
 
     if over_grants {
         tracing::warn!(
@@ -538,6 +625,11 @@ async fn handle_ip_upsert(
                 can_read: Set(true),
                 can_write: Set(true),
                 can_delete: Set(true),
+                // Auto-provisioning confers read/write/delete and nothing more, per `AGENT.MD` §2.
+                // `can_manage` is administrative authority over other keys' rows, so it stays an
+                // explicit grant from someone who already holds it rather than something a key
+                // awards itself as a side effect of creating a group.
+                can_manage: Set(false),
                 created_at: Set(now),
             };
             // on_conflict do_nothing: a concurrent burst from this same key racing to create the
@@ -1334,6 +1426,8 @@ pub struct MePermission {
     pub can_write: bool,
     /// Can delete
     pub can_delete: bool,
+    /// May administer this group's permission rows (revoke-only authority; see `AGENT.MD` §2)
+    pub can_manage: bool,
 }
 
 /// Identity and permission payload returned to the client
@@ -1378,6 +1472,7 @@ pub async fn get_me(
                 can_read: p.can_read,
                 can_write: p.can_write,
                 can_delete: p.can_delete,
+                can_manage: p.can_manage,
             });
         }
     }
@@ -1415,6 +1510,12 @@ pub struct GroupPermInput {
     pub can_write: bool,
     /// Can delete. Requires `can_read` (AGENT.MD least-privilege rule).
     pub can_delete: bool,
+    /// May administer this group's permission rows — the resource-scoped revoke authority.
+    ///
+    /// Defaulted rather than required, so every client written before the column existed keeps
+    /// working and its payloads mean exactly what they meant before: no administrative right.
+    #[serde(default)]
+    pub can_manage: bool,
 }
 
 /// Payload for creating an API Key
@@ -1565,6 +1666,7 @@ async fn build_api_key_summary(
                 can_read: p.can_read,
                 can_write: p.can_write,
                 can_delete: p.can_delete,
+                can_manage: p.can_manage,
             })
         })
         .collect();
@@ -1850,7 +1952,15 @@ pub async fn update_key_group_permissions(
     Json(payload): Json<GroupPermInput>,
 ) -> Result<impl IntoResponse, AppError> {
 
-    if !key.is_master && !key.can_manage_keys {
+    // Admission is the union of the two authorities, because this one endpoint expresses both
+    // directions: a payload that only lowers a row is a revocation, and per-group `can_manage`
+    // satisfies those. Which of the two rules actually applies is decided below, once the target's
+    // current row is known and the request can be classified. Run before any group lookup so a
+    // caller with no administrative standing anywhere cannot probe what exists.
+    if !key.is_master
+        && !key.can_manage_keys
+        && !holds_any_group_manage(&state.db, key.id).await?
+    {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
@@ -1897,13 +2007,38 @@ pub async fn update_key_group_permissions(
     }
 
     // Checked after the group is resolved (so the name in the error is the real one) but before any
-    // write: a caller may only delegate access it already holds on this specific group.
+    // write.
     //
     // A group the caller just created via the `group_name` auto-create path above is covered
     // without a special case — that path grants the creator full read/write/delete first, so the
     // lookup below finds a row that legitimately permits the delegation.
     let caller_perm = caller_group_permission(&state.db, key.id, target_group_id).await?;
-    guard_delegated_group_grant(&key, caller_perm.as_ref(), &resolved_group_name, "grant", &payload)?;
+    let target_perm = caller_group_permission(&state.db, id, target_group_id).await?;
+
+    // Which rule applies is a property of the *request*, not of the endpoint. A payload that adds
+    // any verb the target lacks — or creates the row at all — is a grant and needs global
+    // `can_manage_keys` plus the per-verb ceiling. A payload that only lowers an existing row is a
+    // revocation reached through this endpoint instead of the dedicated one, and is governed by
+    // exactly the rule that governs that one. Splitting on the request rather than the route is what
+    // keeps "revoke the row" and "update the row to a lower value" from drifting apart.
+    if widens_permissions(&payload, target_perm.as_ref()) {
+        if !key.is_master && !key.can_manage_keys {
+            tracing::warn!(
+                "Blocked grant: key {} holds can_manage on group '{}' but not the global \
+                 can_manage_keys, and attempted to widen permissions",
+                key.prefix,
+                resolved_group_name
+            );
+            return Err(AppError::Forbidden(format!(
+                "Permission denied: granting or widening permissions on group \
+                 '{resolved_group_name}' requires the global can_manage_keys scope; per-group \
+                 can_manage only permits revoking"
+            )));
+        }
+        guard_delegated_group_grant(&key, caller_perm.as_ref(), &resolved_group_name, "grant", &payload)?;
+    } else {
+        guard_group_revocation(&key, caller_perm.as_ref(), &resolved_group_name)?;
+    }
 
     let now = Utc::now().naive_utc();
     let perm_model = api_key_group_permission::ActiveModel {
@@ -1913,6 +2048,7 @@ pub async fn update_key_group_permissions(
         can_read: Set(payload.can_read),
         can_write: Set(payload.can_write),
         can_delete: Set(payload.can_delete),
+        can_manage: Set(payload.can_manage),
         created_at: Set(now),
     };
 
@@ -1923,6 +2059,7 @@ pub async fn update_key_group_permissions(
                     api_key_group_permission::Column::CanRead,
                     api_key_group_permission::Column::CanWrite,
                     api_key_group_permission::Column::CanDelete,
+                    api_key_group_permission::Column::CanManage,
                 ])
                 .to_owned()
         )
@@ -1947,10 +2084,18 @@ pub async fn update_key_group_permissions(
 ///
 /// # Managing the group is the whole authority test
 ///
-/// A caller that manages this group — master, or `can_manage_keys` plus a grant of its own on it —
-/// may remove **any** verb from **any** key's row on it, including its own, without holding the
-/// verbs being removed. This matches `simply_hook_executor`, where `can_manage` over a hook confers
-/// exactly this.
+/// A caller that manages this group may remove **any** verb from **any** key's row on it, including
+/// its own, without holding the verbs being removed. Two spellings of "manages this group" qualify,
+/// and [`guard_group_revocation`] is where they are defined:
+///
+/// - **Master**, or **global `can_manage_keys` plus a grant on the group** — the original route.
+/// - **`can_manage = true` on the caller's own row for the group** — the resource-scoped route,
+///   which requires no global scope at all. This is the narrower gate: it admits a caller to
+///   *revocation on one group* and to nothing else, where `can_manage_keys` admits it to every key
+///   and every group in the installation.
+///
+/// The grant path deliberately does **not** accept the second route; see
+/// [`guard_delegated_group_grant`].
 ///
 /// # Why the stricter rule this replaces was relaxed
 ///
@@ -1985,7 +2130,13 @@ pub async fn revoke_key_group_permission(
     Extension(client_ip): Extension<ClientIp>,
     Path((id, group_identifier)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master && !key.can_manage_keys {
+    // Cheap pre-gate, kept ahead of the group lookup so a caller with no administrative standing
+    // anywhere is refused without learning whether the group exists. It admits per-group managers as
+    // a class; *which* group they manage is checked precisely below.
+    if !key.is_master
+        && !key.can_manage_keys
+        && !holds_any_group_manage(&state.db, key.id).await?
+    {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
@@ -2002,7 +2153,7 @@ pub async fn revoke_key_group_permission(
     }
 
     let caller_perm = caller_group_permission(&state.db, key.id, group.id).await?;
-    guard_group_administration(&key, caller_perm.as_ref(), &group.name, "revoke")?;
+    guard_group_revocation(&key, caller_perm.as_ref(), &group.name)?;
 
     let result = api_key_group_permission::Entity::delete_many()
         .filter(
@@ -2088,6 +2239,9 @@ pub async fn create_ip_group(
             can_read: Set(true),
             can_write: Set(true),
             can_delete: Set(true),
+            // See the auto-provisioning note in `upsert_ip`: creating a group does not confer
+            // authority over other keys' rows on it.
+            can_manage: Set(false),
             created_at: Set(now),
         };
         api_key_group_permission::Entity::insert(perm).exec(&state.db).await?;
