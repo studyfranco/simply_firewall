@@ -3770,3 +3770,130 @@ self-targeting refusal, and would otherwise have contradicted the code.
 
 - `CAPACITY_BACKOFF_DIVISOR` still not ported back to `simply_hook_executor` (carried from Sessions
   25/26/30). Unchanged: it is a change to the peer tree, which is read-only from here.
+
+---
+
+## Session 32 — Dashboard UI/UX pass: modal form, fixed-layout table, compact webhook grid
+
+Front-end only. No Rust changed, and none was needed: `lib.rs:93` serves `static/` through `ServeDir`
+from disk rather than embedding it, so there is no asset-embedding test to keep in step. Still vanilla
+ES6 + native HTML5 + CSS — no node_modules, no CDN, no date-picker library.
+
+### 1. Manage Access became a modal
+
+The permanently visible 380px left panel is gone; the IP Records tab is now one full-width table
+section. The form moved verbatim into `#manage-ip-modal`, reusing the existing
+`.modal-overlay`/`.modal-card` pattern rather than inventing a second one. Closes on submit success,
+X, Cancel, backdrop, and Escape. The backdrop handler tests `e.target.id` so a click bubbling out of
+the card cannot close a dialog the user is typing in.
+
+**The one thing that could have broken silently:** `enforceRBACUI()` hid `#manage-ip-section` for keys
+with no write access anywhere. That element no longer exists, and `style.display` on a missing node
+throws — so the gate moved to `#open-manage-ip`, the modal's only entry point. Same condition, same
+effect. `.grid-layout` was left dead by the removal and has been deleted with a note in its place.
+
+Submit logic is untouched. Worth recording why the explicit `if (!address || !group_name) return;`
+guard matters more than it looks: Ban/Whitelist are `type="button"` handlers, so native `required`
+validation never runs on this form — that line *is* the validation, both before and after the move.
+
+### 2. IPv6 overflow
+
+`table-layout: fixed` plus an explicit `<colgroup>`, so column widths come from the markup instead of
+from content and a `/48` CIDR can no longer widen the table into document-level horizontal scroll.
+The address truncates with an ellipsis and carries the full value in `title`.
+
+Two traps found while doing it:
+
+- **`.badge` is `inline-flex`.** `text-overflow` has no effect on text inside a flex box, so a long
+  group name clipped mid-glyph with no ellipsis. `.data-table-fixed .badge-group` switches to
+  `inline-block`, where it ellipsizes; the cell carries a `title` like the address does.
+- **`min-width: 0`** on the address flex child. Without it a flex item refuses to shrink below its
+  content width and the ellipsis never engages at all.
+
+Audit Logs is the *reference* here, not a target — it was left alone, and the IP table adopted its
+`.text-sm` weight for the free-text and timestamp columns so the two read as one system.
+
+### 3. Sticky header, pagination, date range
+
+`.data-table thead` already carried `position: sticky`, which was **inert**: sticky needs a scroll
+container, and there wasn't one. `.table-scroll` (`max-height: 60vh; overflow-y: auto`) is what
+activates the rule that was already there.
+
+Pagination gained `« 5` / `‹` / `Page [n] of N` / `›` / `5 »`. All five paths funnel through
+`gotoIpPage()` → `PagedCache.goToPage()`, so clamping happens once and no control can land on a page
+that does not exist. Two details worth keeping:
+
+- **`N` renders as `12+` while more chunks exist.** Pages are counted from what has been fetched;
+  claiming a precise total would mean either lying or fetching the whole table to count it.
+- **The page input is not rewritten while focused.** Overwriting it mid-keystroke makes it impossible
+  to type a two-digit page.
+
+**Date range — a deliberate split, and the reason for it.** `QueryFilters` has `since` but no upper
+bound. `since` filters on `last_seen_at`, which is exactly what the "Updated At" column renders
+(`app.js` renders `ip.last_seen_at` under that header — the header name is the odd one, not the
+data). So the lower bound is pushed to the server, where rows are skipped rather than fetched and
+discarded, and the upper bound is applied client-side by `ipDateFilter()`. Both bounds reload rather
+than merely re-render, so the two halves behave identically from the user's side.
+
+`PagedCache` grew a `setFilter`/`visibleItems` view that every page calculation now runs through, so
+a client-side filter is indistinguishable from a server-side one to the UI. Records arrive
+newest-first, which means an upper bound excludes a *prefix* — `ensureFilled()` keeps pulling chunks
+while the visible page is empty and the server has more, capped at 20 chunks so a filter matching
+nothing walks a bounded slice rather than the entire table.
+
+### Two bugs caught while reviewing rather than after shipping
+
+- **The conflict view ignored the new date filter.** It read `ipCache.items` directly, bypassing the
+  filtered view. Now it lists from `visibleItems` — but conflict *detection* still runs over the
+  unfiltered cache, and that asymmetry is the point: a conflict is a property of an address across
+  groups, so hiding one half of a pair because it falls outside the window would report the other
+  half as clean, which is the opposite of what the view exists to surface.
+- **Pagination controls stayed live in the conflict view**, which lists everything at once and never
+  paginates. They are disabled while that mode is on — disabled rather than hidden, since a control
+  that vanishes and reappears is more disorienting than one visibly inert.
+
+### 4. Webhook form
+
+Four `.compact-grid` rows (`auto-fit` + `minmax(230px, 1fr)`, so 3→2→1 columns fall out of one rule
+with no breakpoint list) replacing one long stack: universal fields, then Auth Mode, then the
+mode-dependent credentials, then the two payload textareas side by side.
+
+The six-line paragraph describing all four auth modes at once became a single line describing the
+*selected* one, driven from a static `AUTH_MODE_HINTS` map by the existing `syncWebhookAuthFields()`.
+That method already did the show/hide work — this only adds the hint swap, so the required-attribute
+handling it does (a hidden input that is still `required` makes the browser refuse to submit while
+reporting on an element nobody can see) is untouched.
+
+### Verification without a JS engine
+
+No `node`/`deno`/`bun` on this machine, so the usual `node --check` was unavailable. Substituted:
+
+| Check | Result |
+| :--- | :--- |
+| Delimiter balance (string/template/comment/regex aware, written for this) | balanced |
+| `html.parser` tag-balance over `index.html` | balanced |
+| Every `getElementById('…')` target exists in the HTML | 0 missing |
+| Every new CSS class referenced by HTML/JS is defined | 0 missing |
+| Live server: `/`, `/style.css`, `/app.js` | 200, and the new markup present in the served bytes |
+
+The regex-literal case is worth noting: the first balance run reported a false "unterminated string"
+on `.replace(/"/g, '&quot;')` — a quote inside a regex literal. Distinguishing regex from division
+needs the preceding token, which the checker now inspects.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean (no Rust touched) |
+| `cargo test` | **165 passed**, 0 failed |
+| `./scripts/test_e2e.sh` | **420/420**, 0 failed |
+
+Dark theme untouched: every rule added uses the existing `--bg-*`/`--text-*`/`--accent`/`--border`
+variables. `color-scheme: dark` on the date inputs is what makes the native picker render dark, and
+the `::-webkit-calendar-picker-indicator` filter fixes the near-black glyph Chromium draws on a dark
+field.
+
+### Noted, not done
+
+- Audit Logs could take the same `.table-scroll` sticky treatment. Left alone: the brief made it the
+  reference for the IP table's styling, not a target, and changing it was not asked for.

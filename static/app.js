@@ -247,20 +247,38 @@ class PagedCache {
         this.hasMoreOnServer = true;
         this.localPage = 0;
         this.prefetching = null; // in-flight prefetch promise, if any
+        this._visible = null;    // memoized filter result, invalidated whenever items change
+    }
+
+    // An optional client-side predicate applied on top of whatever the server returned. Used for
+    // bounds the API has no parameter for — currently the date range's upper bound. Everything
+    // below (page count, slicing, next/prev availability) works off the filtered view, so a
+    // client-side filter behaves exactly like a server-side one from the UI's perspective.
+    setFilter(fn) {
+        this.filterFn = fn;
+        this._visible = null;
+        this.localPage = 0;
+    }
+
+    get visibleItems() {
+        if (this._visible === null) {
+            this._visible = this.filterFn ? this.items.filter(this.filterFn) : this.items;
+        }
+        return this._visible;
     }
 
     get totalLocalPages() {
-        return Math.max(1, Math.ceil(this.items.length / this.pageSize));
+        return Math.max(1, Math.ceil(this.visibleItems.length / this.pageSize));
     }
 
     get currentPageItems() {
         const start = this.localPage * this.pageSize;
-        return this.items.slice(start, start + this.pageSize);
+        return this.visibleItems.slice(start, start + this.pageSize);
     }
 
     get hasNextPage() {
         const nextPageStart = (this.localPage + 1) * this.pageSize;
-        return nextPageStart < this.items.length || this.hasMoreOnServer;
+        return nextPageStart < this.visibleItems.length || this.hasMoreOnServer;
     }
 
     get hasPrevPage() {
@@ -271,11 +289,15 @@ class PagedCache {
     // whenever the active filters/search change (a different query is a different dataset, not
     // more pages of the old one).
     async loadFirstChunk() {
+        const filterFn = this.filterFn;
         this.reset();
+        this.filterFn = filterFn; // survives a reload: it describes the view, not the data
         const chunk = await this.fetchChunk(0, this.chunkSize);
         this.items = chunk;
+        this._visible = null;
         this.serverOffset = chunk.length;
         this.hasMoreOnServer = chunk.length === this.chunkSize;
+        await this.ensureFilled();
         this._maybePrefetch();
     }
 
@@ -285,6 +307,7 @@ class PagedCache {
         this.prefetching = (async () => {
             const chunk = await this.fetchChunk(this.serverOffset, this.chunkSize);
             this.items = [...this.items, ...chunk];
+            this._visible = null;
             this.serverOffset += chunk.length;
             this.hasMoreOnServer = chunk.length === this.chunkSize;
             this.prefetching = null;
@@ -292,15 +315,44 @@ class PagedCache {
         return this.prefetching;
     }
 
+    // With a client-side filter active, a whole server chunk can be excluded — records are ordered
+    // newest-first, so an upper date bound excludes a *prefix* of them. Without this the user would
+    // see "No records found" while matches sat in the very next chunk. Capped so a filter that
+    // genuinely matches nothing walks a bounded slice of the table rather than the whole thing.
+    async ensureFilled(maxChunks = 20) {
+        let fetched = 0;
+        while (this.visibleItems.length === 0 && this.hasMoreOnServer && fetched < maxChunks) {
+            await this.fetchNextChunk();
+            fetched++;
+        }
+    }
+
+    // Jumps straight to a page, pulling chunks until it exists (or the server runs dry). Backs the
+    // direct page input and the ±5 fast-jump buttons alike, so all three share one clamping rule
+    // and none of them can land on a page that isn't there.
+    async goToPage(target) {
+        const wanted = Math.max(0, Math.floor(target));
+        let guard = 0;
+        while (wanted >= this.totalLocalPages && this.hasMoreOnServer && guard++ < 100) {
+            await this.fetchNextChunk();
+        }
+        this.localPage = Math.min(wanted, this.totalLocalPages - 1);
+        this._maybePrefetch();
+    }
+
+    async jumpPages(delta) {
+        await this.goToPage(this.localPage + delta);
+    }
+
     // Advances one local page. If the next page isn't cached yet but the server might still have
     // more, fetches synchronously first (the one case where "Next" still has to wait on the
     // network — normally avoided by the background prefetch below already having run ahead).
     async nextPage() {
         const nextPageStart = (this.localPage + 1) * this.pageSize;
-        if (nextPageStart >= this.items.length && this.hasMoreOnServer) {
+        if (nextPageStart >= this.visibleItems.length && this.hasMoreOnServer) {
             await this.fetchNextChunk();
         }
-        if (nextPageStart < this.items.length) {
+        if (nextPageStart < this.visibleItems.length) {
             this.localPage++;
         }
         this._maybePrefetch();
@@ -322,6 +374,28 @@ class PagedCache {
 }
 
 class FirewallClient {
+    // Per-mode descriptions for the Auth Mode selector. Static markup rather than a template
+    // literal built per render — these are fixed strings, and keeping them out of
+    // syncWebhookAuthFields() keeps that method about field visibility.
+    //
+    // Trusted, author-written HTML assigned via innerHTML; no interpolation of anything
+    // user-supplied happens here or at the assignment site.
+    static AUTH_MODE_HINTS = {
+        CANONICAL_V1:
+            'Signs the template below and sends <code>X-Timestamp</code> (plus <code>X-API-Key</code> ' +
+            'when set), so the dispatch can authenticate directly against another Simply IP Vault ' +
+            'instance or a hook executor.',
+        BODY_ONLY:
+            'Signs the payload alone as <code>sha256=&lt;hex&gt;</code> — what GitHub-style consumers ' +
+            'expect. No timestamp is sent.',
+        API_KEY_ONLY:
+            'Sends <code>X-API-Key</code> and nothing else. No signature is computed, so the key is ' +
+            'the entire credential.',
+        NONE:
+            'Sends no authentication headers at all. Only appropriate for a receiver that is already ' +
+            'protected some other way.'
+    };
+
     constructor() {
         this.apiKey = localStorage.getItem('simply_ip_vault_key') || '';
         this.signingSecret = localStorage.getItem('simply_ip_vault_signing_secret') || '';
@@ -631,7 +705,11 @@ class FirewallClient {
     enforceRBACUI() {
         // Enforce RBAC logic
         const p = this.state.profile;
-        const manageIpEl = document.getElementById('manage-ip-section');
+        // The "Manage Access" form moved into a modal, so the gate that used to hide the whole
+        // side panel now hides its opener. Same condition, same effect: a key that cannot write
+        // anywhere is never offered the form. Hiding only the button is sufficient because the
+        // modal has no other entry point, and the server enforces this regardless.
+        const manageIpEl = document.getElementById('open-manage-ip');
         const groupsTab = document.getElementById('groups-tab-btn');
         const keysTab = document.getElementById('keys-tab-btn');
         const webhooksTab = document.getElementById('webhooks-tab-btn');
@@ -641,7 +719,7 @@ class FirewallClient {
         if (!p.is_master && p.group_permissions.length === 0 && !p.can_create_groups) {
             manageIpEl.style.display = 'none';
         } else {
-            manageIpEl.style.display = 'block';
+            manageIpEl.style.display = 'inline-block';
         }
 
         // IP Groups tab — kept visible under the same condition that used to gate the whole
@@ -697,12 +775,45 @@ class FirewallClient {
         if (causeQ) params.append('cause', causeQ);
         if (statQ) params.append('status', statQ);
 
+        // The lower bound goes to the server, which has a parameter for exactly this (`since`,
+        // measured against last_seen_at — the same field the "Updated At" column renders). Pushing
+        // it down means the server skips those rows instead of us fetching and discarding them.
+        // There is no matching upper-bound parameter, so `date-to` is applied client-side by
+        // `ipDateFilter()`; see the note there.
+        const from = document.getElementById('date-from').value;
+        if (from) {
+            const start = new Date(`${from}T00:00:00`);
+            if (!Number.isNaN(start.getTime())) {
+                params.append('since', Math.floor(start.getTime() / 1000));
+            }
+        }
+
         return await this.apiFetch(`/ips?${params.toString()}`);
+    }
+
+    // Client-side half of the date range: the upper bound. Returns null when no bound is set, so
+    // PagedCache skips filtering entirely in the common case.
+    //
+    // Compared against `last_seen_at` because that is the value the "Updated At" column displays —
+    // filtering on a field the user cannot see would make the result look arbitrary. The bound is
+    // inclusive of the whole chosen day: a user picking "to 5 March" means through the end of the
+    // 5th, not midnight at its start.
+    ipDateFilter() {
+        const to = document.getElementById('date-to').value;
+        if (!to) return null;
+        const end = new Date(`${to}T23:59:59.999`);
+        if (Number.isNaN(end.getTime())) return null;
+        const cutoff = end.getTime();
+        return (rec) => {
+            const seen = new Date(rec.last_seen_at).getTime();
+            return Number.isNaN(seen) || seen <= cutoff;
+        };
     }
 
     async loadIps() {
         try {
             this.state.selectedIpIds.clear();
+            this.ipCache.setFilter(this.ipDateFilter());
             await this.ipCache.loadFirstChunk();
             this.renderIpTable();
             this.updatePaginationUI();
@@ -921,8 +1032,13 @@ class FirewallClient {
         // "Conflicted IPs Only" shows every match across the whole cached chunk at once (usually
         // a short list — conflicts are the exception, not the rule) rather than being paginated
         // like the normal view; the normal view stays a clean 15-row local page.
+        //
+        // Detection runs over the *unfiltered* cache while the listing respects the date range.
+        // The two differ on purpose: a conflict is a property of the address across groups, so
+        // hiding one half of a pair because it falls outside the window would report the other
+        // half as clean — the opposite of what this view exists to surface.
         const rows = this.state.showConflictsOnly
-            ? cached.filter(ip => conflicts.has(ip.target_address))
+            ? this.ipCache.visibleItems.filter(ip => conflicts.has(ip.target_address))
             : this.ipCache.currentPageItems;
 
         if (rows.length === 0) {
@@ -948,14 +1064,20 @@ class FirewallClient {
             <tr>
                 <td>${ip.is_locked ? '' : `<input type="checkbox" class="row-select" data-id="${ip.id}">`}</td>
                 <td class="font-mono">
-                    ${escapeHtml(ip.target_address)}
-                    ${ip.is_locked ? '<span title="Locked" class="badge">🔒 Locked</span>' : ''}
-                    ${isConflicting ? '<span title="This address is in both a banlist and a whitelist group" class="badge badge-conflict">⚠ Conflict</span>' : ''}
+                    <div class="cell-address">
+                        <!-- `title` carries the untruncated value: with the column fixed-width, a
+                             long IPv6 CIDR shows an ellipsis, and hover is how it stays readable. -->
+                        <span class="address-text" title="${escapeHtml(ip.target_address)}">${escapeHtml(ip.target_address)}</span>
+                        ${ip.is_locked ? '<span title="Locked" class="badge">🔒 Locked</span>' : ''}
+                        ${isConflicting ? '<span title="This address is in both a banlist and a whitelist group" class="badge badge-conflict">⚠ Conflict</span>' : ''}
+                    </div>
                 </td>
                 <td>${statusBadge}</td>
-                <td>${escapeHtml(ip.cause || '-')}</td>
-                <td><span class="badge badge-group">${escapeHtml(ip.group_name || 'Global')}</span></td>
-                <td>${new Date(ip.last_seen_at).toLocaleString()}</td>
+                <!-- text-sm matches the Audit Logs table's weight for free-text and timestamp
+                     columns, and buys the fixed-width columns a little more room before clipping. -->
+                <td class="text-sm" title="${escapeHtml(ip.cause || '')}">${escapeHtml(ip.cause || '-')}</td>
+                <td title="${escapeHtml(ip.group_name || 'Global')}"><span class="badge badge-group">${escapeHtml(ip.group_name || 'Global')}</span></td>
+                <td class="text-sm">${new Date(ip.last_seen_at).toLocaleString()}</td>
                 <td>
                     <div class="flex gap-2">
                         <button class="btn btn-sm btn-danger" onclick="window.app.deleteIp('${escapeHtml(ip.target_address)}', '${escapeHtml(ip.group_name)}')" ${ip.is_locked ? 'disabled' : ''}>Delete</button>
@@ -1128,13 +1250,44 @@ class FirewallClient {
     }
 
     updatePaginationUI() {
-        const pr = document.getElementById('btn-prev');
-        const nt = document.getElementById('btn-next');
-        const ind = document.getElementById('page-indicator');
+        const cache = this.ipCache;
+        const page = cache.localPage + 1;
+        const total = cache.totalLocalPages;
 
-        pr.disabled = !this.ipCache.hasPrevPage;
-        nt.disabled = !this.ipCache.hasNextPage;
-        ind.textContent = `Page ${this.ipCache.localPage + 1}`;
+        // The conflict view lists every match at once rather than paging, so its controls would do
+        // nothing. Disabled rather than hidden: a control that vanishes and reappears is more
+        // disorienting than one that is visibly inert while a mode is on.
+        const paged = !this.state.showConflictsOnly;
+
+        document.getElementById('btn-prev').disabled = !paged || !cache.hasPrevPage;
+        document.getElementById('btn-jump-back').disabled = !paged || !cache.hasPrevPage;
+        document.getElementById('btn-next').disabled = !paged || !cache.hasNextPage;
+        document.getElementById('btn-jump-forward').disabled = !paged || !cache.hasNextPage;
+
+        const input = document.getElementById('page-input');
+        input.disabled = !paged;
+        // Not written while focused: the user may be mid-keystroke on a two-digit page number, and
+        // overwriting the field under them would make it impossible to type "12".
+        if (document.activeElement !== input) input.value = String(page);
+        input.max = String(total);
+
+        // A trailing "+" is the honest rendering of a total that isn't known yet: pages are counted
+        // from what has been fetched so far, and more may still be on the server. Claiming a precise
+        // total would mean either lying or fetching the entire table to count it.
+        document.getElementById('page-total').textContent = cache.hasMoreOnServer ? `${total}+` : `${total}`;
+
+        // Date filtering is client-side for the upper bound, so the visible count can be smaller
+        // than what was fetched — surface that rather than leaving an unexplained short page.
+        document.getElementById('date-clear').hidden =
+            !document.getElementById('date-from').value && !document.getElementById('date-to').value;
+    }
+
+    // Shared by every pagination control: move, re-render, resync. Kept in one place so the five
+    // buttons and the page input cannot drift into slightly different refresh behaviour.
+    async gotoIpPage(mutate) {
+        await mutate(this.ipCache);
+        this.renderIpTable();
+        this.updatePaginationUI();
     }
 
     renderAuditLogsTable() {
@@ -1176,11 +1329,30 @@ class FirewallClient {
     // ───────────────────────────────────────────────────────
     // Actions
     // ───────────────────────────────────────────────────────
+    // Opens the Manage Access dialog. The form keeps whatever the browser has in it only if the
+    // last attempt failed — a successful submit resets it in upsertIp() — so reopening after an
+    // error lets the user fix one field rather than retype everything.
+    openManageIpModal() {
+        document.getElementById('manage-ip-modal').classList.remove('hidden');
+        document.getElementById('form-message').classList.add('hidden');
+        document.getElementById('ip-address').focus();
+    }
+
+    closeManageIpModal() {
+        document.getElementById('manage-ip-modal').classList.add('hidden');
+        // Focus returns to the control that opened the dialog, so keyboard users are not dropped
+        // back at the top of the document.
+        document.getElementById('open-manage-ip').focus();
+    }
+
     async upsertIp(isWhite) {
+        // The form is `required`-annotated but submitted via type="button" handlers, which bypass
+        // native validation — so the explicit check below is the one that runs. Unchanged from
+        // before the modal move.
         const address = document.getElementById('ip-address').value;
         const group_name = document.getElementById('group-name').value;
         const cause = document.getElementById('cause').value;
-        
+
         if (!address || !group_name) return;
 
         try {
@@ -1190,6 +1362,8 @@ class FirewallClient {
             });
             this.showToast(`IP successfully ${isWhite ? 'whitelisted' : 'banned'}`, 'success');
             document.getElementById('manage-form').reset();
+            // Only on success: a failed submit leaves the dialog open with the values still in it.
+            this.closeManageIpModal();
             this.loadInitialData();
         } catch(e) {}
     }
@@ -1514,6 +1688,11 @@ class FirewallClient {
         // API_KEY_ONLY where it is the entire credential — matching the server's own validation.
         toggle('webhook-api-key-group', 'webhook-api-key', needsApiKey, mode === 'API_KEY_ONLY');
         toggle('webhook-hmac-template-group', 'webhook-hmac-template', needsTemplate, true);
+
+        // One line describing the *selected* mode, replacing the permanent paragraph that
+        // described all four at once. Same information, shown when it is relevant.
+        document.getElementById('webhook-auth-mode-hint').innerHTML =
+            FirewallClient.AUTH_MODE_HINTS[mode] || '';
     }
 
     async createWebhook(e) {
@@ -1632,10 +1811,27 @@ class FirewallClient {
             });
         });
 
-        // IP Form
+        // IP Form — unchanged submit path; it now lives inside #manage-ip-modal rather than in a
+        // permanently visible side panel.
         document.getElementById('manage-form').addEventListener('submit', (e) => e.preventDefault());
         document.getElementById('btn-ban').addEventListener('click', () => this.upsertIp(false));
         document.getElementById('btn-white').addEventListener('click', () => this.upsertIp(true));
+
+        // Manage Access modal: open from the toolbar, close on X / Cancel / backdrop / Escape.
+        document.getElementById('open-manage-ip').addEventListener('click', () => this.openManageIpModal());
+        document.getElementById('manage-ip-close').addEventListener('click', () => this.closeManageIpModal());
+        document.getElementById('manage-ip-cancel').addEventListener('click', () => this.closeManageIpModal());
+        document.getElementById('manage-ip-modal').addEventListener('click', (e) => {
+            // Only a click on the overlay itself — a click that merely bubbled up from the card
+            // would close the dialog the user is typing in.
+            if (e.target.id === 'manage-ip-modal') this.closeManageIpModal();
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            if (!document.getElementById('manage-ip-modal').classList.contains('hidden')) {
+                this.closeManageIpModal();
+            }
+        });
 
         // Filters — explicit search only: the search button, Enter in a text filter, or the
         // status dropdown's own change event. Typing alone no longer fires a request.
@@ -1661,20 +1857,48 @@ class FirewallClient {
             this.state.showConflictsOnly = !this.state.showConflictsOnly;
             e.currentTarget.classList.toggle('active', this.state.showConflictsOnly);
             this.renderIpTable();
+            // The conflict view is unpaginated, so the controls have to follow the mode.
+            this.updatePaginationUI();
         });
 
-        // Pagination — most clicks are a pure client-side slice of the cached chunk; nextPage()
-        // only actually awaits a network request on the rare occasion the background prefetch
-        // hasn't resolved yet by the time the user gets there.
-        document.getElementById('btn-prev').addEventListener('click', () => {
-            this.ipCache.prevPage();
-            this.renderIpTable();
-            this.updatePaginationUI();
+        // Date range. Both bounds reload rather than merely re-render: the lower bound is a server
+        // parameter, and reloading on either keeps one predictable behaviour instead of two that
+        // happen to look alike. `change` (not `input`) is what a native date field fires on a
+        // completed pick, so this does not fire once per digit typed into the year.
+        ['date-from', 'date-to'].forEach(id => {
+            document.getElementById(id).addEventListener('change', () => this.triggerIpSearch());
         });
-        document.getElementById('btn-next').addEventListener('click', async () => {
-            await this.ipCache.nextPage();
-            this.renderIpTable();
-            this.updatePaginationUI();
+        document.getElementById('date-clear').addEventListener('click', () => {
+            document.getElementById('date-from').value = '';
+            document.getElementById('date-to').value = '';
+            this.triggerIpSearch();
+        });
+
+        // Pagination — most moves are a pure client-side slice of the cached chunk; only a jump
+        // past what has been fetched actually awaits the network.
+        document.getElementById('btn-prev').addEventListener('click', () =>
+            this.gotoIpPage((c) => c.prevPage()));
+        document.getElementById('btn-next').addEventListener('click', () =>
+            this.gotoIpPage((c) => c.nextPage()));
+        document.getElementById('btn-jump-back').addEventListener('click', () =>
+            this.gotoIpPage((c) => c.jumpPages(-5)));
+        document.getElementById('btn-jump-forward').addEventListener('click', () =>
+            this.gotoIpPage((c) => c.jumpPages(5)));
+
+        // Direct page entry. `change` covers Enter and blur alike, so a typed page applies whether
+        // the user confirms it or simply clicks away; a non-numeric or out-of-range value is
+        // clamped by goToPage() and written back by updatePaginationUI().
+        const pageInput = document.getElementById('page-input');
+        pageInput.addEventListener('change', () => {
+            const wanted = parseInt(pageInput.value, 10);
+            if (Number.isNaN(wanted)) {
+                this.updatePaginationUI();
+                return;
+            }
+            this.gotoIpPage((c) => c.goToPage(wanted - 1));
+        });
+        pageInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); pageInput.blur(); }
         });
 
         // Admin Forms

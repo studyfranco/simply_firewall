@@ -71,89 +71,89 @@
         <!-- TAB: IP Records                                 -->
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-firewall" class="tab-panel active">
-            <div class="grid-layout">
-                <section class="card form-section" id="manage-ip-section">
-                    <h2>Manage Access</h2>
-                    <p class="subtitle">Add a new IP address or CIDR to the firewall.</p>
-
-                    <form id="manage-form" class="manage-form">
-                        <div class="form-group">
-                            <label for="ip-address">IP Address or CIDR <span>*</span></label>
-                            <input type="text" id="ip-address" placeholder="e.g. 203.0.113.50 or 10.0.0.0/24" required
-                                class="input-field">
+            <section class="card list-section">
+                <div class="list-header">
+                    <h2>Recent IP Records</h2>
+                    <div class="filters">
+                        <input type="text" id="ip-filter" placeholder="Filter by IP..." class="input-field">
+                        <div class="combobox" id="group-filter-combobox">
+                            <input type="text" id="group-filter" placeholder="Filter by group..." class="input-field combobox-input" autocomplete="off">
+                            <div class="combobox-menu hidden"></div>
                         </div>
-
-                        <div class="form-group">
-                            <label for="group-name">Group Name (Literal) <span>*</span></label>
-                            <input type="text" id="group-name" placeholder="e.g. production-servers" required class="input-field">
+                        <input type="text" id="cause-filter" placeholder="Filter by cause..." class="input-field">
+                        <select id="status-filter" class="input-field select-field">
+                            <option value="">All Statuses</option>
+                            <option value="ban">Banned</option>
+                            <option value="white">Whitelisted</option>
+                        </select>
+                        <!-- Native date inputs: no picker library, and the browser handles locale
+                             formatting, keyboard entry and validation for free. -->
+                        <div class="date-range" role="group" aria-label="Filter by last-seen date range">
+                            <label for="date-from" class="date-range-label">From</label>
+                            <input type="date" id="date-from" class="input-field date-input" aria-label="Start date">
+                            <label for="date-to" class="date-range-label">To</label>
+                            <input type="date" id="date-to" class="input-field date-input" aria-label="End date">
+                            <button type="button" id="date-clear" class="btn btn-icon" title="Clear the date range" hidden>&times;</button>
                         </div>
-
-                        <div class="form-group">
-                            <label for="cause">Cause / Reason (Optional)</label>
-                            <input type="text" id="cause" placeholder="Reason for ban or whitelist" class="input-field">
-                        </div>
-
-                        <div class="form-actions">
-                            <button type="submit" id="btn-ban" class="btn btn-danger">Ban IP</button>
-                            <button type="button" id="btn-white" class="btn btn-success">Whitelist IP</button>
-                        </div>
-
-                        <div id="form-message" class="message hidden"></div>
-                    </form>
-                </section>
-
-                <section class="card list-section">
-                    <div class="list-header">
-                        <h2>Recent IP Records</h2>
-                        <div class="filters">
-                            <input type="text" id="ip-filter" placeholder="Filter by IP..." class="input-field">
-                            <div class="combobox" id="group-filter-combobox">
-                                <input type="text" id="group-filter" placeholder="Filter by group..." class="input-field combobox-input" autocomplete="off">
-                                <div class="combobox-menu hidden"></div>
-                            </div>
-                            <input type="text" id="cause-filter" placeholder="Filter by cause..." class="input-field">
-                            <button type="button" id="ip-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
-                            <select id="status-filter" class="input-field select-field">
-                                <option value="">All Statuses</option>
-                                <option value="ban">Banned</option>
-                                <option value="white">Whitelisted</option>
-                            </select>
-                            <button type="button" id="conflict-filter-btn" class="btn btn-icon btn-toggle" title="Show only addresses present in both a banlist and a whitelist group">⚠️ Conflicted IPs Only</button>
-                        </div>
+                        <button type="button" id="ip-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
+                        <button type="button" id="conflict-filter-btn" class="btn btn-icon btn-toggle" title="Show only addresses present in both a banlist and a whitelist group">⚠️ Conflicted IPs Only</button>
                     </div>
+                </div>
 
+                <!-- Primary action sits immediately above the table, opposite the batch actions. -->
+                <div class="table-toolbar">
+                    <button type="button" id="open-manage-ip" class="btn btn-primary">+ Add IP / Grant Access</button>
                     <div class="batch-actions hidden">
                         <button type="button" id="delete-selected-ips" class="btn btn-batch-delete" disabled>Delete Selected</button>
                     </div>
+                </div>
 
-                    <div class="table-container">
-                        <table id="ip-table" class="data-table">
-                            <thead>
-                                <tr>
-                                    <th><input type="checkbox" id="select-all-ips" title="Select all"></th>
-                                    <th>Address</th>
-                                    <th>Status</th>
-                                    <th>Cause</th>
-                                    <th>Group</th>
-                                    <th>Updated At</th>
-                                    <th>Actions</th>
-                                </tr>
-                            </thead>
-                            <tbody id="ip-table-body">
-                                <tr>
-                                    <td colspan="7" class="text-center text-muted">Loading data...</td>
-                                </tr>
-                            </tbody>
-                        </table>
-                    </div>
+                <div class="table-container table-scroll">
+                    <table id="ip-table" class="data-table data-table-fixed">
+                        <!-- Explicit proportions: with `table-layout: fixed` these are what stop a
+                             /48 IPv6 CIDR from widening the ADDRESS column and pushing the whole
+                             document into horizontal scroll. -->
+                        <colgroup>
+                            <col class="col-select">
+                            <col class="col-address">
+                            <col class="col-status">
+                            <col class="col-cause">
+                            <col class="col-group">
+                            <col class="col-date">
+                            <col class="col-actions">
+                        </colgroup>
+                        <thead>
+                            <tr>
+                                <th><input type="checkbox" id="select-all-ips" title="Select all"></th>
+                                <th>Address</th>
+                                <th>Status</th>
+                                <th>Cause</th>
+                                <th>Group</th>
+                                <th>Updated At</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ip-table-body">
+                            <tr>
+                                <td colspan="7" class="text-center text-muted">Loading data...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
 
-                    <div class="pagination">
-                        <button id="btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
-                        <span id="page-indicator">Page 1</span>
-                        <button id="btn-next" class="btn btn-icon">Next &raquo;</button>
-                    </div>
-                </section>
-            </div>
+                <div class="pagination">
+                    <button id="btn-jump-back" class="btn btn-icon" title="Back 5 pages" disabled>&laquo;&nbsp;5</button>
+                    <button id="btn-prev" class="btn btn-icon" title="Previous page" disabled>&lsaquo;</button>
+                    <span class="page-jumper">
+                        Page
+                        <input type="number" id="page-input" class="input-field page-input" min="1" value="1"
+                               inputmode="numeric" aria-label="Go to page">
+                        of <span id="page-total">1</span>
+                    </span>
+                    <button id="btn-next" class="btn btn-icon" title="Next page">&rsaquo;</button>
+                    <button id="btn-jump-forward" class="btn btn-icon" title="Forward 5 pages">5&nbsp;&raquo;</button>
+                </div>
+            </section>
         </main>
 
         <!-- ═══════════════════════════════════════════════ -->
@@ -337,7 +337,8 @@
                     <h2>Webhook Configs</h2>
                     <p class="subtitle">Configure advanced templated webhook events, custom headers, and payload templates.</p>
                     <form id="form-create-webhook" class="admin-form">
-                        <div class="form-grid">
+                        <!-- Row 1 — universal fields: every mode needs all three. -->
+                        <div class="compact-grid">
                             <div class="form-group">
                                 <label for="webhook-url">Target URL <span>*</span></label>
                                 <input type="url" id="webhook-url" placeholder="https://example.com" required class="input-field">
@@ -345,10 +346,6 @@
                             <div class="form-group">
                                 <label for="webhook-name">Webhook Name <span>*</span></label>
                                 <input type="text" id="webhook-name" placeholder="My Alert Hook" required class="input-field">
-                            </div>
-                            <div class="form-group" id="webhook-secret-group">
-                                <label for="webhook-secret">HMAC Secret <span>*</span></label>
-                                <input type="password" id="webhook-secret" placeholder="Shared Secret" required class="input-field">
                             </div>
                             <div class="form-group">
                                 <label for="webhook-group-search">Target Group <span>*</span></label>
@@ -358,6 +355,12 @@
                                     <div class="combobox-menu hidden"></div>
                                 </div>
                             </div>
+                        </div>
+
+                        <!-- Row 2 — Auth Mode drives everything below it. The description is a
+                             single line that swaps with the selection (see syncWebhookAuthFields),
+                             instead of a permanent paragraph listing all four modes at once. -->
+                        <div class="compact-grid auth-mode-row">
                             <div class="form-group">
                                 <label for="webhook-auth-mode">Auth Mode <span>*</span></label>
                                 <select id="webhook-auth-mode" class="input-field select-field">
@@ -366,59 +369,66 @@
                                     <option value="API_KEY_ONLY">API_KEY_ONLY (key header, no signature)</option>
                                     <option value="NONE">NONE (no auth headers)</option>
                                 </select>
-                                <small class="field-hint">
-                                    <strong>CANONICAL_V1</strong> signs the template below and adds <code>X-Timestamp</code>
-                                    (plus <code>X-API-Key</code> when set), so the dispatch can authenticate directly against
-                                    another Simply IP Vault instance. <strong>BODY_ONLY</strong> signs the payload alone as
-                                    <code>sha256=&lt;hex&gt;</code> — what GitHub-style consumers expect.
-                                    <strong>API_KEY_ONLY</strong> sends just <code>X-API-Key</code>.
-                                    <strong>NONE</strong> sends no auth headers at all.
-                                </small>
+                            </div>
+                            <p class="auth-mode-hint field-hint" id="webhook-auth-mode-hint" aria-live="polite"></p>
+                        </div>
+
+                        <!-- Row 3 — mode-dependent credentials, shown/hidden by JS. -->
+                        <div class="compact-grid">
+                            <div class="form-group" id="webhook-secret-group">
+                                <label for="webhook-secret">HMAC Secret <span>*</span></label>
+                                <input type="password" id="webhook-secret" placeholder="Shared Secret" required class="input-field">
                             </div>
                             <div class="form-group" id="webhook-api-key-group">
                                 <label for="webhook-api-key">API Key</label>
                                 <input type="password" id="webhook-api-key" placeholder="Sent as X-API-Key" class="input-field" autocomplete="off">
-                                <small class="field-hint">A credential for the <em>receiving</em> system. Stored as given and never shown again.</small>
-                            </div>
-                            <div class="form-group col-span-2" id="webhook-hmac-template-group">
-                                <label for="webhook-hmac-template">HMAC Signature Template <span>*</span></label>
-                                <input type="text" id="webhook-hmac-template" class="input-field font-mono"
-                                       value="{method}\n{path}\n{timestamp}\n{body}" spellcheck="false" autocomplete="off">
-                                <small class="field-hint">
-                                    The exact string that gets signed. <code>\n</code> is a real newline;
-                                    <code>{method}</code>, <code>{path}</code>, <code>{timestamp}</code> and
-                                    <code>{body}</code> are substituted (<code>{path}</code> comes from the target URL).
-                                    Behind a path-rewriting proxy, hardcode the path the receiver actually sees —
-                                    e.g. <code>{method}\n/api/hooks/42/execute\n{timestamp}\n{body}</code>.
-                                    <code>{body}</code> is mandatory.
-                                </small>
-                            </div>
-                            <div class="form-group col-span-2">
-                                <label for="webhook-headers">Custom Headers (JSON)</label>
-                                <textarea id="webhook-headers" placeholder='{"Authorization": "Bearer token"}' class="input-field" rows="2"></textarea>
-                            </div>
-                            <div class="form-group col-span-2">
-                                <label for="webhook-template">Payload Template <span>*</span></label>
-                                <textarea id="webhook-template" required class="input-field" rows="3">{"target_address": "$target_address", "cause": "$cause", "group_name": "$group_name"}</textarea>
-                            </div>
-                            <div class="form-group col-span-2">
-                                <label>Trigger On Events <span>*</span></label>
-                                <div class="permissions-grid mt-2">
-                                    <label class="checkbox-container">
-                                        <input type="checkbox" id="webhook-event-add" checked>
-                                        <span class="checkmark"></span> IP Added
-                                    </label>
-                                    <label class="checkbox-container">
-                                        <input type="checkbox" id="webhook-event-update" checked>
-                                        <span class="checkmark"></span> IP Updated
-                                    </label>
-                                    <label class="checkbox-container">
-                                        <input type="checkbox" id="webhook-event-delete" checked>
-                                        <span class="checkmark"></span> IP Deleted
-                                    </label>
-                                </div>
+                                <small class="field-hint">Credential for the <em>receiving</em> system. Stored as given, never shown again.</small>
                             </div>
                         </div>
+
+                        <div class="form-group" id="webhook-hmac-template-group">
+                            <label for="webhook-hmac-template">HMAC Signature Template <span>*</span></label>
+                            <input type="text" id="webhook-hmac-template" class="input-field font-mono"
+                                   value="{method}\n{path}\n{timestamp}\n{body}" spellcheck="false" autocomplete="off">
+                            <small class="field-hint">
+                                The exact string that gets signed. <code>\n</code> is a real newline;
+                                <code>{method}</code>, <code>{path}</code>, <code>{timestamp}</code>, <code>{body}</code>
+                                are substituted (<code>{path}</code> comes from the target URL). Behind a path-rewriting
+                                proxy, hardcode the path the receiver sees. <code>{body}</code> is mandatory.
+                            </small>
+                        </div>
+
+                        <!-- Row 4 — payload shaping, side by side: both are code-ish textareas and
+                             read better adjacent than stacked full-width. -->
+                        <div class="compact-grid">
+                            <div class="form-group">
+                                <label for="webhook-headers">Custom Headers (JSON)</label>
+                                <textarea id="webhook-headers" placeholder='{"Authorization": "Bearer token"}' class="input-field font-mono" rows="3"></textarea>
+                            </div>
+                            <div class="form-group">
+                                <label for="webhook-template">Payload Template <span>*</span></label>
+                                <textarea id="webhook-template" required class="input-field font-mono" rows="3">{"target_address": "$target_address", "cause": "$cause", "group_name": "$group_name"}</textarea>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Trigger On Events <span>*</span></label>
+                            <div class="permissions-grid mt-2">
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="webhook-event-add" checked>
+                                    <span class="checkmark"></span> IP Added
+                                </label>
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="webhook-event-update" checked>
+                                    <span class="checkmark"></span> IP Updated
+                                </label>
+                                <label class="checkbox-container">
+                                    <input type="checkbox" id="webhook-event-delete" checked>
+                                    <span class="checkmark"></span> IP Deleted
+                                </label>
+                            </div>
+                        </div>
+
                         <div class="form-actions mt-4">
                             <button type="submit" class="btn btn-primary">Create Webhook</button>
                         </div>
@@ -467,6 +477,44 @@
                 </div>
             </section>
         </main>
+    </div>
+
+    <!-- Manage Access Modal (the former left-hand panel on the IP Records tab) -->
+    <div id="manage-ip-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="manage-ip-modal-title">
+        <div class="modal-card modal-card-form card">
+            <div class="modal-header">
+                <h3 id="manage-ip-modal-title">Manage Access</h3>
+                <button type="button" id="manage-ip-close" class="btn-modal-close" aria-label="Close">&times;</button>
+            </div>
+            <p class="subtitle">Add a new IP address or CIDR to the firewall.</p>
+
+            <form id="manage-form" class="manage-form">
+                <div class="form-group">
+                    <label for="ip-address">IP Address or CIDR <span>*</span></label>
+                    <input type="text" id="ip-address" placeholder="e.g. 203.0.113.50 or 10.0.0.0/24" required
+                        class="input-field">
+                </div>
+
+                <div class="form-group">
+                    <label for="group-name">Group Name (Literal) <span>*</span></label>
+                    <input type="text" id="group-name" placeholder="e.g. production-servers" required class="input-field">
+                </div>
+
+                <div class="form-group">
+                    <label for="cause">Cause / Reason (Optional)</label>
+                    <input type="text" id="cause" placeholder="Reason for ban or whitelist" class="input-field">
+                </div>
+
+                <div class="form-actions">
+                    <button type="button" id="manage-ip-cancel" class="btn btn-cancel">Cancel</button>
+                    <button type="submit" id="btn-ban" class="btn btn-danger">Ban IP</button>
+                    <button type="button" id="btn-white" class="btn btn-success">Whitelist IP</button>
+                </div>
+
+                <div id="form-message" class="message hidden"></div>
+            </form>
+        </div>
     </div>
 
     <!-- Edit API Key Modal -->

@@ -172,22 +172,9 @@ body {
     width: 100%;
 }
 
-.grid-layout {
-    display: grid;
-    grid-template-columns: 380px 1fr;
-    gap: 1.5rem;
-    align-items: start;
-}
-
-@media (max-width: 1100px) {
-    .grid-layout {
-        grid-template-columns: 1fr;
-    }
-
-    .grid-layout > * {
-        width: 100%;
-    }
-}
+/* `.grid-layout` (a 380px form column beside the table) was removed with the Manage Access panel:
+   the IP Records tab is now a single full-width table section, and the form lives in
+   #manage-ip-modal. Nothing else used the two-column layout. */
 
 /* ─── Tab Navigation ────────────────────────────────────── */
 
@@ -618,7 +605,80 @@ body {
 .data-table thead {
     position: sticky;
     top: 0;
-    z-index: 1;
+    z-index: 2;
+}
+
+/* Bounded height so the body scrolls under a pinned header instead of the page growing without
+   limit. `sticky` on the thead only has an effect inside a scroll container — without this the
+   rule above is inert, which is what it was before. */
+.table-scroll {
+    max-height: 60vh;
+    overflow-y: auto;
+}
+
+/* The header cells carry the background, not <thead>: a transparent sticky row lets body rows
+   show through as they scroll beneath it. */
+.table-scroll .data-table th {
+    box-shadow: inset 0 -2px 0 var(--border);
+}
+
+/* ─── Fixed-Layout Tables ───────────────────────────────── */
+
+/* Column widths come from <colgroup> rather than content, so one long cell cannot widen the
+   table. Paired with the ellipsis rules below, a /48 IPv6 CIDR truncates instead of pushing the
+   whole document into horizontal scroll. */
+.data-table-fixed {
+    table-layout: fixed;
+    width: 100%;
+}
+
+.data-table-fixed .col-select { width: 2.75rem; }
+.data-table-fixed .col-address { width: 24%; }
+.data-table-fixed .col-status { width: 9rem; }
+.data-table-fixed .col-cause { width: 20%; }
+.data-table-fixed .col-group { width: 14%; }
+.data-table-fixed .col-date { width: 11rem; }
+.data-table-fixed .col-actions { width: 6.5rem; }
+
+/* Every cell clips by default; the badge column opts back out below so its pills stay intact. */
+.data-table-fixed td {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The address itself truncates with an ellipsis and carries the full value in `title`, so the
+   untruncated string is always one hover away. `min-width: 0` is what actually permits a flex
+   child to shrink below its content width — without it the ellipsis never engages. */
+.cell-address {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    min-width: 0;
+}
+
+.cell-address .address-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
+}
+
+/* Badges in the address cell must not be squeezed to nothing by a long address beside them. */
+.cell-address .badge {
+    flex: 0 0 auto;
+}
+
+/* A long group name would otherwise be clipped mid-glyph: `text-overflow` has no effect on the
+   text inside an inline-flex box, so the pill switches to inline-block where it can ellipsize.
+   The cell carries a `title` with the full name, exactly as the address column does. */
+.data-table-fixed .badge-group {
+    display: inline-block;
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    vertical-align: middle;
 }
 
 .data-table th {
@@ -837,17 +897,106 @@ body {
     display: flex;
     align-items: center;
     justify-content: center;
-    gap: 1rem;
+    flex-wrap: wrap;
+    gap: 0.4rem;
     margin-top: 1rem;
     padding-top: 0.75rem;
 }
 
-.pagination #page-indicator {
+/* The IP table uses the .page-jumper below; Audit Logs still has the simple indicator. */
+.pagination #audit-page-indicator {
     color: var(--text-muted);
     font-size: 0.85rem;
     font-weight: 500;
     min-width: 60px;
     text-align: center;
+}
+
+/* "Page [n] of N" — the number is an input so the page can be typed directly, but it should read
+   as text sitting in the sentence rather than as a form field. */
+.page-jumper {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    font-weight: 500;
+    margin: 0 0.35rem;
+}
+
+.page-jumper .page-input {
+    width: 4.25rem;
+    padding: 0.3rem 0.4rem;
+    text-align: center;
+    font-size: 0.85rem;
+    font-variant-numeric: tabular-nums;
+}
+
+/* The spinners steal width from a field this narrow and add nothing — the value is typed or
+   driven by the surrounding buttons. */
+.page-jumper .page-input::-webkit-outer-spin-button,
+.page-jumper .page-input::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+.page-jumper .page-input {
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+
+.page-jumper #page-total {
+    font-variant-numeric: tabular-nums;
+    min-width: 1.5rem;
+}
+
+.pagination .btn-icon {
+    min-width: 2.25rem;
+}
+
+/* ─── Table Toolbar & Date Range ────────────────────────── */
+
+/* The primary action sits left, batch actions right, directly above the table. */
+.table-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+}
+
+.table-toolbar .batch-actions {
+    margin: 0;
+}
+
+.date-range {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex: 0 1 auto;
+}
+
+.date-range-label {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+}
+
+.date-input {
+    width: auto;
+    flex: 0 0 auto;
+    padding: 0.4rem 0.5rem;
+    font-size: 0.82rem;
+    color-scheme: dark;
+}
+
+/* The native calendar glyph renders near-black on a dark field in Chromium; invert it back. */
+.date-input::-webkit-calendar-picker-indicator {
+    filter: invert(0.8);
+    cursor: pointer;
 }
 
 /* ─── Toast Notifications ───────────────────────────────── */
@@ -1169,6 +1318,90 @@ body {
     font-size: 1.1rem;
     font-weight: 600;
     margin-bottom: 0.75rem;
+}
+
+/* Title and close button on one line; the title keeps its own bottom margin so the header does
+   not need one. */
+.modal-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.btn-modal-close {
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    font-size: 1.5rem;
+    line-height: 1;
+    padding: 0 0.25rem;
+    cursor: pointer;
+    border-radius: var(--radius);
+    transition: color var(--transition-fast), background-color var(--transition-fast);
+}
+
+.btn-modal-close:hover {
+    color: var(--text-main);
+    background-color: rgba(255, 255, 255, 0.06);
+}
+
+.btn-modal-close:focus-visible {
+    outline: 2px solid var(--highlight);
+    outline-offset: 2px;
+}
+
+/* A form is taller than a confirmation prompt, so it scrolls inside the card rather than
+   overflowing the viewport on a short window. */
+.modal-card-form {
+    max-width: 520px;
+    max-height: calc(100vh - 3rem);
+    overflow-y: auto;
+}
+
+.modal-card-form .form-actions {
+    justify-content: flex-end;
+}
+
+/* ─── Compact Form Grid ─────────────────────────────────── */
+
+/* Two to three columns depending on width, from one rule: `auto-fit` collapses to whatever fits,
+   so no breakpoint list is needed and a 3-across row becomes 2-across then 1-across on its own. */
+.compact-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+    gap: 0.75rem 1rem;
+    align-items: start;
+    margin-bottom: 0.75rem;
+}
+
+.compact-grid > .form-group {
+    margin-bottom: 0;
+    min-width: 0;
+}
+
+/* Auth Mode and its description share a row: the selector stays narrow and the hint takes the
+   remaining width, instead of a full-width paragraph pushing every later field down the page. */
+.auth-mode-row {
+    grid-template-columns: minmax(230px, 20rem) 1fr;
+    align-items: center;
+}
+
+.auth-mode-hint {
+    margin: 0;
+    align-self: center;
+    padding: 0.5rem 0.7rem;
+    background-color: var(--bg-input);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--highlight);
+    border-radius: var(--radius);
+    line-height: 1.45;
+}
+
+@media (max-width: 700px) {
+    .auth-mode-row {
+        grid-template-columns: 1fr;
+    }
 }
 
 .modal-card .key-reveal-value {
