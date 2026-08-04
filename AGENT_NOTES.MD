@@ -3897,3 +3897,90 @@ field.
 
 - Audit Logs could take the same `.table-scroll` sticky treatment. Left alone: the brief made it the
   reference for the IP table's styling, not a target, and changing it was not asked for.
+
+---
+
+## Session 33 — Fixing the syntax error Session 32 shipped, and the verification gap that let it through
+
+`4bdadf0` left `static/app.js` unparseable. The browser reported
+`Uncaught SyntaxError: unexpected token: identifier` at `app.js:1068:31`, which blocks the *entire*
+file — the dashboard did not load at all.
+
+### The bug
+
+`renderIpTable()` builds each row from a template literal. Session 32 added an explanatory HTML
+comment inside it:
+
+```
+    <!-- `title` carries the untruncated value: ... -->
+```
+
+The backtick before `title` **terminates the template literal**. What follows is the bare identifier
+`title` sitting where an operator was expected — hence "unexpected token: identifier" at exactly the
+column where `title` begins.
+
+Nothing about this is exotic: a backtick inside a template literal ends it, always. The mistake was
+writing prose containing markdown-style code quoting into a context where the backtick is syntax.
+
+### The fix
+
+Both HTML comments moved out of the template and became JS `//` comments above the `return`. That
+fixes the parse and removes a second, quieter problem: an HTML comment inside the row template is
+emitted into the DOM **once per row**, so a 15-row page carried 15 copies of commentary for nobody's
+benefit. `grep -c '<!--' static/app.js` is now 0.
+
+### Why Session 32's verification did not catch it — and what replaced it
+
+Session 32 had no JS engine available and substituted a hand-written delimiter-balance checker. That
+check was **structurally incapable** of finding this bug, and it is worth being precise about why,
+because the check itself did not malfunction:
+
+The stray backtick is not a *tokenization* error. Ending a template literal at a backtick is exactly
+what a correct tokenizer does. The error is a *grammar* error one token later — an identifier where
+an operator belongs. A checker that only balances delimiters cannot see it, and the delimiters did in
+fact stay balanced, so it reported success truthfully and uselessly.
+
+The lesson is not "the checker had a bug". It is that **balance-checking is not parsing**, and
+Session 32's write-up already conceded this ("weaker than a real parse — it would catch unbalanced
+braces and missing elements, but not every syntax error") without treating it as a blocker. It should
+have been one for a file that had just been edited in 292 lines.
+
+**Replacement: a real parser.** No `node`/`deno`/`bun`, no `pip`, no `ensurepip` on this machine — but
+the Rust toolchain and crates.io are right here. A throwaway `jscheck` binary in the scratchpad
+(`oxc_parser`, ~40 lines) parses the file and reports every syntax error with a resolved
+`line:column`. Deliberately a *parser* and not an engine: executing `app.js` would fail on `document`
+and `localStorage` for reasons that have nothing to do with syntax.
+
+It is in the scratchpad, not the repo — the task scoped changes to `static/app.js`, and this is a
+tool rather than a project artefact. To recreate it: a `[dependencies]` block of `oxc_allocator`,
+`oxc_parser`, `oxc_span` (0.90), then
+`Parser::new(&allocator, &src, SourceType::cjs()).parse()` and report `ret.errors`.
+
+**Proven against the bug rather than assumed to work.** Run on `git show 4bdadf0:static/app.js` it
+reports:
+
+```
+FAIL  app.broken.js:1068:30  Expected a semicolon or an implicit semicolon after a statement, but found none
+```
+
+— independently reproducing the position the browser gave (1068:31 in the browser's 1-based column
+numbering). On the fixed file: `0 syntax errors, valid ECMAScript`. A checker that has not been shown
+to fail on a known-bad input is not evidence of anything, which is precisely the trap the previous
+session fell into.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `jscheck static/app.js` (oxc real parser) | **0 syntax errors** |
+| Same checker on the broken `4bdadf0` version | correctly FAILS at 1068:30 |
+| HTML comments remaining inside JS templates | 0 |
+| Every `getElementById` target exists in the HTML | 0 missing |
+| `cargo check --all-targets` | clean |
+| `cargo test` | **165 passed**, 0 failed |
+| `./scripts/test_e2e.sh` | **420/420**, 0 failed |
+
+Note that `cargo test` and the e2e suite passed on the broken commit too, and always would have:
+`static/` is served from disk by `ServeDir` and never parsed by anything in the Rust test path. No
+existing gate in this repo can see a front-end syntax error — which is why the parser check has to be
+run explicitly whenever `static/*.js` changes.

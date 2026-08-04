@@ -1060,21 +1060,27 @@ class FirewallClient {
                 ? '<span class="badge badge-white">Whitelisted</span>'
                 : '<span class="badge badge-ban">Banned</span>';
 
+            // Notes on the row markup below, kept out here as JS comments rather than inside the
+            // template. Two reasons: an HTML comment in the template is emitted into the DOM once
+            // per row for nobody's benefit, and a backtick inside one silently terminates the
+            // template literal — which is exactly how this function got shipped unparseable.
+            //
+            // - The address cell's `title` carries the untruncated value: the column is fixed-width,
+            //   so a long IPv6 CIDR shows an ellipsis and hover is how it stays readable. The cause
+            //   and group cells carry one for the same reason.
+            // - `text-sm` on the free-text and timestamp columns matches the Audit Logs table's
+            //   weight, and buys the fixed-width columns a little more room before clipping.
             return `
             <tr>
                 <td>${ip.is_locked ? '' : `<input type="checkbox" class="row-select" data-id="${ip.id}">`}</td>
                 <td class="font-mono">
                     <div class="cell-address">
-                        <!-- `title` carries the untruncated value: with the column fixed-width, a
-                             long IPv6 CIDR shows an ellipsis, and hover is how it stays readable. -->
                         <span class="address-text" title="${escapeHtml(ip.target_address)}">${escapeHtml(ip.target_address)}</span>
                         ${ip.is_locked ? '<span title="Locked" class="badge">🔒 Locked</span>' : ''}
                         ${isConflicting ? '<span title="This address is in both a banlist and a whitelist group" class="badge badge-conflict">⚠ Conflict</span>' : ''}
                     </div>
                 </td>
                 <td>${statusBadge}</td>
-                <!-- text-sm matches the Audit Logs table's weight for free-text and timestamp
-                     columns, and buys the fixed-width columns a little more room before clipping. -->
                 <td class="text-sm" title="${escapeHtml(ip.cause || '')}">${escapeHtml(ip.cause || '-')}</td>
                 <td title="${escapeHtml(ip.group_name || 'Global')}"><span class="badge badge-group">${escapeHtml(ip.group_name || 'Global')}</span></td>
                 <td class="text-sm">${new Date(ip.last_seen_at).toLocaleString()}</td>
