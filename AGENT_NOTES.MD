@@ -4146,3 +4146,136 @@ ordinary custom header. Users can add any additional headers they like in any mo
 | `cargo test` | **172 passed**, 0 failed (70 unit + 62 RBAC + 37 security + 3 frontend syntax) |
 | `./scripts/test_e2e.sh` | 420/420 |
 | Migration | applies additively; existing rows default to `can_manage = false` |
+
+---
+
+## RBAC_MODEL Gap Analysis
+
+`RBAC_MODEL.md` was added at the repository root as the canonical, byte-identical specification of the
+authorization model shared with `simply_hook_executor`. This section records how the **current
+implementation** measures against it.
+
+**Method.** Every verdict below was established by reading `src/`, the migrations, and the route table
+directly. Historical notes in this file and the claims in `AGENT.MD` were deliberately *not* used as
+evidence — several turned out to be the thing being contradicted. No application logic was changed in
+this pass; this is analysis only.
+
+**Headline:** the specification is substantially *ahead* of the implementation. Of 28 discrete
+requirements: **6 COMPLY**, **13 VIOLATE**, **9 ARE NOT IMPLEMENTED**. Three concepts the
+specification treats as load-bearing — `parent_key_id`, `owner_key_id`, and pre-flight inventory —
+do not exist in the schema at all, and several rules that *are* implemented are implemented more
+loosely than the specification allows.
+
+**The single most important finding** is that **R2 contradicts the change made in the immediately
+preceding commit** (`493f6cf`, Session 34). That session split grant/revoke authority so that
+per-group `can_manage` satisfies revocation *on its own*. R2 requires the **conjunction** —
+`can_manage_keys` AND a `can_manage = true` row — and states plainly that "neither alone is
+sufficient". The specification is now the source of truth, so the code is wrong, not the spec. This
+is exactly the drift the document exists to stop, caught on its first application.
+
+### Verdict table
+
+| § | Requirement | Verdict | Evidence |
+| :--- | :--- | :--- | :--- |
+| 1 | Master unique, bootstrap-only, bypasses scoping | **VIOLATES** | `src/main.rs:62-68` skips bootstrap when a master exists, but `guard_scope_elevation` (`src/api.rs:326-328`) returns `Ok` early for a master, so a master may mint a **second** master via `POST /api/keys`. Uniqueness is convention, not invariant. |
+| 1 | Parent manages resources where a `can_manage` row is held | **VIOLATES** | Managing requires only *a row* (`guard_group_administration`, `src/api.rs:132-151`), not a `can_manage = true` row. |
+| 1 | Daughter (no `can_manage_keys`) may **never** manage resources | **VIOLATES** | `src/api.rs:173` — `caller_perm.is_some_and(\|p\| p.can_manage)` admits a key with **no global scope at all** to revocation. |
+| 1 | Resource-creation rights are Master-only | **VIOLATES** | `can_create_groups` is master-only (`MASTER_ONLY_SCOPES`, `src/api.rs:314`); the nearest analogue of `can_create_webhooks`, `can_manage_webhooks`, is **not** on that list and is set unguarded at `src/api.rs:1603` and `src/api.rs:1813`. |
+| 2 | **R1** Non-amplification | **VIOLATES** | Holds for per-group verbs (`guard_delegated_group_grant`, `src/api.rs:255-279`). Fails for globals: a parent **without** `can_manage_webhooks` may grant it (`src/api.rs:1603`, `1813`). |
+| 2 | **R2** Conjunction of Management | **VIOLATES** | Both directions. Revoke accepts `can_manage` alone (`src/api.rs:173`); grant accepts `can_manage_keys` + any row, never requiring `can_manage = true` (`src/api.rs:255-262`). |
+| 2 | **R3** Parentage confers no privilege | **NOT IMPLEMENTED** | No `parent_key_id` column exists (`src/entities/api_key.rs:9-51`, initial migration `src/migration/m20230101_000001_initial_schema.rs:162-181`). Vacuously unviolated: there is no lineage to derive rights from. |
+| 2 | **R4** Master-only elevation | **VIOLATES** | `can_manage_keys` is correctly master-only (`src/api.rs:314`). The resource-creation half fails, per the §1 row above. |
+| 2 | **R5** Sideways management delegation | **COMPLIES** | `can_manage` is delegable bounded by the caller's own (`src/api.rs:279`); daughter→parent elevation is blocked by `guard_scope_elevation`. |
+| 2 | **R6** Non-escalating revocation | **COMPLIES** | `guard_group_revocation` (`src/api.rs:168-190`) requires no verb-level proof; `widens_permissions` (`src/api.rs:219-232`) classifies reductions via the update endpoint as revocation, exactly as R6 requires. |
+| 2 | **R7** Bounded granting (R1 ∧ R2) | **VIOLATES** | Follows from the R1 and R2 failures. |
+| 3 | Every managed entity carries `owner_key_id` | **NOT IMPLEMENTED** | Absent from `ip_group` (`src/entities/ip_group.rs:10-23`) and `webhook_config` (`src/entities/webhook_config.rs:13-59`). |
+| 3 | Lifecycle restricted to Master + owner | **VIOLATES** | `delete_ip_group` is master-**only** (`src/api.rs:2289-2291`) — no owner may act. `delete_webhook` (`src/api.rs:2779`) admits **any** `can_manage_webhooks` holder with `can_read` on the group, which is neither Master nor creator. No group-rename endpoint exists at all (`src/lib.rs:78-80`). |
+| 3 | Master may reassign `owner_key_id` | **NOT IMPLEMENTED** | No column, no endpoint. |
+| 4 | Master full visibility | **COMPLIES** | Every read path branches on `is_master` before consulting permissions (`list_ip_groups`, `list_ips`, `list_webhooks`). |
+| 4 | Parent full visibility over its own subtree | **NOT IMPLEMENTED** | No subtree exists. Current behaviour *over*-delivers: `list_api_keys` (`src/api.rs:1689-1704`) returns **every** key in the system to any `can_manage_keys` holder. |
+| 4 | Shared-resource **minimal** view of other keys | **VIOLATES** | `build_api_key_summary` (`src/api.rs:1650-1687`) returns global flags, `bound_ips` and **all** group permissions for every key — the opposite of the minimal (ID, name, resource-specific permissions) view. |
+| 4 | Webhooks visible only to creator + Master | **VIOLATES** | `list_webhooks` (`src/api.rs:2755-2772`) scopes by *group readability*, not by creator; there is no creator column to scope by. |
+| 4 | Oracle discipline — `404` outside visibility scope | **VIOLATES (partial)** | Correct on `delete_webhook` (`src/api.rs:2791-2796`, returns `NotFound`) and `revoke_key_group_permission` (`404` before the authority check). Fails on `list_api_keys`, which discloses every key, and on the group-permission guards, which answer `403` and thereby confirm a group exists (`src/api.rs:148-150`). |
+| 5 | Exactly one Master, via partial unique index | **VIOLATES** | No partial unique index on `is_master`; the only unique keys in the initial migration are `key_hash` (`:170`), group name (`:103`), address (`:118`) and the permission pair (`:230-235`). |
+| 5 | Master immutable via API except `bound_ips` | **VIOLATES** | `update_api_key` (`src/api.rs:1755`) lets a **master** change a master's `name`, `can_manage_keys` and `can_create_groups`; `guard_master_target` (`src/api.rs:347-359`) only blocks *non*-masters. |
+| 5 | Master cannot be deleted via API | **COMPLIES** | `delete_api_key` refuses self-deletion (`src/api.rs:1716-1718`) and `guard_master_target` blocks non-masters. Note this is *contingent* on the unenforced uniqueness above: with two masters, each could delete the other. |
+| 6 | Cascade through the daughter subtree | **NOT IMPLEMENTED** | No `parent_key_id`; `delete_api_key` removes exactly one row (`src/api.rs:1725`). |
+| 6 | Resource data never implicitly deleted | **COMPLIES** | No FK from `api_keys` to `ip_groups`/`ip_records`/`webhook_configs`; only `api_key_group_permissions` cascades (`src/migration/m20230101_000001_initial_schema.rs:208-216`), which is permission data, not resource data. |
+| 6 | Pre-flight inventory of owned resources | **NOT IMPLEMENTED** | No ownership to inventory. |
+| 6 | Explicit resolution map on delete | **NOT IMPLEMENTED** | `DELETE /api/keys/{id}` takes no body (`src/lib.rs:68`). |
+| 7 | Partial unique index on `is_master = true` | **NOT IMPLEMENTED** | — |
+| 7 | Indexes on lineage/ownership/hash/join keys | **VIOLATES (partial)** | `key_hash` unique (`:170`) ✅ and the `(api_key_id, group_id)` permission index (`:230-235`) ✅; `parent_key_id` and `owner_key_id` have no columns to index ❌. |
+
+### The three structural absences
+
+Most individual violations above collapse into three missing concepts. Fixing them is a schema
+project, not a guard-tightening exercise:
+
+1. **`parent_key_id`** — without lineage there is no subtree, so R3, cascade deletion, and every
+   "own subtree" visibility rule are unimplementable as written.
+2. **`owner_key_id`** — without ownership, lifecycle authority has nowhere to live, so §3 collapses
+   into "master-only" (groups) or "anyone with the global flag" (webhooks), and §6's pre-flight
+   inventory has nothing to inventory.
+3. **A `can_manage = true` requirement on the grant path** — the cheapest of the three, and the one
+   that closes R2/R7. It is a change to two call sites, but it *narrows* existing behaviour and would
+   break current callers, so it belongs in its own pass with a migration note.
+
+### Where `AGENT.MD` now contradicts `RBAC_MODEL.md`
+
+`RBAC_MODEL.md` is normative; every line below is `AGENT.MD` being stale. Listed rather than edited,
+because amending §2 was not in this pass's scope and doing so would paper over the code divergence
+rather than record it.
+
+| `AGENT.MD` | Says | `RBAC_MODEL.md` |
+| :--- | :--- | :--- |
+| §2, "Revoking is satisfied by either authority" (line 92) | `can_manage_keys` + row **OR** `can_manage` alone | **R2**: both, always. "Neither alone is sufficient." |
+| §2, "Granting requires the global `can_manage_keys` scope plus the entry gate" (line 91) | Entry gate = *any* row | **R2/R7**: the row must have `can_manage = true`. |
+| §2, "`can_manage_webhooks` is deliberately **not** on this list… A delegated key manager can still hand it out" (`src/api.rs:311-313`, mirrored in AGENT.MD line 78) | Freely delegable | **R1/R4**: resource-creation rights are Master-only and never amplifiable. |
+| §2, "Delegation is bounded by the group" (line 82) | Two tiers: master / non-master | **§1**: three tiers — Master / Parent / Daughter, with Daughter barred from resource management entirely. |
+| §3 (line 161), "Master Key Auto-Gen" | Generates a master when none exists | **§5**: consistent, but silent on uniqueness *enforcement*, which §5 requires at the DB level. |
+| Endpoint table (line 252) | `delete_ip_group` master-only | **§3**: Master **and** `owner_key_id`. |
+| Throughout | No concept of `parent_key_id`, `owner_key_id`, cascade, or pre-flight inventory | **§3/§6**: all four are mandatory. |
+
+### What this pass changed
+
+- `RBAC_MODEL.md` — new, at the repository root.
+- `scripts/verify_convergence.sh` — new **Pillar 0** check asserting byte-identity with the peer copy.
+  Byte equality via `cmp`, deliberately **not** the normalized diff the code checks use: everything
+  else in that script normalizes away expected naming differences because it compares code written
+  for different nouns, whereas this file names both services' nouns in the same sentences and is
+  meant to be literally identical. Accepts the peer copy at either `example/RBAC_MODEL.md` or
+  `example/simply_hook_executor/RBAC_MODEL.md`, and reports **ABSENT** (expected, not drift) while
+  the peer has none — this repository cannot create a file in a tree it does not own.
+  All three branches were exercised against a scratchpad replica: identical → MATCH, one appended
+  byte → DRIFT with exit 1, nested-vs-root mount → MATCH.
+- `AGENT_NOTES.MD` — this section.
+
+No file under `src/`, no migration, and nothing under `./example/` was touched.
+
+**One unplanned change, outside the stated file list.** `Cargo.toml` was found already modified in the
+working tree (not by this pass, and not in commit `493f6cf`): the `oxc_*` dev-dependencies had been
+bumped `0.90` → `0.143`. That release renames `ParserReturn::errors` to `diagnostics`, makes
+`labels` a plain slice rather than `Option<Vec<_>>`, and returns `offset()` as `u32`, so
+`tests/frontend_syntax_test.rs` no longer compiled — which meant `cargo check`, `cargo clippy` and
+`cargo test` all failed before running a single assertion, and none of this pass's mandated validation
+could be performed.
+
+`tests/frontend_syntax_test.rs` was adapted to the current API (three lines). It is outside the
+permitted list for this pass but inside none of the prohibitions (`src/`, migrations, `./example/`),
+and the alternative was to report the gate as unrunnable. The check was re-proven against the broken
+`4bdadf0` copy of `app.js` afterwards: it still fails, and 0.143 reports `1068:31` — the exact
+line **and column** the browser originally gave, where 0.90 reported column 30.
+
+The bump also resolves the caveat noted at the end of Session 34: with `Cargo.lock` untracked, a
+floating `0.x` dependency is free to move under the build. Pinning these three to an exact `=0.143.x`
+would prevent a repeat, and is worth doing in a pass that is allowed to touch `Cargo.toml`.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **172 passed**, 0 failed |
+| `./scripts/test_e2e.sh` | 420/420 |
+| `./scripts/verify_convergence.sh` | 30 matching, 2 documented (SQLite pragmas + peer spec absent), 0 unexplained |

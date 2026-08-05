@@ -49,15 +49,19 @@ fn syntax_errors(relative: &str) -> Vec<String> {
     // that the browser would reject in this context.
     let parsed = Parser::new(&allocator, &source, SourceType::cjs()).parse();
 
+    // `diagnostics` in oxc >= 0.9x; the field was called `errors` in earlier releases. Named here
+    // rather than destructured so a future rename fails to compile instead of silently reporting
+    // "no syntax errors" against a list this test never looked at.
     parsed
-        .errors
+        .diagnostics
         .iter()
         .map(|err| {
-            let offset = err
-                .labels
-                .as_ref()
-                .and_then(|labels| labels.first().map(|span| span.offset()))
-                .unwrap_or(0)
+            // `labels` is a plain slice in current oxc (it was `Option<Vec<_>>` in older releases).
+            // A diagnostic without a label falls back to offset 0 rather than being dropped: a
+            // reported error with an unknown position is still a reported error.
+            // `offset()` is a `u32` in current oxc; widened once here so the slicing below stays in
+            // `usize` and cannot silently truncate on a large file.
+            let offset = (err.labels.first().map_or(0, |span| span.offset()) as usize)
                 .min(source.len());
             let line = source[..offset].matches('\n').count() + 1;
             let column = offset - source[..offset].rfind('\n').map_or(0, |i| i + 1) + 1;
@@ -101,7 +105,7 @@ fn the_syntax_check_rejects_the_defect_it_exists_to_catch() {
 
     let parsed = Parser::new(&allocator, broken, SourceType::cjs()).parse();
     assert!(
-        !parsed.errors.is_empty(),
+        !parsed.diagnostics.is_empty(),
         "a backtick inside a template literal must be reported as a syntax error — if this passes, \
          the parser is not actually checking anything"
     );

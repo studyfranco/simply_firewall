@@ -45,6 +45,6 @@ tempfile = "3"
 # broken `app.js` shipped green through `cargo test` and the whole e2e suite once already.
 # Deliberately a *parser* and not an engine: the file references `document` and `localStorage`, so
 # executing it would fail for reasons that have nothing to do with syntax.
-oxc_allocator = "0.90"
-oxc_parser = "0.90"
-oxc_span = "0.90"
+oxc_allocator = "0.143"
+oxc_parser = "0.143"
+oxc_span = "0.143"

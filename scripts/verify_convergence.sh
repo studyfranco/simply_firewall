@@ -173,6 +173,67 @@ echo "  peer:      $PEER_ROOT"
 echo
 
 # ─────────────────────────────────────────────────────────────
+echo "${BOLD}Pillar 0 — Canonical specification${RESET}"
+# `RBAC_MODEL.md` is the single source of truth for the authorization model, and its whole value
+# rests on being the *same* document in both trees. A specification that has drifted is worse than no
+# specification: each side would keep converging against its own copy and call the result agreement.
+#
+# Byte equality, not a normalized diff, and deliberately so. Everything else in this script
+# normalizes away expected differences (crate names, type names) because it compares *code* that is
+# meant to behave alike while being written for different nouns. This file is meant to be literally
+# identical — it names both services' nouns in the same sentences — so a single changed byte is drift
+# by definition.
+#
+# Both mount points are accepted: the peer repository may be checked out at `example/` (its own root)
+# or at `example/simply_hook_executor/` (nested), and the check should not depend on which.
+check_spec_parity() {
+    local label="RBAC_MODEL.md is byte-identical across services"
+    local ours="$PROJECT_ROOT/RBAC_MODEL.md"
+
+    if [ ! -f "$ours" ]; then
+        echo "  ${RED}✗ MISSING${RESET} $label — $ours does not exist"
+        DRIFT_COUNT=$((DRIFT_COUNT + 1))
+        return
+    fi
+
+    local peer_spec=""
+    for candidate in "$PEER_ROOT/RBAC_MODEL.md" "$PROJECT_ROOT/example/RBAC_MODEL.md"; do
+        if [ -f "$candidate" ]; then
+            peer_spec="$candidate"
+            break
+        fi
+    done
+
+    # Not yet published on the peer side. Reported as an expected gap rather than drift: this
+    # service cannot create a file in a tree it does not own, and failing here would make the whole
+    # check red for a condition the peer alone can fix.
+    if [ -z "$peer_spec" ]; then
+        echo "  ${YELLOW}~ ABSENT${RESET}  $label — the peer has no RBAC_MODEL.md yet"
+        echo "             copy $ours into the peer repository root to enable this check"
+        EXPECTED_COUNT=$((EXPECTED_COUNT + 1))
+        return
+    fi
+
+    if cmp -s "$ours" "$peer_spec"; then
+        echo "  ${GREEN}✓ MATCH${RESET}   $label"
+        MATCH_COUNT=$((MATCH_COUNT + 1))
+        return
+    fi
+
+    echo "  ${RED}✗ DRIFT${RESET}   $label — the two copies differ"
+    echo "             ours: $ours"
+    echo "             peer: $peer_spec"
+    DRIFT_COUNT=$((DRIFT_COUNT + 1))
+    if [ "$VERBOSE" == "1" ]; then
+        echo "${BLUE}--- ours / peer ---${RESET}"
+        diff -u "$ours" "$peer_spec" | sed 's/^/    /'
+        echo
+    fi
+}
+check_spec_parity
+echo
+
+# ─────────────────────────────────────────────────────────────
 echo "${BOLD}Pillar 1 — Proxy resolution & X-Forwarded-For${RESET}"
 # The chain walk is the one function that is supposed to be character-for-character identical: both
 # services resolve a client address from the same header under the same trust rule, and a difference
