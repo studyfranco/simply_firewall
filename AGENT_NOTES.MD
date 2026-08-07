@@ -4934,3 +4934,135 @@ Remaining: §6 (cascade deletion, pre-flight inventory) — Phase 4.
 | `cargo test` | **186 passed**, 0 failed |
 | `./scripts/test_e2e.sh` | **467/467** |
 | `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |
+
+---
+
+## Session 36 — RBAC_MODEL Convergence, Phase 4: Cascade Deletion & Pre-flight Inventory
+
+Implements §6. This is the last structural gap from the original analysis, and the one that changes
+`DELETE /api/keys/{id}` from a single-row delete into a subtree operation with a decision gate.
+
+### The shape
+
+1. Walk the target's entire `parent_key_id` subtree.
+2. Inventory every group and webhook owned by **any** key in it.
+3. Non-empty inventory, no resolution map → **`409`** carrying the inventory: `entity_type`, `id`,
+   `name`, `owner_key_id`, `owner_name` per entity, plus `subtree_key_count`.
+4. On resubmission, require a resolution for **every** inventoried entity. Partial maps refused;
+   entries naming something outside the inventory refused; duplicates refused.
+5. Only then write: resolutions first, then the subtree. `api_key_group_permissions` follows by
+   foreign key, and nothing else does — which is what makes §6's "data is never destroyed implicitly"
+   a schema fact rather than a convention.
+
+**The inventory walks the whole subtree, not the target key.** That is the requirement most easily
+got wrong, and the one the tests are built around: the fixture puts a group and a webhook two levels
+*below* the key being deleted, where an implementation that inspects only the target finds nothing,
+reports no conflict, and takes a webhook with it.
+
+**Every validation runs before the first write.** A partial map is the dangerous case precisely
+because it looks like compliance; applying the resolutions it does carry before discovering the gap
+would destroy data the caller never decided about. The tests assert the *database is unchanged* after
+each refusal rather than asserting the status code.
+
+**Reassigning into the doomed subtree is refused.** It reads as a rescue and is a deferred orphaning —
+the new owner disappears microseconds later and the entity lands unowned, i.e. master-only.
+
+### Two smaller decisions
+
+**`Bytes` rather than `Json<T>` for the optional body.** `DELETE` has always been callable with no
+body and every existing client calls it that way; `Json` rejects an empty body outright. Parsing by
+hand is the cost of not breaking every caller that owns nothing — which is most of them.
+
+**`AppError::ConflictWithDetails`.** §6 requires the refusal to carry "a structured payload
+enumerating each owned entity with enough detail to decide its fate", and a bare message would make
+the caller go and find that itself — from the keys that are about to be deleted. The variant merges
+its `details` object into the response at the top level, so `error` reads identically to every other
+variant for a client that ignores the rest.
+
+`owner_name` is carried alongside `owner_key_id` for the same reason: the id alone is a UUID the
+caller would have to resolve against rows that will not exist much longer.
+
+### What this replaced
+
+Phase 2's interim application-level `ON DELETE SET NULL`, which orphaned owned resources to unowned
+and daughters to root-level. Orphaning is not destruction, but it silently produced resources only a
+master could ever act on again. §6 asks for the decision instead.
+
+### Breaking changes
+
+| Change | Who breaks | Remedy |
+| :--- | :--- | :--- |
+| `DELETE /api/keys/{id}` deletes the whole subtree | Anyone expecting one row to go | Intended. `parent_key_id` is `NULL` on pre-migration keys, so their subtrees are empty and behaviour is unchanged for them |
+| `409` when the key or its subtree owns anything | Automation that treats non-`204` as failure | Read `owned_entities`, resubmit with a resolution map |
+
+```sql
+-- Keys whose deletion will now require a resolution map, and how much it will ask about.
+SELECT k.id, k.name, k.prefix,
+       (SELECT COUNT(*) FROM ip_groups g       WHERE g.owner_key_id = k.id) AS owned_groups,
+       (SELECT COUNT(*) FROM webhook_configs w WHERE w.owner_key_id = k.id) AS owned_webhooks
+FROM api_keys k
+WHERE EXISTS (SELECT 1 FROM ip_groups       g WHERE g.owner_key_id = k.id)
+   OR EXISTS (SELECT 1 FROM webhook_configs w WHERE w.owner_key_id = k.id);
+
+-- Keys that will cascade, and how far. One level shown; the walk is recursive.
+SELECT p.id AS parent_id, p.name AS parent_name, COUNT(c.id) AS direct_daughters
+FROM api_keys p JOIN api_keys c ON c.parent_key_id = p.id
+GROUP BY p.id, p.name;
+```
+
+### Tests
+
+Four new, rule-indexed: `s6_pre_flight_inventory_walks_the_whole_subtree_and_refuses_deletion`,
+`s6_a_partial_resolution_map_is_refused_and_applies_nothing`,
+`s6_a_complete_resolution_map_cascades_the_subtree_and_honours_each_resolution`,
+`s6_an_empty_inventory_deletes_directly_and_a_doomed_reassignment_target_is_refused`. They share a
+`nested_ownership_fixture` building manager → parent → child → grandchild with the resources owned at
+the deepest level.
+
+The third one puts an IP record inside the reassigned group and asserts it survives with its
+membership intact — §6's "data is never destroyed implicitly" asserted against the data, not against
+the container.
+
+The e2e suite went 467 → 490.
+
+### Mutation testing
+
+| Mutation | `cargo test` | Verdict |
+| :--- | :--- | :--- |
+| S6a — inventory inspects only the target key, not the subtree | 4 | caught |
+| S6b — partial resolution maps accepted | 2 | caught |
+| S6c — cascade deletes only the target, orphaning descendants | 2 | caught |
+| S6d — `reassign` destroys instead of moving | 2 | caught |
+| S6e — a non-empty inventory does not refuse | 2 | caught |
+
+**One methodological note worth recording.** S6d initially reported zero failures — and that was a
+**false negative from a mutation that did not compile**, not evidence of a coverage gap. The harness
+counted `^test .* FAILED` lines, and a build failure produces none. The mutation was rewritten to
+compile and then fired immediately (2 failures).
+
+The lesson generalises to every mutation result in this session's notes: a mutation must be confirmed
+to **build** before "no failures" can be read as "not covered". The runner now checks `cargo check`
+first. Earlier phases' uncaught mutations (M1a/M1b, M4, R3a-before-rewrite) were all verified to
+compile, so those verdicts stand.
+
+### Gap analysis items resolved
+
+| Requirement | Was | Now |
+| :--- | :--- | :--- |
+| §6 Cascade through the daughter subtree | NOT IMPLEMENTED | **COMPLIES** |
+| §6 Pre-flight inventory of owned resources | NOT IMPLEMENTED | **COMPLIES** |
+| §6 Explicit resolution map on delete | NOT IMPLEMENTED | **COMPLIES** |
+| §6 Resource data never implicitly deleted | COMPLIES | unchanged, now asserted end-to-end |
+
+**Every requirement in the original 28-item gap analysis is now closed** except the one that is
+vacuous here: §3's rename clause for groups, since no group-rename endpoint exists to restrict.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **190 passed**, 0 failed |
+| `./scripts/test_e2e.sh` | **490/490** |
+| `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |

@@ -2666,6 +2666,90 @@ check "200" "#3 clearing ownership returns the group to master-only"
 api_call DELETE "/api/groups/$OWNERVAL_GROUP_ID" "$MASTER_KEY"
 check "204" "#3 clean up the validation group"
 
+# --- 27c-quinquies. §6 cascade deletion & pre-flight inventory --------------------------------
+#
+# RBAC_MODEL.md §6: deleting a key cascades recursively through its daughter subtree, but only after a
+# pre-flight inventory of every resource owned by ANY key in that subtree — and the deletion is
+# refused until each one carries an explicit resolution. "Data is never destroyed implicitly."
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Cascade Root","can_manage_keys":true,"can_create_groups":true,"can_manage_webhooks":true}'
+check "200" "#6 create the root of a subtree to delete"
+CASC_ROOT_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+CASC_ROOT_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$CASC_ROOT_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call POST "/api/keys" "$CASC_ROOT_KEY" '{"name":"Cascade Daughter"}'
+check "200" "#6 the root mints a daughter"
+CASC_CHILD_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+CASC_CHILD_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$CASC_CHILD_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+# The daughter owns a group, so the inventory has to walk past the key actually being deleted.
+api_call PUT "/api/keys/$CASC_CHILD_ID" "$MASTER_KEY" '{"can_create_groups":true}'
+check "200" "#6 let the daughter create a group"
+api_call POST "/api/groups" "$CASC_CHILD_KEY" '{"name":"cascade-owned-group"}'
+check "200" "#6 the daughter creates a group it owns"
+CASC_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# An IP inside it, to prove the cascade never destroys resource data.
+api_call POST "/api/ban" "$CASC_CHILD_KEY" '{"target_address":"203.0.113.211","group_name":"cascade-owned-group","cause":"pre-cascade"}'
+check "200" "#6 put a record in the owned group"
+
+# Deleting the root refuses, and hands back the inventory.
+api_call DELETE "/api/keys/$CASC_ROOT_ID" "$MASTER_KEY"
+check "409" "#6 an unresolved inventory refuses the deletion"
+check_true '.owned_entities | length == 1' "#6 the payload enumerates the owned entity"
+check_true '.owned_entities[0].entity_type == "group"' "#6 ...with its type"
+check_true '.owned_entities[0].name == "cascade-owned-group"' "#6 ...its name"
+check_true ".owned_entities[0].owner_key_id == \"$CASC_CHILD_ID\"" \
+    "#6 ...and the owner, which is the DAUGHTER, not the key being deleted"
+check_true '.subtree_key_count == 2' "#6 the subtree count covers root plus daughter"
+
+# Nothing was touched.
+api_call GET "/api/auth/me" "$CASC_CHILD_KEY"
+check "200" "#6 the refusal deleted no key"
+
+# A partial map — here, an empty one carried alongside a valid JSON body — is refused too.
+api_call DELETE "/api/keys/$CASC_ROOT_ID" "$MASTER_KEY" '{"resolutions":[]}'
+check "409" "#6 an empty resolutions array is still an unresolved inventory"
+
+# A resolution naming something outside the inventory is refused.
+api_call DELETE "/api/keys/$CASC_ROOT_ID" "$MASTER_KEY" \
+    '{"resolutions":[{"entity_type":"group","id":"00000000-0000-0000-0000-000000000000","action":"delete"}]}'
+check "409" "#6 a map that resolves the wrong entity leaves the real one unresolved"
+
+# Reassigning into the doomed subtree is a deferred orphaning, not a rescue.
+api_call DELETE "/api/keys/$CASC_ROOT_ID" "$MASTER_KEY" \
+    "{\"resolutions\":[{\"entity_type\":\"group\",\"id\":\"$CASC_GROUP_ID\",\"action\":\"reassign\",\"owner_key_id\":\"$CASC_CHILD_ID\"}]}"
+check "400" "#6 cannot reassign to a key inside the subtree being deleted"
+
+# A complete map executes: the group is reassigned to a survivor, and the whole subtree cascades.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Cascade Survivor"}'
+check "200" "#6 create a survivor to receive the group"
+CASC_SURVIVOR_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call DELETE "/api/keys/$CASC_ROOT_ID" "$MASTER_KEY" \
+    "{\"resolutions\":[{\"entity_type\":\"group\",\"id\":\"$CASC_GROUP_ID\",\"action\":\"reassign\",\"owner_key_id\":\"$CASC_SURVIVOR_ID\"}]}"
+check "204" "#6 a complete resolution map executes the cascade"
+
+# Both generations are gone...
+api_call GET "/api/auth/me" "$CASC_ROOT_KEY"
+check "401" "#6 the root key no longer authenticates"
+api_call GET "/api/auth/me" "$CASC_CHILD_KEY"
+check "401" "#6 the daughter cascaded with it"
+
+# ...while the group and its contents survived, under the new owner.
+api_call GET "/api/groups" "$MASTER_KEY"
+check_true '[.[] | select(.name == "cascade-owned-group")] | length == 1' \
+    "#6 the reassigned group survived the cascade"
+check_true "[.[] | select(.name == \"cascade-owned-group\") | select(.owner_key_id == \"$CASC_SURVIVOR_ID\")] | length == 1" \
+    "#6 ...with the new owner"
+
+api_call GET "/api/ips?group_name=cascade-owned-group" "$MASTER_KEY"
+check "200" "#6 read the reassigned group's records"
+check_true '[.[] | select(.target_address == "203.0.113.211")] | length == 1' \
+    "#6 resource data is never destroyed implicitly (§6)"
+
 # --- 27d. Stored secrets are opened strictly, or not at all -----------------------------------
 #
 # `SecretCipher::open` refuses any value without a recognized storage prefix, and any sealed value

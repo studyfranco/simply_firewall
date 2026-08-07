@@ -2140,12 +2140,151 @@ pub async fn list_api_keys(
     Ok(Json(summaries))
 }
 
-/// Handles DELETE /api/v1/keys/:id
+/// One entity owned by a key inside the subtree being deleted, as it appears in §6's pre-flight
+/// inventory.
+///
+/// §6 requires "enough detail to decide its fate: type, id, name, and current owner". `owner_name` is
+/// carried alongside `owner_key_id` because the id alone is a UUID the caller would then have to go
+/// and look up — and the keys it would look it up in are the ones about to be deleted.
+#[derive(Serialize)]
+pub struct OwnedEntity {
+    /// `"group"` or `"webhook"` — the value a resolution entry must echo back.
+    pub entity_type: &'static str,
+    /// The entity's id, and the key of its resolution entry.
+    pub id: Uuid,
+    /// Human-readable name.
+    pub name: String,
+    /// The key inside the doomed subtree that owns it.
+    pub owner_key_id: Uuid,
+    /// That key's name.
+    pub owner_name: String,
+}
+
+/// What to do with one inventoried entity.
+#[derive(Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum Resolution {
+    /// Destroy the entity along with the keys.
+    Delete,
+    /// Transfer it to a surviving key.
+    Reassign {
+        /// The new owner. Must exist, must not be the master, and must not itself be inside the
+        /// subtree being deleted.
+        owner_key_id: Uuid,
+    },
+}
+
+/// One entry in the resolution map.
+#[derive(Deserialize)]
+pub struct ResolutionEntry {
+    /// Must match the inventory entry's `entity_type`.
+    pub entity_type: String,
+    /// Must match the inventory entry's `id`.
+    pub id: Uuid,
+    /// What to do with it.
+    #[serde(flatten)]
+    pub resolution: Resolution,
+}
+
+/// Optional body for `DELETE /api/v1/keys/:id`.
+#[derive(Deserialize, Default)]
+pub struct DeleteKeyPayload {
+    /// One entry per inventoried entity. Partial maps are refused.
+    #[serde(default)]
+    pub resolutions: Vec<ResolutionEntry>,
+}
+
+/// Every group and webhook owned by any key in `subtree`, with its owner's name resolved.
+///
+/// §6: "Before any key deletion, the service walks the entire subtree being deleted and collects every
+/// resource and dispatch target owned by any key within it." **The entire subtree**, not just the
+/// target — a daughter's webhooks would otherwise vanish silently when its parent is removed, which is
+/// exactly what §6's "data is never destroyed implicitly" forbids.
+async fn inventory_owned_entities(
+    db: &sea_orm::DatabaseConnection,
+    subtree: &[Uuid],
+) -> Result<Vec<OwnedEntity>, AppError> {
+    let owners: std::collections::HashMap<Uuid, String> = ApiKey::find()
+        .filter(api_key::Column::Id.is_in(subtree.to_vec()))
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|k| (k.id, k.name))
+        .collect();
+    let owner_name = |id: Uuid| owners.get(&id).cloned().unwrap_or_else(|| "<deleted>".to_owned());
+
+    let mut inventory = Vec::new();
+
+    for group in ip_group::Entity::find()
+        .filter(ip_group::Column::OwnerKeyId.is_in(subtree.to_vec()))
+        .all(db)
+        .await?
+    {
+        // `is_in` cannot match a NULL, so the owner is `Some` by construction; the fallback keeps
+        // this total rather than making an inventory walk panic.
+        let owner = group.owner_key_id.unwrap_or_default();
+        inventory.push(OwnedEntity {
+            entity_type: "group",
+            id: group.id,
+            name: group.name,
+            owner_key_id: owner,
+            owner_name: owner_name(owner),
+        });
+    }
+
+    for hook in webhook_config::Entity::find()
+        .filter(webhook_config::Column::OwnerKeyId.is_in(subtree.to_vec()))
+        .all(db)
+        .await?
+    {
+        let owner = hook.owner_key_id.unwrap_or_default();
+        inventory.push(OwnedEntity {
+            entity_type: "webhook",
+            id: hook.id,
+            name: hook.name,
+            owner_key_id: owner,
+            owner_name: owner_name(owner),
+        });
+    }
+
+    Ok(inventory)
+}
+
+/// Handles DELETE /api/v1/keys/:id — **§6's cascade, gated on the pre-flight inventory.**
+///
+/// # The shape of the operation
+///
+/// 1. Walk the target's entire `parent_key_id` subtree.
+/// 2. Inventory every group and webhook owned by **any** key in it.
+/// 3. If the inventory is non-empty and the request carries no resolution map, **refuse** with `409`
+///    and the inventory itself — type, id, name, and current owner for each entity.
+/// 4. On resubmission, require an explicit resolution for **every** inventoried entity. A partial map
+///    is refused; so is one naming an entity that is not in the inventory.
+/// 5. Only then delete: resolutions first, then the whole subtree.
+///
+/// # Why a refusal and not a cascade
+///
+/// §6: "Data is never destroyed implicitly. IP Groups, Hooks, IP Records, Webhook Configs, and
+/// Executors must never disappear as a side effect of removing a key." Deleting a key is a routine
+/// act of credential hygiene; deleting the banlist that key maintained is not, and the two must not be
+/// spelled the same way. The refusal is what turns "remove this key" into a decision the caller makes
+/// with the inventory in front of it.
+///
+/// The interim `ON DELETE SET NULL` this replaces — orphaning owned resources to unowned, and
+/// daughters to root-level — is gone. Orphaning is not destruction, but it silently produced
+/// resources only a master could ever act on again, and §6 asks for the decision instead.
+///
+/// # Which keys may be deleted at all
+///
+/// The subtree is resolved through [`find_administrable_key`], so a caller can only ever delete inside
+/// its own subtree (§4). The caller itself, and the master, are refused explicitly rather than left to
+/// the subtree walk: a caller is the root of its own subtree, and the master is in nobody's.
 pub async fn delete_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
+    body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -2155,52 +2294,172 @@ pub async fn delete_api_key(
         return Err(AppError::Forbidden("Cannot delete yourself".to_owned()));
     }
 
-    // Fetched before deleting (not just relied on rows_affected) so its name is still available
-    // for the audit log below — once deleted, there's nothing left to look the name up from.
-    // §4 oracle discipline: a key outside the caller's own subtree answers exactly as a nonexistent
-    // one does. `guard_master_target` still runs behind it as defence in depth — it is now
-    // unreachable for a non-master, since the master key is in nobody's subtree, and an unreachable
-    // guard that fails closed is cheaper to keep than to prove removable.
+    // `Bytes` rather than `Json<T>`: `DELETE` has always been callable with no body at all, and every
+    // existing client calls it that way. `Json` rejects an empty body outright, so an optional
+    // structured payload has to be parsed by hand — an empty body means "no resolutions", which is
+    // the request that gets the inventory back.
+    let payload: DeleteKeyPayload = if body.is_empty() {
+        DeleteKeyPayload::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|e| {
+            AppError::InvalidInput(format!("Invalid resolution map: {e}"))
+        })?
+    };
+
     let target = find_administrable_key(&state.db, &key, id).await?;
     guard_master_target(&key, &target)?;
-    // Absolute, master callers included. `guard_master_target` above only ever stopped non-masters,
-    // which left the Master deletable by itself the moment `id != key.id` stopped being true for it —
-    // and with §5 uniqueness there is no second master to delete it. §5 puts re-minting behind
-    // database access instead.
     guard_master_immutable(&target, "deleted")?;
     let target_ref = format_key_reference(&target.name, id);
 
-    // The application-level `ON DELETE SET NULL` the schema cannot declare (SQLite has no
-    // `ALTER TABLE … ADD CONSTRAINT`; see the lineage migration). Run *before* the delete so a
-    // failure here leaves the key — and therefore every reference to it — intact.
-    //
-    // Deliberately not a cascade in either direction. §6: "Data is never destroyed implicitly. IP
-    // Groups, Hooks, IP Records, Webhook Configs, and Executors must never disappear as a side effect
-    // of removing a key." Daughters likewise survive, losing only their recorded lineage — which
-    // carries no authority (R3), so nothing is escalated by the loss. Phase 4 replaces this with §6's
-    // pre-flight inventory, which refuses the deletion outright rather than orphaning anything.
-    api_key::Entity::update_many()
-        .col_expr(api_key::Column::ParentKeyId, sea_orm::sea_query::Expr::value(Option::<Uuid>::None))
-        .filter(api_key::Column::ParentKeyId.eq(id))
-        .exec(&state.db)
-        .await?;
-    ip_group::Entity::update_many()
-        .col_expr(ip_group::Column::OwnerKeyId, sea_orm::sea_query::Expr::value(Option::<Uuid>::None))
-        .filter(ip_group::Column::OwnerKeyId.eq(id))
-        .exec(&state.db)
-        .await?;
-    webhook_config::Entity::update_many()
-        .col_expr(webhook_config::Column::OwnerKeyId, sea_orm::sea_query::Expr::value(Option::<Uuid>::None))
-        .filter(webhook_config::Column::OwnerKeyId.eq(id))
-        .exec(&state.db)
-        .await?;
+    let subtree: Vec<Uuid> = collect_key_subtree(&state.db, id).await?.into_iter().collect();
+    // A cycle in `parent_key_id` (only reachable through direct database edits — the API always sets
+    // the parent to a key that already exists) could otherwise put the caller inside the subtree of a
+    // key it is deleting, and take its own credential with it.
+    if subtree.contains(&key.id) {
+        return Err(AppError::Conflict(
+            "Refusing to delete: the subtree of this key contains your own key, which indicates a              cycle in parent_key_id. Resolve it directly in the database."
+                .to_owned(),
+        ));
+    }
 
-    let result = ApiKey::delete_by_id(id).exec(&state.db).await?;
+    let inventory = inventory_owned_entities(&state.db, &subtree).await?;
+
+    if !inventory.is_empty() && payload.resolutions.is_empty() {
+        return Err(AppError::ConflictWithDetails {
+            message: format!(
+                "Refusing to delete {target_ref}: {} owned entit{} in its subtree need an explicit                  resolution. Resubmit this request with a `resolutions` array assigning each one                  either {{\"action\":\"delete\"}} or {{\"action\":\"reassign\",\"owner_key_id\":\"…\"}}.",
+                inventory.len(),
+                if inventory.len() == 1 { "y" } else { "ies" }
+            ),
+            details: serde_json::json!({
+                "subtree_key_count": subtree.len(),
+                "owned_entities": inventory,
+            }),
+        });
+    }
+
+    // Every inventoried entity, exactly once, and nothing else. Checked before a single write, so a
+    // rejected map leaves the installation untouched.
+    let mut resolutions: std::collections::HashMap<(String, Uuid), &Resolution> =
+        std::collections::HashMap::new();
+    for entry in &payload.resolutions {
+        if resolutions
+            .insert((entry.entity_type.clone(), entry.id), &entry.resolution)
+            .is_some()
+        {
+            return Err(AppError::InvalidInput(format!(
+                "Duplicate resolution for {} {}",
+                entry.entity_type, entry.id
+            )));
+        }
+    }
+
+    let missing: Vec<&OwnedEntity> = inventory
+        .iter()
+        .filter(|e| !resolutions.contains_key(&(e.entity_type.to_owned(), e.id)))
+        .collect();
+    if !missing.is_empty() {
+        return Err(AppError::ConflictWithDetails {
+            message: format!(
+                "Refusing to delete {target_ref}: the resolution map is incomplete — {} entit{}                  unresolved. Partial maps are not applied.",
+                missing.len(),
+                if missing.len() == 1 { "y is" } else { "ies are" }
+            ),
+            details: serde_json::json!({ "unresolved": missing }),
+        });
+    }
+
+    let inventoried: std::collections::HashSet<(String, Uuid)> =
+        inventory.iter().map(|e| (e.entity_type.to_owned(), e.id)).collect();
+    if let Some(extra) = resolutions.keys().find(|k| !inventoried.contains(*k)) {
+        return Err(AppError::InvalidInput(format!(
+            "Resolution names {} {}, which is not owned by any key in this subtree",
+            extra.0, extra.1
+        )));
+    }
+
+    // Validate every reassignment target before applying any of them. Reassigning to a key inside the
+    // doomed subtree is refused specifically: it looks like a rescue and is a delayed deletion.
+    let doomed: std::collections::HashSet<Uuid> = subtree.iter().copied().collect();
+    for resolution in resolutions.values() {
+        if let Resolution::Reassign { owner_key_id } = resolution {
+            resolve_owner_assignment(&state.db, Some(*owner_key_id)).await?;
+            if doomed.contains(owner_key_id) {
+                return Err(AppError::InvalidInput(format!(
+                    "Cannot reassign to key {owner_key_id}: it is itself inside the subtree being                      deleted, so the entity would be orphaned the moment this request completes"
+                )));
+            }
+        }
+    }
+
+    // Everything below this line writes. Every validation is above it.
+    let mut deleted_entities = 0usize;
+    let mut reassigned_entities = 0usize;
+    for entity in &inventory {
+        let resolution = resolutions[&(entity.entity_type.to_owned(), entity.id)];
+        match (entity.entity_type, resolution) {
+            ("group", Resolution::Delete) => {
+                IpGroup::delete_by_id(entity.id).exec(&state.db).await?;
+                deleted_entities += 1;
+            }
+            ("webhook", Resolution::Delete) => {
+                WebhookConfig::delete_by_id(entity.id).exec(&state.db).await?;
+                deleted_entities += 1;
+            }
+            ("group", Resolution::Reassign { owner_key_id }) => {
+                ip_group::Entity::update_many()
+                    .col_expr(
+                        ip_group::Column::OwnerKeyId,
+                        sea_orm::sea_query::Expr::value(Some(*owner_key_id)),
+                    )
+                    .filter(ip_group::Column::Id.eq(entity.id))
+                    .exec(&state.db)
+                    .await?;
+                reassigned_entities += 1;
+            }
+            ("webhook", Resolution::Reassign { owner_key_id }) => {
+                webhook_config::Entity::update_many()
+                    .col_expr(
+                        webhook_config::Column::OwnerKeyId,
+                        sea_orm::sea_query::Expr::value(Some(*owner_key_id)),
+                    )
+                    .filter(webhook_config::Column::Id.eq(entity.id))
+                    .exec(&state.db)
+                    .await?;
+                reassigned_entities += 1;
+            }
+            // `entity_type` is set by `inventory_owned_entities` from a closed set of two literals.
+            (other, _) => {
+                tracing::error!("Unhandled inventory entity type {other:?}");
+                return Err(AppError::Internal);
+            }
+        }
+    }
+
+    // The cascade itself. `api_key_group_permissions` rows follow by foreign key; nothing else does,
+    // which is the point.
+    let result = ApiKey::delete_many()
+        .filter(api_key::Column::Id.is_in(subtree.clone()))
+        .exec(&state.db)
+        .await?;
     if result.rows_affected == 0 {
         return Err(AppError::NotFound);
     }
 
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_DELETE", None, None, Some(format!("Deleted key {target_ref}"))).await?;
+    create_audit_log(
+        &state.db,
+        Some(&key),
+        Some(client_ip.0),
+        "KEY_DELETE",
+        None,
+        None,
+        Some(format!(
+            "Deleted key {target_ref} and {} descendant key(s); {deleted_entities} owned \
+             entit(y/ies) deleted, {reassigned_entities} reassigned",
+            subtree.len().saturating_sub(1)
+        )),
+    )
+    .await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

@@ -320,6 +320,11 @@ and not at all otherwise. `webhook_configs.owner_key_id` makes a dispatch target
 `GET /api/webhooks` filters on it directly, replacing the group-readability scoping that exposed every
 tenant's integrations to any `can_manage_webhooks` holder sharing a group.
 
+*Cascade (§6):* deleting a key deletes its whole `parent_key_id` subtree, but only after every group
+and webhook owned by any key in that subtree carries an explicit resolution (`delete` or `reassign`).
+`api_key_group_permissions` rows follow the keys by foreign key; **no resource table does**, which is
+what makes "data is never destroyed implicitly" true at the schema level rather than by convention.
+
 *Indexes added for §7:* `idx-api_keys-parent_key_id`, `idx-ip_groups-owner_key_id`,
 `idx-webhook_configs-owner_key_id`, `idx-akgp-group_id` (the permission join from the group side,
 which the existing `(api_key_id, group_id)` composite cannot serve), and `idx-api_keys-key_hash` (a

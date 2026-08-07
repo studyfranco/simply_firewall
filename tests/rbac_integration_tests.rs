@@ -5324,3 +5324,426 @@ async fn s4_authenticate_then_authorize_ordering_is_not_regressed_by_oracle_disc
         "a proven caller outside its CIDR gets 403; collapsing this to 404 would regress the ordering rule"
     );
 }
+
+// ─────────────────────────────────────────────────────────────
+// RBAC_MODEL.md §6 — cascade deletion & pre-flight inventory
+// ─────────────────────────────────────────────────────────────
+
+/// Builds a three-level lineage under one manager, with resources owned at the deepest level.
+///
+/// Returns `(manager_key, parent_id, child_id, grandchild_id, group_id, webhook_id)`. The group and
+/// webhook are owned by the **grandchild** on purpose: §6 requires the inventory to walk "the entire
+/// subtree being deleted", and a walk that only inspects the target key would miss them entirely — at
+/// which point deleting the parent takes a webhook with it silently, which is precisely what §6
+/// forbids.
+async fn nested_ownership_fixture(
+    db: &DatabaseConnection,
+    app: &axum::Router,
+) -> (String, Uuid, Uuid, Uuid, Uuid, Uuid) {
+    let (_master_id, master_key) = insert_key(db, "Master", true, true, true, true).await;
+    let (manager_id, manager_key) = insert_key(db, "Manager", false, true, false, false).await;
+
+    // Three generations, each created by the one above so the handler records the lineage.
+    let mint = |caller: String, name: &'static str, nth: i64| {
+        let app = app.clone();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("X-API-Key", &caller)
+                .header("Content-Type", "application/json")), nth,
+                json!({ "name": name, "can_manage_webhooks": false }).to_string());
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "minting {name}");
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap();
+            (
+                Uuid::parse_str(body["id"].as_str().unwrap()).unwrap(),
+                body["plaintext_key"].as_str().unwrap().to_owned(),
+                body["signing_secret"].as_str().unwrap().to_owned(),
+            )
+        }
+    };
+
+    let (parent_id, _parent_key, _ps) = mint(manager_key.clone(), "Parent", 1).await;
+    // `can_manage_keys` is master-only (R4), so the intermediate keys are promoted directly — the
+    // subject here is the *shape of the tree*, not how it came to be.
+    for id in [parent_id] {
+        let mut active: simply_ip_vault::entities::api_key::ActiveModel =
+            simply_ip_vault::entities::prelude::ApiKey::find_by_id(id)
+                .one(db).await.unwrap().unwrap().into();
+        active.can_manage_keys = Set(true);
+        active.update(db).await.unwrap();
+    }
+    let (child_id, child_key, _cs) = mint(master_key.clone(), "Child", 2).await;
+    let (grandchild_id, grandchild_key, grandchild_secret) =
+        mint(master_key.clone(), "Grandchild", 3).await;
+
+    // Re-parent so the tree is manager → parent → child → grandchild, regardless of who minted what.
+    for (id, parent) in [(parent_id, manager_id), (child_id, parent_id), (grandchild_id, child_id)] {
+        let mut active: simply_ip_vault::entities::api_key::ActiveModel =
+            simply_ip_vault::entities::prelude::ApiKey::find_by_id(id)
+                .one(db).await.unwrap().unwrap().into();
+        active.parent_key_id = Set(Some(parent));
+        active.update(db).await.unwrap();
+    }
+
+    // The grandchild owns a group and a webhook — two levels below the key that gets deleted.
+    let group_id = insert_group_row(db, "deep-group").await;
+    let mut active: simply_ip_vault::entities::ip_group::ActiveModel =
+        simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+            .one(db).await.unwrap().unwrap().into();
+    active.owner_key_id = Set(Some(grandchild_id));
+    active.update(db).await.unwrap();
+
+    grant_perm(db, grandchild_id, group_id, true, true, true, false).await;
+    let mut active: simply_ip_vault::entities::api_key::ActiveModel =
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(grandchild_id)
+            .one(db).await.unwrap().unwrap().into();
+    active.can_manage_webhooks = Set(true);
+    active.update(db).await.unwrap();
+
+    let req = signed_later_with(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &grandchild_key)
+        .header("Content-Type", "application/json")), &grandchild_secret, 4, json!({
+            "name": "deep-hook",
+            "target_url": "https://example.com/hook",
+            "secret_token": "s3cr3t",
+            "payload_template": "{}",
+            "group_id": group_id.to_string()
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let webhook_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let _ = child_key;
+    (manager_key, parent_id, child_id, grandchild_id, group_id, webhook_id)
+}
+
+/// **§6 — the pre-flight inventory walks the entire subtree, and an unresolved inventory refuses.**
+///
+/// "Before any key deletion, the service walks the entire subtree being deleted and collects every
+/// resource and dispatch target owned by any key within it. If that inventory is non-empty, the
+/// deletion is refused and returns a structured payload enumerating each owned entity with enough
+/// detail to decide its fate: type, id, name, and current owner."
+///
+/// The fixture puts the resources **two levels below** the key being deleted, which is the case a
+/// naive implementation gets wrong: inspecting only the target key finds nothing, reports no conflict,
+/// and takes a webhook with it.
+#[tokio::test]
+async fn s6_pre_flight_inventory_walks_the_whole_subtree_and_refuses_deletion() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (manager_key, parent_id, _child_id, grandchild_id, group_id, webhook_id) =
+        nested_ownership_fixture(&db, &app).await;
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{parent_id}"))
+        .header("X-API-Key", &manager_key)), 10, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT, "an unresolved inventory must refuse the deletion");
+
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let owned = body["owned_entities"].as_array().expect("the payload enumerates owned entities");
+    assert_eq!(owned.len(), 2, "both the group and the webhook, from two levels down: {body}");
+
+    // §6's four required fields, on every entry.
+    for entry in owned {
+        for field in ["entity_type", "id", "name", "owner_key_id", "owner_name"] {
+            assert!(entry.get(field).is_some(), "§6 requires '{field}' on each entity: {entry}");
+        }
+        assert_eq!(
+            entry["owner_key_id"], grandchild_id.to_string(),
+            "the owner named is the grandchild, not the key being deleted"
+        );
+    }
+    let types: Vec<&str> = owned.iter().filter_map(|e| e["entity_type"].as_str()).collect();
+    assert!(types.contains(&"group") && types.contains(&"webhook"), "{types:?}");
+    assert_eq!(body["subtree_key_count"], 3, "parent + child + grandchild");
+
+    // Nothing happened. Not the keys, not the resources.
+    for id in [parent_id, grandchild_id] {
+        assert!(
+            simply_ip_vault::entities::prelude::ApiKey::find_by_id(id)
+                .one(&db).await.unwrap().is_some(),
+            "the refusal must not have deleted any key"
+        );
+    }
+    assert!(
+        simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+            .one(&db).await.unwrap().is_some()
+    );
+    assert!(
+        simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(webhook_id)
+            .one(&db).await.unwrap().is_some()
+    );
+}
+
+/// **§6 — "Deletion executes only when every entity in the inventory carries an explicit resolution;
+/// partial maps are refused."**
+///
+/// A partial map is the dangerous case: it looks like compliance, and applying the resolutions it does
+/// carry before discovering the gap would destroy data the caller never decided about. So the check
+/// runs before a single write, and the response names what is still unresolved.
+#[tokio::test]
+async fn s6_a_partial_resolution_map_is_refused_and_applies_nothing() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (manager_key, parent_id, _child_id, _grandchild_id, group_id, webhook_id) =
+        nested_ownership_fixture(&db, &app).await;
+
+    // Resolves the group, says nothing about the webhook.
+    let partial = json!({
+        "resolutions": [ { "entity_type": "group", "id": group_id.to_string(), "action": "delete" } ]
+    })
+    .to_string();
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{parent_id}"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 10, partial);
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CONFLICT, "a partial map must be refused");
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let unresolved = body["unresolved"].as_array().expect("the response names what is missing");
+    assert_eq!(unresolved.len(), 1);
+    assert_eq!(unresolved[0]["id"], webhook_id.to_string());
+
+    // **The half it did carry was not applied.** This is the assertion that matters: the group was
+    // marked for deletion and is still here.
+    assert!(
+        simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+            .one(&db).await.unwrap().is_some(),
+        "a refused partial map must apply none of its resolutions"
+    );
+    assert!(
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(parent_id)
+            .one(&db).await.unwrap().is_some()
+    );
+
+    // A map naming something outside the inventory is refused too — otherwise "resolve everything"
+    // could be satisfied by resolving the wrong things.
+    let stray = json!({
+        "resolutions": [
+            { "entity_type": "group", "id": group_id.to_string(), "action": "delete" },
+            { "entity_type": "webhook", "id": webhook_id.to_string(), "action": "delete" },
+            { "entity_type": "group", "id": Uuid::new_v4().to_string(), "action": "delete" }
+        ]
+    })
+    .to_string();
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{parent_id}"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 11, stray);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST,
+        "a resolution naming an entity outside the inventory is refused"
+    );
+    assert!(
+        simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+            .one(&db).await.unwrap().is_some(),
+        "and again, nothing was applied"
+    );
+}
+
+/// **§6 — a complete map executes: the subtree cascades, and resolutions are honoured exactly.**
+///
+/// Reassignment must *move* ownership, not destroy — §6's "data is never destroyed implicitly" cuts
+/// both ways, and a `reassign` that quietly deleted would be the worst possible reading of it. So one
+/// entity is reassigned and one is deleted in the same request, and both outcomes are asserted
+/// against the database rather than against the status code.
+#[tokio::test]
+async fn s6_a_complete_resolution_map_cascades_the_subtree_and_honours_each_resolution() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (manager_key, parent_id, child_id, grandchild_id, group_id, webhook_id) =
+        nested_ownership_fixture(&db, &app).await;
+
+    // A survivor outside the doomed subtree to receive the group.
+    let (survivor_id, _survivor_key) = insert_key(&db, "Survivor", false, false, false, false).await;
+
+    // Some IP data in the group, to prove reassignment moves the container without touching contents.
+    let record_id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_record::ActiveModel {
+        id: Set(record_id),
+        target_address: Set("203.0.113.5".to_owned()),
+        cause: Set(Some("pre-cascade".to_owned())),
+        is_locked: Set(false),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+        last_seen_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+        ip_record_id: Set(record_id),
+        group_id: Set(group_id),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let complete = json!({
+        "resolutions": [
+            { "entity_type": "group", "id": group_id.to_string(),
+              "action": "reassign", "owner_key_id": survivor_id.to_string() },
+            { "entity_type": "webhook", "id": webhook_id.to_string(), "action": "delete" }
+        ]
+    })
+    .to_string();
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{parent_id}"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 10, complete);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "a complete map executes"
+    );
+
+    // The cascade reached every generation, not just the target.
+    for (id, label) in [(parent_id, "parent"), (child_id, "child"), (grandchild_id, "grandchild")] {
+        assert!(
+            simply_ip_vault::entities::prelude::ApiKey::find_by_id(id)
+                .one(&db).await.unwrap().is_none(),
+            "the {label} key must be gone — §6 cascades recursively through the subtree"
+        );
+    }
+    assert!(
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(survivor_id)
+            .one(&db).await.unwrap().is_some(),
+        "a key outside the subtree is untouched"
+    );
+
+    // `reassign` moved the group; it did not destroy it.
+    let group = simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+        .one(&db).await.unwrap()
+        .expect("a reassigned group survives");
+    assert_eq!(group.owner_key_id, Some(survivor_id), "and it has the new owner");
+
+    // `delete` removed the webhook.
+    assert!(
+        simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(webhook_id)
+            .one(&db).await.unwrap().is_none()
+    );
+
+    // §6: "Data is never destroyed implicitly." The IP record inside the reassigned group is
+    // untouched, and so is its membership.
+    let record = simply_ip_vault::entities::prelude::IpRecord::find_by_id(record_id)
+        .one(&db).await.unwrap()
+        .expect("resource data must survive a key cascade");
+    assert!(!record.is_deleted, "and it was not soft-deleted either");
+    assert_eq!(
+        simply_ip_vault::entities::ip_record_group_membership::Entity::find()
+            .filter(simply_ip_vault::entities::ip_record_group_membership::Column::GroupId.eq(group_id))
+            .all(&db).await.unwrap().len(),
+        1,
+        "the record is still in the group it was reassigned with"
+    );
+}
+
+/// **§6 — a key owning nothing deletes without ceremony, and reassigning into the doomed subtree is
+/// refused.**
+///
+/// The first half keeps the inventory from becoming a tax on the common case: most keys own nothing,
+/// and requiring a resolution map for them would make routine credential hygiene a two-request dance
+/// for no benefit.
+///
+/// The second half closes the obvious way to satisfy the map while defeating it. Reassigning an entity
+/// to a key that is *itself* inside the subtree being deleted reads as a rescue and is a deferred
+/// orphaning: the new owner disappears microseconds later, leaving the entity unowned and master-only.
+#[tokio::test]
+async fn s6_an_empty_inventory_deletes_directly_and_a_doomed_reassignment_target_is_refused() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    // The fixture seeds this database's one master (§5 permits no second), so it is built first and
+    // its manager is reused for the barren-key half below.
+    let (manager_key, parent_id, child_id, _grandchild_id, group_id, webhook_id) =
+        nested_ownership_fixture(&db, &app).await;
+
+    // A key owning nothing: no body, no inventory, straight through.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/keys")
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 5,
+        json!({ "name": "Owns nothing" }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let barren_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{barren_id}"))
+        .header("X-API-Key", &manager_key)), 6, "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NO_CONTENT,
+        "a key owning nothing needs no resolution map"
+    );
+
+    let doomed = json!({
+        "resolutions": [
+            // `child_id` is inside the subtree being deleted.
+            { "entity_type": "group", "id": group_id.to_string(),
+              "action": "reassign", "owner_key_id": child_id.to_string() },
+            { "entity_type": "webhook", "id": webhook_id.to_string(), "action": "delete" }
+        ]
+    })
+    .to_string();
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/keys/{parent_id}"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 10, doomed);
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST,
+        "reassigning to a key inside the doomed subtree is a deferred orphaning, not a rescue"
+    );
+
+    // And again: nothing applied. The webhook was marked for deletion in the same refused request.
+    assert!(
+        simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(webhook_id)
+            .one(&db).await.unwrap().is_some(),
+        "the validated-before-written ordering holds for this refusal too"
+    );
+    assert!(
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(parent_id)
+            .one(&db).await.unwrap().is_some()
+    );
+}
