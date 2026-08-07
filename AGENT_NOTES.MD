@@ -4279,3 +4279,141 @@ would prevent a repeat, and is worth doing in a pass that is allowed to touch `C
 | `cargo test` | **172 passed**, 0 failed |
 | `./scripts/test_e2e.sh` | 420/420 |
 | `./scripts/verify_convergence.sh` | 30 matching, 2 documented (SQLite pragmas + peer spec absent), 0 unexplained |
+
+---
+
+## Session 36 — RBAC_MODEL Convergence, Phase 0: Master Integrity
+
+Phase 0 of the multi-phase programme to close the gaps recorded in **RBAC_MODEL Gap Analysis** above.
+`RBAC_MODEL.md` is normative; every verdict below was re-verified against `src/` before acting on it,
+not taken from the gap analysis on faith.
+
+### Terminology resolution (managed resource vs dispatch target)
+
+`RBAC_MODEL.md` distinguishes a **managed resource** (shared, permission rows, tier/conjunction rules)
+from a **dispatch target** (creator-private, visible only to creator and Master), and says an entity
+cannot be both. Against this schema:
+
+| Entity | Classification | Evidence |
+| :--- | :--- | :--- |
+| `ip_groups` | **Managed resource**, unambiguous | The only entity with a per-resource permission table (`api_key_group_permissions`, unique on `(api_key_id, group_id)`, `m20230101_000001:230-235`); multiple keys hold rows; it is what every guard in `src/api.rs:132-300` is scoped to. |
+| `ip_records` | **Resource data** | Reached only through `ip_record_group_memberships`; authority is derived from the containing group, never held directly. |
+| `webhook_configs` | **Dispatch target** *per the specification* — but the schema does not yet agree | See below. |
+
+**Two discrepancies worth stating before Phase 2 acts on them.**
+
+1. **`webhook_configs` is currently governed as resource data, not as a creator-private target.** It
+   has no creator column at all, and `webhook_configs.group_id` is a `NOT NULL` FK to `ip_groups` with
+   `ON DELETE CASCADE`. Every access path scopes it by *group readability*: creation requires
+   `can_read` on the target group (`src/api.rs:2358-2365`), listing filters to readable groups
+   (`src/api.rs:2757-2771`), deletion likewise (`src/api.rs:2793-2798`). That is precisely the
+   "shared-resource visibility rule" §4 says must never expose a dispatch target. The specification
+   resolves the classification itself — §3 names "Webhook Config / Executor" as carrying
+   `owner_key_id`, and §4 says dispatch targets are "visible exclusively to their creator and Master"
+   — so Phase 2/3 will follow it. The consequence to plan for is that this is a **narrowing**: a key
+   holding `can_manage_webhooks` + `can_read` that did not create a webhook loses all access to it,
+   and pre-existing rows have no creator to attribute, so they become Master-only until reassigned.
+2. **`can_create_webhooks` does not exist in this codebase.** The terminology table maps the
+   resource-creation right to that name; the actual column is `can_manage_webhooks`
+   (`src/entities/api_key.rs`), and it is a *management* right covering create, update, delete and
+   list rather than a creation right. Separately, this service has **two** resource-creation rights
+   where the specification names one: `can_create_groups` (mints managed resources, already
+   Master-only via `MASTER_ONLY_SCOPES`) and `can_manage_webhooks` (mints dispatch targets, currently
+   freely delegable — the R1/R4 violation Phase 1 closes).
+
+### What Phase 0 changed
+
+**1. `oxc_*` pinned to `=0.143.0`** (`Cargo.toml`). Pre-1.0 caret requirements are breaking-change
+carriers, and with `Cargo.lock` untracked the `0.90` → `0.143` move happened on its own and left the
+whole suite unable to compile. A syntax checker that stops the build for reasons unrelated to syntax
+is worse than no checker. This is the only exact pin in the file, and the comment says why.
+
+**2. Master uniqueness is now a schema invariant** (`m20260807_000007_add_api_key_master_marker`).
+Nullable `master_marker` column carrying the single value `'master'`, under a plain unique index.
+A **marker column rather than a partial unique index** on `is_master = true`: PostgreSQL and SQLite
+support partial indexes, MySQL does not, and `AGENT.MD` requires the data layer to stay SQL-agnostic
+across all three enabled drivers. `RBAC_MODEL.md` §5 anticipates exactly this and names the
+substitute. NULLs do not collide in a unique index on any of the three engines.
+
+The migration **refuses to run** on a database that already holds two masters, naming the ids and the
+`UPDATE` that resolves it. Demoting a key silently would strip an operator's authority without asking,
+and "keep the oldest" is a guess dressed as a policy. It checks *before* adding the column, so a
+refused migration leaves the schema untouched and a retry starts clean.
+
+**3. `is_master` left the API surface.** Both key payloads reject the field with `400` —
+`guard_no_master_flag` — in either direction and from every caller, master included. Rejected rather
+than silently dropped: ignoring it satisfies the letter of §5 while leaving a caller that posted
+`is_master: true` holding a `200` and an ordinary key it believes is a master. `MASTER_ONLY_SCOPES`
+shrank from three entries to two, since a scope nobody can request needs no rule about who may request
+it. The dashboard's "Master Access" checkbox was removed for the same reason (`static/index.html`,
+`static/app.js`).
+
+**4. The Master is immutable through the API except its own `bound_ips`** (`guard_master_immutable`).
+Deletion, both rotation endpoints, renaming and re-scoping are refused. `guard_master_target` was only
+ever *relative* — "not by a non-master" — which left the master fully mutable by itself. A payload
+mixing `bound_ips` with a forbidden field is refused whole rather than partially applied, so the one
+permitted edit cannot become a carrier for the rest.
+
+Refusing rotation looks like a regression, and is a deliberate trade: `POST /keys/{id}/rotate` returns
+the new plaintext in its response body, so an API-reachable master rotation is an API-reachable way to
+mint a working master credential from any session that already holds one. §5 puts re-minting behind
+database access instead, which an HTTP-only compromise does not have.
+
+### Breaking changes for operators
+
+| Change | Who breaks | Fix |
+| :--- | :--- | :--- |
+| `is_master` in a key payload → `400` | Any client that posts the field, including one posting `false` | Remove the field. `SELECT` is not needed; the error names it. |
+| `PUT /api/keys/{master_id}` with any field but `bound_ips` → `403` | Automation that renames or re-scopes the master | Nothing to migrate; the operation is gone by design. |
+| `POST /api/keys/{master_id}/rotate{,-secret}` → `403` | Credential-hygiene automation targeting the master | Delete the master row directly in the database and restart; the service re-mints. |
+| `DELETE /api/keys/{master_id}` → `403` | — | As above. |
+| Migration refuses to start with >1 master | A deployment that minted a second master through the old API | `SELECT id, name, prefix, created_at FROM api_keys WHERE is_master = true;` then demote all but one: `UPDATE api_keys SET is_master = false WHERE id IN (...);` |
+
+### Test changes, and two fixtures that had to give ground
+
+Four new tests in `tests/security_tests.rs` cover §5 directly:
+`attack_a_second_master_cannot_be_written_even_bypassing_the_api` (writes straight to the table, which
+is the only way to distinguish "the handlers refuse it" from "the database refuses it"),
+`attack_a_master_cannot_mint_a_second_master`,
+`attack_the_master_key_cannot_be_deleted_through_the_api`, and
+`master_may_edit_only_its_own_bound_ips`. Two more cover the migration:
+`the_master_marker_migration_backfills_an_existing_master` — which runs migrations 1–6, seeds a master
+as it would have existed before §5, then runs 7, and asserts the column holds `api::MASTER_MARKER`.
+That closes the one silent drift the design invites: the migration keeps a **private copy** of the
+literal on purpose (an applied migration is history and must not change when the API constant is
+refactored), so the two are checked against each other through the database rather than by comparing
+constants. And `the_master_marker_migration_refuses_a_database_with_two_masters`, which also asserts
+the offending ids are legible — they are what the operator's `UPDATE` targets.
+
+Three existing fixtures minted a second master and are now refused by the schema. Each was adjusted to
+the weakest change that preserves what it was actually testing:
+`attack_master_key_is_not_exempt_from_its_bound_ips` (its second key tests a property of `bound_ips`,
+not of master status), `replay_tracking_is_scoped_per_key` (replay tracking is keyed on identity, not
+scope), and `test_signature_must_match_the_looked_up_key` (nothing there depends on scope). The e2e
+suite's §6b and §27 both minted purpose-built masters; both now target the **real** one, which is a
+strictly stronger test since it is the credential that actually matters. §6b narrows the master's own
+`bound_ips` and restores it — deliberately keeping loopback in the set, because without it the restore
+would be sent from `127.0.0.1`, land outside the master's own CIDR, and lock the suite out of its only
+master with ~1500 checks still to run.
+
+**One unrelated flake fixed in passing.**
+`test_anti_replay_timestamp_window_is_enforced_in_both_directions` read the clock **once** and derived
+every offset from it, so each call drifted toward "stale" by however long the preceding ones took.
+Under a loaded `cargo test` the `-290` case reached `-300` (the boundary) and the `+301` case reached
+`+300` (inside the window) — observed, not theorised: it failed on the first full run of this session
+and passed in isolation. The clock is now read per call.
+
+### What Phase 0 did *not* touch
+
+R1–R7, ownership, lineage, visibility scoping and cascade deletion are all still as the gap analysis
+records them. Phase 0 is scoped to §5 plus the dependency pin.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **178 passed**, 0 failed (70 unit + 62 RBAC + 43 security + 3 frontend syntax) |
+| `./scripts/test_e2e.sh` | **427/427** |
+| `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |

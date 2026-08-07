@@ -28,6 +28,14 @@ use crate::state::{AppState, WebhookEvent};
 /// `audit_log::Model::action` and `webhook_config::Model::events`.
 const IP_EVENT_ACTIONS: [&str; 3] = ["IP_ADD", "IP_UPDATE", "IP_DELETE"];
 
+/// The single non-null value `api_keys.master_marker` ever carries.
+///
+/// A unique index covers that column, and null values do not collide on any supported backend, so
+/// writing this string is what makes "at most one Master key" a schema-level fact rather than a
+/// convention — `RBAC_MODEL.md` §5. Only `bootstrap_master_key` writes it; a second insert carrying
+/// the same value is refused by the database.
+pub const MASTER_MARKER: &str = "master";
+
 // ─────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────
@@ -299,19 +307,20 @@ fn guard_delegated_group_grant(
 
 /// The global scopes only a master key may hand out.
 ///
-/// `is_master` is obvious. The other two are here because each is a *path back to* master authority
-/// rather than a leaf capability:
+/// `is_master` is **not** on this list, because it is no longer grantable by anyone: `RBAC_MODEL.md`
+/// §5 makes master status a bootstrap-only property, and both key payloads reject the field outright
+/// rather than gating it (see [`guard_no_master_flag`]). A scope nobody can request does not need a
+/// rule about who may request it.
+///
+/// The two that remain are here because each is a *path back to* master authority rather than a leaf
+/// capability:
 ///
 /// - `can_manage_keys` is the scope that reaches every other key — granting it creates a second
 ///   administrator, so a non-master able to grant it could multiply itself without limit and, in
 ///   combination with any future gap in [`guard_master_target`], reach a master key.
 /// - `can_create_groups` mints groups whose creator is auto-granted full read/write/delete
 ///   (`AGENT.MD` §2), which is the one way to obtain group access without a master signing off.
-///
-/// `can_manage_webhooks` is deliberately **not** on this list: it confers no authority over keys or
-/// groups, and is bounded by the caller's own group access. A delegated key manager can still hand
-/// it out.
-const MASTER_ONLY_SCOPES: [&str; 3] = ["is_master", "can_manage_keys", "can_create_groups"];
+const MASTER_ONLY_SCOPES: [&str; 2] = ["can_manage_keys", "can_create_groups"];
 
 /// Rejects any attempt by a non-master to grant one of [`MASTER_ONLY_SCOPES`].
 ///
@@ -320,8 +329,8 @@ const MASTER_ONLY_SCOPES: [&str; 3] = ["is_master", "can_manage_keys", "can_crea
 /// refusing an actual elevation. Revoking is always allowed — removing authority is not escalation.
 fn guard_scope_elevation(
     caller: &api_key::Model,
-    requested: [Option<bool>; 3],
-    held: [bool; 3],
+    requested: [Option<bool>; 2],
+    held: [bool; 2],
 ) -> Result<(), AppError> {
     if caller.is_master {
         return Ok(());
@@ -356,6 +365,72 @@ fn guard_master_target(caller: &api_key::Model, target: &api_key::Model) -> Resu
         ));
     }
     Ok(())
+}
+
+/// The refusal `RBAC_MODEL.md` §5 requires for every API operation on the Master key that is not an
+/// edit of its own `bound_ips`.
+///
+/// "The Master key is immutable through the API **except for its own `bound_ips`** […] No other
+/// field, permission, or rotation is reachable through the API," and "The Master key cannot be
+/// deleted through the API." That covers deletion, both rotation endpoints, and every field of the
+/// generic update except one — so the operations are named in the message rather than the caller
+/// being left to guess which of several checks refused it.
+///
+/// This is strictly stronger than [`guard_master_target`], which only ever blocked *non*-masters and
+/// therefore left the Master free to rotate, rename and re-scope itself. Uniqueness (§5, enforced by
+/// the `master_marker` unique index) means "the Master key" is unambiguous: there is no second master
+/// for this to be relative to.
+///
+/// # Why rotation is refused too, when it looks like routine hygiene
+///
+/// It reads like a regression — the one credential most worth rotating is the one that now cannot
+/// be. But `POST /keys/{id}/rotate` returns the new plaintext in its response body, so an API-reachable
+/// master rotation is an API-reachable way to *mint a working master credential* from any session
+/// that already has one. The specification's answer is to take the operation out of the API surface
+/// entirely: delete the row directly in the database and the service re-mints at next boot
+/// (`bootstrap_master_key`). That is a deliberate trade of convenience for a smaller blast radius,
+/// and it requires database access, which an HTTP-only compromise does not have.
+fn guard_master_immutable(target: &api_key::Model, operation: &str) -> Result<(), AppError> {
+    if !target.is_master {
+        return Ok(());
+    }
+
+    tracing::warn!(
+        "Blocked master mutation: attempt to {} master key {}",
+        operation,
+        target.prefix
+    );
+    Err(AppError::Forbidden(format!(
+        "The master key is immutable through the API and cannot be {operation}. Only its own \
+         bound_ips may be edited, by itself. To re-mint it, delete the row directly in the database \
+         and restart the service."
+    )))
+}
+
+/// Rejects any key payload that carries `is_master` at all, in either direction.
+///
+/// `RBAC_MODEL.md` §5: "`is_master` must not be settable or clearable through any API endpoint […]
+/// no key-creation or key-update payload may carry it."
+///
+/// Refused rather than silently dropped. Ignoring the field would satisfy the letter of the rule —
+/// the flag would still never change — while leaving a caller that posted `is_master: true` holding a
+/// `200` and an ordinary key it believes is a master. A security-relevant field that quietly means
+/// nothing is how a deployment ends up with no master at all and nobody noticing until the day it is
+/// needed. `400` says so.
+///
+/// Both directions, including `false`: "cleared" is named explicitly in the rule, and a payload that
+/// carries the field is asserting authority over it either way.
+fn guard_no_master_flag(is_master: Option<bool>) -> Result<(), AppError> {
+    if is_master.is_none() {
+        return Ok(());
+    }
+
+    Err(AppError::InvalidInput(
+        "'is_master' cannot be set or cleared through the API. Master status is established at \
+         bootstrap only and is enforced by a database uniqueness constraint; remove the field from \
+         this payload."
+            .to_owned(),
+    ))
 }
 
 /// Helper to insert an audit log entry. `key` denormalizes the acting key's name/prefix into the
@@ -1525,7 +1600,9 @@ pub struct CreateApiKeyPayload {
     pub name: String,
     /// Bound CIDRs
     pub bound_ips: Option<String>,
-    /// Master flag
+    /// Accepted only so it can be **rejected**. Master status is bootstrap-only (`RBAC_MODEL.md`
+    /// §5); a payload carrying this field in either direction is refused with `400` by
+    /// [`guard_no_master_flag`] rather than being silently ignored.
     pub is_master: Option<bool>,
     /// Manage keys flag
     pub can_manage_keys: Option<bool>,
@@ -1563,16 +1640,20 @@ pub async fn create_api_key(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
+    // Nobody mints a master any more, master included: the flag is bootstrap-only and the unique
+    // index on `master_marker` would refuse a second row regardless. Checked before the scope guard
+    // so a payload carrying both `is_master` and an over-reach gets the specific answer.
+    guard_no_master_flag(payload.is_master)?;
+
     // Only a master key may mint a key carrying master-only scopes. Without this,
     // `can_manage_keys` was transitively equivalent to `is_master`: a key manager could create a
-    // master key, read its plaintext out of this very response, and use it — a one-request
-    // escalation from a delegated scope to full control of the system.
+    // key with `can_manage_keys`, chain it, and reach every credential in the system.
     //
     // A brand-new key holds none of these, so `held` is all-false: every `true` here is a grant.
     guard_scope_elevation(
         &key,
-        [payload.is_master, payload.can_manage_keys, payload.can_create_groups],
-        [false, false, false],
+        [payload.can_manage_keys, payload.can_create_groups],
+        [false, false],
     )?;
 
     if let Some(bips) = &payload.bound_ips {
@@ -1598,7 +1679,10 @@ pub async fn create_api_key(
         name: Set(payload.name.clone()),
         prefix: Set(prefix),
         bound_ips: Set(payload.bound_ips.clone()),
-        is_master: Set(payload.is_master.unwrap_or(false)),
+        // Hardcoded, not derived from the payload: the field that once fed this is now rejected
+        // above. `master_marker` stays `NULL` so this row does not contend for the unique index.
+        is_master: Set(false),
+        master_marker: Set(None),
         can_manage_keys: Set(payload.can_manage_keys.unwrap_or(false)),
         can_manage_webhooks: Set(payload.can_manage_webhooks.unwrap_or(false)),
         can_create_groups: Set(payload.can_create_groups.unwrap_or(false)),
@@ -1722,6 +1806,11 @@ pub async fn delete_api_key(
     // for the audit log below — once deleted, there's nothing left to look the name up from.
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     guard_master_target(&key, &target)?;
+    // Absolute, master callers included. `guard_master_target` above only ever stopped non-masters,
+    // which left the Master deletable by itself the moment `id != key.id` stopped being true for it —
+    // and with §5 uniqueness there is no second master to delete it. §5 puts re-minting behind
+    // database access instead.
+    guard_master_immutable(&target, "deleted")?;
     let target_ref = format_key_reference(&target.name, id);
 
     let result = ApiKey::delete_by_id(id).exec(&state.db).await?;
@@ -1734,15 +1823,19 @@ pub async fn delete_api_key(
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
-/// Payload for updating an existing API key's name, `bound_ips`, and global scope flags. Does not
-/// include `is_master`: promoting/demoting master status is deliberately not exposed through this
-/// generic update endpoint.
+/// Payload for updating an existing API key's name, `bound_ips`, and global scope flags.
+///
+/// `is_master` is present but unassignable: see the field's own note, and `RBAC_MODEL.md` §5.
 #[derive(Deserialize)]
 pub struct UpdateApiKeyPayload {
     /// New name, if changing it
     pub name: Option<String>,
     /// New bound CIDRs, if changing them
     pub bound_ips: Option<String>,
+    /// Accepted only so it can be **rejected**, exactly as on [`CreateApiKeyPayload`]. It was
+    /// previously absent from this struct, which meant serde discarded it silently; a field that is
+    /// refused out loud is the difference between "you cannot do that" and "nothing happened".
+    pub is_master: Option<bool>,
     /// New value for the "manage keys" global scope, if changing it
     pub can_manage_keys: Option<bool>,
     /// New value for the "manage webhooks" global scope, if changing it
@@ -1763,16 +1856,41 @@ pub async fn update_api_key(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
+    guard_no_master_flag(payload.is_master)?;
+
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     guard_master_target(&key, &target)?;
+
+    // §5's one exception: the Master may edit its own `bound_ips`, and nothing else about it is
+    // reachable. Every other field is refused here rather than silently dropped, so an operator who
+    // tried to rename the master learns that it did not happen.
+    //
+    // `key.id == target.id` is the "its own" half. With uniqueness enforced there is no other master
+    // to be the caller, so in practice this only ever refuses the master editing itself in a way §5
+    // forbids — but stating it explicitly means the rule does not quietly depend on the constraint
+    // holding.
+    if target.is_master {
+        let touches_other_fields = payload.name.is_some()
+            || payload.can_manage_keys.is_some()
+            || payload.can_manage_webhooks.is_some()
+            || payload.can_create_groups.is_some();
+        if touches_other_fields {
+            guard_master_immutable(&target, "renamed or re-scoped")?;
+        }
+        if key.id != target.id {
+            return Err(AppError::Forbidden(
+                "Only the master key itself may edit its bound_ips".to_owned(),
+            ));
+        }
+    }
 
     // The master-only scopes cannot be granted to *anyone* by a non-master, self or otherwise.
     // `target`'s current values are the baseline, so re-submitting a scope the key already holds
     // is a no-op rather than a rejection.
     guard_scope_elevation(
         &key,
-        [None, payload.can_manage_keys, payload.can_create_groups],
-        [target.is_master, target.can_manage_keys, target.can_create_groups],
+        [payload.can_manage_keys, payload.can_create_groups],
+        [target.can_manage_keys, target.can_create_groups],
     )?;
 
     // `can_manage_webhooks` is delegable, but still not to *yourself*: `can_manage_keys` is
@@ -1858,6 +1976,7 @@ pub async fn rotate_api_key(
 
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     guard_master_target(&key, &target)?;
+    guard_master_immutable(&target, "rotated")?;
     let target_ref = format_key_reference(&target.name, id);
 
     let plaintext_key = generate_random_key();
@@ -1915,6 +2034,7 @@ pub async fn rotate_signing_secret(
 
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     guard_master_target(&key, &target)?;
+    guard_master_immutable(&target, "re-keyed")?;
     let target_name = target.name.clone();
     let target_ref = format_key_reference(&target_name, id);
 

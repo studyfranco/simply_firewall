@@ -1532,7 +1532,8 @@ class FirewallClient {
         const payload = {
             name: document.getElementById('apikey-name').value,
             bound_ips: document.getElementById('apikey-bound-ips').value,
-            is_master: document.getElementById('apikey-is-master').checked,
+            // No `is_master`: master status is established at bootstrap only (RBAC_MODEL.md §5) and
+            // the API now rejects the field outright, so sending it would fail every creation.
             can_manage_keys: document.getElementById('apikey-can-manage-keys').checked,
             can_manage_webhooks: document.getElementById('apikey-can-manage-webhooks').checked,
             can_create_groups: document.getElementById('apikey-can-create-groups').checked

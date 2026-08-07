@@ -75,7 +75,17 @@ To keep this context clean and modular, responsibilities are split across three 
 
 ### 2. Granular Multi-Tenant RBAC (M:N)
 
+> **`RBAC_MODEL.md` is normative for everything in this section.** It is the byte-identical
+> specification shared with `simply_hook_executor`, and where it and this document disagree, this
+> document is stale. Rules are cited below by their identifiers there (R1–R7, §3–§7).
+
 - **Global Rights:** An `ApiKey` can be `is_master` (bypasses all checks) or hold global booleans (`can_manage_keys`, `can_manage_webhooks`, `can_create_groups`).
+- **Master Key Guarantees (`RBAC_MODEL.md` §5):** exactly one Master key exists, and the API cannot create, alter, or remove it.
+  - **Uniqueness is a schema invariant.** `api_keys.master_marker` is nullable, carries the single value `'master'` on the Master row, and has a **plain unique index** over it. A nullable marker rather than a partial unique index on `is_master = true`, because MySQL has no partial indexes and the data layer stays SQL-agnostic; NULLs do not collide on any supported engine. Application logic alone was never sufficient — `bootstrap_master_key` checks then inserts, which two processes starting together both pass.
+  - **`is_master` is bootstrap-only.** No key-creation or key-update payload may carry the field, in either direction, from any caller including a master. It is **rejected with `400`**, not silently dropped: a caller that posts `is_master: true` and gets a `200` walks away believing it holds a master key. The dashboard's "Master Access" checkbox was removed for the same reason.
+  - **The Master is immutable through the API except for its own `bound_ips`,** which it alone may edit. Renaming, re-scoping, both rotation endpoints, and deletion are all refused (`guard_master_immutable`). A payload mixing `bound_ips` with any other field is refused whole rather than partially applied.
+  - **Why rotation is refused, when it is the one credential most worth rotating.** `POST /keys/{id}/rotate` returns the new plaintext in its response body, so an API-reachable master rotation is an API-reachable way to mint a working master credential from any session that already holds one. Re-minting is instead: delete the row directly in the database; the service re-mints at next boot. That requires database access, which an HTTP-only compromise does not have.
+  - **Upgrade path.** The migration backfills a single existing master and **refuses to run** on a database that already holds two, naming the offending ids and the `UPDATE` that resolves it rather than silently demoting someone.
 - **Group Rights:** Managed via junction table `ApiKeyGroupPermission` linking keys to `IpGroup` with explicit flags (`can_read`, `can_write`, `can_delete`, `can_manage`).
 - **Least Privilege:** `can_write` or `can_delete` require `can_read` to be true.
 - **Auto-Provisioning:** When an API Key creates a new `IpGroup`, the backend MUST automatically generate full read/write/delete permissions for that key on the new group.
@@ -242,7 +252,7 @@ For every route registered under `/api`, tests MUST assert three distinct outcom
   - **Flexible Body / Query Deserialization (`DELETE /api/ips`):**
     `DELETE /api/ips` MUST accept parameters both via URL Query strings (`?target_address=...&group_name=...`) and via JSON request body (`{"target_address": "...", "group_name": "..."}`).
   - **Key Rotation & Editing:**
-    `POST /api/keys/{id}/rotate` MUST generate a new secret while keeping key ID/name intact and invalidating the old secret. `PUT /api/keys/{id}` MUST allow updating key name, bound IPs, and global scopes.
+    `POST /api/keys/{id}/rotate` MUST generate a new secret while keeping key ID/name intact and invalidating the old secret. `PUT /api/keys/{id}` MUST allow updating key name, bound IPs, and global scopes. **Neither reaches the Master key** — see the Master Key Guarantees in §2; the Master's only API-editable field is its own `bound_ips`, and both rotation endpoints and `DELETE` refuse it outright.
   - **Signing-Secret Rotation (`POST /api/keys/{id}/rotate-secret`):**
     Replaces **only** the HMAC `signing_secret`, in place. The key's id, name, `key_hash`/`X-API-Key`, `bound_ips`, global scopes, and every `api_key_group_permissions` row MUST be left untouched — this is the narrow sibling of `/rotate`, for routine credential hygiene without forcing a full identity change on every client. It is also the documented recovery path for a key whose `signing_secret` is `NULL` (created before HMAC auth existed).
     Master or `can_manage_keys` only; writes a `KEY_SECRET_ROTATE` audit entry; returns the new secret exactly once and MUST NOT reissue `plaintext_key`. The previous secret stops working immediately.

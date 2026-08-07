@@ -216,6 +216,7 @@ async fn test_auth_and_cidr_rejection() {
         name: Set("Test Key".to_owned()),
         bound_ips: Set(Some("192.168.1.1/32".to_owned())),
         is_master: Set(false),
+        master_marker: Set(None),
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
@@ -273,6 +274,7 @@ async fn test_tenant_isolation_mn_rbac() {
         name: Set("Tenant Key".to_owned()),
         bound_ips: Set(Some("0.0.0.0/0".to_owned())),
         is_master: Set(false),
+        master_marker: Set(None),
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
@@ -335,6 +337,7 @@ async fn test_auto_provisioning_on_group_creation() {
         name: Set("Creator Key".to_owned()),
         bound_ips: Set(Some("0.0.0.0/0".to_owned())),
         is_master: Set(false),
+        master_marker: Set(None),
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(true), // CAN CREATE GROUPS
@@ -529,6 +532,7 @@ async fn test_explicit_key_group_manipulation() {
         name: Set("System Master".to_owned()),
         bound_ips: Set(Some("0.0.0.0/0".to_owned())),
         is_master: Set(true), // CAN MANAGE KEYS
+        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -548,6 +552,7 @@ async fn test_explicit_key_group_manipulation() {
         name: Set("Target Sub-Key".to_owned()),
         bound_ips: Set(Some("192.168.1.1/32".to_owned())),
         is_master: Set(false),
+        master_marker: Set(None),
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
@@ -603,6 +608,7 @@ async fn test_multi_group_and_temporal_filtering() {
         name: Set("Master".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
+        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -766,6 +772,7 @@ async fn test_webhook_hmac_signature_and_delivery() {
         name: Set("Webhook Tester".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
+        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -901,6 +908,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
         name: Set("Event Filter Tester".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
+        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -1014,6 +1022,7 @@ async fn test_reban_into_same_group_does_not_500() {
         name: Set("Master".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
+        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -1081,6 +1090,7 @@ async fn test_create_webhook_rejects_invalid_url() {
         name: Set("Master".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
+        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -1150,6 +1160,7 @@ async fn insert_key(
         name: Set(name.to_owned()),
         bound_ips: Set(None),
         is_master: Set(is_master),
+        master_marker: Set(is_master.then(|| simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(can_manage_keys),
         can_manage_webhooks: Set(can_manage_webhooks),
         can_create_groups: Set(can_create_groups),
@@ -1371,6 +1382,7 @@ async fn insert_key_with_bound_ips(db: &DatabaseConnection, name: &str, bound_ip
         name: Set(name.to_owned()),
         bound_ips: Set(Some(bound_ips.to_owned())),
         is_master: Set(false),
+        master_marker: Set(None),
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
@@ -3342,16 +3354,20 @@ async fn test_anti_replay_timestamp_window_is_enforced_in_both_directions() {
 
     let (_id, key) = insert_key(&db, "Replay", true, true, true, true).await;
     let secret = test_signing_secret(&key);
-    let now = chrono::Utc::now().timestamp();
 
+    // The clock is read *per call*, not once up front. Reading it once made every offset drift
+    // toward "stale" by however long the preceding calls took, so under a loaded `cargo test` the
+    // -290 case could arrive at -300 (the boundary) and the +301 case at +300 (inside the window) —
+    // a real intermittent failure, observed rather than theorised.
     let call = |offset: i64| {
         let app = app.clone();
         let key = key.clone();
         let secret = secret.clone();
         async move {
+            let ts = chrono::Utc::now().timestamp() + offset;
             let req = signed_at(inject_connect_info(Request::builder()
                 .uri("/api/auth/me")
-                .header("X-API-Key", &key)), &secret, now + offset, "");
+                .header("X-API-Key", &key)), &secret, ts, "");
             app.oneshot(req).await.unwrap().status()
         }
     };
@@ -3445,8 +3461,12 @@ async fn test_signature_must_match_the_looked_up_key() {
     let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
     let app = create_app(state);
 
-    let (_a_id, key_a) = insert_key(&db, "Key A", true, true, true, true).await;
-    let (_b_id, key_b) = insert_key(&db, "Key B", true, true, true, true).await;
+    // Deliberately *not* masters. Nothing here depends on scope — `/api/auth/me` authenticates and
+    // returns the caller's own identity — and only one master may exist per database now that
+    // `api_keys.master_marker` carries a unique index (RBAC_MODEL.md §5), so a fixture that mints two
+    // is refused by the schema before the test can even start.
+    let (_a_id, key_a) = insert_key(&db, "Key A", false, false, false, false).await;
+    let (_b_id, key_b) = insert_key(&db, "Key B", false, false, false, false).await;
 
     let req = signed_with(inject_connect_info(Request::builder()
         .uri("/api/auth/me")
@@ -3471,6 +3491,7 @@ async fn test_key_without_signing_secret_cannot_authenticate() {
         name: Set("Legacy Key".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
+        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -4266,6 +4287,7 @@ async fn test_rotate_secret_recovers_a_key_with_no_signing_secret() {
         name: Set("Legacy".to_owned()),
         bound_ips: Set(None),
         is_master: Set(false),
+        master_marker: Set(None),
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),

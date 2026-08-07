@@ -45,6 +45,14 @@ tempfile = "3"
 # broken `app.js` shipped green through `cargo test` and the whole e2e suite once already.
 # Deliberately a *parser* and not an engine: the file references `document` and `localStorage`, so
 # executing it would fail for reasons that have nothing to do with syntax.
-oxc_allocator = "0.143"
-oxc_parser = "0.143"
-oxc_span = "0.143"
+#
+# Pinned to an exact version with `=`, unlike every other dependency here. `oxc` is pre-1.0, so its
+# `0.x` releases carry breaking changes under a caret requirement: `0.90` → `0.143` renamed
+# `ParserReturn::errors` to `diagnostics`, changed `labels` from `Option<Vec<_>>` to a slice, and
+# widened `offset()` to `u32`. With `Cargo.lock` untracked, that moved under the build on its own and
+# left the whole test suite unable to compile — every gate failing before a single assertion ran.
+# A syntax checker that stops the build for reasons unrelated to syntax is worse than no checker, so
+# this one does not float.
+oxc_allocator = "=0.143.0"
+oxc_parser = "=0.143.0"
+oxc_span = "=0.143.0"

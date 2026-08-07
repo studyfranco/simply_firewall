@@ -398,6 +398,10 @@ log "Server is up."
 api_call GET "/api/auth/me" "$MASTER_KEY"
 check "200" "the deterministic INITIAL_MASTER_KEY authenticates"
 check_jq ".is_master" "true" "it reports is_master=true"
+# The one master in this installation, and now the only one there can ever be — RBAC_MODEL.md §5
+# makes master status bootstrap-only and a unique index on api_keys.master_marker enforces it. Every
+# later section that needs a master *target* uses this id, because no second one can be minted.
+MASTER_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
 # ── 1. Basic auth ────────────────────────────────────────────────────────────
 
@@ -824,16 +828,41 @@ if curl -s -o /dev/null --interface 127.0.0.2 --max-time 5 "$BASE_URL/api/auth/m
     check "200" "the same X-Forwarded-For from the trusted proxy IS honored"
 
     # A master key with bound_ips is subject to them like any other key — no exemption.
-    api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Bound Master Key","is_master":true,"bound_ips":"203.0.113.0/24"}'
-    check "200" "create a master key bound to 203.0.113.0/24"
-    BOUND_MASTER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
-    register_key_secret "$BOUND_MASTER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+    #
+    # This used to mint a second master to test against. It cannot any more (RBAC_MODEL.md §5), so it
+    # narrows the real one instead — which doubles as the positive case for §5's single exception:
+    # bound_ips is the one field the master may edit about itself.
+    #
+    # Loopback stays in the set on purpose. Without it, the restore below would be sent from
+    # 127.0.0.1, land outside the master's own CIDR, and be refused — locking the suite out of its
+    # only master with ~1500 checks still to run. 8.8.8.8 is outside either way, which is what the
+    # "no exemption" assertion actually turns on.
+    api_call PUT "/api/keys/$MASTER_ID" "$MASTER_KEY" '{"bound_ips":"203.0.113.0/24,127.0.0.1/32,::1/128"}'
+    check "200" "the master may edit its OWN bound_ips (the one field §5 leaves editable)"
 
-    api_call GET "/api/auth/me" "$BOUND_MASTER_KEY" "" "203.0.113.99"
+    api_call GET "/api/auth/me" "$MASTER_KEY" "" "203.0.113.99"
     check "200" "a bound master key works from inside its CIDR"
 
-    api_call GET "/api/auth/me" "$BOUND_MASTER_KEY" "" "8.8.8.8"
+    api_call GET "/api/auth/me" "$MASTER_KEY" "" "8.8.8.8"
     check "403" "a bound MASTER key is rejected outside its CIDR (no master exemption)"
+
+    # Everything else about the master is refused on the same endpoint that just accepted bound_ips,
+    # so the difference is the field and not the caller.
+    api_call PUT "/api/keys/$MASTER_ID" "$MASTER_KEY" '{"name":"Renamed Master"}'
+    check "403" "the master cannot be renamed through the API"
+
+    api_call POST "/api/keys/$MASTER_ID/rotate" "$MASTER_KEY"
+    check "403" "the master cannot be rotated through the API"
+
+    api_call POST "/api/keys/$MASTER_ID/rotate-secret" "$MASTER_KEY"
+    check "403" "the master's signing secret cannot be re-keyed through the API"
+
+    api_call DELETE "/api/keys/$MASTER_ID" "$MASTER_KEY"
+    check "403" "the master cannot be deleted through the API"
+
+    # Restore, or every remaining master call in this suite is a 403.
+    api_call PUT "/api/keys/$MASTER_ID" "$MASTER_KEY" '{"bound_ips":"0.0.0.0/0,::/0"}'
+    check "200" "restore the master's original binding"
 else
     warn "curl --interface 127.0.0.2 unavailable — skipping untrusted-peer spoofing checks."
 fi
@@ -1890,14 +1919,27 @@ MANAGER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
 MANAGER_ID=$(echo "$RESP_BODY" | jq -r '.id')
 register_key_secret "$MANAGER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
-# A master key for it to attack.
-api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Escalation Victim","is_master":true}'
-check "200" "create a master key to serve as the escalation target"
-VICTIM_ID=$(echo "$RESP_BODY" | jq -r '.id')
+# The master key it will attack. Previously a purpose-built second master; RBAC_MODEL.md §5 makes
+# that impossible, so the target is the real one — which is a strictly stronger test, since it is the
+# credential that actually matters.
+VICTIM_ID="$MASTER_ID"
 
-# 1. Minting a master key would return its plaintext in this very response.
+# 1. Minting a master key would return its plaintext in this very response. The refusal is now a
+#    `400` rather than a `403`: master status left the API surface entirely, so this is not a scope
+#    the caller lacks authority over, it is a field no payload may carry.
 api_call POST "/api/keys" "$MANAGER_KEY" '{"name":"Self-Promoted Master","is_master":true}'
-check "403" "a non-master cannot mint a master key"
+check "400" "a non-master cannot mint a master key"
+
+# 1b. Nor can the master itself, and nor does an explicit `false` slip through — §5 says "settable or
+#     clearable", so the field is refused in both directions from every caller.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Co-Master","is_master":true}'
+check "400" "not even a master can mint a second master"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Explicitly Not Master","is_master":false}'
+check "400" "is_master:false is refused too — the field may not appear at all"
+
+api_call GET "/api/keys" "$MASTER_KEY"
+check_true '[.[] | select(.is_master == true)] | length == 1' "exactly one master key exists"
 
 # 2. Rotating a master key hands back a working master credential outright.
 api_call POST "/api/keys/$VICTIM_ID/rotate" "$MANAGER_KEY"

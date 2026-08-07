@@ -37,7 +37,25 @@ pub struct Model {
     /// value means no CIDR restriction is enforced.
     pub bound_ips: Option<String>,
     /// Bypasses all group permission checks (and CIDR binding checks) when `true`.
+    ///
+    /// Not reachable through any API payload: `RBAC_MODEL.md` §5 makes master status a
+    /// bootstrap-only property, and `create_api_key`/`update_api_key` reject a request that carries
+    /// the field at all. The only writer is `bootstrap_master_key`.
     pub is_master: bool,
+    /// Uniqueness marker, kept in lockstep with [`Self::is_master`]: [`MASTER_MARKER`] on the Master
+    /// key, `NULL` on every other key.
+    ///
+    /// Carries no authority and is read by no guard — [`Self::is_master`] remains the flag every
+    /// permission check consults. This column exists so a **unique index** can express "at most one
+    /// Master" in the schema itself, which `RBAC_MODEL.md` §5 requires be enforced by the database
+    /// rather than by application logic alone. See
+    /// `migration::m20260807_000007_add_api_key_master_marker` for why a marker column rather than a
+    /// partial unique index (MySQL has no partial indexes).
+    ///
+    /// `serde(default)` so a payload that omits it — every payload, since it is never settable —
+    /// still deserializes.
+    #[serde(default)]
+    pub master_marker: Option<String>,
     /// Global privilege to create/edit/delete other API keys.
     pub can_manage_keys: bool,
     /// Global privilege to manage webhook configurations.

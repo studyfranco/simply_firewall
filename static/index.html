@@ -237,11 +237,9 @@
                         </div>
 
                         <div class="permissions-grid mt-2 mb-4">
-                            <label class="checkbox-container">
-                                <input type="checkbox" id="apikey-is-master">
-                                <span class="checkmark"></span>
-                                Master Access
-                            </label>
+                            <!-- No "Master Access" checkbox: master status is established at
+                                 bootstrap only (RBAC_MODEL.md §5), enforced by a unique index on
+                                 api_keys.master_marker, and the API rejects the field outright. -->
                             <label class="checkbox-container">
                                 <input type="checkbox" id="apikey-can-manage-keys">
                                 <span class="checkmark"></span>

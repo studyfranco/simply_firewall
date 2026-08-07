@@ -14,6 +14,7 @@ use axum::{
     http::{Request, StatusCode},
 };
 use sea_orm::{
+    ConnectionTrait,
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Database, DatabaseConnection, EntityTrait,
     QueryFilter,
 };
@@ -93,6 +94,7 @@ async fn insert_key(
         name: Set(name.to_owned()),
         bound_ips: Set(bound_ips.map(str::to_owned)),
         is_master: Set(is_master),
+        master_marker: Set(is_master.then(|| simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(can_manage_keys),
         can_manage_webhooks: Set(can_manage_webhooks),
         can_create_groups: Set(can_create_groups),
@@ -158,6 +160,7 @@ async fn insert_master_key(db: &DatabaseConnection, name: &str) -> String {
         name: Set(name.to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
+        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -1164,11 +1167,16 @@ async fn attack_master_key_is_not_exempt_from_its_bound_ips() {
         "a master key with bound_ips set must be rejected outside that CIDR"
     );
 
-    // A master key with *no* bound_ips is still unrestricted — an empty column means "no
-    // restriction configured", not "restrict to nothing".
-    let (_id2, free_master) = insert_key(&db, "Free Master", true, true, true, true, None).await;
+    // A key with *no* bound_ips is still unrestricted — an empty column means "no restriction
+    // configured", not "restrict to nothing".
+    //
+    // Not a second master: `api_keys.master_marker` carries a unique index now (RBAC_MODEL.md §5),
+    // so one database holds one master and this fixture cannot mint another. Nothing is lost — the
+    // property under test is a property of `bound_ips`, not of master status, and the master-specific
+    // half of this test (no CIDR exemption) is already proven by the two assertions above.
+    let (_id2, free_key) = insert_key(&db, "Free Key", false, false, false, false, None).await;
     assert_eq!(
-        call(free_master.clone(), test_signing_secret(&free_master), "203.0.113.9").await,
+        call(free_key.clone(), test_signing_secret(&free_key), "203.0.113.9").await,
         StatusCode::OK,
         "a key without bound_ips stays unrestricted"
     );
@@ -1197,6 +1205,12 @@ async fn escalation_fixture(
 /// Minting a master key returns its plaintext in the very same response, so accepting
 /// `is_master: true` from a non-master was a single-request escalation from a delegated scope to
 /// full control of the system.
+///
+/// The refusal moved from `403` to `400` when `RBAC_MODEL.md` §5 took master status out of the API
+/// surface entirely: it is no longer a scope the caller lacks authority for, it is a field no
+/// payload may carry — from *any* caller, master included. `attack_a_master_cannot_mint_a_second_master`
+/// covers the other half of that, and the count assertion below is unchanged and still the point:
+/// whatever the status code, no second master row appears.
 #[tokio::test]
 async fn attack_non_master_cannot_mint_a_master_key() {
     let db = setup_test_db().await;
@@ -1226,8 +1240,21 @@ async fn attack_non_master_cannot_mint_a_master_key() {
     let (status, body) = create(json!({ "name": "escalated", "is_master": true })).await;
     assert_eq!(
         status,
-        StatusCode::FORBIDDEN,
+        StatusCode::BAD_REQUEST,
         "a non-master must not be able to create a master key (got body {body})"
+    );
+    assert!(
+        body.contains("is_master"),
+        "the refusal must name the offending field so the caller knows what to remove: {body}"
+    );
+
+    // Clearing it is refused on the same terms. §5 says "settable or clearable", and a payload that
+    // carries the field is asserting authority over it in either direction.
+    let (status, _) = create(json!({ "name": "explicitly-not-master", "is_master": false })).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "`is_master: false` is refused too — the field may not appear at all"
     );
 
     // Nothing was written — the rejection happens before the insert, so no orphan key is left over.
@@ -1256,10 +1283,12 @@ async fn attack_non_master_cannot_mint_a_master_key() {
     let (status, _) = create(json!({ "name": "ordinary", "can_manage_webhooks": true })).await;
     assert_eq!(status, StatusCode::OK, "a non-master may still create non-master keys");
 
-    // An explicit `false` is not treated as a request for elevation.
+    // An explicit `false` on the master-only *scopes* is not treated as a request for elevation.
+    // `is_master` is absent here on purpose: it is no longer a scope with a permissive `false`
+    // branch, it is a field the payload may not carry at all, which the assertion further up
+    // establishes separately.
     let (status, _) = create(json!({
-        "name": "explicitly-not-master",
-        "is_master": false,
+        "name": "explicitly-unscoped",
         "can_manage_keys": false,
         "can_create_groups": false,
     }))
@@ -1325,6 +1354,341 @@ async fn attack_non_master_cannot_elevate_an_existing_key_into_master_scopes() {
         .unwrap();
     assert!(!after.is_master && !after.can_manage_keys && !after.can_create_groups);
     assert!(after.can_manage_webhooks, "the delegable scope did land");
+}
+
+// ─────────────────────────────────────────────────────────────
+// Attack 6b — Master uniqueness and immutability (RBAC_MODEL.md §5)
+// ─────────────────────────────────────────────────────────────
+
+/// Master uniqueness is a **schema** invariant, not an application convention.
+///
+/// `RBAC_MODEL.md` §5 is explicit that it must be "enforced by a database constraint rather than by
+/// application logic alone", and the reason is that application logic has a gap by construction:
+/// `bootstrap_master_key` checks for an existing master and then inserts, which two processes
+/// starting together both pass. This test bypasses every guard in `src/api.rs` and writes straight to
+/// the table, which is the only way to distinguish "the handlers refuse it" from "the database
+/// refuses it".
+#[tokio::test]
+async fn attack_a_second_master_cannot_be_written_even_bypassing_the_api() {
+    let db = setup_test_db().await;
+
+    let _first = insert_master_key(&db, "The Master").await;
+
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    let second = simply_ip_vault::entities::api_key::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        key_hash: Set(simply_ip_vault::api::hash_key(&plaintext)),
+        signing_secret: Set(Some(stored_signing_secret(&plaintext))),
+        name: Set("Usurper".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(true),
+        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
+        can_manage_keys: Set(true),
+        can_manage_webhooks: Set(true),
+        can_create_groups: Set(true),
+        prefix: Set("usurper1".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await;
+
+    let err = second.expect_err("the unique index on master_marker must refuse a second master");
+    assert!(
+        format!("{err:?}").to_lowercase().contains("unique"),
+        "the refusal must come from the uniqueness constraint, not from something incidental: {err:?}"
+    );
+
+    let masters = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::IsMaster.eq(true))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(masters.len(), 1, "exactly one master survives the attempt");
+}
+
+/// The upgrade path: an existing database with one master gets its `master_marker` backfilled, and
+/// the value the migration writes is the one `MASTER_MARKER` names.
+///
+/// The migration keeps its own private copy of the literal deliberately — an applied migration is
+/// history and must not change when the API constant is refactored — which leaves exactly one way for
+/// the two to drift apart silently. This closes it by asserting against the value actually in the
+/// column after a real migration run, rather than comparing two constants.
+///
+/// Migrations 1–6 run first, a master is seeded as it would have existed before §5, then 7 runs.
+#[tokio::test]
+async fn the_master_marker_migration_backfills_an_existing_master() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    migration::Migrator::up(&db, Some(6)).await.unwrap();
+
+    let id = Uuid::new_v4();
+    let plaintext = simply_ip_vault::api::generate_random_key();
+    db.execute_unprepared(&format!(
+        // `x'...'` rather than a quoted string: SeaORM stores `Uuid` as a 16-byte BLOB on SQLite,
+        // and a 36-character hyphenated literal fails to decode on read.
+        "INSERT INTO api_keys (id, name, key_hash, prefix, bound_ips, is_master, can_manage_keys, \
+         can_manage_webhooks, can_create_groups, created_at, updated_at) VALUES \
+         (x'{}', 'Legacy Master', '{}', 'legacy01', NULL, true, true, true, true, \
+          '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+        id.simple(),
+        simply_ip_vault::api::hash_key(&plaintext),
+    ))
+    .await
+    .unwrap();
+
+    migration::Migrator::up(&db, None).await.unwrap();
+
+    let migrated = simply_ip_vault::entities::prelude::ApiKey::find_by_id(id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        migrated.master_marker.as_deref(),
+        Some(simply_ip_vault::api::MASTER_MARKER),
+        "the pre-existing master must be marked, with the value the API constant names"
+    );
+}
+
+/// A database that already holds two masters stops the migration rather than being silently
+/// resolved.
+///
+/// Demoting a key would strip an operator's authority without asking, and picking the "oldest" is a
+/// guess dressed as a policy. Failing names the ids and the `UPDATE` that fixes it, which is
+/// recoverable in one command — and the migration leaves the schema untouched, so a retry after the
+/// fix starts from a clean state rather than a half-applied one.
+#[tokio::test]
+async fn the_master_marker_migration_refuses_a_database_with_two_masters() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+    migration::Migrator::up(&db, Some(6)).await.unwrap();
+
+    for name in ["Master A", "Master B"] {
+        let plaintext = simply_ip_vault::api::generate_random_key();
+        db.execute_unprepared(&format!(
+            "INSERT INTO api_keys (id, name, key_hash, prefix, bound_ips, is_master, \
+             can_manage_keys, can_manage_webhooks, can_create_groups, created_at, updated_at) \
+             VALUES (x'{}', '{name}', '{}', 'legacy01', NULL, true, true, true, true, \
+              '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            Uuid::new_v4().simple(),
+            simply_ip_vault::api::hash_key(&plaintext),
+        ))
+        .await
+        .unwrap();
+    }
+
+    let err = migration::Migrator::up(&db, None)
+        .await
+        .expect_err("two masters must stop the migration");
+    let message = format!("{err}");
+    assert!(
+        message.contains("RBAC_MODEL.md §5") && message.contains("UPDATE api_keys"),
+        "the failure must say what is wrong and how to fix it: {message}"
+    );
+    assert!(
+        !message.contains("<unreadable id>"),
+        "the offending ids must be legible — they are what the operator's UPDATE targets: {message}"
+    );
+
+    // Left exactly as found: the column was never added, so a retry after the operator's `UPDATE`
+    // starts clean instead of hitting a half-applied schema.
+    assert!(
+        db.execute_unprepared("SELECT master_marker FROM api_keys").await.is_err(),
+        "the column must not have been added before the check refused"
+    );
+}
+
+/// Even the Master cannot mint a second Master through the API.
+///
+/// `attack_non_master_cannot_mint_a_master_key` covers the delegated caller. This covers the one
+/// caller that used to be allowed: before §5, `guard_scope_elevation` returned `Ok` early for a
+/// master, so `POST /api/keys` with `is_master: true` from the master produced a second master and
+/// returned its plaintext in the response body.
+#[tokio::test]
+async fn attack_a_master_cannot_mint_a_second_master() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let master = insert_master_key(&db, "The Master").await;
+    let secret = test_signing_secret(&master);
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        &json!({ "name": "Co-Master", "is_master": true }).to_string(),
+    );
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::BAD_REQUEST,
+        "master status is bootstrap-only; no payload may carry the field, from any caller"
+    );
+
+    let masters = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::IsMaster.eq(true))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(masters.len(), 1, "no second master row was written");
+}
+
+/// The Master key cannot be deleted through the API — by itself or by anyone else.
+///
+/// `RBAC_MODEL.md` §5: "The Master key cannot be deleted through the API. Regeneration is: delete the
+/// row directly in the database; the service re-mints at next boot." The previous guards were both
+/// *relative* — "not yourself" and "not by a non-master" — which together left the master deletable
+/// by any other master, and the whole point of §5 is that there is no other master.
+#[tokio::test]
+async fn attack_the_master_key_cannot_be_deleted_through_the_api() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let master = insert_master_key(&db, "The Master").await;
+    let secret = test_signing_secret(&master);
+    let master_id = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::IsMaster.eq(true))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{master_id}"))
+                .header("X-API-Key", &master),
+        ),
+        &secret,
+        "",
+    );
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "the master key must not be deletable through the API"
+    );
+
+    assert!(
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(master_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some(),
+        "the row is still there"
+    );
+}
+
+/// `bound_ips` is the Master's *only* API-editable field, and every other one is refused.
+///
+/// §5 draws the line here rather than at "immutable" outright because a master locked to a network it
+/// can no longer reach is unrecoverable without database access, and relocating an operator's own
+/// admin network is a routine, non-escalating change. Renaming and re-scoping are neither routine nor
+/// non-escalating, and rotation hands back a working master credential in the response body — so all
+/// three are outside the API surface entirely.
+#[tokio::test]
+async fn master_may_edit_only_its_own_bound_ips() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let master = insert_master_key(&db, "The Master").await;
+    let secret = test_signing_secret(&master);
+    let master_id = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::IsMaster.eq(true))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    // Repeats below differ only in body, and two identical bodies inside one second would produce
+    // the same signature — which the replay guard refuses for reasons unrelated to this test.
+    let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let call = |method: &'static str, path: String, body: String| {
+        let (app, master, secret, tick) =
+            (app.clone(), master.clone(), secret.clone(), tick.clone());
+        async move {
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("X-API-Key", &master)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                &body,
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    let put = |body: serde_json::Value| call("PUT", format!("/api/keys/{master_id}"), body.to_string());
+
+    // The permitted edit.
+    assert_eq!(
+        put(json!({ "bound_ips": "10.0.0.0/8" })).await,
+        StatusCode::OK,
+        "the master may edit its own bound_ips"
+    );
+    let after = simply_ip_vault::entities::prelude::ApiKey::find_by_id(master_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.bound_ips.as_deref(), Some("10.0.0.0/8"), "and the edit landed");
+
+    // Everything else on the same endpoint.
+    for field in ["name", "can_manage_keys", "can_manage_webhooks", "can_create_groups"] {
+        let value = if field == "name" { json!("Renamed") } else { json!(false) };
+        assert_eq!(
+            put(json!({ field: value })).await,
+            StatusCode::FORBIDDEN,
+            "the master's '{field}' must not be editable through the API"
+        );
+    }
+
+    // A payload mixing the one permitted field with a forbidden one is refused whole rather than
+    // partially applied — otherwise "edit bound_ips" would become a carrier for the rest.
+    assert_eq!(
+        put(json!({ "bound_ips": "192.0.2.0/24", "name": "Sneaky" })).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // Both rotation endpoints, which §5 names explicitly.
+    assert_eq!(
+        call("POST", format!("/api/keys/{master_id}/rotate"), String::new()).await,
+        StatusCode::FORBIDDEN,
+        "rotating the master would return a working master credential in the response body"
+    );
+    assert_eq!(
+        call("POST", format!("/api/keys/{master_id}/rotate-secret"), String::new()).await,
+        StatusCode::FORBIDDEN,
+        "re-keying the master's HMAC secret is equally out of the API surface"
+    );
+
+    // Nothing leaked through: the master is exactly as it was except for the one permitted field.
+    let final_state = simply_ip_vault::entities::prelude::ApiKey::find_by_id(master_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(final_state.name, "The Master", "the name never changed");
+    assert!(final_state.can_manage_keys && final_state.can_manage_webhooks);
+    assert_eq!(final_state.key_hash, after.key_hash, "the credential never rotated");
+    assert_eq!(
+        final_state.bound_ips.as_deref(),
+        Some("10.0.0.0/8"),
+        "the rejected mixed payload did not apply its bound_ips half either"
+    );
 }
 
 /// Rotating a key returns fresh credentials for it. Allowing that against a *master* key handed a
@@ -2404,8 +2768,11 @@ async fn replay_tracking_is_scoped_per_key() {
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
     let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
-    let (_a, first) = insert_key(&db, "First", true, true, true, true, None).await;
-    let (_b, second) = insert_key(&db, "Second", true, true, true, true, None).await;
+    // Ordinary keys: replay tracking is keyed on identity, not on scope, and only one master may
+    // exist per database (RBAC_MODEL.md §5). `GET /api/ips` answers `200` with an empty list for a
+    // key holding no grants, which is all this test needs from it.
+    let (_a, first) = insert_key(&db, "First", false, false, false, false, None).await;
+    let (_b, second) = insert_key(&db, "Second", false, false, false, false, None).await;
     let timestamp = chrono::Utc::now().timestamp();
 
     for key in [&first, &second] {
