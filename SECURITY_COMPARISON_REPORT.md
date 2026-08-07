@@ -1,267 +1,215 @@
 # Comparative Security Audit — `simply_ip_vault` ↔ `simply_hook_executor`
 
-**Date:** 2026-08-02 · **Mode:** strictly read-only — no source file in `src/` or `./example` was
-modified, and no commit was created. **Scope:** closing pass on the audit committed as `f6239ee`,
-re-verifying its contested findings against current source rather than against commit messages.
+**Date:** 2026-08-07 · **Mode:** strictly read-only — no file under `src/`, `tests/`, `migration/` or
+`./example` was modified, and no commit was created. **Scope:** the state of both services after each
+independently completed a six-phase implementation of `RBAC_MODEL.md`.
+
+Every finding below was verified against source. `AGENT.MD`, `AGENT_NOTES.MD`, commit messages and
+prior audit reports were treated as leads only — and one of them turned out to be wrong again, which
+is the headline of this audit.
 
 ---
 
 ## 0. Reference freshness
 
-### 0.1 The reference is not a git checkout — and `rev-parse` lies about it
-
-`git -C ./example rev-parse HEAD` **returns a hash, and that hash is a trap.** It answers
-`5f7b5b1de4511eff4babdd367b8d5def5384a678`, which is *this* repository's HEAD. `./example` holds no
-`.git`, so git walks up to the enclosing repository and reports its commit. Recording that number
-would attribute a provenance the reference does not have.
+`./example` holds **no `.git`**. It is a flat file snapshot, so `git -C ./example rev-parse HEAD`
+would walk up and report *this* repository's commit — a provenance the reference does not have. No
+git command was run inside it. Freshness was established from file modification times and from the
+phase headings inside `example/simply_hook_executor/AGENT_NOTES.MD`.
 
 | Probe | Result | Meaning |
 | :--- | :--- | :--- |
-| `example/simply_hook_executor/.git` | absent | not an independent checkout |
-| `.gitmodules` | does not exist | not a submodule |
-| `git ls-files example \| wc -l` | `0` | untracked by this repo |
-| `.gitignore` line 9 | `example/*` | deliberately excluded |
+| `example/simply_hook_executor/.git` | absent | flat snapshot, not an independent checkout |
+| Peer `AGENT_NOTES.MD` last phase heading | `## Phase 5 — Compliance Suite & Mutation Validation` (line 3397) | the peer's six-phase run completed |
+| Peer newest source mtime | `src/api.rs`, `src/migration/m20230107_…` — 2026-08-07 15:48 | same-day |
+| Peer `AGENT_NOTES.MD` mtime | 2026-08-07 15:51 | same-day |
+| This repo's newest source mtime | `src/api.rs` — 2026-08-07 20:21 | ~4.5 h later |
+| Peer `RBAC_MODEL.md` mtime | 2026-08-07 09:44 | predates both implementations — the shared spec, unmoved |
 
-**No commit hash can be pinned.** Freshness is corroborated by mtime and by content instead.
+**Verdict: current, with a stated lag.** The snapshot is from the same working day and reflects the
+peer's *completed* Phase 5. This repository's Phases 3–5 landed after the snapshot was taken, so where
+a difference below favours `simply_ip_vault`, the possibility that the peer has since closed it cannot
+be excluded from here. Where a difference favours the peer, no such caveat applies — the peer's code
+is older than the finding.
 
-### 0.2 Corroboration — the reference is CURRENT
+---
 
-| Artifact | Timestamp |
+## 1. `RBAC_MODEL.md` byte-identity — the check that had never run
+
+**It ran, for the first time, and it passes.**
+
+Both services previously reported the peer's copy as ABSENT, so Pillar 0 had never executed against a
+real file. The peer snapshot now carries `RBAC_MODEL.md`.
+
+| Probe | Result |
 | :--- | :--- |
-| `example/.../src/api.rs`, `src/middleware.rs` | 2026-08-02 17:13 |
-| `example/.../src/lib.rs`, `src/main.rs` | 2026-08-02 17:31 |
-| `example/.../Cargo.toml` | 2026-08-02 17:32 |
-| `example/.../src/config.rs` | 2026-08-02 17:33 |
-| `example/.../AGENT_NOTES.MD` | 2026-08-02 17:35 |
-| `example/.../src/` (directory) | 2026-08-02 18:46 |
-| this repo — `ee84e72` (ReplayGuard rewrite) | 2026-08-02 17:21 |
-| this repo — `40cb4f4` (legacy-crypto purge) | 2026-08-02 17:38 |
-| this repo — `5f7b5b1` (HEAD) | 2026-08-02 21:28 |
+| `cmp RBAC_MODEL.md example/simply_hook_executor/RBAC_MODEL.md` | **byte-identical** (exit 0) |
+| `md5sum`, both copies | `42c0c8bd1ab010a41793fb41f7c27395` |
+| Size, both copies | 7 846 bytes |
+| `./scripts/verify_convergence.sh` Pillar 0 | `✓ MATCH  RBAC_MODEL.md is byte-identical across services` |
 
-The reference's newest content postdates `ee84e72` and falls within five minutes of `40cb4f4`.
-Content corroborates the timestamps independently, which matters more than the mtimes themselves:
-the reference's `AGENT_NOTES.MD` documents *its own* dead-code sweep (177 tests, 632/632 e2e), its
-`src/replay.rs` exists as a standalone module, and its `SecretCipher::open` is already fail-closed.
-All three are post-audit states that could not have been present in a stale copy.
-
-> **✅ Reference freshness: CURRENT** — corroborated by mtime and content, not pinned to a hash.
-> This supersedes the previous audit's `⚠ UNVERIFIED` flag, which was correct when written.
->
-> HEAD has since moved to `5f7b5b1`, which touches `static/app.js` only (+1/−2) and changes nothing
-> in scope.
-
-### 0.3 Project-direction correction
-
-The brief states that `simply_ip_vault` "is in `./example`" and that `simply_hook_executor` is the
-current repository. **This is inverted**, per the package manifests:
-
-| Path | `Cargo.toml` `name` |
-| :--- | :--- |
-| `.` (this repository) | `simply_ip_vault` |
-| `./example/simply_hook_executor/` | `simply_hook_executor` |
-
-The mandated column *positions* are preserved so the table shape matches the brief; the *labels* are
-corrected so each cell describes the codebase it actually came from.
+There are no substantive divergences to report, because there are no divergences at all. This is the
+first audit in which the specification itself has been *verified* shared rather than assumed shared.
 
 ---
 
-## 1. Proxy & IP middleware
+## 2. §5 master uniqueness — the mechanism, not its presence
 
-| Aspect | `simply_ip_vault` — **this repo** (brief's col. 1) | `simply_hook_executor` — **`./example`** (brief's col. 2) | Assessment |
+Both services added a `master_marker` column under a plain unique index. **They are not equivalent,
+and the difference is exploitable.**
+
+`RBAC_MODEL.md` §5: uniqueness must be "enforced by a database constraint rather than by application
+logic alone."
+
+| Aspect | simply_ip_vault | simply_hook_executor | Assessment |
 | :--- | :--- | :--- | :--- |
-| `resolve_client_ip` body | `config.rs:563` | `config.rs:416` | **Equivalent** — textually identical, line for line |
-| Trust gate | `if !is_trusted(peer, trusted) { return peer }` before any header read | identical | **Equivalent** — the load-bearing check; headers unreachable for an untrusted peer |
-| XFF chain walk | `.rev().find(\|ip\| !is_trusted(*ip, trusted))` | identical | **Equivalent** — right-to-left, skipping trusted hops |
-| All-trusted chain | falls through; never invents a client | identical | **Equivalent** |
-| `X-Real-IP` | honoured only from a trusted peer, only when XFF yielded nothing | identical | **Equivalent** |
-| IPv4-mapped normalization | `normalize_ip` on the peer and every hop | identical | **Equivalent** |
-| Positive DNS TTL | `POSITIVE_TTL = 30s` (`config.rs:97`) | `TRUSTED_PROXY_DNS_TTL = 30s` (`config.rs:23`) | **Equivalent** — names differ, values match |
-| Negative DNS TTL | `NEGATIVE_TTL = 5s` (`config.rs:108`) | `TRUSTED_PROXY_DNS_NEGATIVE_TTL = 5s` (`config.rs:38`) | **Equivalent** |
-| Boot grace period | `BOOT_GRACE_PERIOD = 60s`, private | `TRUSTED_PROXY_BOOT_GRACE = 60s`, `pub` | **Equivalent** behaviour; visibility differs only |
-| Negative-caching granularity | per-hostname (`HostnameState`) | per-hostname (`HostnameEntry`) | **Equivalent** — one bad name never drags healthy ones onto the short window |
-| Concurrent-resolution collapse | re-check under the write lock in `resolved()` | equivalent double-check | **Equivalent** — bounds DNS amplification across simultaneous requests |
-| `resolve_hostname` return shape | `Vec<IpNetwork>`; caller derives `resolved = !addresses.is_empty()` (`config.rs:468`) | `(Vec<IpNetwork>, bool)` | **Equivalent — previously misreported.** The peer returns `false` in *exactly* the empty cases, so the bool is `!networks.is_empty()` by construction. See §5.1 |
-| DNS-failure direction | empty ⇒ untrusted; never widens trust | identical | **Equivalent** — fails safe on both sides |
-| Malformed `TRUSTED_PROXIES` entry | dropped with a warning; startup continues | identical | **Equivalent** |
-| `bound_ips` on master keys | enforced, no `is_master` bypass (`middleware.rs:274`) | enforced, no bypass (`middleware.rs:439`) | **Equivalent** — both fixed the decorative-restriction bug |
-| `bound_ips` check position | after HMAC verification (`middleware.rs:257`) | after HMAC verification (`middleware.rs:421`) | **Equivalent** — closes the 403-vs-401 topology oracle |
-| Malformed CIDR in DB | `AppError::Internal` (500); never fail-open | identical | **Equivalent** |
-| Positive-TTL **expiry** test | **absent** — no test drives a positive entry to expiry | `a_successful_resolution_is_re_queried_once_its_positive_ttl_expires` | **`simply_hook_executor` stronger** — see §5.2 |
+| Marker mechanism | **Application-maintained.** `VARCHAR(16) NULL`, written only by `bootstrap_master_key` (`src/main.rs:120`), migration `m20260807_000007_add_api_key_master_marker` | **Engine-generated.** `INTEGER GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)`, migration `m20230106_000001_master_key_uniqueness:56-72` | **`simply_hook_executor` — materially stronger.** The marker cannot be omitted, forged, or desynchronised from `is_master`, because nothing may write it |
+| §5 satisfied? | **No.** Verified live: schema is `"master_marker" varchar(16) NULL`; a direct `INSERT … is_master=1, master_marker=NULL` **was accepted**, leaving two masters. NULLs do not collide in a unique index, so the constraint never fires | **Yes.** `is_master = true` forces `master_marker = 1` by construction; a second such row collides on `idx_api_keys_master_marker` | **`simply_hook_executor`.** The vault's constraint is precisely the "application logic alone" §5 forbids — it holds only for a cooperative writer |
+| Storage mode per backend | n/a — not a generated column | `STORED` on PostgreSQL (VIRTUAL arrived in 18), `VIRTUAL` on SQLite (the only mode `ALTER TABLE` permits) and MySQL | **`simply_hook_executor`.** The vault has no equivalent decision to get right |
+| Storage mode pinned by tests | n/a | Yes — unit tests at `m20230106_000001:106-136` assert the exact suffix per backend and that the DDL contains `GENERATED ALWAYS AS … is_master` | **`simply_hook_executor`.** A backend-specific DDL error would otherwise surface only against a real PostgreSQL |
+| Compliance test | `s5_…`, `s7_…` assert a second master insert fails — but both **supply the marker explicitly**, so they test a cooperative writer | `s5_exactly_one_master_immutable_and_undeletable`; the bypass is unreachable by construction | **`simply_hook_executor`.** The vault's tests pass and its constraint is still bypassable — the gap is in what the test omits to try |
 
-Both sides expose a test-only TTL builder, but only the peer's suite exercises the positive window's
-*expiry*. All three of our TTL tests pass a 30-second positive TTL, which cannot lapse inside a test.
+**This is the audit's principal finding and it is against this repository.** It was demonstrated, not
+inferred: a live database built from the current migrations accepted a second master row.
+`AGENT_NOTES.MD` (Phase 0) states the constraint is enforced "by the schema, not by application
+logic". That claim is wrong, and the migration's own module doc repeats it.
+
+The fix is a schema change and therefore out of scope for a read-only audit. The shape is known and
+already proven on the peer side: replace the nullable column with
+`GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)`, per-backend storage mode, and drop
+the entity field and the `bootstrap_master_key` write, since a generated column must not be written.
 
 ---
 
-## 2. RBAC & privilege-escalation guards
+## 3. Terminology resolution — resolved on one side, structurally open on the other
 
-| Aspect | `simply_ip_vault` — **this repo** | `simply_hook_executor` — **`./example`** | Assessment |
+Both claims from the peer's report were verified and both are true.
+
+| Aspect | simply_ip_vault | simply_hook_executor | Assessment |
 | :--- | :--- | :--- | :--- |
-| **Contested finding #1** — cross-tenant revocation | `revoke_key_group_permission` (`api.rs:1944`) resolves the caller's own grant via `caller_group_permission`, then applies `guard_delegated_group_grant(.., "revoke", ..)` against the *existing* grant's verbs | n/a — finding was against this repo | **CLOSED** — verified in source |
-| **Contested finding #2** — any-verb-grants-any-verb | n/a — finding was against the peer | `guard_delegated_hook_grant` (`api.rs:461`) tests `can_execute` and `can_manage` **independently** via `wanted && !holds` | **CLOSED** — verified in source |
-| Revocation authority scope | caller must hold each verb being removed | caller needs only `can_manage` on the hook (`require_manage`) | **`simply_ip_vault` stronger** — see §5.3 |
-| Ordering of `404` vs `403` on revoke | `NotFound` returned before the authority guard (`api.rs:1980` → `:1985`) | `delete_many` first; `404` derived from `rows_affected == 0` | **`simply_ip_vault` stronger** — peer's order is safe today but structurally fragile |
-| Self-revocation of own grants | blocked for non-master (`api.rs:1958`) | not blocked | **Equivalent in risk** — dropping your own access is de-escalation |
-| Self-**granting** of own permissions | blocked for non-master | blocked for non-master (`api.rs:2272`) | **Equivalent** |
-| Master-target guard | `guard_master_target` (`api.rs:225`) | `require_master_to_administer` (`api.rs:379`) | **Equivalent** — same predicate; peer additionally names the action |
-| — applied on `update` | ✅ (`api.rs:1630`) | ✅ (`api.rs:2077`) | **Equivalent** |
-| — applied on `delete` | ✅ (`api.rs:1587`) | ✅ (`api.rs:2150`) | **Equivalent** |
-| — applied on `rotate` | ✅ (`api.rs:1723`) | ✅ (`api.rs:2200`) | **Equivalent** — rotation returns the new plaintext secret, so this is the critical one |
-| Self-deletion | blocked | blocked | **Equivalent** |
-| `is_master` promotion via update | payload carries no `is_master` field | payload carries no `is_master` field | **Equivalent** — promotion unreachable by construction |
-| Master-only scope grants on create | `MASTER_ONLY_SCOPES` zip-check (`api.rs:208`) | `require_master_to_grant_scopes` (`api.rs:343`) | **Equivalent** — `can_manage_keys` is no longer transitively `is_master` |
-| Permission rows on a master target | refused as `InvalidInput` (`api.rs:1824`) | refused as `InvalidInput` (`api.rs:2266`) | **Equivalent** |
-| Entry gate on permission handlers | `!is_master && !can_manage_keys` ⇒ 403 | identical | **Equivalent** |
-| Audit logging of grant/revoke | `KEY_PERM_REVOKE` with actor, IP, target | identical vocabulary | **Equivalent** |
+| Managed resource | `ip_groups` — shared, permission rows in `api_key_group_permissions` | `hooks` — shared, permission rows in `api_key_hook_permissions` | Equivalent |
+| Dispatch target | `webhook_configs`, distinct entity, creator-private via `owner_key_id` | **None.** `src/entities/` holds `hook.rs`, `execution.rs`, `hook_parameter.rs` — no Executor entity exists | **Divergent readings.** The vault has two entities for the spec's two roles; the peer has one entity holding both |
+| `can_create_executor` | n/a | **Absent from `src/` entirely** — the only occurrence anywhere is a comment in `tests/rbac_model_compliance.rs:209` saying so | **Specification defect** (see §4) |
+| §3 ownership means | Two ownerships: `ip_groups.owner_key_id` (managed resource) and `webhook_configs.owner_key_id` (dispatch target) | One: `hooks.owner_key_id`, covering both roles at once | Compatible in effect; the peer cannot separate lifecycle authority over "the shared thing" from "the private thing" because they are the same row |
+| §4 scope 3 (creator-plus-Master) means | A real, separate scope: `list_webhooks` filters on `owner_key_id`, and a group peer gets `404` | **Collapses into scope 2.** A hook's visibility is its permission row (`require_visibility`, `src/api.rs:343`); there is no creator-private surface to scope | **Divergent.** Scope 3 is implemented in the vault and vacuous in the peer — not a peer defect, a consequence of the entity model |
+| §6 inventory covers | `ip_groups` **and** `webhook_configs` owned by any key in the subtree | `hooks` only — one entity type, so `entity_type` is effectively constant | Equivalent in rigour; different in breadth because the schemas differ |
+
+The two readings have **silently diverged**, and neither service is wrong under its own schema. The
+divergence lives in the specification: `RBAC_MODEL.md` asserts that managed resource and dispatch
+target are distinct roles that "an entity cannot [both] hold", and one of the two services it governs
+has a schema in which they are the same entity. The peer complied by making the Hook a managed
+resource and treating scope 3 as unreachable; that is the only available reading, and it means §4 has
+three scopes in one service and two in the other.
 
 ---
 
-## 3. Cryptography, HMAC, authentication posture & replay protection
+## 4. Rights named in the specification that do not exist
 
-| Aspect | `simply_ip_vault` — **this repo** | `simply_hook_executor` — **`./example`** | Assessment |
+| Right named in the spec's terminology table | Exists in `simply_ip_vault`? | Exists in `simply_hook_executor`? | Assessment |
 | :--- | :--- | :--- | :--- |
-| **Authentication posture** | mandatory full-URI HMAC + anti-replay on **every** key; no per-key mode, no opt-out, no alternate signature header | per-key `HmacMode` (`CanonicalV1` / `BodyOnly`), `X-Hub-Signature-256` accepted in `BodyOnly` only, `BodyOnly` excluded from replay tracking, `REQUIRE_SIGNED_REQUESTS` promotes signing to mandatory | **Intentional asymmetry — do not unify** |
-| MAC comparison | `Mac::verify_slice` (`crypto.rs:165`) — the only comparison in the crate | `Mac::verify_slice` (`middleware.rs:195`) — the only one | **Equivalent** — constant-time via `CtOutput::eq` → `subtle::ct_eq` |
-| Non-constant-time comparison of secret material | none — no `==` against any secret, signature, digest or MAC | none | **Equivalent** |
-| `key_hash` lookup | indexed DB lookup keyed on a SHA-256 digest | identical | **Equivalent** — *not* a secret comparison; timing reveals only index behaviour |
-| Canonical string | `METHOD\nTARGET\nTIMESTAMP\nBODY`, LF-joined | identical (`signature_base`) | **Equivalent** |
-| Target component | `path_and_query()`, never `path()` (`middleware.rs:96`) | `path_and_query()`, never `path()` (`middleware.rs:362`) | **Equivalent** — query string covered on both |
-| `OriginalUri` under `nest()` | used, with a `parts.uri` fallback | used, with a `parts.uri` fallback | **Equivalent** — without it every signature would mismatch |
-| Signature header parsing | `sha256=` prefix **optional**; bare hex accepted (`crypto.rs:156`) | `sha256=` prefix **required** (`middleware.rs:182`) | **`simply_hook_executor` stronger** — see §5.4 |
-| Digest returned from verification | `Option<Vec<u8>>` — raw decoded bytes | `Result<Vec<u8>, AppError>` — raw decoded bytes | **Equivalent** — both normalize hex spelling by construction |
-| `open()` accepted formats | exactly `v1.plain.` and `v1.xchacha20poly1305.` (`crypto.rs:346`) | exactly `v1.plain.` and `v1.xchacha20poly1305.` (`crypto.rs:141`) | **Equivalent** — closed set matching what `seal()` emits |
-| Unrecognized prefix | `MalformedCiphertext` — **fail-closed** | `MalformedCiphertext` — **fail-closed** | **Equivalent** — neither returns an unprefixed value verbatim |
-| Legacy ciphertext format | none — `aesgcm256:` purged in `40cb4f4`, `aes-gcm` crate removed | none | **Equivalent** — neither carries a legacy format the other has dropped |
-| Sealed row with no key configured | `DecryptionFailed`, never silent passthrough | `DecryptionFailed` | **Equivalent** |
-| AEAD | XChaCha20-Poly1305, fresh 24-byte random nonce per seal | identical | **Equivalent** — 192-bit nonce, no counter state to persist |
-| Malformed encryption key at startup | hard error; never degrades to plaintext | hard error | **Equivalent** |
-| Decryption failure at request time | `500`, logged loudly — not `401` | `500`, logged loudly | **Equivalent** — an operator emergency must not read as a client error |
-| Replay clock source | `tokio::time::Instant` (monotonic) | `std::time::Instant` (monotonic) | **Equivalent** — both immune to NTP steps; ours is additionally pausable for deterministic tests |
-| Replay key | `SignatureId { key_id, digest: Vec<u8> }`, raw bytes | identical | **Equivalent** — cross-key collision and hex re-spelling both impossible |
-| Behaviour at capacity | sweep + warn, **never** `clear()`; map may grow | sweep + warn, **never** `clear()` | **Equivalent** — the `seen.clear()` defect is closed on both sides |
-| Capacity-sweep backoff | `CAPACITY_BACKOFF_DIVISOR = 16` — at most one sweep per window/16 while saturated | none — sweeps on **every request** while saturated (`replay.rs:143`) | **`simply_ip_vault` stronger** — see §5.5 |
-| Routine sweep strategy | interval, `PRUNE_INTERVAL_DIVISOR = 4` | interval, `PRUNE_INTERVAL_DIVISOR = 4` | **Equivalent** — amortized, not per-request `O(n)` |
-| Tracked-signature ceiling | `100_000` | `250_000` | **Equivalent** — both are runaway-client alarms, not attack controls |
-| Poisoned-lock behaviour | fails **closed** (rejects the request) | fails **closed** | **Equivalent** |
-| Window clamp | `clamp(1, 3600)` | `clamp(1, 3600)` | **Equivalent** — a config typo cannot disable the guard |
-| Record-after-verify ordering | recorded only after `verify_slice` passes | identical | **Equivalent** — avoids the DoS-against-the-client inversion |
-| `X-Timestamp` vs. API-key DB lookup | validated **before** the lookup (`middleware.rs:155`) | validated **before** the lookup (`middleware.rs:281`) | **Equivalent** — an unauthenticated caller cannot buy a query with a stale timestamp |
-| Authoritative window re-check | single unconditional check | `prevalidate_timestamp_header` is the fast path; authoritative check repeated in the `CanonicalV1` branch | **Equivalent** — the peer's duplication is required by its per-key posture |
-| Skew symmetry | `.abs()` — future-dated rejected too | `.abs()` | **Equivalent** |
-| Encryption-key env var | primary `VAULT_ENCRYPTION_KEY`, alias `SIGNING_SECRET_KEY` | primary `SIGNING_SECRET_KEY`, alias `VAULT_ENCRYPTION_KEY` | **Equivalent** — deliberate mirror; each service seals its own database |
-| `ReplayGuard::tracked()` | `#[cfg(test)]` — compiled out of release builds | `pub` | **`simply_ip_vault` marginally tighter** — no security impact |
-| `ReplayGuard::new()` | private; `Default` is the only production path | `pub` — takes the configurable window from `RuntimeConfig` | **Equivalent** — follows from the posture asymmetry |
-| Signature-buffer cap | `MAX_SIGNED_BODY_BYTES = crate::MAX_REQUEST_BODY_BYTES` | identical derivation | **Equivalent** — no parser-differential band |
+| `can_create_webhooks` | **No.** The real column is `api_keys.can_manage_webhooks` — a *management* right covering create, update, delete and list, not a creation right | n/a | **Specification defect** — the table names a column that has never existed |
+| `can_create_executor` | n/a | **No.** Absent from `src/`; the closest is `api_keys.can_manage_hooks` | **Specification defect** |
+| Number of resource-creation rights implied by the table | 1 | 1 | — |
+| Number actually present | **2** — `can_create_groups` (managed resources) and `can_manage_webhooks` (dispatch targets) | **1** — `can_manage_hooks` | **Specification defect.** The table assumes a one-to-one mapping that holds in neither service |
+
+Both services resolved this identically and independently: treat the real management flags as the
+resource-creation rights §1 places at Master-only tier, and make them Master-only under R4. That is
+the correct reading, and both got there. **The defect is in `RBAC_MODEL.md`'s terminology table**,
+which names two columns that exist nowhere and undercounts the vault's creation rights.
+
+Because the specification is byte-identical and normative, this cannot be fixed on one side. It needs
+a coordinated edit — the table should name `can_manage_webhooks` / `can_create_groups` and
+`can_manage_hooks`, or state that the generic term maps to whatever each service's Master-only
+creation flags are.
 
 ---
 
-## 4. Database configuration & edge cases
+## 5. Rules "covered but not fully enforced"
 
-| Aspect | `simply_ip_vault` — **this repo** | `simply_hook_executor` — **`./example`** | Assessment |
+The peer reported two. Both verified true. The vault was then checked for the equivalents.
+
+| Gap | simply_ip_vault | simply_hook_executor | Assessment |
 | :--- | :--- | :--- | :--- |
-| `journal_mode=WAL` issued | `state::apply_sqlite_pragmas` (`state.rs:58`) | `db::apply_sqlite_pragmas` (`db.rs:49`) | **Equivalent** — different module, same logic |
-| Failure handling | **non-fatal**; returns `()`, so no error channel exists | **non-fatal**; returns `Result`, swallowed by `if let Err` at `main.rs:239` | **Equivalent** — ours makes it unpropagatable by construction; peer's is explicit at the call site |
-| Mode read-back | reads `journal_mode` from the response row | reads `journal_mode` from the response row | **Equivalent** — SQLite declines silently, so a clean return proves nothing |
-| `busy_timeout` | `5000` ms | `5000` ms | **Equivalent** |
-| Backend guard | skips unless `DatabaseBackend::Sqlite` | identical | **Equivalent** — the one documented exception to the SQL-agnostic rule |
-| Applied before migrations | yes | yes | **Equivalent** — migration is the long write that would otherwise hit `SQLITE_BUSY` |
-| **File-backed WAL test** | `wal_engages_on_a_file_backed_database_and_survives_reconnection` (`tests/security_tests.rs:2591`) | `wal_and_busy_timeout_are_applied_to_a_file_backed_database` (`src/db.rs:106`) | **Equivalent** — both now test a real file, not only `sqlite::memory:` |
-| — asserts `journal_mode == wal` | ✅ | ✅ | **Equivalent** |
-| — asserts `busy_timeout == 5000` | ✅ | ✅ | **Equivalent** |
-| — asserts survival across reconnection | ✅ fresh pool, no re-apply | ✅ fresh connection | **Equivalent** — proves the setting lives in the file header |
-| — runs migrations under WAL | ✅ | ✗ | **`simply_ip_vault` marginally stronger** — proves usability, not just reporting |
-| — temp-directory cleanup | `tempfile::tempdir()` — RAII, survives a panic | `std::env::temp_dir()` + manual `remove_dir_all` | **`simply_ip_vault` stronger** — peer leaks a directory on test panic (hygiene, not security) |
-| In-memory graceful-decline test | `sqlite_pragma_failures_never_stop_the_service` — also serves a signed request afterwards | `a_database_that_cannot_use_wal_still_starts_and_works` | **Equivalent** — ours additionally proves the app still serves |
-| DNS failure ⇒ negative cache | 5s, per hostname | 5s, per hostname | **Equivalent** |
-| Boot-time delayed abort | `prime()` + 60s grace on a detached task | `prime_trusted_proxies` + 60s grace | **Equivalent** — a slow-starting proxy is not fatal |
-| `DefaultBodyLimit` | `3 * 1024 * 1024`, one router-wide layer set exactly once | `3 * 1024 * 1024`, set once | **Equivalent** |
-| Signature buffer derives from it | `= crate::MAX_REQUEST_BODY_BYTES` | `= crate::MAX_REQUEST_BODY_BYTES` | **Equivalent** — not an independently chosen number |
+| **R2's wider reading** — per-resource `can_manage` without the global half authorizes changing what the resource *does* | **Does not exist.** `guard_group_manage` (`src/api.rs`) requires both halves and governs permission rows; the analogue of `script_path` is a webhook's `target_url`, gated on `owner_key_id` (`update_webhook`), which is stricter still. No endpoint renames or re-scopes a group at all | **Present and real.** `require_manage` (`src/api.rs:323-336`) checks `p.can_manage` alone, with **no `can_manage_keys` conjunct**, and gates `update_hook` — so a Daughter key with one permission row can rewrite `script_path`, i.e. **which binary executes**. Bounded by `require_master_for_privileged_hook` (elevated hooks) and `validate_script_path` (allowed roots), so the blast radius is non-privileged hooks inside permitted directories | **`simply_ip_vault` stronger.** §1's tier matrix says a Daughter "may never" manage resources; the peer's read/execute surface honours that, its definition-editing surface does not |
+| **§3 applied to keys themselves** — `api_keys.owner_key_id` populated but not an authorization input | **Cannot exist.** `api_keys` has no `owner_key_id`; key administration is scoped by `parent_key_id` subtree membership, which **is** enforced (`find_administrable_key`, `caller_can_administer_key`) | **Present.** `api_keys.owner_key_id` is written on creation (`src/api.rs:2639`) and walked by §6's inventory, but every authorization read of `owner_key_id` resolves the *hook* model (`src/api.rs:1291`). No guard consults the key's own owner | **`simply_ip_vault` marginally stronger** — one lineage concept, enforced. The peer has two, enforces one, and carries an authorization-shaped column that authorizes nothing |
+
+Neither gap appears in this repository's own report. Verified here: **that is because they do not
+exist in the vault, not because they were not looked for.** The R2 gap is structurally impossible
+given how narrowly `guard_group_manage` is scoped, and the §3-on-keys gap requires a column the vault
+never added.
 
 ---
 
-## 5. Notes a table cell cannot hold
+## 6. Remaining security-relevant implementation choices
 
-### 5.1 The previous audit's `resolve_hostname` divergence is retired as cosmetic
-
-It was recorded as an open divergence on diagnosability grounds. Reading both implementations side
-by side retires that claim: the peer returns `true` only when `!networks.is_empty()`, and `false` in
-both empty cases — the lookup error *and* the zero-address success. Ours computes
-`resolved = !addresses.is_empty()` at the call site. The tuple therefore carries **no information
-the scalar does not**, both feed the same positive/negative TTL split, and cache behaviour is
-identical. Nothing to port; the item should be struck from the divergence register rather than
-carried forward.
-
-### 5.2 The one new finding, and it is on our side
-
-Our TTL suite tests that a *negative* entry expires, and that a *positive* entry stays fresh
-alongside a failing one — but never that a positive entry **lapses**. That is the security-relevant
-direction: `POSITIVE_TTL` is the window during which a recreated container keeps its old address
-trusted, an address the orchestrator may already have reassigned. A positive entry that never
-expired would be a standing trust grant to whoever inherited that address, clearable only by a
-restart — and every current test would still pass. `with_ttls` already accepts a positive duration,
-so the test is writable without touching production code. The peer added exactly this test
-(`a_successful_resolution_is_re_queried_once_its_positive_ttl_expires`) in its most recent sweep,
-and mutation-checked it.
-
-### 5.3 Revocation authority: a defensible difference, not a defect
-
-Ours requires the caller to hold each verb it removes; the peer requires only `can_manage` on the
-hook. Under the peer's rule, a caller holding `can_manage` but not `can_execute` can destroy an
-`can_execute` grant it could not have created. That is an asymmetry, but not an escalation — the
-peer's own rationale (`api.rs:450`, `api.rs:2373`) argues that removing authority should never
-require a master, and it is coherent. Recorded as a difference in strictness; neither side is wrong.
-
-### 5.4 Bare-hex signatures
-
-Ours accepts `sha256=<hex>` *or* a bare `<hex>`; the peer requires the prefix. Not exploitable — the
-HMAC must still verify and `hex::decode` still rejects non-canonical spellings — but it is a laxer
-parse than the documented wire format, and laxity in a signature parser is worth removing on
-principle rather than after a reason appears.
-
-### 5.5 The capacity-sweep backoff is still worth porting back
-
-The peer's `prune_if_due` returns early only when `now < *next_prune && !over_capacity`. Once the map
-is saturated with entries that are all still live, `over_capacity` stays true, every request takes
-the sweep branch, and the full `retain` runs per request inside the global lock — freeing nothing and
-reinstating precisely the `O(n)`-per-request scan the module exists to remove. Ours bounds this to
-one sweep per window/16. The peer's higher ceiling (250k vs. 100k) makes the saturated state rarer
-but more expensive when reached. This was flagged in the previous audit and has not been picked up;
-it remains the clearest single improvement either codebase could take from the other.
-
-Both implementations also acquire the `seen` lock once per request purely to read `len()` for the
-capacity test. Hoisting that behind the schedule check would remove a lock acquisition from every
-authenticated request on both sides.
+| Aspect | simply_ip_vault | simply_hook_executor | Assessment |
+| :--- | :--- | :--- | :--- |
+| DDL foreign keys on `parent_key_id` / `owner_key_id` | **Omitted.** Reason recorded: SQLite has no `ALTER TABLE … ADD CONSTRAINT`, so the constraint would exist on two backends and silently not on the one CI runs. Integrity enforced in `resolve_owner_assignment` (validates on write) and `delete_api_key` (nulls on removal) | **Omitted.** Reason recorded: both FK actions are wrong — `CASCADE` violates §6's "data is never destroyed implicitly", `SET NULL` silently orphans exactly what the inventory exists to show the caller. §6's inventory *is* the integrity mechanism, and is necessarily application-level because it is interactive | **Equivalent outcome, and the peer's reasoning is the better one.** Both omit; the peer's argument survives even on a backend that supports the DDL, the vault's does not |
+| Unknown / forbidden payload fields | `is_master` **retained as a field** on `CreateApiKeyPayload` and `UpdateApiKeyPayload`, rejected by `guard_no_master_flag` with **`400`** naming the field and stating why. No `deny_unknown_fields` anywhere | `is_master` **removed from the payload types entirely**; `#[serde(deny_unknown_fields)]` on `CreateApiKeyPayload`, `UpdateApiKeyPayload`, the resolution map and its entries (`src/api.rs:2424, 2732, 2855, 2869`) | **`simply_hook_executor` stronger structurally**, and it is what Phase 0's brief actually asked for — "remove it from the payload type entirely rather than guarding it at the handler, so no future handler can reintroduce the path." The vault's guard is behaviourally correct today and one careless handler away from not being. The vault's message is more actionable; that is the lesser property |
+| Master rotation refused for every caller incl. the master | Yes — `guard_master_immutable(&target, "rotated")` / `"re-keyed"` keys on `target.is_master` alone, caller-independent | Yes — `refuse_master_lifecycle_action` keys on `target.is_master` alone | Equivalent |
+| Master deletion refused, and independent of the uniqueness constraint | Yes — `guard_master_immutable(&target, "deleted")`, unconditional; does not consult row count or the index | Yes, and stated explicitly: "barred regardless of row count so that the rule does not silently depend on the uniqueness index … two independent controls, not one control leaning on another" | **Equivalent in behaviour.** Note the vault's independence here is what stops §2's bypass from also yielding a deletable master |
+| `owner_key_id` / `parent_key_id` backfill | `NULL` everywhere. Rationale: `audit_logs` is retention-swept, `ON DELETE SET NULL`, and inconsistent across auto-provisioning paths — reconstructing ownership from it would hand out the right to delete a resource | `NULL` everywhere. Same rationale, plus a sharper one: a hook's creator is *not recorded anywhere*, since `grant_full_hook_permission` gives the creator a permission row byte-identical to a delegated one | Equivalent, independently reasoned to the same conclusion |
+| What pre-upgrade rows can do afterwards | Groups: unowned → Master-only lifecycle (unchanged from before, which was Master-only). Webhooks: unowned → **Master-only for read, update and delete** — a real narrowing. Keys: no `parent_key_id` → in nobody's subtree → administrable only by Master | Hooks: unowned → Master-only lifecycle. Keys: no `parent_key_id` → outside every subtree | **Equivalent posture.** The vault's narrowing is wider in effect because webhook *visibility* moved too, which the peer had no equivalent of (see §3) |
+| Rules with a firing mutation | **12 / 12.** Verified during this audit that the 401-vs-403 ordering also fires (unknown key → `403` mutation ⇒ `s4_authenticate_then_authorize_ordering_survives_oracle_discipline` FAILED); it was not exercised in Phase 5 | **14 / 14** enforcement sites | Equivalent rigour |
+| Surviving mutations, documented | 2, both defence-in-depth: the two `can_manage_keys` conjunct sites mask each other (removing both fires); the fail-closed branch in `guard_delegated_group_grant` is unreachable by construction | 2, both defence-in-depth and the same shape: the global-R2 half is enforced at both `has_permission_admin_standing` and `require_hook_manage_conjunction` (removing both fires) | **Equivalent, and independently arrived at the same honest framing** — recorded rather than counted as covered |
+| A mutation that initially survived and exposed a real test gap | Yes — endpoint parity (R6) changed no result until a reduction *leaving* a verb the caller lacks was added | Yes — the §4 oracle probed only one route, leaving `verb_denied` unpinned; the test now walks six routes | Equivalent; both found the same class of defect and both fixed the test rather than the report |
+| Compliance suite | 14 tests, 12 rule prefixes; convergence gate greps `fn` definitions only and was **verified to fail** (dropping `r5_` ⇒ `✗ GAP`, exit 1) | 14 tests, 12 rule prefixes (three `s4_`, matching) | Equivalent |
+| Assertions one side makes that the other only assumes | Vault's `s7_…` queries `sqlite_master` for the live DDL **and** asserts the constraint behaviourally, because an index that exists but is not unique passes any name check | Peer's `m20230106_000001` unit tests pin the **generated-column DDL per backend** — the vault has no equivalent because it has no generated column | **Split.** Each asserts something the other does not; the peer's is the one that would have caught §2's defect |
+| Authentication posture | Full-URI HMAC + anti-replay, every key, no switch | Per-key configurable (full / body-only / none), for third-party senders | **Intentional asymmetry — do not unify** |
 
 ---
 
-## 6. Executive summary
+## 7. Executive summary
 
-**Eighty-three aspects were compared across four categories** — 18 proxy/IP, 16 RBAC, 32
-crypto/HMAC/replay, and 17 database/edge-case rows. **Seventy-four are equivalent**, one is the
-permanent intentional asymmetry (mandatory full-HMAC on `simply_ip_vault` versus per-key `HmacMode`
-on `simply_hook_executor` — recorded, not scored, and now subsuming the `X-Hub-Signature-256`
-acceptance path and the `BodyOnly` replay exclusion that the previous audit listed as separate
-asymmetries), and **eight are genuine differences in strictness — six favouring `simply_ip_vault`,
-two favouring `simply_hook_executor`. None is exploitable.** Both contested RBAC findings are
-**CLOSED**, verified by reading current source rather than trusting either side's commit message:
-`simply_ip_vault`'s `revoke_key_group_permission` now resolves the caller's own grant and re-uses the
-same per-verb delegation predicate as granting, with the `404` deliberately ordered ahead of the
-authority check so a nonexistent grant cannot become a `403` that confirms a group's existence to
-someone with no access to it; and `simply_hook_executor`'s `guard_delegated_hook_grant` now tests
-`can_execute` and `can_manage` independently, so holding one confers no right to grant the other.
-Every other patch the previous round claimed also holds up: the `seen.clear()` flush is gone from
-both replay guards, both expire entries against a monotonic clock, both `open()` implementations
-accept only the closed two-format set that `seal()` can produce — with no legacy prefix on either
-side and no fail-open passthrough — both validate `X-Timestamp` before the API-key lookup, both check
-`bound_ips` only after the HMAC has verified, and both now exercise WAL against a real file-backed
-database rather than only `sqlite::memory:`. Two items are worth acting on. The **new** one is a
-test-coverage gap on *our* side: nothing drives a positive DNS entry to expiry, so a `POSITIVE_TTL`
-that never lapsed — a standing trust grant to whoever inherits a recycled container address — would
-pass the suite unnoticed. The **carried-over** one is the peer's missing capacity-sweep backoff,
-which reinstates an `O(n)` scan per request while the replay map is saturated. Separately, the
-previous audit's `resolve_hostname` divergence is **retired as cosmetic**: the peer's `(Vec, bool)`
-return is `true` in exactly the non-empty cases, making it identical to the `!addresses.is_empty()`
-our caller already derives. Reference freshness is **CURRENT**, corroborated by mtime and by content
-rather than pinned to a hash, because `./example` is an untracked, ignored directory with no `.git`
-of its own — and `git -C ./example rev-parse HEAD` silently reports the *parent* repository's commit,
-a result to distrust rather than record.
+**Aspects compared:** 44 across seven dimensions — specification identity, §5 uniqueness mechanism,
+terminology resolution, named-but-absent rights, partially-enforced rules, and fifteen
+implementation choices.
+
+**The specification is now verifiably shared.** `RBAC_MODEL.md` is byte-identical across both
+repositories (`md5 42c0c8bd…`, 7 846 bytes). Pillar 0 executed against a real peer file for the first
+time and passed. Every prior audit reported it ABSENT.
+
+**Genuine divergences: 4.**
+
+1. **§5 master uniqueness — `simply_ip_vault` is weaker, and the constraint does not hold.**
+   Demonstrated on a live database: a direct insert with `is_master = 1` and `master_marker = NULL`
+   was accepted, producing two masters, because NULLs do not collide in a unique index. The vault's
+   marker is application-maintained; the peer's is `GENERATED ALWAYS AS` and cannot be desynchronised.
+   The vault's own compliance tests pass because they supply the marker — they test a cooperative
+   writer. **This is the one place where a rule in `RBAC_MODEL.md` is not actually enforced by the
+   service that claims it.**
+2. **R2's wider reading — `simply_hook_executor` is weaker.** `require_manage` omits the
+   `can_manage_keys` conjunct, so a Daughter key with a single permission row can edit a hook's
+   `script_path` — which binary runs. Bounded by the privileged-hook guard and script-root
+   validation, and self-reported. The vault has no equivalent surface.
+3. **§3 applied to keys — `simply_hook_executor` carries a dormant column.** `api_keys.owner_key_id`
+   is written and inventoried but read by no guard. The vault has no such column and enforces key
+   administration through `parent_key_id` subtree membership.
+4. **Payload strictness — `simply_hook_executor` is stronger structurally.** It removed `is_master`
+   from the payload types and applies `deny_unknown_fields`; the vault retains the field and rejects
+   it at the handler with a `400`. Equivalent today; the peer's cannot be reintroduced by a careless
+   handler.
+
+**Intentional asymmetries: 2.** The authentication posture (permanent, recorded, never scored). And
+§4's third visibility scope, which is real in the vault and vacuous in the peer — a consequence of
+entity models, not of rigour.
+
+**Specification defects: 3.** `can_create_webhooks` and `can_create_executor` name columns that exist
+in neither service; the terminology table implies one resource-creation right where the vault has two;
+and the table's managed-resource/dispatch-target split assumes a separation the peer's schema does not
+have, leaving one service implementing three visibility scopes and the other two. All three need a
+coordinated edit to the byte-identical spec — none can be fixed on one side.
+
+**Is either service currently weaker than the other on any rule in `RBAC_MODEL.md`? Yes — both, on
+different rules.**
+
+- `simply_ip_vault` is weaker on **§5**. Its uniqueness constraint is bypassable by any writer with
+  database access, which is the threat model §5 names. This is the more serious of the two: the rule
+  is documented as enforced, tested as enforced, and is not enforced.
+- `simply_hook_executor` is weaker on **R2**, on the hook-definition surface. A Daughter key can
+  change what executes.
+
+Everything else is equivalent or explained. Both services independently reached the same conclusions
+on backfill posture, foreign-key omission, master-deletion independence from the uniqueness index, and
+the honest treatment of surviving mutations — convergence that was not coordinated and is worth more
+than the checklist that produced it.

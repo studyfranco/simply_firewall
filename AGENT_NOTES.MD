@@ -5174,3 +5174,109 @@ compliant.
 | `cargo test` | **204 passed**, 0 failed |
 | `./scripts/test_e2e.sh` | **490/490** |
 | `./scripts/verify_convergence.sh` | 31 matching, 2 documented, 0 unexplained |
+
+---
+
+## Session 37 — Comparative Security Audit (read-only)
+
+Strictly read-only comparative audit of `simply_ip_vault` against the `./example` snapshot of
+`simply_hook_executor`, after both independently completed six-phase implementations of
+`RBAC_MODEL.md`. Full findings in `SECURITY_COMPARISON_REPORT.md`; recorded here is what this
+repository must act on.
+
+### `RBAC_MODEL.md` byte-identity finally executed — and passed
+
+The peer snapshot now carries `RBAC_MODEL.md`. `cmp` reports byte-identical, `md5 42c0c8bd…`, 7 846
+bytes both sides, and Pillar 0 of `verify_convergence.sh` reports `✓ MATCH` instead of `~ ABSENT` for
+the first time. Every previous claim that the check "passed" was a check that had never run.
+
+### ACTION REQUIRED — §5 master uniqueness is not enforced
+
+**`m20260807_000007_add_api_key_master_marker` does not satisfy §5, and this file previously said it
+did.** The Phase 0 notes claim uniqueness is enforced "by the schema, not by application logic"; the
+migration's own module doc repeats it. Both are wrong.
+
+`master_marker` is a nullable `VARCHAR(16)` **written only by `bootstrap_master_key`**. Any writer
+that sets `is_master = true` and leaves the marker `NULL` gets a second master, because NULLs do not
+collide in a unique index. That is the "application logic alone" §5 explicitly forbids.
+
+Demonstrated, not inferred — on a database built from the current migrations:
+
+```
+schema:  "master_marker" varchar(16) NULL
+index:   CREATE UNIQUE INDEX "idx-api_keys-master_marker" ON "api_keys" ("master_marker")
+masters before: 1
+INSERT INTO api_keys (..., is_master, master_marker, ...) VALUES (..., 1, NULL, ...)  -> ACCEPTED
+masters after:  2
+```
+
+`s5_master_is_unique_unsettable_immutable_and_undeletable` and
+`s7_the_schema_carries_the_required_constraints_and_indexes` both pass, because both **supply the
+marker explicitly**. They test a cooperative writer. The mutation that would have caught this —
+dropping `.unique()` — also fires, for the same reason. Coverage and mutation testing agreed with each
+other and were both blind to the same omission.
+
+**The peer's approach is the fix, already proven in `m20230106_000001_master_key_uniqueness`:**
+
+```sql
+ALTER TABLE api_keys ADD COLUMN master_marker INTEGER
+  GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END) <STORAGE>
+```
+
+`STORED` on PostgreSQL (VIRTUAL arrived only in 18), `VIRTUAL` on SQLite (the only mode `ALTER TABLE`
+permits) and MySQL. The peer pins the per-backend suffix with unit tests in the migration itself,
+which is worth copying — a wrong pairing fails only against a real PostgreSQL.
+
+Consequences to handle when this is done: `api_key::Model::master_marker` must be **removed** (a
+generated column cannot be written, so the ORM must not know it), `bootstrap_master_key`'s
+`master_marker: Set(...)` goes with it, and every test fixture that sets the field. The compliance
+test must be rewritten to attempt the **NULL-marker** insert, which is the case that currently
+succeeds.
+
+### Two gaps confirmed absent here, having been checked rather than assumed
+
+The peer self-reports two rules "covered but not fully enforced". Both were checked against this
+source and neither exists here:
+
+- **R2's wider reading.** The peer's `require_manage` omits the `can_manage_keys` conjunct, so a
+  Daughter key can edit a hook's `script_path`. `guard_group_manage` requires both halves, and the
+  nearest analogue — a webhook's `target_url` — is owner-gated, which is stricter. No endpoint renames
+  or re-scopes a group at all.
+- **§3 on keys.** The peer populates `api_keys.owner_key_id` and never reads it as authorization.
+  This service has no such column; key administration is `parent_key_id` subtree membership, enforced
+  by `find_administrable_key`.
+
+### Worth adopting from the peer, beyond §5
+
+- **`#[serde(deny_unknown_fields)]`** on the key payloads, with `is_master` removed from the payload
+  *type* rather than guarded in the handler. Phase 0's brief asked for exactly that and this
+  implementation did not do it — the field is still present and rejected by `guard_no_master_flag`.
+  Behaviourally equivalent today, structurally one careless handler away from not being. The trade-off
+  is the actionable `400` message, which is the lesser property.
+- **The foreign-key omission rationale.** Both services omit DDL FKs on the new reference columns.
+  The peer's reason is better and survives on a backend that supports the DDL: both actions are wrong,
+  since `CASCADE` violates §6 and `SET NULL` orphans silently exactly what the inventory exists to
+  show the caller. This repository's reason (SQLite cannot `ALTER TABLE ADD CONSTRAINT`) is true but
+  weaker.
+
+### Verified during this audit, not during Phase 5
+
+The 401-vs-403 ordering mutation was never run in Phase 5. Run here: mutating the unknown-key path in
+`src/middleware.rs` from `Unauthorized` to `Forbidden` fails
+`s4_authenticate_then_authorize_ordering_survives_oracle_discipline`. The source was restored; the
+rule is genuinely pinned, bringing this service to **12/12 rules with a confirmed firing mutation**.
+
+### Specification defects — cannot be fixed on one side
+
+`RBAC_MODEL.md` is normative and byte-identical, so these need a coordinated edit:
+
+1. `can_create_webhooks` and `can_create_executor` name columns that exist in **neither** service.
+2. The terminology table implies one resource-creation right per service; this one has two
+   (`can_create_groups`, `can_manage_webhooks`).
+3. The managed-resource / dispatch-target split assumes a separation `simply_hook_executor`'s schema
+   does not have — a Hook is both — so §4 has three visibility scopes here and two there.
+
+### Files changed
+
+`SECURITY_COMPARISON_REPORT.md` (rewritten), `AGENT_NOTES.MD` (this section). No file under `src/`,
+`tests/`, `migration/` or `./example` was modified; no commit was created.
