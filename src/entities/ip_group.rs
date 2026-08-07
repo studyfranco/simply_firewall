@@ -18,6 +18,18 @@ pub struct Model {
     pub group_type: String,
     /// Optional detailed description of the group's purpose.
     pub description: Option<String>,
+    /// The key holding lifecycle authority over this group, or `None` when unassigned.
+    ///
+    /// `RBAC_MODEL.md` §3: deleting or renaming the group itself is "restricted exclusively to Master
+    /// and the designated `owner_key_id`", and "holding manage rights or any operational verb confers
+    /// no lifecycle authority: a parent that merely uses a resource must not be able to delete it."
+    /// Master may reassign it at any time.
+    ///
+    /// `None` on every pre-migration row: nothing in the schema recorded who created them, and
+    /// inventing an owner would hand out the right to delete a resource. Unassigned reads as
+    /// "Master only".
+    #[serde(default)]
+    pub owner_key_id: Option<Uuid>,
     /// Group creation timestamp.
     pub created_at: DateTime,
 }

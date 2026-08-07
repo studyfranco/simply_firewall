@@ -121,6 +121,9 @@ async fn bootstrap_master_key(
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        // The root of every lineage. R3 makes this a bookkeeping fact and nothing more — being a
+        // daughter of the Master confers no standing over any other daughter.
+        parent_key_id: Set(None),
         created_at: Set(now),
         updated_at: Set(now),
     };

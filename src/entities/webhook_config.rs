@@ -55,6 +55,18 @@ pub struct Model {
     /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook should fire for.
     /// `None` means all events (the historical, pre-filtering behavior).
     pub events: Option<String>,
+    /// The key that created this dispatch target, or `None` when unassigned.
+    ///
+    /// A webhook is a **dispatch target** in `RBAC_MODEL.md`'s terminology, not a managed resource:
+    /// creator-private, "visible exclusively to their creator and Master", and "never exposed by the
+    /// shared-resource rule". This column is what makes that expressible — before it, a webhook was
+    /// reachable by any `can_manage_webhooks` holder with `can_read` on its group, which is precisely
+    /// the shared-resource rule §4 forbids applying here.
+    ///
+    /// `None` on every pre-migration row, which under §3/§4 means Master-only until a master
+    /// reassigns it. That is a deliberate narrowing, accepted rather than guessed around.
+    #[serde(default)]
+    pub owner_key_id: Option<Uuid>,
     /// Creation timestamp.
     pub created_at: DateTime,
 }

@@ -78,10 +78,15 @@ pub fn create_app(state: AppState) -> Router {
         .route("/groups", post(api::create_ip_group))
         .route("/groups", get(api::list_ip_groups))
         .route("/groups/{id}", delete(api::delete_ip_group))
+        // Ownership reassignment, master-only (RBAC_MODEL.md §3). Separate routes rather than a
+        // field on the update payloads: `ip_groups` has no update endpoint at all, and folding a
+        // master-only field into a delegable one invites a guard that checks the wrong thing.
+        .route("/groups/{id}/owner", put(api::reassign_group_owner))
         .route("/webhooks", post(api::create_webhook))
         .route("/webhooks", get(api::list_webhooks))
         .route("/webhooks/{id}", put(api::update_webhook))
         .route("/webhooks/{id}", delete(api::delete_webhook))
+        .route("/webhooks/{id}/owner", put(api::reassign_webhook_owner))
         .route("/audit-logs", get(api::list_audit_logs))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

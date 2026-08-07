@@ -98,6 +98,7 @@ async fn insert_key(
         can_manage_keys: Set(can_manage_keys),
         can_manage_webhooks: Set(can_manage_webhooks),
         can_create_groups: Set(can_create_groups),
+        parent_key_id: Set(None),
         prefix: Set("sectest2".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -115,6 +116,7 @@ async fn insert_group(db: &DatabaseConnection, name: &str) -> Uuid {
         id: Set(id),
         name: Set(name.to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -191,6 +193,7 @@ async fn insert_master_key(db: &DatabaseConnection, name: &str) -> String {
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        parent_key_id: Set(None),
         prefix: Set("sectest1".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -664,6 +667,7 @@ async fn attack_hmac_template_injection_via_payload_body_cannot_forge_canonical_
         id: Set(group_id),
         name: Set("injection-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -845,6 +849,7 @@ async fn attack_canonical_v1_webhook_without_a_secret_is_rejected() {
         id: Set(group_id),
         name: Set("authmode-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -962,6 +967,7 @@ async fn attack_webhook_secret_is_not_recoverable_from_read_endpoints() {
         id: Set(group_id),
         name: Set("leak-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -1422,6 +1428,7 @@ async fn attack_a_second_master_cannot_be_written_even_bypassing_the_api() {
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        parent_key_id: Set(None),
         prefix: Set("usurper1".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),

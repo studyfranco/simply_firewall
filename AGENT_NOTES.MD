@@ -4635,3 +4635,167 @@ ownership indexes).
 | `cargo test` | **178 passed**, 0 failed |
 | `./scripts/test_e2e.sh` | **446/446** |
 | `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |
+
+---
+
+## Session 36 — RBAC_MODEL Convergence, Phase 2: Lineage, Ownership & Lifecycle Authority
+
+Adds the two concepts the gap analysis identified as structurally absent — `parent_key_id` and
+`owner_key_id` — and the §3 authority rules that depend on them. Both open questions from the
+terminology check were answered by the user before this phase started: webhooks are dispatch targets
+and align strictly with the specification, and both `can_create_groups` and `can_manage_webhooks` are
+Master-only resource-creation rights (Phase 1's reading, confirmed).
+
+### Schema (`m20260807_000008_add_lineage_and_ownership`)
+
+| Column | Table | Purpose |
+| :--- | :--- | :--- |
+| `parent_key_id` | `api_keys` | Lineage. **Authority-free** (R3) — cascade and visibility scoping only |
+| `owner_key_id` | `ip_groups` | Lifecycle authority (§3) |
+| `owner_key_id` | `webhook_configs` | Lifecycle authority **and** §4 creator-private visibility |
+
+Indexes added for §7: `idx-api_keys-parent_key_id`, `idx-ip_groups-owner_key_id`,
+`idx-webhook_configs-owner_key_id`, `idx-akgp-group_id`, `idx-api_keys-key_hash`. The last two need a
+word: `key_hash` was already unique (which implies an index everywhere), so that one is a restatement
+under an explicit name; `idx-akgp-group_id` is genuinely new, because the existing
+`(api_key_id, group_id)` composite cannot serve a lookup that does not constrain its leading column,
+and both §6's inventory and §4's shared-resource view walk a group's permission rows from the group
+side.
+
+### Two decisions worth defending
+
+**1. No database-level foreign keys on the three new columns.** Every other cross-table reference here
+is declared inside its `CREATE TABLE`; these were added by `ALTER TABLE`, and **SQLite has no
+`ALTER TABLE … ADD CONSTRAINT`**. The choice was a constraint that exists on PostgreSQL and MySQL and
+silently does not on the default development backend — where the entire test suite runs — or no
+constraint plus an explicit application rule. The first is worse than the second, because it is the CI
+run that would have caught the violation. So: `resolve_owner_assignment` looks the key up before
+writing (refusing a dangling id **and** the master key), and `delete_api_key` nulls every reference to
+a key it removes. Both are asserted by tests, which a declared-but-unenforced FK would not have been.
+
+Nothing cascades, in either direction. §6: "Data is never destroyed implicitly … IP Groups, Hooks, IP
+Records, Webhook Configs, and Executors must never disappear as a side effect of removing a key." A
+`CASCADE` on `parent_key_id` would be worse still — it would delete a whole subtree on any direct
+`DELETE`, bypassing the pre-flight inventory §6 requires. Until Phase 4, deleting a parent orphans its
+daughters (lineage lost, authority unchanged, since R3 makes lineage authority-free).
+
+**2. The backfill is `NULL` everywhere.** Nothing in the pre-migration schema recorded who created a
+key. `audit_logs` holds `GROUP_CREATE` and `WEBHOOK_CREATE` entries naming the acting key and is
+tempting — and is not authoritative: it is prunable by retention, its `api_key_id` is
+`ON DELETE SET NULL`, and the auto-provisioning paths never logged consistently. Reconstructing
+ownership from a lossy trail would hand out **the right to delete a resource** based on whichever log
+row happened to survive. `NULL` reads as "no owner, therefore Master only", which withholds authority
+rather than inventing it, and `PUT /api/{groups,webhooks}/{id}/owner` is the deliberate assignment
+path.
+
+A master creating a resource also leaves it unowned, matching what `create_ip_group` already did for
+permission rows: a master is not a tenant, and pinning its id into `owner_key_id` would make an
+administrative act look like a claim of ownership. `resolve_owner_assignment` refuses the master as an
+owner for the same reason — `NULL` already means master-only, and two spellings of one state invite
+guards that check the wrong one.
+
+### Behaviour
+
+- **`guard_resource_lifecycle`** — Master or `owner_key_id`, and nothing else. Deliberately a separate
+  guard from `guard_group_manage` rather than another branch inside it: `can_manage` is authority over
+  a resource's **permission rows**, ownership is authority over its **existence**, and conflating them
+  means the key trusted to hand out read access can also delete the thing everyone is reading. §3 says
+  it directly: "a parent that merely uses a resource must not be able to delete it."
+- **`delete_ip_group`** was master-only; now Master **or** owner. A widening for owners, unchanged for
+  everyone else, since unowned still means master-only.
+- **`update_webhook` / `delete_webhook`** were scoped by *group readability*; now by ownership. This is
+  a **narrowing**, and the significant one — see below.
+- **`PUT /api/groups/{id}/owner`**, **`PUT /api/webhooks/{id}/owner`** — master-only, and deliberately
+  not delegable to the current owner. A transferable owner flag would let a tenant pass the
+  authority-to-destroy onward without the master who granted it seeing the transfer: the same
+  amplification R1 forbids for permission verbs, one level up.
+- **No group-rename endpoint exists**, so §3's rename clause is vacuous for groups. It binds
+  `PUT /api/webhooks/{id}`, which does rename, and that endpoint is now owner-gated whole rather than
+  split into "you may repoint but not rename" — a distinction with no holder, since the visibility test
+  is identical either way.
+
+### Breaking changes
+
+**Webhook access is now creator-private.** A key holding `can_manage_webhooks` + `can_read` on a group
+could previously list, edit and delete every webhook in that group. It can now reach only the ones it
+created. **Every pre-migration webhook has `owner_key_id = NULL` and is therefore Master-only until
+reassigned.**
+
+```sql
+-- Every webhook that no non-master key can reach any more. Each needs an owner assigned, or is
+-- deliberately left master-only.
+SELECT w.id, w.name, w.target_url, g.name AS group_name
+FROM webhook_configs w
+JOIN ip_groups g ON g.id = w.group_id
+WHERE w.owner_key_id IS NULL;
+```
+
+*Remedy, per webhook:* `PUT /api/webhooks/{id}/owner` with `{"owner_key_id": "<key uuid>"}`, from the
+master. To find the likely intended owner, the audit log is a starting point and explicitly **not**
+authoritative — confirm before assigning, because assigning ownership grants the right to delete:
+
+```sql
+SELECT details, api_key_name, api_key_prefix, timestamp
+FROM audit_logs WHERE action = 'WEBHOOK_CREATE' ORDER BY timestamp DESC;
+```
+
+Groups are unaffected in the narrowing direction: `delete_ip_group` was master-only and unowned groups
+stay master-only, so this phase only *adds* the owner as a second holder.
+
+### Tests
+
+Four new tests in `tests/rbac_integration_tests.rs`, rule-indexed ahead of Phase 5's suite:
+`r3_lineage_confers_no_authority_on_a_daughter_of_the_master`,
+`s3_group_deletion_is_restricted_to_master_and_the_owner`,
+`s3_only_a_master_may_reassign_ownership`,
+`s3_webhook_lifecycle_follows_its_owner_not_its_group`. The e2e suite gained 19 checks (446 → 465).
+
+The e2e's privileged-webhook block had to be restructured rather than patched: it created the webhook
+as the *master* and then asserted a delegated manager could rename but not repoint it. Under §4 a
+non-owner now gets `404` for everything and never reaches the privileged-field guard, so the manager
+is created first and creates the webhook itself. Owning it is the only position from which "may
+rename, may not repoint" is a distinction that can be observed at all. A second manager sharing the
+same group was added alongside, asserting the `404` that replaced group-scoped webhook visibility.
+
+### Mutation testing
+
+| Mutation | `cargo test` | Verdict |
+| :--- | :--- | :--- |
+| S3a — lifecycle guard checks *that* there is an owner, not *which* | 2 | caught |
+| S3b — webhook scoping reverts to group readability | 2 | caught |
+| S3c — ownership reassignment loses its master-only gate | 2 | caught |
+| R3a — `guard_group_manage` bypasses for any key with a parent | 0 → **2** | caught *after the test was rewritten* |
+| R3b — lineage confers lifecycle authority | **2** | caught |
+
+**R3a is the finding of this phase.** The first draft of the R3 test was a two-way differential — the
+master's child against an ordinary parent's child — and it did not fire, because the most likely
+mutation (`parent_key_id.is_some()`) elevates *both* children and they go on agreeing. Worse, the
+probes it used were all refused by the cheaper pre-gate before `guard_group_manage` ran at all, so the
+mutated line was never reached.
+
+The rewrite fixes both. It is a **three-way** differential — master's child, parent's child, and a key
+with no parent — so a guard keyed on "has any parent" breaks the equality. And each arm now holds
+`can_manage` on one group while the probes attack a *second* group where it holds only a plain row,
+which is what puts the decision in `guard_group_manage` instead of the pre-gate. Both R3 mutations
+fire against it.
+
+### Gap analysis items resolved
+
+| Requirement | Was | Now |
+| :--- | :--- | :--- |
+| R3 Parentage confers no privilege | NOT IMPLEMENTED | **COMPLIES** |
+| §3 Every managed entity carries `owner_key_id` | NOT IMPLEMENTED | **COMPLIES** |
+| §3 Lifecycle restricted to Master + owner | VIOLATES | **COMPLIES** (rename vacuous for groups: no endpoint) |
+| §3 Master may reassign `owner_key_id` | NOT IMPLEMENTED | **COMPLIES** |
+| §7 Indexes on lineage/ownership/hash/join keys | VIOLATES (partial) | **COMPLIES** |
+| §4 Webhooks visible only to creator + Master | VIOLATES | **partially** — update/delete now owner-scoped; `list_webhooks` is Phase 3 |
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **182 passed**, 0 failed |
+| `./scripts/test_e2e.sh` | **465/465** |
+| `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |

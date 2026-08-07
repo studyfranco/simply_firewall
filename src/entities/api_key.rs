@@ -62,6 +62,21 @@ pub struct Model {
     pub can_manage_webhooks: bool,
     /// Global privilege to create new IP groups.
     pub can_create_groups: bool,
+    /// The key that created this one, or `None` for the Master key and for every key that predates
+    /// the lineage column.
+    ///
+    /// **Confers no authority whatsoever.** `RBAC_MODEL.md` R3: "`parent_key_id` exists solely for
+    /// cascading deletion and visibility scoping. A daughter of the Master key is an ordinary
+    /// daughter key with no elevated standing. Rights are never derived from key lineage." No
+    /// permission guard reads this field, and a test asserts a daughter of Master holds no more than
+    /// any other daughter.
+    ///
+    /// No database-level foreign key backs it — SQLite has no `ALTER TABLE … ADD CONSTRAINT`, and the
+    /// data layer stays SQL-agnostic. `create_api_key` validates the reference on write and
+    /// `delete_api_key` clears it on removal; see the migration for why an application rule beats a
+    /// constraint that only exists on two of the three backends.
+    #[serde(default)]
+    pub parent_key_id: Option<Uuid>,
     /// Key generation timestamp.
     pub created_at: DateTime,
     /// Key last-update timestamp.

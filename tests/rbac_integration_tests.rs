@@ -120,6 +120,18 @@ fn signed_with(
     build_signed(builder, Some(signing_secret), body.into())
 }
 
+/// [`signed_with`] plus [`signed_later`]'s explicit clock offset — for a server-minted key that also
+/// needs to issue several requests inside one wall-clock second without tripping the replay guard.
+fn signed_later_with(
+    builder: axum::http::request::Builder,
+    signing_secret: &str,
+    offset_secs: i64,
+    body: impl Into<String>,
+) -> Request<Body> {
+    let timestamp = (chrono::Utc::now().timestamp() + offset_secs).to_string();
+    build_signed_at(builder, Some(signing_secret), timestamp, body.into())
+}
+
 /// Builds a request signed at an explicit `X-Timestamp`, for exercising the anti-replay window.
 ///
 /// The signature is computed over the same (possibly stale) timestamp that is sent, so these
@@ -220,6 +232,7 @@ async fn test_auth_and_cidr_rejection() {
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -259,6 +272,7 @@ async fn test_tenant_isolation_mn_rbac() {
         id: Set(group_a_id),
         name: Set("Group A".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }.insert(&db).await.unwrap();
@@ -278,6 +292,7 @@ async fn test_tenant_isolation_mn_rbac() {
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -341,6 +356,7 @@ async fn test_auto_provisioning_on_group_creation() {
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(true), // CAN CREATE GROUPS
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -536,6 +552,7 @@ async fn test_explicit_key_group_manipulation() {
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -556,6 +573,7 @@ async fn test_explicit_key_group_manipulation() {
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -612,6 +630,7 @@ async fn test_multi_group_and_temporal_filtering() {
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -635,6 +654,7 @@ async fn test_multi_group_and_temporal_filtering() {
         id: Set(old_group_id),
         name: Set("group-old".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -776,6 +796,7 @@ async fn test_webhook_hmac_signature_and_delivery() {
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -789,6 +810,7 @@ async fn test_webhook_hmac_signature_and_delivery() {
         id: Set(group_id),
         name: Set("hook-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -912,6 +934,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -925,6 +948,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
         id: Set(group_id),
         name: Set("event-filter-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -1026,6 +1050,7 @@ async fn test_reban_into_same_group_does_not_500() {
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -1094,6 +1119,7 @@ async fn test_create_webhook_rejects_invalid_url() {
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -1107,6 +1133,7 @@ async fn test_create_webhook_rejects_invalid_url() {
         id: Set(group_id),
         name: Set("webhook-validation-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -1164,6 +1191,7 @@ async fn insert_key(
         can_manage_keys: Set(can_manage_keys),
         can_manage_webhooks: Set(can_manage_webhooks),
         can_create_groups: Set(can_create_groups),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -1386,6 +1414,7 @@ async fn insert_key_with_bound_ips(db: &DatabaseConnection, name: &str, bound_ip
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -1671,6 +1700,7 @@ async fn test_webhook_dispatch_does_not_block_api_response() {
         id: Set(group_id),
         name: Set("slow-hook-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -2493,6 +2523,7 @@ async fn insert_group_row(db: &DatabaseConnection, name: &str) -> Uuid {
         id: Set(id),
         name: Set(name.to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -3588,6 +3619,7 @@ async fn test_key_without_signing_secret_cannot_authenticate() {
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -3810,6 +3842,7 @@ async fn setup_webhook_fixture(
         id: Set(group_id),
         name: Set(group_name.to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }
@@ -3964,6 +3997,7 @@ async fn test_auth_mode_is_validated_and_exposed_in_listings() {
         id: Set(group_id),
         name: Set("mode-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }.insert(&db).await.unwrap();
@@ -4048,6 +4082,7 @@ async fn test_auth_mode_preconditions_are_enforced_at_creation() {
         id: Set(group_id),
         name: Set("precondition-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }.insert(&db).await.unwrap();
@@ -4291,6 +4326,7 @@ async fn test_rotate_secret_swaps_only_the_signing_secret() {
         id: Set(group_id),
         name: Set("rotate-secret-group".to_owned()),
         group_type: Set("banlist".to_owned()),
+        owner_key_id: Set(None),
         description: Set(None),
         created_at: Set(chrono::Utc::now().naive_utc()),
     }.insert(&db).await.unwrap();
@@ -4384,6 +4420,7 @@ async fn test_rotate_secret_recovers_a_key_with_no_signing_secret() {
         can_manage_keys: Set(false),
         can_manage_webhooks: Set(false),
         can_create_groups: Set(false),
+        parent_key_id: Set(None),
         prefix: Set("dummy123".to_owned()),
         created_at: Set(chrono::Utc::now().naive_utc()),
         updated_at: Set(chrono::Utc::now().naive_utc()),
@@ -4469,4 +4506,444 @@ async fn test_rotate_secret_authorization_and_audit_trail() {
     // The secret itself must never reach the audit trail.
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(!text.contains("signing_secret"), "audit log leaked a signing secret field");
+}
+
+// ─────────────────────────────────────────────────────────────
+// RBAC_MODEL.md §3 — lineage, ownership and lifecycle authority
+// ─────────────────────────────────────────────────────────────
+
+/// **R3 — parentage confers no authority.** A daughter of the Master key is an ordinary daughter key.
+///
+/// `RBAC_MODEL.md` R3: "`parent_key_id` exists solely for cascading deletion and visibility scoping.
+/// A daughter of the Master key is an ordinary daughter key with no elevated standing. Rights are
+/// never derived from key lineage."
+///
+/// The failure this guards against is subtle and tempting: once lineage exists, "the master's own
+/// children are trusted" reads like common sense, and it would make `parent_key_id` a second,
+/// undeclared permission column.
+///
+/// # Why three keys and not two, and why they are set up so precisely
+///
+/// This is a **three-way differential**: a child of the Master, a child of an ordinary parent, and a
+/// key with no parent at all. Two arms would miss the most likely mutation — a guard keyed on
+/// `parent_key_id.is_some()` rather than on who the parent is — because both children would be
+/// elevated together and still agree.
+///
+/// All three then hold **identical** scopes and **identical** grants, so lineage is the only variable
+/// left. The grants are shaped so that every probe below is decided by `guard_group_manage` rather
+/// than by the cheaper pre-gate in front of it: each key manages `lineage-home` (satisfying "does
+/// this caller administer anything?") while holding only a plain row on `lineage-target`, which is
+/// what the probes attack. A lineage-sensitive branch anywhere in that path moves one arm and breaks
+/// the equality; without the two-group setup the pre-gate would refuse first and mask it — which it
+/// did, on the first draft of this test, and which mutation testing is how that was found.
+#[tokio::test]
+async fn r3_lineage_confers_no_authority_on_a_daughter_of_the_master() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (parent_id, parent_key) = insert_key(&db, "Ordinary parent", false, true, false, false).await;
+
+    // Two keys created through the API, so lineage is recorded by the handler rather than the fixture.
+    let create_via = |caller: String, name: &'static str, nth: i64| {
+        let app = app.clone();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("X-API-Key", &caller)
+                .header("Content-Type", "application/json")), nth, json!({ "name": name }).to_string());
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap();
+            (
+                Uuid::parse_str(body["id"].as_str().unwrap()).unwrap(),
+                body["plaintext_key"].as_str().unwrap().to_owned(),
+                body["signing_secret"].as_str().unwrap().to_owned(),
+            )
+        }
+    };
+
+    let (royal_id, royal_key, royal_secret) = create_via(master_key.clone(), "Master's child", 1).await;
+    let (commoner_id, commoner_key, commoner_secret) =
+        create_via(parent_key.clone(), "Parent's child", 2).await;
+    // The third arm: no parent at all, seeded directly.
+    let (orphan_id, orphan_plain) = insert_key(&db, "Orphan", false, false, false, false).await;
+    let orphan_secret = test_signing_secret(&orphan_plain);
+
+    // Precondition: the lineages really are three different things. Without this the test could pass
+    // because every key looks the same to begin with.
+    let lineage = |id: Uuid| {
+        let db = db.clone();
+        async move {
+            simply_ip_vault::entities::prelude::ApiKey::find_by_id(id)
+                .one(&db).await.unwrap().unwrap().parent_key_id
+        }
+    };
+    assert_eq!(lineage(royal_id).await, Some(master_id), "the master's child records the master");
+    assert_eq!(lineage(commoner_id).await, Some(parent_id), "the parent's child records the parent");
+    assert_eq!(lineage(orphan_id).await, None, "the seeded key records no parent");
+
+    // Identical scopes across all three, applied directly so the differential is exact — R4 would not
+    // let the ordinary parent grant `can_manage_keys` through the API, and an arm that differed in
+    // scope would prove nothing about lineage.
+    for id in [royal_id, commoner_id, orphan_id] {
+        let mut active: simply_ip_vault::entities::api_key::ActiveModel =
+            simply_ip_vault::entities::prelude::ApiKey::find_by_id(id)
+                .one(&db).await.unwrap().unwrap().into();
+        active.can_manage_keys = Set(true);
+        active.update(&db).await.unwrap();
+    }
+
+    // Identical grants: `can_manage` on one group, a plain row on the group the probes attack. The
+    // first satisfies the pre-gate; the second is what `guard_group_manage` must refuse.
+    let home = insert_group_row(&db, "lineage-home").await;
+    let target = insert_group_row(&db, "lineage-target").await;
+    for id in [royal_id, commoner_id, orphan_id] {
+        grant_perm(&db, id, home, true, true, true, true).await;
+        grant_perm(&db, id, target, true, true, true, false).await;
+    }
+
+    let (victim_id, _victim_key) = insert_key(&db, "Victim", false, false, false, false).await;
+    grant_perm(&db, victim_id, target, true, false, false, false).await;
+
+    let probe = |plaintext: String, secret: String, nth: i64| {
+        let app = app.clone();
+        async move {
+            let mut statuses = Vec::new();
+
+            // 1. Grant on `lineage-target`, where the caller holds a row but not `can_manage`. R2
+            //    refuses; lineage must not supply the missing half.
+            let req = signed_later_with(inject_connect_info(Request::builder()
+                .method("POST")
+                .uri(format!("/api/keys/{victim_id}/permissions"))
+                .header("X-API-Key", &plaintext)
+                .header("Content-Type", "application/json")), &secret, nth, json!({
+                    "group_name": "lineage-target", "can_read": true, "can_write": true, "can_delete": false
+                }).to_string());
+            statuses.push(app.clone().oneshot(req).await.unwrap().status());
+
+            // 2. Revoke on the same group, same reasoning.
+            let req = signed_later_with(inject_connect_info(Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/keys/{victim_id}/permissions/lineage-target"))
+                .header("X-API-Key", &plaintext)), &secret, nth + 1, "");
+            statuses.push(app.clone().oneshot(req).await.unwrap().status());
+
+            // 3. The audit log — master-only, and descent from the master is not mastery.
+            let req = signed_later_with(inject_connect_info(Request::builder()
+                .uri("/api/audit-logs")
+                .header("X-API-Key", &plaintext)), &secret, nth + 2, "");
+            statuses.push(app.clone().oneshot(req).await.unwrap().status());
+
+            // 4. Deleting an unowned group — §3 lifecycle authority, which lineage also must not supply.
+            let req = signed_later_with(inject_connect_info(Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/groups/{target}"))
+                .header("X-API-Key", &plaintext)), &secret, nth + 3, "");
+            statuses.push(app.clone().oneshot(req).await.unwrap().status());
+
+            statuses
+        }
+    };
+
+    let royal_answers = probe(royal_key, royal_secret, 10).await;
+    let commoner_answers = probe(commoner_key, commoner_secret, 20).await;
+    let orphan_answers = probe(orphan_plain, orphan_secret, 30).await;
+
+    assert_eq!(
+        royal_answers, commoner_answers,
+        "descent from the master must change nothing: royal={royal_answers:?} commoner={commoner_answers:?}"
+    );
+    assert_eq!(
+        royal_answers, orphan_answers,
+        "having a parent at all must change nothing: royal={royal_answers:?} orphan={orphan_answers:?}"
+    );
+    assert!(
+        royal_answers.iter().all(|s| *s == StatusCode::FORBIDDEN),
+        "and the shared answer must be refusal, not three matching successes: {royal_answers:?}"
+    );
+
+    // The victim's row survived, so those were refusals and not silent no-ops.
+    assert!(
+        simply_ip_vault::entities::api_key_group_permission::Entity::find()
+            .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(victim_id))
+            .one(&db).await.unwrap().is_some()
+    );
+}
+
+/// **§3 — lifecycle authority belongs to Master and the owner, and to nobody else.**
+///
+/// The clause under test is the second sentence: "Holding manage rights or any operational verb
+/// confers no lifecycle authority: a parent that merely uses a resource must not be able to delete
+/// it." So the caller refused below is not a bystander — it is the most privileged non-owner the
+/// model allows: `can_manage_keys` globally, and `can_read`/`can_write`/`can_delete`/`can_manage` on
+/// the group itself. Every verb, and still no authority over the group's existence.
+#[tokio::test]
+async fn s3_group_deletion_is_restricted_to_master_and_the_owner() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (owner_id, owner_key) = insert_key(&db, "Owner", false, false, false, true).await;
+    let (user_id, user_key) = insert_key(&db, "Privileged user", false, true, false, false).await;
+
+    // The owner creates the group through the API, so ownership is recorded by the handler.
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/groups")
+        .header("X-API-Key", &owner_key)
+        .header("Content-Type", "application/json")), json!({ "name": "owned-group" }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let group_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let stored = simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+        .one(&db).await.unwrap().unwrap();
+    assert_eq!(stored.owner_key_id, Some(owner_id), "the creator is recorded as the owner");
+
+    // Every verb the model can give a non-owner.
+    grant_perm(&db, user_id, group_id, true, true, true, true).await;
+
+    // Fixture keys derive their signing secret from their plaintext, so `signed_later` finds it from
+    // the header — no explicit secret needed for any caller here.
+    let delete_as = |plaintext: String, nth: i64| {
+        let app = app.clone();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/groups/{group_id}"))
+                .header("X-API-Key", &plaintext)), nth, "");
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    assert_eq!(
+        delete_as(user_key, 1).await,
+        StatusCode::FORBIDDEN,
+        "read+write+delete+can_manage on a group confers no authority over the group itself"
+    );
+    assert!(
+        simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+            .one(&db).await.unwrap().is_some(),
+        "the refusal blocked the delete rather than reporting one"
+    );
+
+    // The owner may. This is the half that changed: deletion used to be master-only.
+    assert_eq!(
+        delete_as(owner_key, 2).await,
+        StatusCode::NO_CONTENT,
+        "the owner may delete its own group"
+    );
+
+    // And a master may delete a group it does not own.
+    let unowned = insert_group_row(&db, "unowned-group").await;
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/groups/{unowned}"))
+        .header("X-API-Key", &master_key)), 3, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
+}
+
+/// **§3 — "Master may reassign `owner_key_id` on any resource or dispatch target at any time."**
+///
+/// Also the recovery path for the `NULL` backfill: every group and webhook that predates the
+/// ownership column arrives unowned, which reads as master-only, and this is how it stops being so.
+/// Reassignment is master-only and *not* delegable to the current owner — ownership is the authority
+/// to destroy the resource, and a transferable owner flag would let a tenant pass that on without the
+/// master who granted it ever seeing the transfer.
+#[tokio::test]
+async fn s3_only_a_master_may_reassign_ownership() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (alice_id, alice_key) = insert_key(&db, "Alice", false, true, true, true).await;
+    let (bob_id, bob_key) = insert_key(&db, "Bob", false, true, true, true).await;
+
+    // An unowned group, exactly as the backfill leaves every pre-migration row.
+    let group_id = insert_group_row(&db, "legacy-group").await;
+    assert_eq!(
+        simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+            .one(&db).await.unwrap().unwrap().owner_key_id,
+        None,
+        "precondition: unowned, as the backfill leaves it"
+    );
+
+    let reassign_as = |plaintext: String, to: Option<Uuid>, nth: i64| {
+        let app = app.clone();
+        async move {
+            let body = json!({ "owner_key_id": to });
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("PUT")
+                .uri(format!("/api/groups/{group_id}/owner"))
+                .header("X-API-Key", &plaintext)
+                .header("Content-Type", "application/json")), nth, body.to_string());
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    // A non-master cannot claim an unowned resource for itself.
+    assert_eq!(
+        reassign_as(alice_key.clone(), Some(alice_id), 1).await,
+        StatusCode::FORBIDDEN,
+        "an unowned resource cannot be claimed by whoever asks first"
+    );
+
+    // The master assigns it.
+    assert_eq!(
+        reassign_as(master_key.clone(), Some(alice_id), 2).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+            .one(&db).await.unwrap().unwrap().owner_key_id,
+        Some(alice_id)
+    );
+
+    // Alice now owns it — and still cannot pass it on. Ownership is granted, never traded.
+    assert_eq!(
+        reassign_as(alice_key, Some(bob_id), 3).await,
+        StatusCode::FORBIDDEN,
+        "the owner may not transfer ownership; only a master reassigns"
+    );
+
+    // Nor may Bob take it.
+    assert_eq!(
+        reassign_as(bob_key, Some(bob_id), 4).await,
+        StatusCode::FORBIDDEN
+    );
+
+    // The master can clear it back to unowned, which is master-only authority again.
+    assert_eq!(
+        reassign_as(master_key.clone(), None, 5).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        simply_ip_vault::entities::prelude::IpGroup::find_by_id(group_id)
+            .one(&db).await.unwrap().unwrap().owner_key_id,
+        None
+    );
+
+    // The master key itself is refused as an owner: ownership is a tenancy relationship, and `NULL`
+    // already means "master only". Two spellings of the same state invite guards that check one.
+    let master_row = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::IsMaster.eq(true))
+        .one(&db).await.unwrap().unwrap();
+    assert_eq!(
+        reassign_as(master_key.clone(), Some(master_row.id), 6).await,
+        StatusCode::BAD_REQUEST,
+        "the master cannot be recorded as an owner"
+    );
+
+    // A nonexistent key is refused rather than written as a dangling reference — the check that
+    // stands in for the foreign key SQLite will not let this schema declare.
+    assert_eq!(
+        reassign_as(master_key.clone(), Some(Uuid::new_v4()), 7).await,
+        StatusCode::BAD_REQUEST,
+        "a dangling owner_key_id must not be writable"
+    );
+}
+
+/// **§3/§4 — a webhook belongs to its creator, and lifecycle follows ownership rather than the group.**
+///
+/// Before this, `update_webhook` and `delete_webhook` scoped by *group readability*: any
+/// `can_manage_webhooks` holder with `can_read` on a group could edit or delete another tenant's
+/// integration in it. That is the shared-resource rule §4 explicitly forbids applying to a dispatch
+/// target — "visible exclusively to their creator and Master … never exposed by the shared-resource
+/// rule".
+#[tokio::test]
+async fn s3_webhook_lifecycle_follows_its_owner_not_its_group() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (owner_id, owner_key) = insert_key(&db, "Webhook owner", false, false, true, false).await;
+    let (peer_id, peer_key) = insert_key(&db, "Group peer", false, false, true, false).await;
+
+    // Both keys can read the same group. Under the old rule that alone made the webhook theirs.
+    let group_id = insert_group_row(&db, "shared-webhook-group").await;
+    grant_perm(&db, owner_id, group_id, true, true, true, false).await;
+    grant_perm(&db, peer_id, group_id, true, true, true, false).await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &owner_key)
+        .header("Content-Type", "application/json")), json!({
+            "name": "owned-hook",
+            "target_url": "https://example.com/hook",
+            "secret_token": "s3cr3t",
+            "payload_template": "{}",
+            "group_id": group_id.to_string()
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let webhook_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    assert_eq!(
+        simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(webhook_id)
+            .one(&db).await.unwrap().unwrap().owner_key_id,
+        Some(owner_id),
+        "the creator is recorded as the owner"
+    );
+
+    // The peer shares the group and holds `can_manage_webhooks`. It gets a `404`, not a `403`: a
+    // dispatch target outside the caller's scope must be indistinguishable from one that never
+    // existed.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/webhooks/{webhook_id}"))
+        .header("X-API-Key", &peer_key)), 1, "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NOT_FOUND,
+        "sharing the group is not owning the webhook"
+    );
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("PUT")
+        .uri(format!("/api/webhooks/{webhook_id}"))
+        .header("X-API-Key", &peer_key)
+        .header("Content-Type", "application/json")), 2, json!({ "name": "hijacked" }).to_string());
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NOT_FOUND,
+        "nor may it rename one"
+    );
+
+    assert!(
+        simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(webhook_id)
+            .one(&db).await.unwrap().is_some(),
+        "the webhook survived both refusals"
+    );
+
+    // The owner may, and so may a master.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("PUT")
+        .uri(format!("/api/webhooks/{webhook_id}"))
+        .header("X-API-Key", &owner_key)
+        .header("Content-Type", "application/json")), 3, json!({ "name": "renamed-by-owner" }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("DELETE")
+        .uri(format!("/api/webhooks/{webhook_id}"))
+        .header("X-API-Key", &master_key)), 4, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 }

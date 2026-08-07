@@ -127,6 +127,84 @@ async fn caller_group_permission(
         .map_err(AppError::DbError)
 }
 
+/// The `owner_key_id` to record when `creator` creates a resource.
+///
+/// `None` for a master, matching what `create_ip_group` already did for permission rows: a master is
+/// not a tenant, it is the system, and pinning its id into `owner_key_id` would make an
+/// administrative action look like a claim of ownership. A master-created resource is unowned until
+/// someone is deliberately assigned, and [`guard_resource_lifecycle`] reads unowned as "Master only",
+/// which is exactly the authority a master already had.
+fn resource_owner(creator: &api_key::Model) -> Option<Uuid> {
+    (!creator.is_master).then_some(creator.id)
+}
+
+/// **§3 — lifecycle authority.** Deleting or renaming a resource is restricted to the Master and the
+/// designated `owner_key_id`, and to nobody else.
+///
+/// `RBAC_MODEL.md` §3: "Resource lifecycle actions — deleting or renaming the entity itself — are
+/// restricted exclusively to Master and the designated `owner_key_id`. Holding manage rights or any
+/// operational verb confers no lifecycle authority: a parent that merely uses a resource must not be
+/// able to delete it."
+///
+/// That last clause is the whole point, and it is why this is a separate guard rather than another
+/// branch inside [`guard_group_manage`]. `can_manage` is authority over a resource's **permission
+/// rows** — who may read and write its contents. Lifecycle authority is over the resource's
+/// **existence**. Conflating them means the key you trusted to hand out read access can also delete
+/// the thing everyone was reading, and no combination of operational verbs adds up to that.
+///
+/// # An unowned resource is Master-only
+///
+/// `owner_key_id` is `NULL` on every row that predates the column, and on everything a master
+/// creates. There is no owner to admit, so only the master passes — which withholds authority rather
+/// than inventing it, and is recoverable in one call to the owner-reassignment endpoint.
+fn guard_resource_lifecycle(
+    caller: &api_key::Model,
+    owner_key_id: Option<Uuid>,
+    resource: &str,
+    action: &str,
+) -> Result<(), AppError> {
+    if caller.is_master || owner_key_id.is_some_and(|owner| owner == caller.id) {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden(format!(
+        "Permission denied: only the master key or this {resource}'s owner may {action} it. \
+         Managing its permissions or holding read/write/delete on its contents confers no authority \
+         over the {resource} itself."
+    )))
+}
+
+/// Validates an `owner_key_id` a caller asked to assign, and returns it ready to store.
+///
+/// No database-level foreign key backs these columns (SQLite has no `ALTER TABLE … ADD CONSTRAINT`;
+/// see the migration), so the reference is checked here instead — this is the only path by which one
+/// can be introduced. A master key is refused as an owner for the same reason
+/// [`resource_owner`] never records one: ownership is a tenancy relationship, and the master is not a
+/// tenant. `None` clears ownership, returning the resource to Master-only.
+async fn resolve_owner_assignment(
+    db: &sea_orm::DatabaseConnection,
+    requested: Option<Uuid>,
+) -> Result<Option<Uuid>, AppError> {
+    let Some(owner_id) = requested else {
+        return Ok(None);
+    };
+
+    let owner = ApiKey::find_by_id(owner_id)
+        .one(db)
+        .await?
+        .ok_or_else(|| AppError::InvalidInput("No such key to assign ownership to".to_owned()))?;
+
+    if owner.is_master {
+        return Err(AppError::InvalidInput(
+            "The master key cannot be a resource owner; leave owner_key_id null instead, which \
+             already means master-only"
+                .to_owned(),
+        ));
+    }
+
+    Ok(Some(owner_id))
+}
+
 /// **R2 — management of a resource is a conjunction.** The single authority test for touching *any*
 /// key's permissions on one group, in either direction.
 ///
@@ -499,16 +577,22 @@ async fn create_audit_log(
 /// uses `on_conflict(...).do_nothing()` for the insert and always re-reads by name afterwards, so
 /// either outcome (we created it, or a concurrent request beat us to it) converges on the same
 /// canonical row.
+///
+/// `owner` becomes the group's `owner_key_id` when this call is the one that creates it, per §3.
+/// When a concurrent request wins the race the existing row's owner is left alone — ownership belongs
+/// to whoever actually created the resource, and the loser of a race did not.
 async fn get_or_create_group(
     db: &sea_orm::DatabaseConnection,
     name: &str,
     default_group_type: &str,
+    owner: Option<Uuid>,
 ) -> Result<ip_group::Model, AppError> {
     let new_group = ip_group::ActiveModel {
         id: Set(Uuid::new_v4()),
         name: Set(name.to_owned()),
         group_type: Set(default_group_type.to_owned()),
         description: Set(None),
+        owner_key_id: Set(owner),
         created_at: Set(Utc::now().naive_utc()),
     };
     ip_group::Entity::insert(new_group)
@@ -715,7 +799,7 @@ async fn handle_ip_upsert(
         }
 
         let default_type = if is_whitelist { "whitelist" } else { "banlist" };
-        let group = get_or_create_group(&state.db, group_name, default_type).await?;
+        let group = get_or_create_group(&state.db, group_name, default_type, resource_owner(&key)).await?;
         target_group_id = group.id;
         resolved_group_name = group.name;
 
@@ -1711,6 +1795,9 @@ pub async fn create_api_key(
         // above. `master_marker` stays `NULL` so this row does not contend for the unique index.
         is_master: Set(false),
         master_marker: Set(None),
+        // R3: recorded for cascade deletion and visibility scoping, and read by no permission guard.
+        // A daughter of the Master is an ordinary daughter key.
+        parent_key_id: Set(Some(key.id)),
         can_manage_keys: Set(payload.can_manage_keys.unwrap_or(false)),
         can_manage_webhooks: Set(payload.can_manage_webhooks.unwrap_or(false)),
         can_create_groups: Set(payload.can_create_groups.unwrap_or(false)),
@@ -1840,6 +1927,31 @@ pub async fn delete_api_key(
     // database access instead.
     guard_master_immutable(&target, "deleted")?;
     let target_ref = format_key_reference(&target.name, id);
+
+    // The application-level `ON DELETE SET NULL` the schema cannot declare (SQLite has no
+    // `ALTER TABLE … ADD CONSTRAINT`; see the lineage migration). Run *before* the delete so a
+    // failure here leaves the key — and therefore every reference to it — intact.
+    //
+    // Deliberately not a cascade in either direction. §6: "Data is never destroyed implicitly. IP
+    // Groups, Hooks, IP Records, Webhook Configs, and Executors must never disappear as a side effect
+    // of removing a key." Daughters likewise survive, losing only their recorded lineage — which
+    // carries no authority (R3), so nothing is escalated by the loss. Phase 4 replaces this with §6's
+    // pre-flight inventory, which refuses the deletion outright rather than orphaning anything.
+    api_key::Entity::update_many()
+        .col_expr(api_key::Column::ParentKeyId, sea_orm::sea_query::Expr::value(Option::<Uuid>::None))
+        .filter(api_key::Column::ParentKeyId.eq(id))
+        .exec(&state.db)
+        .await?;
+    ip_group::Entity::update_many()
+        .col_expr(ip_group::Column::OwnerKeyId, sea_orm::sea_query::Expr::value(Option::<Uuid>::None))
+        .filter(ip_group::Column::OwnerKeyId.eq(id))
+        .exec(&state.db)
+        .await?;
+    webhook_config::Entity::update_many()
+        .col_expr(webhook_config::Column::OwnerKeyId, sea_orm::sea_query::Expr::value(Option::<Uuid>::None))
+        .filter(webhook_config::Column::OwnerKeyId.eq(id))
+        .exec(&state.db)
+        .await?;
 
     let result = ApiKey::delete_by_id(id).exec(&state.db).await?;
     if result.rows_affected == 0 {
@@ -2128,7 +2240,7 @@ pub async fn update_key_group_permissions(
             return Err(AppError::Forbidden("Permission denied: Target group does not exist and you cannot create groups".to_owned()));
         }
 
-        let group = get_or_create_group(&state.db, group_name, "banlist").await?;
+        let group = get_or_create_group(&state.db, group_name, "banlist", resource_owner(&key)).await?;
         target_group_id = group.id;
         resolved_group_name = group.name;
     } else {
@@ -2326,6 +2438,7 @@ pub async fn create_ip_group(
         name: Set(payload.name.clone()),
         group_type: Set(group_type.to_owned()),
         description: Set(None),
+        owner_key_id: Set(resource_owner(&key)),
         created_at: Set(now),
     };
     if let Err(err) = ip_group::Entity::insert(model).exec(&state.db).await {
@@ -2386,16 +2499,22 @@ pub async fn list_ip_groups(
     Ok(Json(groups))
 }
 
-/// Handles DELETE /api/v1/groups/:id
+/// Handles DELETE /api/v1/groups/:id — a **lifecycle** action, restricted by §3 to the Master and the
+/// group's `owner_key_id`.
+///
+/// Previously master-only, which satisfied "not just anyone" without expressing why. §3 names the
+/// owner as the second holder of this authority, and names what does *not* confer it: neither
+/// `can_manage` on the group's permission rows nor any read/write/delete verb over its contents. A
+/// group with no owner recorded — every pre-migration row, and everything a master creates — stays
+/// master-only, which is exactly the authority that existed before.
 pub async fn delete_ip_group(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !key.is_master {
-        return Err(AppError::Forbidden("Only the master key can strictly drop entire groups".to_owned()));
-    }
+    let group = IpGroup::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    guard_resource_lifecycle(&key, group.owner_key_id, "group", "delete")?;
 
     let result = IpGroup::delete_by_id(id).exec(&state.db).await?;
     if result.rows_affected == 0 {
@@ -2405,6 +2524,101 @@ pub async fn delete_ip_group(
     create_audit_log(&state.db, Some(&key), Some(client_ip.0), "GROUP_DELETE", None, None, Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Payload for reassigning a resource's owner. `owner_key_id: null` clears ownership, returning the
+/// resource to Master-only lifecycle authority.
+#[derive(Deserialize)]
+pub struct ReassignOwnerPayload {
+    /// The key to make the new owner, or `null` to leave the resource unowned.
+    pub owner_key_id: Option<Uuid>,
+}
+
+/// Handles PUT /api/v1/groups/:id/owner — **§3: "Master may reassign `owner_key_id` on any resource
+/// or dispatch target at any time."**
+///
+/// Master-only, and deliberately not delegable even to the current owner. Ownership is the authority
+/// to destroy the resource, so a transferable owner flag would let a tenant hand that authority
+/// onward without the master who granted it ever seeing the transfer — the same amplification R1
+/// forbids for permission verbs, one level up. It is also the sole recovery path for the `NULL`
+/// backfill: every pre-migration resource arrives here to be assigned an owner.
+pub async fn reassign_group_owner(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<ReassignOwnerPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master {
+        return Err(AppError::Forbidden(
+            "Only the master key can reassign resource ownership".to_owned(),
+        ));
+    }
+
+    let group = IpGroup::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let owner = resolve_owner_assignment(&state.db, payload.owner_key_id).await?;
+
+    let group_name = group.name.clone();
+    let mut active: ip_group::ActiveModel = group.into();
+    active.owner_key_id = Set(owner);
+    active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        Some(&key),
+        Some(client_ip.0),
+        "GROUP_OWNER_REASSIGN",
+        None,
+        Some(group_name),
+        Some(match owner {
+            Some(owner_id) => format!("Owner set to {owner_id}"),
+            None => "Owner cleared (master-only)".to_owned(),
+        }),
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({ "id": id, "owner_key_id": owner })))
+}
+
+/// Handles PUT /api/v1/webhooks/:id/owner — the dispatch-target counterpart to
+/// [`reassign_group_owner`], and the only way a pre-migration webhook becomes visible to anyone but
+/// the master again.
+pub async fn reassign_webhook_owner(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    Path(id): Path<Uuid>,
+    Json(payload): Json<ReassignOwnerPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master {
+        return Err(AppError::Forbidden(
+            "Only the master key can reassign resource ownership".to_owned(),
+        ));
+    }
+
+    let webhook = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let owner = resolve_owner_assignment(&state.db, payload.owner_key_id).await?;
+
+    let webhook_name = webhook.name.clone();
+    let mut active: webhook_config::ActiveModel = webhook.into();
+    active.owner_key_id = Set(owner);
+    active.update(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        Some(&key),
+        Some(client_ip.0),
+        "WEBHOOK_OWNER_REASSIGN",
+        None,
+        None,
+        Some(match owner {
+            Some(owner_id) => format!("Owner of '{webhook_name}' set to {owner_id}"),
+            None => format!("Owner of '{webhook_name}' cleared (master-only)"),
+        }),
+    )
+    .await?;
+
+    Ok(Json(serde_json::json!({ "id": id, "owner_key_id": owner })))
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2545,6 +2759,9 @@ pub async fn create_webhook(
         headers_json: Set(payload.headers_json.clone()),
         payload_template: Set(payload.payload_template.clone()),
         group_id: Set(payload.group_id),
+        // §4 makes a webhook creator-private. This column is the "creator" half; without it the only
+        // scoping available was the group's, which is the shared-resource rule §4 forbids here.
+        owner_key_id: Set(resource_owner(&key)),
         is_active: Set(payload.is_active.unwrap_or(true)),
         events: Set(payload.events.clone()),
         created_at: Set(now),
@@ -2694,13 +2911,15 @@ pub async fn update_webhook(
 
     let target = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
 
-    // Same scoping as create/delete: a webhook the caller cannot see is a webhook it cannot edit.
-    // `404` keeps the two indistinguishable from outside.
-    if !key.is_master {
-        let perm = caller_group_permission(&state.db, key.id, target.group_id).await?;
-        if !perm.is_some_and(|p| p.can_read) {
-            return Err(AppError::NotFound);
-        }
+    // Same scoping as create/delete, and for the same §4 reason: a dispatch target is visible to its
+    // creator and Master and to nobody else, so a webhook the caller does not own is one it cannot
+    // edit. `404` keeps "not yours" and "does not exist" indistinguishable from outside.
+    //
+    // This endpoint renames webhooks, which §3 names as a lifecycle action — but the ownership test
+    // is the same test either way, so it is applied once here rather than split into "you may repoint
+    // it but not rename it", which would be a distinction with no holder.
+    if !key.is_master && target.owner_key_id != Some(key.id) {
+        return Err(AppError::NotFound);
     }
 
     if let Some(url) = &payload.target_url {
@@ -2893,15 +3112,17 @@ pub async fn delete_webhook(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    // Read the row first so deletion can be scoped to the caller's groups, matching the constraint
-    // on creation. `404` rather than `403` for a group the caller cannot read: it never appeared in
-    // that caller's `GET /api/webhooks`, so the webhook's existence is not something to confirm.
+    // A webhook is a **dispatch target**: creator-private, and never reachable through the group it
+    // watches. Scoping deletion by group readability — what this did before — is the shared-resource
+    // rule §4 explicitly forbids applying to a dispatch target, and it meant any `can_manage_webhooks`
+    // holder with `can_read` on a group could delete another tenant's integration.
+    //
+    // `404` rather than `403` for a webhook the caller does not own: it never appeared in that
+    // caller's `GET /api/webhooks`, so its existence is not something to confirm. That is §4's oracle
+    // discipline, which Phase 3 extends to the rest of the surface.
     let target = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
-    if !key.is_master {
-        let perm = caller_group_permission(&state.db, key.id, target.group_id).await?;
-        if !perm.is_some_and(|p| p.can_read) {
-            return Err(AppError::NotFound);
-        }
+    if !key.is_master && target.owner_key_id != Some(key.id) {
+        return Err(AppError::NotFound);
     }
 
     let result = WebhookConfig::delete_by_id(id).exec(&state.db).await?;

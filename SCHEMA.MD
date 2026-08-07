@@ -61,6 +61,7 @@ Stores authentication tokens, global access rights, and CIDR network binding rul
 | `can_manage_keys` | `Boolean` | Default: `false` | Global privilege to create/edit/delete API keys. Grantable **only by the Master key** (`RBAC_MODEL.md` R4). Confers no authority over any group on its own — see the conjunction under `api_key_group_permissions` |
 | `can_manage_webhooks` | `Boolean` | Default: `false` | Global privilege to manage webhook configurations. Grantable **only by the Master key** — this service's spelling of the specification's `can_create_webhooks`, a resource-creation right, which §1 places at the same tier as `can_manage_keys` and R4 makes Master-only. Previously delegable, which made it freely amplifiable (a parent that did not hold it could hand it out) |
 | `can_create_groups` | `Boolean` | Default: `false` | Global privilege to create new IP groups. Grantable **only by the Master key** (R4) |
+| `parent_key_id` | `UUID` | Nullable, Indexed | The key that created this one. `NULL` for the Master and for every pre-migration row. **Confers no authority** — `RBAC_MODEL.md` R3: it "exists solely for cascading deletion and visibility scoping … Rights are never derived from key lineage." No permission guard reads it. No database-level FK (see the note below) |
 | `bound_ips` | `Text` | Nullable | Comma-separated CIDR ranges allowed to use this key (e.g. `127.0.0.1/32,::/0`) |
 | `created_at` | `DateTimeUtc` | Not Null | Key generation timestamp |
 | `updated_at` | `DateTimeUtc` | Not Null | Key last update timestamp |
@@ -113,6 +114,7 @@ Logical collections of IP rules (e.g. `fail2ban`, `sshd`, `vpn_whitelist`).
 | `name` | `String` | Not Null, Unique, Indexed | Group name used in API requests and UI |
 | `group_type` | `String` | Not Null, Default: `'banlist'` | Type of group: `'banlist'` or `'whitelist'` |
 | `description` | `Text` | Nullable | Optional detailed description of the group's purpose |
+| `owner_key_id` | `UUID` | Nullable, Indexed | The key holding **lifecycle authority** over this group (§3): deleting or renaming the group itself is restricted to the Master and this key. Holding `can_manage` on its permission rows, or any read/write/delete verb over its contents, confers none of it. `NULL` means unassigned, which reads as master-only; set on creation to the creating key (`NULL` when a master creates it), and reassignable by a master through `PUT /api/groups/{id}/owner` |
 | `created_at` | `DateTimeUtc` | Not Null | Group creation timestamp |
 
 ---
@@ -284,3 +286,35 @@ To ensure optimal query performance under high load, the following indexes are m
 7. `ip_records.deleted_at`: Indexed for the retention purge sweep.
 6. `api_key_group_permissions (api_key_id, group_id)`: Unique joint index for instant permission verification.
 7. `audit_logs.action` & `audit_logs.timestamp`: Fast lookup for audit logs filtering.
+---
+
+## 🔗 Lineage & Ownership Columns
+
+`api_keys.parent_key_id`, `ip_groups.owner_key_id` and `webhook_configs.owner_key_id` were added by
+`m20260807_000008_add_lineage_and_ownership` and share three properties worth stating once.
+
+**No database-level foreign key backs any of them.** Every other cross-table reference in this schema
+is declared inside its `CREATE TABLE`; these three were added by `ALTER TABLE`, and **SQLite has no
+`ALTER TABLE … ADD CONSTRAINT`**. The alternative would be a constraint that exists on PostgreSQL and
+MySQL and silently does not on the default development backend — where the entire test suite runs —
+which is worse than none, because it is the CI run that would have caught the violation. Referential
+integrity is enforced in `src/api.rs` instead: the referenced key is looked up before assignment, and
+`delete_api_key` nulls every reference to a key it removes.
+
+**Nothing cascades.** `RBAC_MODEL.md` §6: "Data is never destroyed implicitly … IP Groups, Hooks, IP
+Records, Webhook Configs, and Executors must never disappear as a side effect of removing a key."
+Deleting a key therefore orphans what it owned rather than taking it along. A `CASCADE` on
+`parent_key_id` would be worse still, deleting an entire subtree on any direct `DELETE` and bypassing
+§6's pre-flight inventory.
+
+**The backfill is `NULL` everywhere, deliberately.** Nothing in the pre-migration schema recorded who
+created a key, and `audit_logs` is not authoritative for ownership — it is prunable by retention, its
+`api_key_id` is `ON DELETE SET NULL`, and the auto-provisioning paths never logged consistently.
+Reconstructing ownership from a lossy trail would hand out the right to *delete a resource* based on
+whichever log row happened to survive. Unassigned withholds authority instead of inventing it, and a
+master assigns it deliberately.
+
+*Indexes added for §7:* `idx-api_keys-parent_key_id`, `idx-ip_groups-owner_key_id`,
+`idx-webhook_configs-owner_key_id`, `idx-akgp-group_id` (the permission join from the group side,
+which the existing `(api_key_id, group_id)` composite cannot serve), and `idx-api_keys-key_hash` (a
+restatement of the existing unique constraint under an explicit name).

@@ -2062,11 +2062,12 @@ fi
 # A webhook that carries an api_key is *privileged*: its dispatches authenticate as a real caller on
 # the receiving system (instance chaining), and that credential belongs to the remote system so
 # rotation cannot invalidate it. Repointing one is therefore master-only.
-api_call POST "/api/webhooks" "$MASTER_KEY" \
-    "{\"name\":\"privileged-hook\",\"target_url\":\"https://legitimate.example.com/hook\",\"secret_token\":\"s\",\"api_key\":\"downstream-credential\",\"payload_template\":\"{}\",\"group_id\":\"$HIJACK_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\"}"
-check "200" "create a privileged webhook that carries an api_key"
-PRIV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
-
+#
+# The manager is created FIRST and creates the privileged webhook itself, so it is the recorded
+# `owner_key_id`. That ordering matters as of RBAC_MODEL.md §3/§4: a webhook is a creator-private
+# dispatch target, so a non-owner now gets `404` for every operation on it and never reaches the
+# privileged-field guard at all. Owning it is what puts this caller inside the visibility scope, which
+# is the only position from which "may rename, may not repoint" is a distinction that can be observed.
 api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Webhook Manager","can_manage_webhooks":true}'
 check "200" "create a non-master webhook manager"
 WHM_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
@@ -2077,8 +2078,32 @@ api_call POST "/api/keys/$WHM_KEY_ID/permissions" "$MASTER_KEY" \
     "{\"group_id\":\"$HIJACK_GROUP_ID\",\"can_read\":true,\"can_write\":true,\"can_delete\":true}"
 check "200" "grant the webhook manager access to the hijack group"
 
+api_call POST "/api/webhooks" "$WHM_KEY" \
+    "{\"name\":\"privileged-hook\",\"target_url\":\"https://legitimate.example.com/hook\",\"secret_token\":\"s\",\"api_key\":\"downstream-credential\",\"payload_template\":\"{}\",\"group_id\":\"$HIJACK_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\"}"
+check "200" "create a privileged webhook that carries an api_key"
+PRIV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
 api_call PUT "/api/webhooks/$PRIV_HOOK_ID" "$WHM_KEY" '{"target_url":"https://attacker.example.net/collect"}'
 check "403" "a non-master cannot repoint a privileged (api_key-bearing) webhook"
+
+# A second webhook manager, sharing the same group, cannot see it at all — the §4 rule that replaced
+# group-scoped webhook visibility. `404`, not `403`: outside the scope is indistinguishable from
+# nonexistent.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Other Webhook Manager","can_manage_webhooks":true}'
+check "200" "create a second webhook manager in the same group"
+WHM2_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+WHM2_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$WHM2_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call POST "/api/keys/$WHM2_KEY_ID/permissions" "$MASTER_KEY" \
+    "{\"group_id\":\"$HIJACK_GROUP_ID\",\"can_read\":true,\"can_write\":true,\"can_delete\":true}"
+check "200" "grant it the same group access as the owner"
+
+api_call PUT "/api/webhooks/$PRIV_HOOK_ID" "$WHM2_KEY" '{"name":"stolen"}'
+check "404" "#3 sharing the group is not owning the webhook — a dispatch target is creator-private"
+
+api_call DELETE "/api/webhooks/$PRIV_HOOK_ID" "$WHM2_KEY"
+check "404" "#3 nor may a group peer delete it"
 
 api_call PUT "/api/webhooks/$PRIV_HOOK_ID" "$WHM_KEY" '{"hmac_template":"{method}\\n{path}\\n{timestamp}\\n{body}\\nx"}'
 check "403" "a non-master cannot rewrite a privileged webhook's hmac_template"
@@ -2560,6 +2585,73 @@ check "200" "#27 both halves together grant"
 
 api_call DELETE "/api/keys/$CONJ_VICTIM_ID/permissions/conjunction-group" "$CONJ_SCOPED_KEY"
 check "204" "#27 both halves together revoke"
+
+# --- 27c-quater. §3 lifecycle authority: Master and owner, and nobody else -------------------
+#
+# RBAC_MODEL.md §3: "Resource lifecycle actions — deleting or renaming the entity itself — are
+# restricted exclusively to Master and the designated owner_key_id. Holding manage rights or any
+# operational verb confers no lifecycle authority: a parent that merely uses a resource must not be
+# able to delete it."
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Group Owner","can_create_groups":true}'
+check "200" "#3 create a key that will own a group"
+OWNER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+OWNER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$OWNER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call POST "/api/groups" "$OWNER_KEY" '{"name":"owned-lifecycle-group"}'
+check "200" "#3 the owner creates its group"
+OWNED_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# The most privileged non-owner the model allows: can_manage_keys globally, and every verb including
+# can_manage on the group itself.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Privileged Non-Owner","can_manage_keys":true}'
+check "200" "#3 create a fully-privileged non-owner"
+NONOWNER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+NONOWNER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$NONOWNER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call POST "/api/keys/$NONOWNER_ID/permissions" "$MASTER_KEY" \
+    "{\"group_id\":\"$OWNED_GROUP_ID\",\"can_read\":true,\"can_write\":true,\"can_delete\":true,\"can_manage\":true}"
+check "200" "#3 give the non-owner every verb the model has, can_manage included"
+
+api_call DELETE "/api/groups/$OWNED_GROUP_ID" "$NONOWNER_KEY"
+check "403" "#3 every verb on a group confers no authority over the group itself"
+
+api_call GET "/api/groups" "$MASTER_KEY"
+check_true '[.[] | select(.name == "owned-lifecycle-group")] | length == 1' \
+    "#3 the refusal blocked the delete rather than reporting one"
+
+# Ownership reassignment is master-only, and not delegable to the current owner.
+api_call PUT "/api/groups/$OWNED_GROUP_ID/owner" "$OWNER_KEY" "{\"owner_key_id\":\"$NONOWNER_ID\"}"
+check "403" "#3 the owner may not hand ownership on; only a master reassigns"
+
+api_call PUT "/api/groups/$OWNED_GROUP_ID/owner" "$MASTER_KEY" "{\"owner_key_id\":\"$NONOWNER_ID\"}"
+check "200" "#3 a master reassigns ownership"
+
+api_call DELETE "/api/groups/$OWNED_GROUP_ID" "$OWNER_KEY"
+check "403" "#3 the previous owner lost lifecycle authority with the reassignment"
+
+api_call DELETE "/api/groups/$OWNED_GROUP_ID" "$NONOWNER_KEY"
+check "204" "#3 and the new owner gained it"
+
+# A dangling or master owner_key_id is refused rather than written — the check standing in for the
+# foreign key SQLite will not let this schema declare.
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"owner-validation-group"}'
+check "200" "#3 create a group for the owner-validation checks"
+OWNERVAL_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call PUT "/api/groups/$OWNERVAL_GROUP_ID/owner" "$MASTER_KEY" '{"owner_key_id":"00000000-0000-0000-0000-000000000000"}'
+check "400" "#3 a nonexistent key cannot be recorded as an owner"
+
+api_call PUT "/api/groups/$OWNERVAL_GROUP_ID/owner" "$MASTER_KEY" "{\"owner_key_id\":\"$MASTER_ID\"}"
+check "400" "#3 nor can the master — null already means master-only"
+
+api_call PUT "/api/groups/$OWNERVAL_GROUP_ID/owner" "$MASTER_KEY" '{"owner_key_id":null}'
+check "200" "#3 clearing ownership returns the group to master-only"
+
+api_call DELETE "/api/groups/$OWNERVAL_GROUP_ID" "$MASTER_KEY"
+check "204" "#3 clean up the validation group"
 
 # --- 27d. Stored secrets are opened strictly, or not at all -----------------------------------
 #
