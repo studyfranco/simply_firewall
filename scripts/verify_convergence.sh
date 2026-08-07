@@ -231,6 +231,52 @@ check_spec_parity() {
     fi
 }
 check_spec_parity
+
+# Rule coverage: every rule and section in RBAC_MODEL.md must have at least one compliance test.
+#
+# Byte-identity proves the two services agree on *what the specification says*. It says nothing about
+# whether either of them enforces it. This check closes the other half locally: `tests/rbac_model_compliance.rs`
+# names every test after the rule it enforces (`r1_`…`r7_`, `s3_`…`s7_`), so a rule with no test is a
+# missing prefix and shows up here rather than in an incident.
+#
+# Deliberately shallow, and it says so: a test named `r2_…` proves a rule was thought about, not that
+# it is enforced. Mutation testing is what proves the second half, and its results live in
+# AGENT_NOTES.MD — a rule whose mutation does not fire is recorded there as untested rather than
+# counted as covered. This check is the tripwire for the case mutation testing cannot catch, which is
+# a rule nobody wrote a test for at all.
+check_rule_coverage() {
+    local suite="$PROJECT_ROOT/tests/rbac_model_compliance.rs"
+    local label="every RBAC_MODEL.md rule has a compliance test"
+
+    if [ ! -f "$suite" ]; then
+        echo "  ${RED}✗ MISSING${RESET} $label — $suite does not exist"
+        DRIFT_COUNT=$((DRIFT_COUNT + 1))
+        return
+    fi
+
+    # Only `fn` definitions count. A rule mentioned in a doc comment or an assertion message is not a
+    # test, and matching those would let prose satisfy the check.
+    local uncovered=""
+    local covered=0
+    for rule in r1 r2 r3 r4 r5 r6 r7 s3 s4 s5 s6 s7; do
+        if grep -qE "^\s*async fn ${rule}_|^\s*fn ${rule}_" "$suite"; then
+            covered=$((covered + 1))
+        else
+            uncovered="$uncovered $rule"
+        fi
+    done
+
+    if [ -n "$uncovered" ]; then
+        echo "  ${RED}✗ GAP${RESET}     $label — no test for:$uncovered"
+        echo "             add one to tests/rbac_model_compliance.rs named <rule>_<what it asserts>"
+        DRIFT_COUNT=$((DRIFT_COUNT + 1))
+        return
+    fi
+
+    echo "  ${GREEN}✓ MATCH${RESET}   $label ($covered/12 rules and sections)"
+    MATCH_COUNT=$((MATCH_COUNT + 1))
+}
+check_rule_coverage
 echo
 
 # ─────────────────────────────────────────────────────────────

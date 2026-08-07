@@ -5066,3 +5066,111 @@ vacuous here: §3's rename clause for groups, since no group-rename endpoint exi
 | `cargo test` | **190 passed**, 0 failed |
 | `./scripts/test_e2e.sh` | **490/490** |
 | `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |
+
+---
+
+## Session 36 — RBAC_MODEL Convergence, Phase 5: Compliance Suite & Mutation Validation
+
+The previous five phases enforced the specification. This one makes that enforcement **auditable** —
+first by name, then by mutation.
+
+### `tests/rbac_model_compliance.rs`
+
+Fourteen tests, every one named for the rule or section it enforces: `r1_`…`r7_`, `s3_`…`s7_`.
+Coverage against `RBAC_MODEL.md` is now a matter of reading test names.
+
+Deliberately self-contained, with its own harness, for the same reason `security_tests.rs` is: a
+refactor of the functional suites must not be able to silently weaken the suite that proves the model
+is enforced.
+
+`s7_the_schema_carries_the_required_constraints_and_indexes` is the odd one and worth a note. It
+queries `sqlite_master` directly rather than reading the migration source, because a migration edited
+after being applied — or one whose `create_index` silently no-ops — still reads correctly in the file.
+It also asserts the uniqueness constraint **behaviourally** (a second master insert must fail), since
+an index that exists but is not unique satisfies every name check.
+
+### Convergence gate: no rule without a test
+
+`scripts/verify_convergence.sh` gained a Pillar 0 check that greps the compliance suite for each of
+the twelve `r1_`…`s7_` prefixes and **fails if any is missing**. Only `fn` definitions count — a rule
+mentioned in a doc comment or an assertion message is not a test, and matching prose would let a
+comment satisfy the check.
+
+**Verified to fail, not merely to pass.** Renaming `r5_manage_propagates_sideways_without_creating_parents`
+to drop its prefix produced `✗ GAP … no test for: r5`, `1 unexplained`, and exit 1; restoring it
+returned exit 0. A gate that has never been shown to fail is not evidence of anything.
+
+The check is deliberately shallow and says so in its own comment: a test named `r2_…` proves a rule
+was thought about, not that it is enforced. It is the tripwire for the one case mutation testing
+cannot catch — a rule nobody wrote a test for at all.
+
+### Mutation testing: all twelve rules
+
+For each rule the enforcement was disabled in `src/`, the compliance suite run, and the change
+reverted. `own` counts failures in that rule's own test; `total` counts failures across the whole
+compliance suite (a mutation firing more broadly is expected — the rules compose).
+
+| Rule | Mutation applied | own | total | Verdict |
+| :--- | :--- | :--- | :--- | :--- |
+| **R1** | per-verb ceiling disabled in `guard_delegated_group_grant` | 1 | 3 | **fires** |
+| **R2** | conjunction weakened to a disjunction at *both* sites | 1 | 5 | **fires** |
+| **R3** | `guard_group_manage` bypasses for any key with a parent | 1 | 2 | **fires** |
+| **R4** | `can_manage_webhooks` no longer passed to `guard_scope_elevation` | 1 | 2 | **fires** |
+| **R5** | `can_manage` made non-delegable (`requested.can_manage` always over-grants) | 1 | 2 | **fires** |
+| **R6** | reductions routed through the grant path (endpoint parity broken) | 1 | 2 | **fires** |
+| **R7** | R1 layer removed while R2 kept | 1 | 3 | **fires** |
+| **§3** | lifecycle guard checks *that* there is an owner, not *which* | 1 | 2 | **fires** |
+| **§4** | `list_api_keys` returns every key in full | 1 | 2 | **fires** |
+| **§4** | out-of-scope key answers `403` instead of `404` | 1 | 2 | **fires** |
+| **§5** | `guard_no_master_flag` becomes a no-op | 1 | 2 | **fires** |
+| **§6** | pre-flight inventory never refuses | 1 | 2 | **fires** |
+| **§7** | master-marker index created non-unique | 1 | 3 | **fires** |
+
+**Twelve of twelve rules have a mutation that fires.** No rule is recorded as covered-by-name-only.
+
+### Two mutations that reported false negatives, and what they cost
+
+Both were errors in the *mutation*, not gaps in the tests, and both are recorded because the failure
+mode generalises.
+
+1. **R1, first attempt: operator precedence.** The mutation prefixed the guard expression with
+   `false && `, intending to disable it. `&&` binds tighter than `||`, so
+   `false && A || B || C` is `(false && A) || B || C` — only the first of four clauses was disabled,
+   and the test correctly still refused. Fixed by parenthesising the whole disjunction. The lesson:
+   a mutation must actually change behaviour, and "the test still passes" is the same observation
+   whether it did or not.
+2. **R4, first attempt: mutating a string, not a check.** The mutation renamed the third entry of
+   `MASTER_ONLY_SCOPES` — which is used **only in the error message**. The gate itself is positional,
+   iterating `requested.zip(held).zip(names)`, so the rename changed nothing enforceable. Fixed by
+   passing `None` for that slot at both call sites.
+
+Together with Phase 4's S6d (a mutation that did not compile, and produced no `FAILED` lines to
+count), these are three distinct ways for a mutation to report "not covered" while proving nothing.
+The runner now checks `cargo check` before reading a result, and each mutation was confirmed to change
+the behaviour it targets.
+
+### The honest ledger, carried forward
+
+Uncaught mutations from earlier phases stand as recorded, and none of them is a rule without a test:
+
+- **M1a / M1b (Phase 1)** — the two `can_manage_keys` conjunct sites mask each other; removing either
+  alone changes no request. M1c removes both and fires. Defence in depth, not absent coverage.
+- **M4 (Phase 1)** — the fail-closed branch in `guard_delegated_group_grant` is unreachable by
+  construction; no test can distinguish `Ok` from `Forbidden` there without first breaking the gate
+  above it, which is M1c/M2, both caught.
+
+### Final gap-analysis state
+
+All 28 requirements from the original analysis are closed, with one vacuous: §3's rename clause for
+groups, since no group-rename endpoint exists to restrict. Recorded here rather than counted as
+compliant.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **204 passed**, 0 failed |
+| `./scripts/test_e2e.sh` | **490/490** |
+| `./scripts/verify_convergence.sh` | 31 matching, 2 documented, 0 unexplained |
