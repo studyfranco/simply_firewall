@@ -4947,3 +4947,380 @@ async fn s3_webhook_lifecycle_follows_its_owner_not_its_group() {
         .header("X-API-Key", &master_key)), 4, "");
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 }
+
+// ─────────────────────────────────────────────────────────────
+// RBAC_MODEL.md §4 — visibility scopes and oracle discipline
+// ─────────────────────────────────────────────────────────────
+
+/// **§4 — the three visibility scopes, asserted in one listing.**
+///
+/// A parent sees its own subtree "in full, minus raw secrets", and sees a key that merely shares a
+/// resource it manages "in minimal form only: id, name, and that key's rights on that resource alone.
+/// Global flags, bound IPs, and unrelated resource memberships remain hidden. A single shared resource
+/// must never become a keyhole into another parent's whole configuration."
+///
+/// The stranger — a key with no relationship to the caller at all — must not appear. What this
+/// replaced returned **every key in the system in full** to any `can_manage_keys` holder, which is the
+/// keyhole sentence's opposite and did not even require a shared resource.
+#[tokio::test]
+async fn s4_key_listing_shows_own_subtree_in_full_and_shared_keys_minimally() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (caller_id, caller_key) = insert_key(&db, "Caller", false, true, false, false).await;
+
+    // A daughter, created through the API so the handler records the lineage.
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/keys")
+        .header("X-API-Key", &caller_key)
+        .header("Content-Type", "application/json")), json!({
+            "name": "Own daughter", "bound_ips": "10.0.0.0/8"
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let daughter_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    // A group the caller manages (R2's conjunction: it already holds can_manage_keys).
+    let shared = insert_group_row(&db, "shared-group").await;
+    grant_perm(&db, caller_id, shared, true, true, true, true).await;
+
+    // A peer belonging to someone else, sharing that one group — and holding a private group and
+    // global scopes that must not leak through it.
+    let (peer_id, _peer_key) = insert_key(&db, "Other tenant", false, true, true, true).await;
+    let private = insert_group_row(&db, "other-tenants-private-group").await;
+    grant_perm(&db, peer_id, shared, true, true, false, false).await;
+    grant_perm(&db, peer_id, private, true, true, true, true).await;
+
+    // A stranger with no relationship to the caller at all.
+    let (stranger_id, _stranger_key) = insert_key(&db, "Stranger", false, true, true, true).await;
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/keys")
+        .header("X-API-Key", &caller_key)), 1, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let listing: Vec<serde_json::Value> = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+
+    let by_id = |id: Uuid| listing.iter().find(|k| k["id"] == id.to_string());
+
+    // Scope 3: the stranger is absent entirely.
+    assert!(by_id(stranger_id).is_none(), "a key with no relationship to the caller must not appear");
+
+    // Scope 1: own subtree, in full. The caller itself is the root of its own subtree.
+    for (id, label) in [(caller_id, "the caller"), (daughter_id, "its daughter")] {
+        let entry = by_id(id).unwrap_or_else(|| panic!("{label} must be listed"));
+        assert_eq!(entry["view"], "full", "{label} is in the caller's own subtree");
+        assert!(entry.get("can_manage_keys").is_some(), "{label}: global flags are visible in full view");
+        assert!(entry.get("prefix").is_some(), "{label}: prefix is visible in full view");
+    }
+    assert_eq!(
+        by_id(daughter_id).unwrap()["bound_ips"], "10.0.0.0/8",
+        "§4: a parent sees its daughters' bound IPs"
+    );
+
+    // Scope 2: the peer, minimally. This is the assertion that matters.
+    let peer = by_id(peer_id).expect("a key sharing a managed group must be listed");
+    assert_eq!(peer["view"], "minimal");
+    for withheld in ["bound_ips", "is_master", "can_manage_keys", "can_manage_webhooks", "can_create_groups", "prefix", "parent_key_id"] {
+        assert!(
+            peer.get(withheld).is_none(),
+            "§4: '{withheld}' must not leak through a shared resource, got {peer}"
+        );
+    }
+    let peer_groups = peer["group_permissions"].as_array().unwrap();
+    assert_eq!(peer_groups.len(), 1, "only the shared group, not every membership: {peer}");
+    assert_eq!(peer_groups[0]["group_name"], "shared-group");
+    assert_eq!(peer_groups[0]["can_read"], true);
+    assert_eq!(peer_groups[0]["can_delete"], false, "the shared row's real rights are shown");
+
+    // The peer's *own* private group must be nowhere in the response at all — not merely absent from
+    // its entry. Serialised whole so a leak through any other field is caught too.
+    let rendered = serde_json::to_string(&listing).unwrap();
+    assert!(
+        !rendered.contains("other-tenants-private-group"),
+        "a shared resource must not become a keyhole into another parent's configuration: {rendered}"
+    );
+    assert!(!rendered.contains(&stranger_id.to_string()), "the stranger leaked somewhere: {rendered}");
+
+    // Control: a master still sees everything, in full — the scoping narrowed delegated callers, not
+    // the endpoint.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/keys")
+        .header("X-API-Key", &master_key)), 2, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    let master_listing: Vec<serde_json::Value> = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(master_listing.len(), 5, "master sees every key: {master_listing:?}");
+    assert!(master_listing.iter().all(|k| k["view"] == "full"));
+}
+
+/// **§4 — dispatch targets are visible to their creator and Master, and to nobody else.**
+///
+/// The listing used to be scoped by group readability, which is the shared-resource rule §4 forbids
+/// applying here — so a `can_manage_webhooks` holder saw every other tenant's integration in any group
+/// it could read, target URL and headers included.
+#[tokio::test]
+async fn s4_webhook_listing_is_creator_private() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (alice_id, alice_key) = insert_key(&db, "Alice", false, false, true, false).await;
+    let (bob_id, bob_key) = insert_key(&db, "Bob", false, false, true, false).await;
+
+    // One group, read by both. Under the old rule that alone made each other's webhooks visible.
+    let group_id = insert_group_row(&db, "shared-hook-group").await;
+    grant_perm(&db, alice_id, group_id, true, true, true, false).await;
+    grant_perm(&db, bob_id, group_id, true, true, true, false).await;
+
+    let create_hook = |caller: String, name: &'static str, nth: i64| {
+        let app = app.clone();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("X-API-Key", &caller)
+                .header("Content-Type", "application/json")), nth, json!({
+                    "name": name,
+                    "target_url": "https://example.com/hook",
+                    "secret_token": "s3cr3t",
+                    "payload_template": "{}",
+                    "group_id": group_id.to_string()
+                }).to_string());
+            assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+        }
+    };
+    create_hook(alice_key.clone(), "alice-hook", 1).await;
+    create_hook(bob_key.clone(), "bob-hook", 2).await;
+
+    let list_as = |caller: String, nth: i64| {
+        let app = app.clone();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .uri("/api/webhooks")
+                .header("X-API-Key", &caller)), nth, "");
+            let res = app.oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let hooks: Vec<serde_json::Value> = serde_json::from_slice(
+                &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap();
+            hooks.iter().filter_map(|h| h["name"].as_str().map(str::to_owned)).collect::<Vec<_>>()
+        }
+    };
+
+    assert_eq!(list_as(alice_key, 3).await, vec!["alice-hook"], "Alice sees only her own");
+    assert_eq!(list_as(bob_key, 4).await, vec!["bob-hook"], "Bob sees only his own");
+
+    let mut master_sees = list_as(master_key, 5).await;
+    master_sees.sort();
+    assert_eq!(master_sees, vec!["alice-hook", "bob-hook"], "the master sees both");
+}
+
+/// **§4 oracle discipline — an out-of-scope id answers exactly as a nonexistent one.**
+///
+/// "Any key, resource, or dispatch target outside the caller's visibility scope must return the
+/// identical status and body the service would return if that id did not exist."
+///
+/// Both halves are asserted: the status *and* the body. A `404` whose body differs is still an oracle,
+/// just a quieter one.
+///
+/// Named for the control it covers, because there are two and they are easy to conflate — see
+/// `s4_authenticate_then_authorize_ordering_is_not_regressed_by_oracle_discipline`, which covers the
+/// other one.
+#[tokio::test]
+async fn s4_oracle_discipline_an_invisible_key_is_indistinguishable_from_a_missing_one() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (master_id, _master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    // Holds both administrative scopes, so every refusal below comes from the *visibility* check
+    // rather than from a missing scope — a caller lacking `can_manage_webhooks` is refused uniformly
+    // for every id and reveals nothing, which is a different (and also correct) shape, asserted
+    // separately at the end.
+    let (_caller_id, caller_key) = insert_key(&db, "Caller", false, true, true, false).await;
+    // A real key the caller has no relationship with, and a real webhook it did not create.
+    let (stranger_id, _stranger_key) = insert_key(&db, "Stranger", false, false, false, false).await;
+    let (owner_id, _owner_key) = insert_key(&db, "Hook owner", false, false, true, false).await;
+
+    let group_id = insert_group_row(&db, "hook-group").await;
+    grant_perm(&db, owner_id, group_id, true, true, true, false).await;
+    let hook_id = Uuid::new_v4();
+    simply_ip_vault::entities::webhook_config::ActiveModel {
+        id: Set(hook_id),
+        name: Set("someone-elses-hook".to_owned()),
+        target_url: Set("https://example.com/h".to_owned()),
+        secret_token: Set("s".to_owned()),
+        auth_mode: Set("BODY_ONLY".to_owned()),
+        api_key: Set(None),
+        hmac_template: Set(None),
+        headers_json: Set(None),
+        payload_template: Set("{}".to_owned()),
+        group_id: Set(group_id),
+        owner_key_id: Set(Some(owner_id)),
+        is_active: Set(true),
+        events: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let absent_key = Uuid::new_v4();
+    let absent_hook = Uuid::new_v4();
+
+    let probe = |method: &'static str, path: String, nth: i64| {
+        let (app, caller_key) = (app.clone(), caller_key.clone());
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method(method)
+                .uri(path)
+                .header("X-API-Key", &caller_key)), nth, "");
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+    };
+
+    // A key outside the caller's subtree, against a key that does not exist, on every
+    // credential-level operation.
+    for (n, (method, suffix)) in [
+        ("DELETE", ""),
+        ("POST", "/rotate"),
+        ("POST", "/rotate-secret"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let n = n as i64 * 10;
+        let invisible = probe(method, format!("/api/keys/{stranger_id}{suffix}"), n + 1).await;
+        let missing = probe(method, format!("/api/keys/{absent_key}{suffix}"), n + 2).await;
+        assert_eq!(invisible.0, StatusCode::NOT_FOUND, "{method} {suffix}: invisible must be 404");
+        assert_eq!(
+            invisible, missing,
+            "{method} {suffix}: an invisible key must answer identically to a missing one"
+        );
+
+        // The master key specifically — the most valuable id to be able to confirm.
+        let master_probe = probe(method, format!("/api/keys/{master_id}{suffix}"), n + 3).await;
+        assert_eq!(
+            master_probe, missing,
+            "{method} {suffix}: the master key must not be enumerable through a distinct status"
+        );
+    }
+
+    // A dispatch target the caller did not create.
+    let invisible = probe("DELETE", format!("/api/webhooks/{hook_id}"), 100).await;
+    let missing = probe("DELETE", format!("/api/webhooks/{absent_hook}"), 101).await;
+    assert_eq!(invisible.0, StatusCode::NOT_FOUND);
+    assert_eq!(invisible, missing, "an invisible webhook must answer identically to a missing one");
+
+    // Nothing was actually deleted by any of the probes.
+    assert!(
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(stranger_id)
+            .one(&db).await.unwrap().is_some()
+    );
+    assert!(
+        simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(hook_id)
+            .one(&db).await.unwrap().is_some()
+    );
+
+    // The other correct shape, for contrast. A caller lacking `can_manage_webhooks` is refused
+    // `403` for *every* webhook id — existing, invisible, or invented — so the refusal is a property
+    // of the caller and discloses nothing about the target. Oracle discipline is about answers that
+    // vary with the id, not about every refusal becoming a `404`.
+    let (_scopeless_id, scopeless_key) = insert_key(&db, "No webhook scope", false, true, false, false).await;
+    let scopeless_probe = |target: Uuid, nth: i64| {
+        let (app, scopeless_key) = (app.clone(), scopeless_key.clone());
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/webhooks/{target}"))
+                .header("X-API-Key", &scopeless_key)), nth, "");
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(body.to_vec()).unwrap())
+        }
+    };
+    let real = scopeless_probe(hook_id, 200).await;
+    let invented = scopeless_probe(absent_hook, 201).await;
+    assert_eq!(real.0, StatusCode::FORBIDDEN);
+    assert_eq!(real, invented, "a scope refusal must be identical for every id, real or not");
+}
+
+/// **The other control: authenticate, then authorize — `401` before `403`, for unauthenticated callers.**
+///
+/// §4 is explicit that these are two distinct rules and that neither may be satisfied by regressing
+/// the other: oracle discipline "governs *authenticated* callers distinguishing absent from invisible.
+/// It is a distinct control from the authenticate-then-authorize ordering rule, which governs
+/// *unauthenticated* callers probing key bindings via 401-vs-403. Both hold simultaneously."
+///
+/// The regression this guards against is specific: making everything `404` in pursuit of the first
+/// rule would also turn a CIDR rejection into a `404`, which tells an unauthenticated attacker that
+/// the key it guessed does not exist — the exact inference the ordering rule exists to prevent. A
+/// caller that cannot prove possession of the signing secret must get `401` whatever else is wrong.
+#[tokio::test]
+async fn s4_authenticate_then_authorize_ordering_is_not_regressed_by_oracle_discipline() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    // Bound to a network the test requests do not come from.
+    let (bound_id, bound_key) = insert_key(&db, "Bound", false, false, false, false).await;
+    let mut active: simply_ip_vault::entities::api_key::ActiveModel =
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(bound_id)
+            .one(&db).await.unwrap().unwrap().into();
+    active.bound_ips = Set(Some("203.0.113.0/24".to_owned()));
+    active.update(&db).await.unwrap();
+
+    // A real key, wrong signature: `401`, and it must not reveal that the key exists by any other
+    // status.
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &bound_key)), "not-the-right-secret", "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "an unproven caller gets 401 before any authorization question is asked"
+    );
+
+    // A key that does not exist, also wrong signature: the same `401`. Indistinguishable.
+    let req = signed_with(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", "0000000000000000000000000000000000000000000000000000000000000000")),
+        "not-the-right-secret", "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "a nonexistent key gets the same 401 — the two must not be distinguishable"
+    );
+
+    // Correct signature, wrong network: `403`, **not** `404`. This is the assertion that would break
+    // if oracle discipline were implemented by turning every refusal into a 404: the caller has
+    // proven possession of the signing secret, so there is nothing left to hide from it, and a `404`
+    // here would make the CIDR check itself a probe.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/auth/me")
+        .header("X-API-Key", &bound_key)), 1, "");
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "a proven caller outside its CIDR gets 403; collapsing this to 404 would regress the ordering rule"
+    );
+}

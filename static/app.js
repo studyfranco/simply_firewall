@@ -1131,22 +1131,36 @@ class FirewallClient {
             return;
         }
 
-        tbody.innerHTML = this.state.apiKeys.map(k => `
-            <tr>
-                <td><input type="checkbox" class="row-select" data-id="${k.id}"></td>
-                <td><strong>${escapeHtml(k.name)}</strong></td>
-                <td class="font-mono">${escapeHtml(k.bound_ips || '-')}</td>
-                <td>${this.renderKeyScopes(k)}</td>
-                <td>
-                    <div class="flex gap-2">
+        // A key may arrive in either of the two shapes RBAC_MODEL.md §4 allows: "full" for the
+        // caller's own subtree, "minimal" for a key visible only because it shares a group the caller
+        // manages. The minimal shape carries id, name and that key's rights on the shared groups —
+        // no bound_ips, no global flags — and the credential operations are not available on it,
+        // because the server scopes those to the caller's subtree and would answer 404.
+        //
+        // The distinction is drawn from `view` rather than from a missing field: an absent flag means
+        // *withheld*, not `false`, and rendering it as "no scopes" would describe another tenant's key
+        // as unprivileged.
+        tbody.innerHTML = this.state.apiKeys.map(k => {
+            const minimal = k.view === 'minimal';
+            const actions = minimal
+                ? '<span class="text-muted text-sm" title="This key is visible because it shares a group you manage. Its credentials are outside your scope.">Shared &mdash; view only</span>'
+                : `
                         <button class="btn btn-sm btn-secondary" onclick="window.app.openEditKeyModal('${k.id}')">Edit</button>
                         <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateKeySecret('${k.id}')" title="Replace BOTH the API key and its signing secret">Regenerate</button>
                         <button class="btn btn-sm btn-cancel" onclick="window.app.rotateSigningSecret('${k.id}')" title="Replace only the HMAC signing secret; the API key, name and permissions stay the same">Rotate Secret</button>
-                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>
-                    </div>
+                        <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>`;
+            return `
+            <tr>
+                <td>${minimal ? '' : `<input type="checkbox" class="row-select" data-id="${k.id}">`}</td>
+                <td><strong>${escapeHtml(k.name)}</strong></td>
+                <td class="font-mono">${minimal ? '<span class="text-muted">hidden</span>' : escapeHtml(k.bound_ips || '-')}</td>
+                <td>${this.renderKeyScopes(k)}</td>
+                <td>
+                    <div class="flex gap-2">${actions}</div>
                 </td>
             </tr>
-        `).join('');
+        `;
+        }).join('');
 
         this.wireRowSelection({
             tbodySelector: '#apikeys-table-body', selectAllId: 'select-all-keys', deleteBtnId: 'delete-selected-keys',
@@ -1160,6 +1174,8 @@ class FirewallClient {
     // carries a "×" button to revoke that specific group permission.
     renderKeyScopes(k) {
         const scopes = [];
+        // Global flags are withheld entirely in the minimal view, so nothing is claimed about them.
+        if (k.view === 'minimal') scopes.push('<span class="badge badge-scope" title="Global scopes are outside your visibility for this key">scopes hidden</span>');
         if (k.is_master) scopes.push('<span class="badge badge-scope badge-scope-master">Master</span>');
         if (k.can_manage_keys) scopes.push('<span class="badge badge-scope">Manage Keys</span>');
         if (k.can_manage_webhooks) scopes.push('<span class="badge badge-scope">Manage Webhooks</span>');

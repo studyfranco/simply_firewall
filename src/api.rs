@@ -1818,45 +1818,135 @@ pub async fn create_api_key(
     }))
 }
 
-/// Public-safe summary of an API key for admin listings. Deliberately omits `key_hash`: the
-/// hash of the live secret has no reason to ever leave the server, even to trusted admin UIs.
+/// Public-safe summary of an API key, in one of the two shapes `RBAC_MODEL.md` §4 allows a
+/// non-master caller to see.
+///
+/// [`Self::view`] says which, and it is not decoration — the two shapes carry genuinely different
+/// information, and a client that treats an absent field as `false` rather than as *withheld* will
+/// draw a key as unprivileged when it may not be.
+///
+/// - **`"full"`** — a key inside the caller's own subtree. §4: "a parent sees its own key subtree in
+///   full, minus raw secrets — its daughters, their granted rights, and their bound IPs." Everything
+///   below is populated. `key_hash` and `signing_secret` are absent from this struct entirely and
+///   always have been: the hash of a live credential has no reason to leave the server.
+/// - **`"minimal"`** — a key visible *only* because it holds a permission row on a resource the
+///   caller manages. §4: "a parent sees, in minimal form only, any key holding a permission row on a
+///   resource it manages: id, name, and that key's rights on that resource alone. Global flags, bound
+///   IPs, and unrelated resource memberships remain hidden. A single shared resource must never become
+///   a keyhole into another parent's whole configuration." Only `id`, `name` and the rights **on the
+///   shared groups themselves** are present.
+///
+/// A master sees every key in the `"full"` shape.
+///
+/// One wart, stated rather than hidden: `bound_ips` is `None` both when it is withheld (minimal view)
+/// and when the key genuinely has no CIDR restriction (full view). [`Self::view`] disambiguates, and
+/// that is what it is for.
 #[derive(Serialize)]
 pub struct ApiKeySummary {
     /// Key ID
     pub id: Uuid,
     /// Key name
     pub name: String,
-    /// First 8 characters of the plaintext key, for display/identification only
-    pub prefix: String,
-    /// Bound CIDRs
+    /// Which §4 visibility scope produced this entry: `"full"` or `"minimal"`.
+    pub view: &'static str,
+    /// First 8 characters of the plaintext key, for display/identification only. Full view only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prefix: Option<String>,
+    /// Bound CIDRs. Full view only.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub bound_ips: Option<String>,
-    /// Master flag
-    pub is_master: bool,
-    /// Global key management scope
-    pub can_manage_keys: bool,
-    /// Global webhook management scope
-    pub can_manage_webhooks: bool,
-    /// Global group creation scope
-    pub can_create_groups: bool,
-    /// Key creation timestamp
-    pub created_at: chrono::NaiveDateTime,
-    /// Per-group permissions granted to this key
+    /// Master flag. Full view only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub is_master: Option<bool>,
+    /// Global key management scope. Full view only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub can_manage_keys: Option<bool>,
+    /// Global webhook management scope. Full view only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub can_manage_webhooks: Option<bool>,
+    /// Global group creation scope. Full view only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub can_create_groups: Option<bool>,
+    /// The key that created this one. Full view only, and carries no authority (R3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_key_id: Option<Uuid>,
+    /// Key creation timestamp. Full view only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<chrono::NaiveDateTime>,
+    /// Per-group permissions. **All** of them in the full view; in the minimal view, only the rows on
+    /// groups the caller itself manages.
     pub group_permissions: Vec<MePermission>,
 }
 
-/// Builds the public-safe summary (including per-group permissions) for a single key. Shared by
-/// every endpoint that returns key details, so the shape stays consistent everywhere.
-async fn build_api_key_summary(
+/// The `"full"` view: everything about a key except its secrets.
+async fn full_api_key_summary(
     db: &sea_orm::DatabaseConnection,
     k: api_key::Model,
 ) -> Result<ApiKeySummary, AppError> {
+    let group_permissions = key_group_permissions(db, k.id, None).await?;
+
+    Ok(ApiKeySummary {
+        id: k.id,
+        name: k.name,
+        view: "full",
+        prefix: Some(k.prefix),
+        bound_ips: k.bound_ips,
+        is_master: Some(k.is_master),
+        can_manage_keys: Some(k.can_manage_keys),
+        can_manage_webhooks: Some(k.can_manage_webhooks),
+        can_create_groups: Some(k.can_create_groups),
+        parent_key_id: k.parent_key_id,
+        created_at: Some(k.created_at),
+        group_permissions,
+    })
+}
+
+/// The `"minimal"` view: id, name, and this key's rights on `visible_groups` and nothing else.
+async fn minimal_api_key_summary(
+    db: &sea_orm::DatabaseConnection,
+    k: api_key::Model,
+    visible_groups: &[Uuid],
+) -> Result<ApiKeySummary, AppError> {
+    let group_permissions = key_group_permissions(db, k.id, Some(visible_groups)).await?;
+
+    Ok(ApiKeySummary {
+        id: k.id,
+        name: k.name,
+        view: "minimal",
+        prefix: None,
+        bound_ips: None,
+        is_master: None,
+        can_manage_keys: None,
+        can_manage_webhooks: None,
+        can_create_groups: None,
+        parent_key_id: None,
+        created_at: None,
+        group_permissions,
+    })
+}
+
+/// One key's permission rows, optionally narrowed to a set of groups.
+///
+/// `Some(&[])` is a meaningful argument and returns nothing — a caller that manages no groups sees no
+/// shared rows, which is different from `None` ("no filter, return everything").
+async fn key_group_permissions(
+    db: &sea_orm::DatabaseConnection,
+    key_id: Uuid,
+    only_groups: Option<&[Uuid]>,
+) -> Result<Vec<MePermission>, AppError> {
+    let mut condition =
+        Condition::all().add(api_key_group_permission::Column::ApiKeyId.eq(key_id));
+    if let Some(groups) = only_groups {
+        condition = condition.add(api_key_group_permission::Column::GroupId.is_in(groups.to_vec()));
+    }
+
     let perms = api_key_group_permission::Entity::find()
-        .filter(api_key_group_permission::Column::ApiKeyId.eq(k.id))
+        .filter(condition)
         .find_also_related(ip_group::Entity)
         .all(db)
         .await?;
 
-    let group_permissions = perms
+    Ok(perms
         .into_iter()
         .filter_map(|(p, g)| {
             g.map(|group| MePermission {
@@ -1868,23 +1958,131 @@ async fn build_api_key_summary(
                 can_manage: p.can_manage,
             })
         })
-        .collect();
-
-    Ok(ApiKeySummary {
-        id: k.id,
-        name: k.name,
-        prefix: k.prefix,
-        bound_ips: k.bound_ips,
-        is_master: k.is_master,
-        can_manage_keys: k.can_manage_keys,
-        can_manage_webhooks: k.can_manage_webhooks,
-        can_create_groups: k.can_create_groups,
-        created_at: k.created_at,
-        group_permissions,
-    })
+        .collect())
 }
 
-/// Handles GET /api/v1/keys
+/// Every key at or below `root` in the `parent_key_id` tree, `root` included.
+///
+/// Iterative breadth-first rather than recursive, with a `visited` set: `parent_key_id` has no
+/// database-level foreign key and nothing in the schema prevents a cycle, so a hand-edited row could
+/// otherwise put this in an infinite loop — inside a request handler, holding a connection. The
+/// visited set makes a cycle terminate at the cost of one extra pass instead of taking the process
+/// down.
+///
+/// One query per level, not one per key: the level's ids go into a single `IN` clause against the
+/// `idx-api_keys-parent_key_id` index added in §7's migration.
+async fn collect_key_subtree(
+    db: &sea_orm::DatabaseConnection,
+    root: Uuid,
+) -> Result<std::collections::HashSet<Uuid>, AppError> {
+    let mut visited = std::collections::HashSet::from([root]);
+    let mut frontier = vec![root];
+
+    while !frontier.is_empty() {
+        let children: Vec<Uuid> = api_key::Entity::find()
+            .filter(api_key::Column::ParentKeyId.is_in(frontier.clone()))
+            .all(db)
+            .await?
+            .into_iter()
+            .map(|k| k.id)
+            .collect();
+
+        frontier = children.into_iter().filter(|id| visited.insert(*id)).collect();
+    }
+
+    Ok(visited)
+}
+
+/// The groups a caller *manages* in R2's sense — the ones whose shared keys it may see in minimal
+/// form.
+///
+/// Deliberately the same test the write path uses (`can_manage_keys` globally **and** `can_manage` on
+/// the row), so §4's "a resource it manages" and R2's "manage" cannot drift into meaning two
+/// different things. A master manages everything and never reaches this.
+async fn groups_the_caller_manages(
+    db: &sea_orm::DatabaseConnection,
+    caller: &api_key::Model,
+) -> Result<Vec<Uuid>, AppError> {
+    if !caller.can_manage_keys {
+        return Ok(Vec::new());
+    }
+
+    Ok(api_key_group_permission::Entity::find()
+        .filter(
+            Condition::all()
+                .add(api_key_group_permission::Column::ApiKeyId.eq(caller.id))
+                .add(api_key_group_permission::Column::CanManage.eq(true)),
+        )
+        .all(db)
+        .await?
+        .into_iter()
+        .map(|p| p.group_id)
+        .collect())
+}
+
+/// Whether `target` is inside the caller's **own subtree** — the scope §4 grants full visibility over,
+/// and the scope every credential-level operation on another key is bounded by.
+///
+/// Distinct from the shared-resource scope on purpose. §4 lets a parent see, in minimal form, a key
+/// that merely shares a resource it manages; it does not follow that the parent may rotate that key's
+/// credential or rewrite its bound IPs. Seeing a name is not administering a credential, so
+/// `update`/`delete`/`rotate`/`rotate-secret` use this and nothing wider.
+async fn caller_can_administer_key(
+    db: &sea_orm::DatabaseConnection,
+    caller: &api_key::Model,
+    target: Uuid,
+) -> Result<bool, AppError> {
+    if caller.is_master {
+        return Ok(true);
+    }
+    Ok(collect_key_subtree(db, caller.id).await?.contains(&target))
+}
+
+/// Resolves a key-targeted request to its row, or to the `404` §4's oracle discipline requires.
+///
+/// §4: "Any key, resource, or dispatch target outside the caller's visibility scope must return the
+/// identical status and body the service would return if that id did not exist."
+///
+/// This replaced a `403` that used to come from `guard_master_target`, whose stated reasoning was that
+/// "the caller legitimately holds `can_manage_keys` and can already see the key in `GET /api/keys`".
+/// That reasoning was true when key listing was unscoped and is false now: a delegated manager no
+/// longer sees the master, or anything outside its subtree, so a `403` here would confirm the
+/// existence of a key the caller cannot otherwise observe. The master key is the obvious case — a
+/// `403` on `POST /keys/{id}/rotate` was a way to enumerate it.
+///
+/// **This does not touch the authenticate-then-authorize ordering.** That rule governs *unauthenticated*
+/// callers probing key bindings through `401`-vs-`403` and lives in the middleware; this one governs
+/// *authenticated* callers distinguishing absent from invisible. §4 is explicit that both hold and
+/// neither may be satisfied by regressing the other.
+async fn find_administrable_key(
+    db: &sea_orm::DatabaseConnection,
+    caller: &api_key::Model,
+    target: Uuid,
+) -> Result<api_key::Model, AppError> {
+    let key = ApiKey::find_by_id(target).one(db).await?.ok_or(AppError::NotFound)?;
+
+    if !caller_can_administer_key(db, caller, target).await? {
+        return Err(AppError::NotFound);
+    }
+
+    Ok(key)
+}
+
+/// Handles GET /api/v1/keys — **§4's three visibility scopes, in one listing.**
+///
+/// | Caller | Sees |
+/// | :--- | :--- |
+/// | Master | every key, `"full"` |
+/// | `can_manage_keys` holder | its own subtree `"full"`, plus every key sharing a group it manages, `"minimal"` |
+/// | anyone else | `403` — this is a key-administration endpoint |
+///
+/// # What this replaced
+///
+/// Every key in the system, in full, to any `can_manage_keys` holder: global flags, `bound_ips`, and
+/// every group membership of every other tenant. §4 calls the shape out by name — "A single shared
+/// resource must never become a keyhole into another parent's whole configuration" — and the previous
+/// behaviour did not even require a shared resource. A delegated key manager scoped to one group could
+/// read the entire installation's key inventory, which is a map of what to attack next.
 pub async fn list_api_keys(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
@@ -1893,10 +2091,50 @@ pub async fn list_api_keys(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    let keys = ApiKey::find().all(&state.db).await?;
-    let mut summaries = Vec::with_capacity(keys.len());
-    for k in keys {
-        summaries.push(build_api_key_summary(&state.db, k).await?);
+    if key.is_master {
+        let keys = ApiKey::find().all(&state.db).await?;
+        let mut summaries = Vec::with_capacity(keys.len());
+        for k in keys {
+            summaries.push(full_api_key_summary(&state.db, k).await?);
+        }
+        return Ok(Json(summaries));
+    }
+
+    let subtree = collect_key_subtree(&state.db, key.id).await?;
+    let managed_groups = groups_the_caller_manages(&state.db, &key).await?;
+
+    // Keys sharing a managed group. Empty when the caller manages nothing, which `is_in([])` already
+    // expresses — but the query is skipped rather than issued, since "manages nothing" is the common
+    // case for a scoped manager and there is no reason to ask the database about it.
+    let shared: Vec<Uuid> = if managed_groups.is_empty() {
+        Vec::new()
+    } else {
+        api_key_group_permission::Entity::find()
+            .filter(api_key_group_permission::Column::GroupId.is_in(managed_groups.clone()))
+            .all(&state.db)
+            .await?
+            .into_iter()
+            .map(|p| p.api_key_id)
+            .filter(|id| !subtree.contains(id))
+            .collect()
+    };
+
+    let mut summaries = Vec::new();
+    for id in subtree {
+        // A subtree member could have been deleted between the walk and here; skipping is correct
+        // rather than erroring, and the caller sees the same list it would have a moment later.
+        if let Some(k) = ApiKey::find_by_id(id).one(&state.db).await? {
+            summaries.push(full_api_key_summary(&state.db, k).await?);
+        }
+    }
+    let mut seen: std::collections::HashSet<Uuid> = summaries.iter().map(|s| s.id).collect();
+    for id in shared {
+        if !seen.insert(id) {
+            continue;
+        }
+        if let Some(k) = ApiKey::find_by_id(id).one(&state.db).await? {
+            summaries.push(minimal_api_key_summary(&state.db, k, &managed_groups).await?);
+        }
     }
 
     Ok(Json(summaries))
@@ -1919,7 +2157,11 @@ pub async fn delete_api_key(
 
     // Fetched before deleting (not just relied on rows_affected) so its name is still available
     // for the audit log below — once deleted, there's nothing left to look the name up from.
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    // §4 oracle discipline: a key outside the caller's own subtree answers exactly as a nonexistent
+    // one does. `guard_master_target` still runs behind it as defence in depth — it is now
+    // unreachable for a non-master, since the master key is in nobody's subtree, and an unreachable
+    // guard that fails closed is cheaper to keep than to prove removable.
+    let target = find_administrable_key(&state.db, &key, id).await?;
     guard_master_target(&key, &target)?;
     // Absolute, master callers included. `guard_master_target` above only ever stopped non-masters,
     // which left the Master deletable by itself the moment `id != key.id` stopped being true for it —
@@ -1998,7 +2240,7 @@ pub async fn update_api_key(
 
     guard_no_master_flag(payload.is_master)?;
 
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = find_administrable_key(&state.db, &key, id).await?;
     guard_master_target(&key, &target)?;
 
     // §5's one exception: the Master may edit its own `bound_ips`, and nothing else about it is
@@ -2070,7 +2312,7 @@ pub async fn update_api_key(
 
     create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_UPDATE", None, None, Some(format!("Updated key {target_ref}"))).await?;
 
-    Ok(Json(build_api_key_summary(&state.db, updated).await?))
+    Ok(Json(full_api_key_summary(&state.db, updated).await?))
 }
 
 /// Response after rotating an API key's secret
@@ -2102,7 +2344,7 @@ pub async fn rotate_api_key(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = find_administrable_key(&state.db, &key, id).await?;
     guard_master_target(&key, &target)?;
     guard_master_immutable(&target, "rotated")?;
     let target_ref = format_key_reference(&target.name, id);
@@ -2160,7 +2402,7 @@ pub async fn rotate_signing_secret(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    let target = find_administrable_key(&state.db, &key, id).await?;
     guard_master_target(&key, &target)?;
     guard_master_immutable(&target, "re-keyed")?;
     let target_name = target.name.clone();
@@ -3076,24 +3318,20 @@ pub async fn list_webhooks(
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    // Scoped to the groups the caller can read, mirroring `list_ip_groups`. A webhook row reveals
-    // its group, target URL and configured headers, so an unscoped listing leaked the shape of
-    // every other tenant's integrations to any key holding `can_manage_webhooks`.
+    // §4: "Dispatch targets: visible exclusively to their creator and Master. They are never exposed
+    // by the shared-resource rule above."
+    //
+    // This was scoped by *group readability*, which is that shared-resource rule — so every
+    // `can_manage_webhooks` holder with `can_read` on a group saw every other tenant's integrations in
+    // it, target URL and configured headers included. A webhook row is a description of where a
+    // tenant sends its data and what it puts in the request; a shared banlist is not a reason to hand
+    // that over.
+    //
+    // Pre-migration rows carry `owner_key_id = NULL` and so appear to nobody but the master until
+    // reassigned — the deliberate consequence of the null backfill, recorded in AGENT_NOTES.MD.
     let mut query = WebhookConfig::find();
     if !key.is_master {
-        let readable: Vec<Uuid> = api_key_group_permission::Entity::find()
-            .filter(
-                Condition::all()
-                    .add(api_key_group_permission::Column::ApiKeyId.eq(key.id))
-                    .add(api_key_group_permission::Column::CanRead.eq(true)),
-            )
-            .all(&state.db)
-            .await?
-            .into_iter()
-            .map(|p| p.group_id)
-            .collect();
-
-        query = query.filter(webhook_config::Column::GroupId.is_in(readable));
+        query = query.filter(webhook_config::Column::OwnerKeyId.eq(key.id));
     }
 
     let webhooks = query.all(&state.db).await?;

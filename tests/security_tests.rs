@@ -179,6 +179,23 @@ async fn grant_manager(
     .unwrap();
 }
 
+/// Records `parent` as `child`'s creator, so a seeded fixture lands inside a caller's subtree.
+///
+/// §4 scopes credential-level operations to the caller's own subtree, and `insert_key` seeds keys with
+/// no lineage at all — which puts them outside everyone's. A test about *authority* has to place its
+/// target inside the caller's scope first, or it measures visibility instead.
+async fn set_parent(db: &DatabaseConnection, child: Uuid, parent: Uuid) {
+    let mut active: simply_ip_vault::entities::api_key::ActiveModel =
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(child)
+            .one(db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    active.parent_key_id = Set(Some(parent));
+    active.update(db).await.unwrap();
+}
+
 /// Seeds a master API key directly into the database and returns its plaintext form.
 async fn insert_master_key(db: &DatabaseConnection, name: &str) -> String {
     let plaintext = simply_ip_vault::api::generate_random_key();
@@ -1345,9 +1362,12 @@ async fn attack_non_master_cannot_elevate_an_existing_key_into_master_scopes() {
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
     let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
-    let (_mid, manager) = insert_key(&db, "Manager", false, true, true, false, None).await;
+    let (mid, manager) = insert_key(&db, "Manager", false, true, true, false, None).await;
     let secret = test_signing_secret(&manager);
     let (victim_id, _victim) = insert_key(&db, "Ordinary", false, false, false, false, None).await;
+    // Inside the manager's subtree, so every refusal below is R4 refusing an elevation rather than §4
+    // refusing to admit the key exists.
+    set_parent(&db, victim_id, mid).await;
 
     // Some calls below repeat verbatim, so each takes its own timestamp — an identical repeat
     // inside one second is the same signature, which is exactly what a replay is.
@@ -1737,6 +1757,12 @@ async fn master_may_edit_only_its_own_bound_ips() {
 /// Rotating a key returns fresh credentials for it. Allowing that against a *master* key handed a
 /// non-master complete, immediate takeover of the master credential — the single most direct
 /// escalation path in the system.
+///
+/// The refusal moved from `403` to `404` when §4's visibility scoping landed, and that is a
+/// **strengthening, not a regression**. `403` confirmed the id named a real key; the master is in no
+/// non-master's subtree, so §4 requires it to answer exactly as a nonexistent id would. A `403` on
+/// `POST /keys/{id}/rotate` was a way to enumerate the master key, which is precisely the oracle §4
+/// closes. The credential-leak assertions below are unchanged and remain the point of the test.
 #[tokio::test]
 async fn attack_non_master_cannot_rotate_or_destroy_a_master_key() {
     let db = setup_test_db().await;
@@ -1765,7 +1791,7 @@ async fn attack_non_master_cannot_rotate_or_destroy_a_master_key() {
 
     // Full rotation — would have returned a working master API key *and* signing secret.
     let (status, body) = call("POST", format!("/api/keys/{victim_id}/rotate"), "").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-master rotated a master key");
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-master rotated a master key");
     assert!(
         !body.contains("plaintext_key") && !body.contains("signing_secret"),
         "the rejection must not leak credentials, got {body}"
@@ -1773,7 +1799,7 @@ async fn attack_non_master_cannot_rotate_or_destroy_a_master_key() {
 
     // Signing-secret-only rotation — same takeover, narrower blast radius.
     let (status, body) = call("POST", format!("/api/keys/{victim_id}/rotate-secret"), "").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-master rotated a master key's signing secret");
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-master rotated a master key's signing secret");
     assert!(!body.contains("signing_secret"), "the rejection must not leak a secret, got {body}");
 
     // Relocating a master key's network binding to the attacker's own range.
@@ -1783,11 +1809,11 @@ async fn attack_non_master_cannot_rotate_or_destroy_a_master_key() {
         r#"{"bound_ips":"203.0.113.0/24"}"#,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-master rewrote a master key's bound_ips");
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-master rewrote a master key's bound_ips");
 
     // Removing the master keys that would otherwise contain the incident.
     let (status, _) = call("DELETE", format!("/api/keys/{victim_id}"), "").await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "non-master deleted a master key");
+    assert_eq!(status, StatusCode::NOT_FOUND, "non-master deleted a master key");
 
     // The victim is untouched: still master, still holding its original signing secret.
     let victim = simply_ip_vault::entities::prelude::ApiKey::find_by_id(victim_id)
@@ -1800,6 +1826,7 @@ async fn attack_non_master_cannot_rotate_or_destroy_a_master_key() {
     // Control: the same operations against a *non-master* target still succeed, so the guard is
     // scoped to master targets rather than having disabled key administration outright.
     let (other_id, _other) = insert_key(&db, "Ordinary", false, false, false, false, None).await;
+    set_parent(&db, other_id, manager_id).await;
     let (status, _) = call("POST", format!("/api/keys/{other_id}/rotate"), "").await;
     assert_eq!(status, StatusCode::OK, "rotating a non-master key must still work");
     let (status, _) = call("DELETE", format!("/api/keys/{other_id}"), "").await;

@@ -1919,10 +1919,9 @@ MANAGER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
 MANAGER_ID=$(echo "$RESP_BODY" | jq -r '.id')
 register_key_secret "$MANAGER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
-# An ordinary key for the scope-elevation checks to target.
-api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Scope Elevation Target"}'
-check "200" "create an ordinary key to attempt scope elevation against"
-VICTIM_NONMASTER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+# An ordinary key for the scope-elevation checks to target. Created BY the manager, so it lands
+# inside the manager's subtree — §4 scopes credential operations there, and a target outside it would
+# answer 404 for visibility reasons rather than 403 for the R4 reason under test.
 
 # The master key it will attack. Previously a purpose-built second master; RBAC_MODEL.md §5 makes
 # that impossible, so the target is the real one — which is a strictly stronger test, since it is the
@@ -1946,20 +1945,30 @@ check "400" "is_master:false is refused too — the field may not appear at all"
 api_call GET "/api/keys" "$MASTER_KEY"
 check_true '[.[] | select(.is_master == true)] | length == 1' "exactly one master key exists"
 
-# 2. Rotating a master key hands back a working master credential outright.
+# 2-4. Rotating, repointing or deleting the master. Each answers `404`, not `403`, since §4 scopes
+#      credential operations to the caller's own subtree and the master is in nobody's. That is
+#      stronger than the `403` it replaced: `403` confirmed the id named a real key, which made
+#      `POST /keys/{id}/rotate` a way to enumerate the master.
 api_call POST "/api/keys/$VICTIM_ID/rotate" "$MANAGER_KEY"
-check "403" "a non-master cannot rotate a master key"
+check "404" "a non-master cannot rotate a master key"
 
 api_call POST "/api/keys/$VICTIM_ID/rotate-secret" "$MANAGER_KEY"
-check "403" "a non-master cannot rotate a master key's signing secret"
+check "404" "a non-master cannot rotate a master key's signing secret"
 
-# 3. Relocating a master key's network binding to the attacker's own range.
 api_call PUT "/api/keys/$VICTIM_ID" "$MANAGER_KEY" '{"bound_ips":"203.0.113.0/24"}'
-check "403" "a non-master cannot rewrite a master key's bound_ips"
+check "404" "a non-master cannot rewrite a master key's bound_ips"
 
-# 4. Removing the master keys that would contain the incident.
 api_call DELETE "/api/keys/$VICTIM_ID" "$MANAGER_KEY"
-check "403" "a non-master cannot delete a master key"
+check "404" "a non-master cannot delete a master key"
+
+# ...and the answer is byte-identical to the one a genuinely nonexistent id produces. §4: "must
+# return the identical status and body the service would return if that id did not exist."
+api_call DELETE "/api/keys/$VICTIM_ID" "$MANAGER_KEY"
+MASTER_PROBE_BODY="$RESP_BODY"
+api_call DELETE "/api/keys/11111111-2222-3333-4444-555555555555" "$MANAGER_KEY"
+check "404" "#4 a nonexistent key answers 404 too"
+check_local "$RESP_BODY" "$MASTER_PROBE_BODY" \
+    "#4 oracle discipline: an invisible key is byte-identical to a nonexistent one"
 
 # 5. Widening its own scopes through the generic update endpoint.
 api_call PUT "/api/keys/$MANAGER_ID" "$MANAGER_KEY" '{"can_create_groups":true}'
@@ -1978,6 +1987,10 @@ check "403" "a non-master cannot grant can_create_groups"
 # plainest possible non-amplification violation.
 api_call POST "/api/keys" "$MANAGER_KEY" '{"name":"Escalated Webhooks","can_manage_keys":false,"can_manage_webhooks":true}'
 check "403" "a non-master cannot grant can_manage_webhooks"
+
+api_call POST "/api/keys" "$MANAGER_KEY" '{"name":"Scope Elevation Target"}'
+check "200" "create a daughter key to attempt scope elevation against"
+VICTIM_NONMASTER_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
 api_call PUT "/api/keys/$VICTIM_NONMASTER_ID" "$MANAGER_KEY" '{"can_manage_webhooks":true}'
 check "403" "nor elevate an existing key into can_manage_webhooks"

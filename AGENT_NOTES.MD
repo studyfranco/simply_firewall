@@ -4799,3 +4799,138 @@ fire against it.
 | `cargo test` | **182 passed**, 0 failed |
 | `./scripts/test_e2e.sh` | **465/465** |
 | `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |
+
+---
+
+## Session 36 — RBAC_MODEL Convergence, Phase 3: Visibility Scopes & Oracle Discipline
+
+Implements §4 in full. This phase closes the single largest disclosure in the gap analysis and moves
+several refusals from `403` to `404` — both narrowings, both breaking for callers that relied on the
+looser view.
+
+### The three scopes
+
+| Scope | Who | What is visible |
+| :--- | :--- | :--- |
+| Master | `is_master` | everything, in full |
+| **Own subtree** | a key and its `parent_key_id` descendants | full, minus raw secrets |
+| **Shared resource** | a key holding a row on a group the caller *manages* (R2's conjunction) | **minimal**: id, name, and that key's rights on the shared groups alone |
+| **Dispatch target** | `webhook_configs` | creator + Master only, never via the shared-resource rule |
+
+`GET /api/keys` tags each entry `"view": "full"` or `"view": "minimal"`. The tag is not decoration: an
+absent field in the minimal shape means **withheld**, not `false`, and a client inferring from absence
+would draw another tenant's privileged key as unprivileged. The dashboard reads `view` and renders
+"scopes hidden" plus a view-only action cell rather than empty badges and dead buttons.
+
+What this replaced returned **every key in the system, in full**, to any `can_manage_keys` holder —
+global flags, `bound_ips`, and every group membership of every tenant. §4 names the shape directly
+("A single shared resource must never become a keyhole into another parent's whole configuration"),
+and the old behaviour did not even require a shared resource to hand it over.
+
+`GET /api/webhooks` was scoped by *group readability*, which is the shared-resource rule §4 forbids
+applying to a dispatch target. A webhook row describes where a tenant sends its data and what it puts
+in the request; sharing a banlist is not a reason to hand that over.
+
+### The subtree/shared split, and why credential operations use only the narrower one
+
+§4 lets a parent see a key that shares a managed resource. It does not follow that the parent may
+rotate that key's credential. So `PUT`/`DELETE /api/keys/{id}` and both rotation endpoints resolve
+through `find_administrable_key`, which is the **own-subtree** scope alone; the shared scope grants
+visibility in a listing and nothing else. Seeing a name is not administering a credential.
+
+`collect_key_subtree` walks iteratively with a visited set rather than recursing. `parent_key_id` has
+no database-level foreign key and nothing prevents a cycle, so a hand-edited row could otherwise spin
+a request handler forever while holding a connection. One query per level against
+`idx-api_keys-parent_key_id`, not one per key.
+
+### Oracle discipline, and the control it must not break
+
+An id outside the caller's visibility scope now returns the identical status **and body** a
+nonexistent id would. The `403` it replaced came from `guard_master_target`, whose stated reasoning
+was that "the caller legitimately holds `can_manage_keys` and can already see the key in
+`GET /api/keys`". That was true when listing was unscoped and is false as of this phase — which makes
+`POST /keys/{id}/rotate` a way to enumerate the master key, since only the master answered `403`
+while every absent id answered `404`.
+
+**The counterpart rule was easy to break and is asserted separately.** §4 is explicit that oracle
+discipline is "a distinct control from the authenticate-then-authorize ordering rule … Both hold
+simultaneously; neither may be satisfied by regressing the other." Implementing the first by turning
+every refusal into `404` would turn a CIDR rejection into "no such key" — precisely the inference the
+`401`-before-`403` ordering exists to prevent.
+
+The distinction that keeps both true: a refusal that is a property of the **caller** (a missing global
+scope) is a uniform `403` for every id and discloses nothing; only refusals that vary *with the id*
+need to be `404`. `s4_oracle_discipline_an_invisible_key_is_indistinguishable_from_a_missing_one`
+asserts the first control and, at its end, asserts the caller-property shape explicitly so a future
+pass does not "fix" it into a `404`.
+`s4_authenticate_then_authorize_ordering_is_not_regressed_by_oracle_discipline` asserts the second.
+Both test names say which control they cover, because the two are easy to conflate.
+
+### Breaking changes
+
+| Change | Who breaks | Remedy |
+| :--- | :--- | :--- |
+| `GET /api/keys` no longer returns every key | Tooling enumerating the installation through a delegated manager | Use the master key, or accept the scope. Entries now carry `view`; treat a missing field as withheld |
+| `GET /api/webhooks` is creator-private | Any non-creator with `can_manage_webhooks` + `can_read` | `PUT /api/webhooks/{id}/owner` from the master. **Every pre-migration webhook is Master-only** — see Phase 2's query |
+| Key ops on out-of-subtree targets: `403` → `404` | Error handling that branches on `403` | Treat `404` as "not yours or not there"; the distinction is deliberately unavailable |
+| Keys seeded directly in a database have no `parent_key_id` and are in **nobody's** subtree | Operators who create keys with SQL | Set `parent_key_id`, or administer those keys with the master |
+
+```sql
+-- Keys no delegated manager can administer, because they have no recorded creator. Each is
+-- master-only until a parent is recorded.
+SELECT id, name, prefix, created_at FROM api_keys
+WHERE parent_key_id IS NULL AND is_master = false;
+```
+
+### Tests
+
+Four new, rule-indexed: `s4_key_listing_shows_own_subtree_in_full_and_shared_keys_minimally`,
+`s4_webhook_listing_is_creator_private`,
+`s4_oracle_discipline_an_invisible_key_is_indistinguishable_from_a_missing_one`,
+`s4_authenticate_then_authorize_ordering_is_not_regressed_by_oracle_discipline`. The first serialises
+the whole listing and greps it for the peer's private group name, so a leak through *any* field is
+caught rather than only through the fields the assertions happen to name.
+
+Two existing security tests changed. `attack_non_master_cannot_rotate_or_destroy_a_master_key` now
+expects `404` — a strengthening, since `403` confirmed the id named a real key; its credential-leak
+assertions are unchanged and remain the point.
+`attack_non_master_cannot_elevate_an_existing_key_into_master_scopes` needed its victim placed inside
+the manager's subtree, or it would have measured visibility instead of R4. A `set_parent` fixture
+helper was added for exactly that: `insert_key` seeds keys with no lineage, which puts them outside
+everyone's scope.
+
+The e2e suite went 465 → 467, including a direct byte-comparison of the `404` body for an invisible
+key against the body for an invented one.
+
+### Mutation testing
+
+| Mutation | `cargo test` | Verdict |
+| :--- | :--- | :--- |
+| S4a — `list_api_keys` returns every key in full | 2 | caught |
+| S4b — shared keys returned in full instead of minimal | 2 | caught |
+| S4c — webhook listing scoped by group readability again | 2 | caught |
+| S4d — out-of-scope key answers `403` instead of `404` | 2 | caught |
+
+All four fired first time, which is the first phase where that happened.
+
+### Gap analysis items resolved
+
+| Requirement | Was | Now |
+| :--- | :--- | :--- |
+| §4 Parent full visibility over its own subtree | NOT IMPLEMENTED | **COMPLIES** |
+| §4 Shared-resource minimal view | VIOLATES | **COMPLIES** |
+| §4 Webhooks visible only to creator + Master | VIOLATES | **COMPLIES** |
+| §4 Oracle discipline — `404` outside visibility scope | VIOLATES (partial) | **COMPLIES** |
+| §4 Master full visibility | COMPLIES | unchanged |
+
+Remaining: §6 (cascade deletion, pre-flight inventory) — Phase 4.
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **186 passed**, 0 failed |
+| `./scripts/test_e2e.sh` | **467/467** |
+| `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |

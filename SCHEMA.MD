@@ -314,6 +314,12 @@ Reconstructing ownership from a lossy trail would hand out the right to *delete 
 whichever log row happened to survive. Unassigned withholds authority instead of inventing it, and a
 master assigns it deliberately.
 
+*Visibility (§4):* `parent_key_id` defines the **own-subtree** scope — `GET /api/keys` returns a key
+in full only inside the caller's subtree, minimally when it merely shares a group the caller manages,
+and not at all otherwise. `webhook_configs.owner_key_id` makes a dispatch target creator-private:
+`GET /api/webhooks` filters on it directly, replacing the group-readability scoping that exposed every
+tenant's integrations to any `can_manage_webhooks` holder sharing a group.
+
 *Indexes added for §7:* `idx-api_keys-parent_key_id`, `idx-ip_groups-owner_key_id`,
 `idx-webhook_configs-owner_key_id`, `idx-akgp-group_id` (the permission join from the group side,
 which the existing `(api_key_id, group_id)` composite cannot serve), and `idx-api_keys-key_hash` (a
