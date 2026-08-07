@@ -150,6 +150,33 @@ async fn grant(
     .unwrap();
 }
 
+/// Grants a key read/write/delete **and** the administrative `can_manage` flag on a group.
+///
+/// R2 makes `can_manage` half of the authority to touch a group's permission rows at all, so any
+/// fixture whose caller is expected to grant or revoke needs this rather than [`grant`].
+async fn grant_manager(
+    db: &DatabaseConnection,
+    key_id: Uuid,
+    group_id: Uuid,
+    read: bool,
+    write: bool,
+    del: bool,
+) {
+    simply_ip_vault::entities::api_key_group_permission::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        api_key_id: Set(key_id),
+        group_id: Set(group_id),
+        can_read: Set(read),
+        can_write: Set(write),
+        can_delete: Set(del),
+        can_manage: Set(true),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(db)
+    .await
+    .unwrap();
+}
+
 /// Seeds a master API key directly into the database and returns its plaintext form.
 async fn insert_master_key(db: &DatabaseConnection, name: &str) -> String {
     let plaintext = simply_ip_vault::api::generate_random_key();
@@ -1268,7 +1295,7 @@ async fn attack_non_master_cannot_mint_a_master_key() {
     // The other two master-only scopes are each a path *back to* master authority — one mints
     // co-administrators, the other mints groups whose creator is auto-granted full access — so a
     // non-master cannot hand either out.
-    for scope in ["can_manage_keys", "can_create_groups"] {
+    for scope in ["can_manage_keys", "can_create_groups", "can_manage_webhooks"] {
         let (status, _) = create(json!({ "name": format!("escalated-{scope}"), scope: true })).await;
         assert_eq!(
             status,
@@ -1277,11 +1304,18 @@ async fn attack_non_master_cannot_mint_a_master_key() {
         );
     }
 
-    // Control: the same caller can still create an ordinary key, so the scope itself still works.
-    // `can_manage_webhooks` remains delegable — it confers no authority over keys or groups and is
-    // bounded by the caller's own group access.
-    let (status, _) = create(json!({ "name": "ordinary", "can_manage_webhooks": true })).await;
-    assert_eq!(status, StatusCode::OK, "a non-master may still create non-master keys");
+    // `can_manage_webhooks` joined the master-only set under R4. It was previously delegable on the
+    // reasoning that it "confers no authority over keys or groups", which was too narrow: a webhook is
+    // a standing export of everything happening in a group to a URL its creator picks, and the scope
+    // was freely amplifiable — a parent that did not hold it could hand it out, R1's plainest
+    // violation. §1 puts resource-creation rights at the same tier as `can_manage_keys`.
+    let (status, _) = create(json!({ "name": "webhook-minter", "can_manage_webhooks": true })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "a non-master cannot grant can_manage_webhooks");
+
+    // Control: the same caller can still create an ordinary key, so the guards bound key
+    // administration rather than having disabled it.
+    let (status, _) = create(json!({ "name": "ordinary" })).await;
+    assert_eq!(status, StatusCode::OK, "a non-master may still create unscoped keys");
 
     // An explicit `false` on the master-only *scopes* is not treated as a request for elevation.
     // `is_master` is absent here on purpose: it is no longer a scope with a permissive `false`
@@ -1291,6 +1325,7 @@ async fn attack_non_master_cannot_mint_a_master_key() {
         "name": "explicitly-unscoped",
         "can_manage_keys": false,
         "can_create_groups": false,
+        "can_manage_webhooks": false,
     }))
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1331,7 +1366,8 @@ async fn attack_non_master_cannot_elevate_an_existing_key_into_master_scopes() {
         }
     };
 
-    for scope in ["can_manage_keys", "can_create_groups"] {
+    // Every global scope is master-only under R4 — `can_manage_webhooks` included, as of Phase 1.
+    for scope in ["can_manage_keys", "can_create_groups", "can_manage_webhooks"] {
         assert_eq!(
             update(json!({ scope: true })).await,
             StatusCode::FORBIDDEN,
@@ -1339,13 +1375,12 @@ async fn attack_non_master_cannot_elevate_an_existing_key_into_master_scopes() {
         );
     }
 
-    // Delegable scopes and ordinary fields still update normally.
-    assert_eq!(update(json!({ "can_manage_webhooks": true })).await, StatusCode::OK);
+    // Ordinary fields still update normally, so the guard bounds elevation rather than freezing the
+    // endpoint.
     assert_eq!(update(json!({ "name": "Renamed" })).await, StatusCode::OK);
 
-    // Re-submitting a scope the target already holds is a no-op, not an elevation — an idempotent
-    // PUT from a dashboard that posts every field must not start failing.
-    assert_eq!(update(json!({ "can_manage_webhooks": true })).await, StatusCode::OK);
+    // Lowering a scope is never an elevation, so a non-master may still take one away.
+    assert_eq!(update(json!({ "can_manage_webhooks": false })).await, StatusCode::OK);
 
     let after = simply_ip_vault::entities::prelude::ApiKey::find_by_id(victim_id)
         .one(&db)
@@ -1353,7 +1388,8 @@ async fn attack_non_master_cannot_elevate_an_existing_key_into_master_scopes() {
         .unwrap()
         .unwrap();
     assert!(!after.is_master && !after.can_manage_keys && !after.can_create_groups);
-    assert!(after.can_manage_webhooks, "the delegable scope did land");
+    assert!(!after.can_manage_webhooks, "no scope was granted");
+    assert_eq!(after.name, "Renamed", "the non-scope field did land");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1842,8 +1878,11 @@ async fn attack_cannot_self_grant_or_over_grant_group_permissions() {
 
     let own_group = insert_group(&db, "own-group").await;
     let foreign_group = insert_group(&db, "foreign-group").await;
-    // The caller can read and write its own group, but cannot delete in it.
-    grant(&db, caller_id, own_group, true, true, false).await;
+    // The caller can read and write its own group, but cannot delete in it — and it administers the
+    // group, which under R2 is what admits it to the grant path at all. Without `can_manage` every
+    // assertion below would pass on the admission check rather than on the per-verb ceiling this test
+    // is about, and the control at the end would fail.
+    grant_manager(&db, caller_id, own_group, true, true, false).await;
 
     // `group_id` is a plain string (it doubles as a name), and all three verbs are required fields.
     let post = |target: Uuid, group: Uuid, read: bool, write: bool, del: bool| {

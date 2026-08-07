@@ -2026,14 +2026,21 @@ async fn a_key_manager_cannot_revoke_access_to_a_group_it_does_not_manage() {
     // The victim: another tenant's worker key.
     let (victim_id, _victim_key) = insert_key(&db, "Tenant B worker", false, false, false, false).await;
 
-    // Master grants each key access to its own group.
-    for (holder, group_name) in [(attacker_id, "tenant-a-group"), (victim_id, "tenant-b-group")] {
+    // Master grants each key access to its own group. Only the attacker gets `can_manage`, which is
+    // R2's second half — with `can_manage_keys` it makes the attacker a genuine manager of
+    // `tenant-a-group`, so the refusal below is about *which* group it reaches rather than about it
+    // having no administrative standing at all.
+    for (holder, group_name, manage) in [
+        (attacker_id, "tenant-a-group", true),
+        (victim_id, "tenant-b-group", false),
+    ] {
         let req = signed_later(inject_connect_info(Request::builder()
             .method("POST")
             .uri(format!("/api/keys/{holder}/permissions"))
             .header("X-API-Key", &master_key)
             .header("Content-Type", "application/json")), 1, json!({
-                "group_name": group_name, "can_read": true, "can_write": true, "can_delete": true
+                "group_name": group_name, "can_read": true, "can_write": true, "can_delete": true,
+                "can_manage": manage
             }).to_string());
         assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
     }
@@ -2125,7 +2132,10 @@ async fn a_group_manager_may_remove_verbs_it_does_not_hold_itself() {
 
     assert_eq!(
         grant(manager_id, json!({
-            "group_name": "shared-group", "can_read": true, "can_write": false, "can_delete": false
+            "group_name": "shared-group", "can_read": true, "can_write": false, "can_delete": false,
+            // R2's resource half. Read-only on the group's *data*, administrative over its grants —
+            // which is exactly what makes "removes a verb it does not hold" a real assertion.
+            "can_manage": true
         }), 1).await,
         StatusCode::OK
     );
@@ -2179,19 +2189,57 @@ async fn a_group_manager_may_remove_verbs_it_does_not_hold_itself() {
         "the same removal must succeed through the dedicated endpoint too"
     );
 
+    // **Endpoint parity, in the one shape that distinguishes it.** R6: a reduction reached through
+    // the general update endpoint is classified as a revocation "regardless of which endpoint it
+    // arrives at". Every reduction so far has also been within the caller's own verbs, so routing it
+    // through the grant path by mistake would produce the same answer and no test would notice.
+    //
+    // This one is not: the worker keeps `can_write`, which the manager does **not** hold, while
+    // losing `can_delete`. It adds no verb, so it is a revocation and must succeed — but under the
+    // grant path the surviving `can_write` trips the per-verb ceiling and it would be refused.
+    assert_eq!(
+        grant(worker_id, json!({
+            "group_name": "shared-group", "can_read": true, "can_write": true, "can_delete": true
+        }), 6).await,
+        StatusCode::OK
+    );
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/keys/{worker_id}/permissions"))
+        .header("X-API-Key", &manager_key)
+        .header("Content-Type", "application/json")), 7, json!({
+            "group_name": "shared-group", "can_read": true, "can_write": true, "can_delete": false
+        }).to_string());
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "dropping one verb while leaving another the caller does not hold is still a revocation"
+    );
+
+    let partial = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(worker_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the worker's row survives the partial reduction");
+    assert!(
+        partial.can_read && partial.can_write && !partial.can_delete,
+        "only the dropped verb changed: {partial:?}"
+    );
+
     // Granting is still bounded per verb — the relaxation is one-directional, and a test that did
     // not assert this would be consistent with the guard having been deleted outright.
     let req = signed_later(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{worker_id}/permissions"))
         .header("X-API-Key", &manager_key)
-        .header("Content-Type", "application/json")), 6, json!({
-            "group_name": "shared-group", "can_read": true, "can_write": true, "can_delete": false
+        .header("Content-Type", "application/json")), 8, json!({
+            "group_name": "shared-group", "can_read": true, "can_write": true, "can_delete": true
         }).to_string());
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
         StatusCode::FORBIDDEN,
-        "a read-only manager still cannot confer can_write it does not hold"
+        "a read-only manager still cannot confer can_delete it does not hold"
     );
 }
 
@@ -2220,17 +2268,22 @@ async fn a_group_manager_may_revoke_and_reduce_its_own_access() {
         .uri(format!("/api/keys/{manager_id}/permissions"))
         .header("X-API-Key", &master_key)
         .header("Content-Type", "application/json")), json!({
-            "group_name": "self-revoke-group", "can_read": true, "can_write": true, "can_delete": true
+            "group_name": "self-revoke-group", "can_read": true, "can_write": true,
+            "can_delete": true, "can_manage": true
         }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
-    // Self-reduction through the update endpoint: drop your own delete.
+    // Self-reduction through the update endpoint: drop your own delete. `can_manage` is re-submitted
+    // rather than omitted — omitting it would *also* be a valid reduction (dropping the
+    // administrative right in the same call), but it would strip the very authority the later
+    // assertions test, and the interesting case is reducing one verb while keeping the role.
     let req = signed_later(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{manager_id}/permissions"))
         .header("X-API-Key", &manager_key)
         .header("Content-Type", "application/json")), 1, json!({
-            "group_name": "self-revoke-group", "can_read": true, "can_write": true, "can_delete": false
+            "group_name": "self-revoke-group", "can_read": true, "can_write": true,
+            "can_delete": false, "can_manage": true
         }).to_string());
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
@@ -2244,7 +2297,8 @@ async fn a_group_manager_may_revoke_and_reduce_its_own_access() {
         .uri(format!("/api/keys/{manager_id}/permissions"))
         .header("X-API-Key", &manager_key)
         .header("Content-Type", "application/json")), 2, json!({
-            "group_name": "self-revoke-group", "can_read": true, "can_write": true, "can_delete": true
+            "group_name": "self-revoke-group", "can_read": true, "can_write": true,
+            "can_delete": true, "can_manage": true
         }).to_string());
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
@@ -2312,7 +2366,8 @@ async fn a_group_left_ungoverned_by_self_revocation_stays_visible_to_a_master() 
         .uri(format!("/api/keys/{manager_id}/permissions"))
         .header("X-API-Key", &master_key)
         .header("Content-Type", "application/json")), json!({
-            "group_name": "orphaned-group", "can_read": true, "can_write": true, "can_delete": true
+            "group_name": "orphaned-group", "can_read": true, "can_write": true,
+            "can_delete": true, "can_manage": true
         }).to_string());
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
 
@@ -2379,7 +2434,8 @@ async fn a_group_left_ungoverned_by_self_revocation_stays_visible_to_a_master() 
         .uri(format!("/api/keys/{manager_id}/permissions"))
         .header("X-API-Key", &master_key)
         .header("Content-Type", "application/json")), 5, json!({
-            "group_name": "orphaned-group", "can_read": true, "can_write": true, "can_delete": true
+            "group_name": "orphaned-group", "can_read": true, "can_write": true,
+            "can_delete": true, "can_manage": true
         }).to_string());
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
@@ -2446,19 +2502,22 @@ async fn insert_group_row(db: &DatabaseConnection, name: &str) -> Uuid {
     id
 }
 
-/// Per-group `can_manage` confers revocation on that group — and revocation only.
+/// **R2 — neither half of the conjunction is sufficient alone.**
 ///
-/// This is the split the column exists for. `can_manage_keys` is a system-wide scope: it reaches
-/// every key and every group, so before this column, delegating "you may take a verb away from one
-/// key on one group" meant handing over authority across the whole installation. `can_manage` is
-/// that delegation at the size it was actually wanted.
+/// `RBAC_MODEL.md` R2: "Managing a specific resource requires holding both global `can_manage_keys`
+/// AND a `can_manage = true` row for that specific resource. Neither alone is sufficient.
+/// `can_manage_keys` is never a global bypass of per-resource RBAC."
 ///
-/// The direction it does **not** confer is the load-bearing half of the test. Removing a verb raises
-/// nobody's authority, so a resource-scoped right is a sound gate for it. Conferring one can raise
-/// authority above the caller's own, so allowing a group-scoped flag to grant would make it a way to
-/// escalate out of the very group it is scoped to.
+/// This asserts the resource half in isolation, which is the half that used to be enough: a steward
+/// holding `can_manage = true` and **no global scope whatsoever** could revoke, on the reasoning that
+/// removing a verb raises nobody's authority. That reasoning is about escalation, and revocation is
+/// not an escalation problem — it is an integrity one. §1 draws the tier boundary instead: a Daughter
+/// key (no `can_manage_keys`) "may never" manage resources, in either direction.
+///
+/// The control at the end is what stops this passing for the wrong reason: the identical operation,
+/// from a caller that holds *both* halves, succeeds.
 #[tokio::test]
-async fn per_group_can_manage_permits_revoking_but_never_granting() {
+async fn per_group_can_manage_alone_confers_no_authority() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
     let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
@@ -2468,120 +2527,130 @@ async fn per_group_can_manage_permits_revoking_but_never_granting() {
     let (worker_id, _worker_key) = insert_key(&db, "Worker", false, false, false, false).await;
 
     let group_id = insert_group_row(&db, "stewarded-group").await;
-    // Read-only *and* administrative: the steward cannot itself write or delete in the group, which
-    // is what makes "revokes a verb it does not hold" a real assertion below.
-    grant_perm(&db, steward_id, group_id, true, false, false, true).await;
+    grant_perm(&db, steward_id, group_id, true, true, true, true).await;
     grant_perm(&db, worker_id, group_id, true, true, true, false).await;
 
-    // REVOKE — permitted, and over verbs the steward does not hold itself.
+    // REVOKE — refused. This is the assertion that inverted under R2.
     let req = signed(inject_connect_info(Request::builder()
         .method("DELETE")
         .uri(format!("/api/keys/{worker_id}/permissions/stewarded-group"))
         .header("X-API-Key", &steward_key)), "");
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
-        StatusCode::NO_CONTENT,
-        "per-group can_manage must permit revoking, including verbs the caller does not hold"
+        StatusCode::FORBIDDEN,
+        "can_manage without can_manage_keys must not permit revoking"
     );
 
-    // GRANT — refused. Same caller, same group, opposite direction.
+    // GRANT — refused too, so the refusal is not direction-specific.
     let req = signed_later(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{worker_id}/permissions"))
         .header("X-API-Key", &steward_key)
         .header("Content-Type", "application/json")), 1, json!({
-            "group_name": "stewarded-group", "can_read": true, "can_write": false, "can_delete": false
+            "group_name": "stewarded-group", "can_read": true, "can_write": true, "can_delete": true
         }).to_string());
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
         StatusCode::FORBIDDEN,
-        "per-group can_manage must NOT permit creating a permission row"
+        "can_manage without can_manage_keys must not permit granting either"
     );
 
-    // ...nor widening one that already exists.
-    grant_perm(&db, worker_id, group_id, true, false, false, false).await;
+    // Lowering a row through the update endpoint is a revocation reached by another route (R6), and
+    // is refused on exactly the same terms — the classification decides which *extra* rule applies,
+    // never whether R2 applies at all.
     let req = signed_later(inject_connect_info(Request::builder()
         .method("POST")
         .uri(format!("/api/keys/{worker_id}/permissions"))
         .header("X-API-Key", &steward_key)
         .header("Content-Type", "application/json")), 2, json!({
-            "group_name": "stewarded-group", "can_read": true, "can_write": true, "can_delete": false
-        }).to_string());
-    assert_eq!(
-        app.clone().oneshot(req).await.unwrap().status(),
-        StatusCode::FORBIDDEN,
-        "per-group can_manage must NOT permit widening an existing row"
-    );
-
-    // ...but reducing that same row through the same endpoint is a revocation, and is permitted.
-    // Both spellings of "reduce" have to agree, or the dedicated endpoint becomes a way around the
-    // update endpoint (or vice versa).
-    let req = signed_later(inject_connect_info(Request::builder()
-        .method("POST")
-        .uri(format!("/api/keys/{worker_id}/permissions"))
-        .header("X-API-Key", &steward_key)
-        .header("Content-Type", "application/json")), 3, json!({
             "group_name": "stewarded-group", "can_read": false, "can_write": false, "can_delete": false
         }).to_string());
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
-        StatusCode::OK,
-        "lowering a row is a revocation and must be permitted through the update endpoint too"
+        StatusCode::FORBIDDEN,
+        "a reduction through the update endpoint is governed by R2 like any other reduction"
     );
 
-    let reduced = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+    let untouched = simply_ip_vault::entities::api_key_group_permission::Entity::find()
         .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(worker_id))
         .one(&db)
         .await
         .unwrap()
-        .expect("the row still exists, reduced");
-    assert!(!reduced.can_read, "the reduction actually landed");
+        .expect("the worker's row survives every refused attempt");
+    assert!(
+        untouched.can_read && untouched.can_write && untouched.can_delete,
+        "the refusals blocked the writes rather than merely reporting a failure"
+    );
 
-    // The steward's authority is confined to its own group: another group is untouchable in either
-    // direction, which is the containment the scoped flag is supposed to buy.
-    let other_id = insert_group_row(&db, "other-group").await;
-    grant_perm(&db, worker_id, other_id, true, true, true, false).await;
+    // Control: the same steward, with the missing half added, may do both. Without this the test
+    // would pass just as well against a build where revocation had been disabled outright.
+    let mut promoted: simply_ip_vault::entities::api_key::ActiveModel =
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(steward_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    promoted.can_manage_keys = Set(true);
+    promoted.update(&db).await.unwrap();
+
     let req = signed_later(inject_connect_info(Request::builder()
         .method("DELETE")
-        .uri(format!("/api/keys/{worker_id}/permissions/other-group"))
-        .header("X-API-Key", &steward_key)), 4, "");
+        .uri(format!("/api/keys/{worker_id}/permissions/stewarded-group"))
+        .header("X-API-Key", &steward_key)), 3, "");
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
-        StatusCode::FORBIDDEN,
-        "can_manage on one group confers nothing on another"
+        StatusCode::NO_CONTENT,
+        "both halves together are the authority; the row alone was never the missing piece"
     );
 }
 
-/// The three caller classes, asserted side by side so the split cannot regress into a single rule.
+/// **R2 across all four caller classes, side by side**, so the conjunction cannot regress into
+/// either of its halves.
 ///
-/// A test that only checked the new path would still pass if `can_manage_keys` had been broken into
-/// meaning nothing, and one that only checked the old path would pass if `can_manage` were ignored.
+/// A test that only exercised the "holds both" case would pass just as well against a build that had
+/// dropped one half of the check. Each class below is refused (or admitted) for a different reason,
+/// and the two middle rows are the ones R2 changed: each holds exactly one half and was previously
+/// admitted to at least one direction.
+///
+/// | Class | `can_manage_keys` | `can_manage` row | Grant | Revoke |
+/// | :--- | :--- | :--- | :--- | :--- |
+/// | Global-only | ✅ | ❌ | ❌ | ❌ |
+/// | Scoped-only | ❌ | ✅ | ❌ | ❌ |
+/// | Both | ✅ | ✅ | ✅ (verb-bounded) | ✅ |
+/// | Neither | ❌ | ❌ | ❌ | ❌ |
 #[tokio::test]
-async fn grant_and_revoke_authority_differs_by_caller_class() {
+async fn grant_and_revoke_authority_requires_both_halves_of_the_conjunction() {
     let db = setup_test_db().await;
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
     let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let group_id = insert_group_row(&db, "classes-group").await;
 
-    // Class 1: global can_manage_keys, plus a row on the group (the entry gate) — may do both.
+    // Class 1: global `can_manage_keys` and a row on the group, but the row lacks `can_manage`. This
+    // was the original grant path in full, and R2 refuses it — `can_manage_keys` is never a global
+    // bypass of per-resource RBAC.
     let (global_id, global_key) = insert_key(&db, "Global manager", false, true, false, false).await;
     grant_perm(&db, global_id, group_id, true, true, true, false).await;
 
-    // Class 2: per-group can_manage only, no global scope — may revoke, may not grant.
+    // Class 2: per-group `can_manage`, no global scope. This was the revoke path.
     let (scoped_id, scoped_key) = insert_key(&db, "Scoped manager", false, false, false, false).await;
     grant_perm(&db, scoped_id, group_id, true, true, true, true).await;
 
-    // Class 3: neither. Holds ordinary access to the group but no administrative right at all.
+    // Class 3: both halves. The only class that may act.
+    let (full_id, full_key) = insert_key(&db, "Full manager", false, true, false, false).await;
+    grant_perm(&db, full_id, group_id, true, true, true, true).await;
+
+    // Class 4: neither. Ordinary access to the group and no administrative right at all.
     let (plain_id, plain_key) = insert_key(&db, "Plain holder", false, false, false, false).await;
     grant_perm(&db, plain_id, group_id, true, true, true, false).await;
 
     let (victim_id, _victim_key) = insert_key(&db, "Victim", false, false, false, false).await;
 
     // `write` selects whether the payload genuinely widens the victim's row. That distinction is the
-    // whole subject of this test: classification is by *effect*, so re-submitting a row's existing
-    // values is a no-op rather than a grant, and asserting "scoped cannot grant" against a no-op
-    // would pass for the wrong reason (it did, on the first draft of this test).
+    // whole subject of the classification: it is by *effect*, so re-submitting a row's existing
+    // values is a no-op rather than a grant, and asserting "X cannot grant" against a no-op would
+    // pass for the wrong reason (it did, on the first draft of this test).
     let grant_as = |caller: String, nth: i64, write: bool| {
         let app = app.clone();
         async move {
@@ -2606,23 +2675,46 @@ async fn grant_and_revoke_authority_differs_by_caller_class() {
         }
     };
 
-    // Class 3 — refused both. Asserted first, while no row exists for the victim, so the grant
-    // refusal cannot be mistaken for a 404 on a missing row.
-    assert_eq!(grant_as(plain_key.clone(), 1, false).await, StatusCode::FORBIDDEN, "no authority: no grant");
+    // Every refusal is asserted first, while no row exists for the victim, so a grant refusal cannot
+    // be mistaken for a 404 on a missing row.
+    assert_eq!(grant_as(plain_key.clone(), 1, false).await, StatusCode::FORBIDDEN, "neither half: no grant");
+    assert_eq!(grant_as(global_key.clone(), 2, false).await, StatusCode::FORBIDDEN, "can_manage_keys alone: no grant");
+    assert_eq!(grant_as(scoped_key.clone(), 3, false).await, StatusCode::FORBIDDEN, "can_manage alone: no grant");
 
-    // Class 1 — grants. Creates the victim's row as read-only.
-    assert_eq!(grant_as(global_key.clone(), 2, false).await, StatusCode::OK, "can_manage_keys grants");
+    // Class 3 grants. Creates the victim's row as read-only.
+    assert_eq!(grant_as(full_key.clone(), 4, false).await, StatusCode::OK, "both halves grant");
 
-    // Class 3 — refused revoking the row that now exists.
-    assert_eq!(revoke_as(plain_key, 3).await, StatusCode::FORBIDDEN, "no authority: no revoke");
+    // Now that a row exists, every class is asked to revoke it.
+    assert_eq!(revoke_as(plain_key, 5).await, StatusCode::FORBIDDEN, "neither half: no revoke");
+    assert_eq!(revoke_as(global_key.clone(), 6).await, StatusCode::FORBIDDEN, "can_manage_keys alone: no revoke");
+    assert_eq!(revoke_as(scoped_key.clone(), 7).await, StatusCode::FORBIDDEN, "can_manage alone: no revoke");
 
-    // Class 2 — refused *widening* (adding can_write the victim lacks), permitted revoking.
-    assert_eq!(grant_as(scoped_key.clone(), 4, true).await, StatusCode::FORBIDDEN, "scoped: no grant");
-    assert_eq!(revoke_as(scoped_key, 5).await, StatusCode::NO_CONTENT, "scoped: revokes");
+    // Widening is refused for the same two classes, so the refusal is not specific to row creation.
+    assert_eq!(grant_as(global_key, 8, true).await, StatusCode::FORBIDDEN, "can_manage_keys alone: no widening");
+    assert_eq!(grant_as(scoped_key, 9, true).await, StatusCode::FORBIDDEN, "can_manage alone: no widening");
 
-    // Class 1 — revokes too, so the new path did not displace the old one.
-    assert_eq!(grant_as(global_key.clone(), 6, true).await, StatusCode::OK);
-    assert_eq!(revoke_as(global_key, 7).await, StatusCode::NO_CONTENT, "can_manage_keys revokes");
+    // The row survived every refusal, so the 403s blocked writes rather than reporting them.
+    let survived = simply_ip_vault::entities::api_key_group_permission::Entity::find()
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(victim_id))
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the victim's row is still there");
+    assert!(survived.can_read && !survived.can_write, "unchanged since class 3 created it");
+
+    // Class 3 widens and then revokes, so neither direction was disabled outright.
+    assert_eq!(grant_as(full_key.clone(), 10, true).await, StatusCode::OK, "both halves widen");
+    assert_eq!(revoke_as(full_key, 11).await, StatusCode::NO_CONTENT, "both halves revoke");
+    assert!(
+        simply_ip_vault::entities::api_key_group_permission::Entity::find()
+            .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(victim_id))
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none(),
+        "and the revocation genuinely removed the row"
+    );
+    let _ = (full_id, scoped_id, global_id, plain_id);
 }
 
 /// `can_manage` is itself a verb, so it cannot be conferred by someone who does not hold it.
@@ -2697,12 +2789,11 @@ async fn can_manage_cannot_be_conferred_by_a_caller_who_lacks_it() {
     assert!(!after.can_manage, "a payload omitting can_manage confers none");
 }
 
-/// A group left ungoverned via the **new** per-group revoke path stays visible to a master.
+/// A group left ungoverned via the dedicated revoke route stays visible to a master.
 ///
-/// The existing ungoverned-group test drives that state through a `can_manage_keys` holder. This
-/// reaches the same state through the narrower gate — a steward with no global scope at all
-/// surrendering its own row — because that is now a second, independent way for a group to end up
-/// with no permission rows, and a master's view must not depend on which route got it there.
+/// The other ungoverned-group test reaches that state by lowering a row through the *update*
+/// endpoint. This one reaches it through `DELETE .../permissions/{group}`, because R6 requires the
+/// two routes to be governed identically and a master's view must not depend on which one got there.
 #[tokio::test]
 async fn a_group_left_ungoverned_via_per_group_manage_stays_visible_to_a_master() {
     let db = setup_test_db().await;
@@ -2710,7 +2801,9 @@ async fn a_group_left_ungoverned_via_per_group_manage_stays_visible_to_a_master(
     let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
     let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
-    let (steward_id, steward_key) = insert_key(&db, "Sole steward", false, false, false, false).await;
+    // R2's conjunction: `can_manage_keys` plus the `can_manage` row granted below. Before R2 this
+    // fixture held no global scope at all, which is exactly the case R2 closed.
+    let (steward_id, steward_key) = insert_key(&db, "Sole steward", false, true, false, false).await;
 
     let group_id = insert_group_row(&db, "steward-orphaned").await;
     grant_perm(&db, steward_id, group_id, true, true, true, true).await;
@@ -2733,7 +2826,7 @@ async fn a_group_left_ungoverned_via_per_group_manage_stays_visible_to_a_master(
     assert_eq!(
         app.clone().oneshot(req).await.unwrap().status(),
         StatusCode::NO_CONTENT,
-        "a scoped steward may surrender its own row"
+        "a manager may surrender its own row through the dedicated route"
     );
 
     let rows = simply_ip_vault::entities::api_key_group_permission::Entity::find()

@@ -58,9 +58,9 @@ Stores authentication tokens, global access rights, and CIDR network binding rul
 | `prefix` | `String` | Not Null, Indexed | First 8 characters of key for display and fast lookup |
 | `is_master` | `Boolean` | Default: `false` | Bypasses all group permission checks. **Bootstrap-only** — not settable or clearable through any API payload (`RBAC_MODEL.md` §5); a request carrying the field is rejected with `400` |
 | `master_marker` | `String(16)` | Nullable, **Unique** | Uniqueness marker for the Master key: `'master'` on the one Master row, `NULL` on every other. Carries no authority and is read by no guard — it exists so a plain unique index can express "at most one Master" in the schema itself, which `RBAC_MODEL.md` §5 requires be enforced by the database rather than by application logic. A **nullable marker column** rather than a partial unique index on `is_master = true`, because MySQL has no partial indexes and the data layer must stay SQL-agnostic; NULLs do not collide in a unique index on any supported engine. Written only by `bootstrap_master_key` |
-| `can_manage_keys` | `Boolean` | Default: `false` | Global privilege to create/edit/delete API keys |
-| `can_manage_webhooks` | `Boolean` | Default: `false` | Global privilege to manage webhook configurations |
-| `can_create_groups` | `Boolean` | Default: `false` | Global privilege to create new IP groups |
+| `can_manage_keys` | `Boolean` | Default: `false` | Global privilege to create/edit/delete API keys. Grantable **only by the Master key** (`RBAC_MODEL.md` R4). Confers no authority over any group on its own — see the conjunction under `api_key_group_permissions` |
+| `can_manage_webhooks` | `Boolean` | Default: `false` | Global privilege to manage webhook configurations. Grantable **only by the Master key** — this service's spelling of the specification's `can_create_webhooks`, a resource-creation right, which §1 places at the same tier as `can_manage_keys` and R4 makes Master-only. Previously delegable, which made it freely amplifiable (a parent that did not hold it could hand it out) |
+| `can_create_groups` | `Boolean` | Default: `false` | Global privilege to create new IP groups. Grantable **only by the Master key** (R4) |
 | `bound_ips` | `Text` | Nullable | Comma-separated CIDR ranges allowed to use this key (e.g. `127.0.0.1/32,::/0`) |
 | `created_at` | `DateTimeUtc` | Not Null | Key generation timestamp |
 | `updated_at` | `DateTimeUtc` | Not Null | Key last update timestamp |
@@ -128,22 +128,32 @@ Maps fine-grained read, write, delete, and administrative permissions per API ke
 | `can_read` | `Boolean` | Default: `true` | Permission to view IPs within this group |
 | `can_write` | `Boolean` | Default: `false` | Permission to add/update IPs in this group |
 | `can_delete` | `Boolean` | Default: `false` | Permission to remove IPs from this group |
-| `can_manage` | `Boolean` | Not Null, Default: `false` | Permission to administer **this group's** permission rows. Resource-scoped counterpart to the global `api_keys.can_manage_keys`, and deliberately narrower: it satisfies the **revoke** path only. Granting or widening a verb still requires `can_manage_keys` — see `AGENT.MD` §2. Never auto-provisioned: creating a group confers read/write/delete and not this |
+| `can_manage` | `Boolean` | Not Null, Default: `false` | Permission to administer **this group's** permission rows — the resource half of `RBAC_MODEL.md` R2's conjunction. Confers nothing on its own: every administrative action also requires the global `api_keys.can_manage_keys`, and that scope in turn confers nothing on a group where this column is `false`. Never auto-provisioned: creating a group confers read/write/delete and not this |
 | `created_at` | `DateTimeUtc` | Not Null | Assignment timestamp |
 
 *Constraints & Indexes:*
 - Unique Index: `(api_key_id, group_id)`
 
-*Authority summary* — the two columns that grant authority over this table are not interchangeable:
+*Authority summary* — the two columns that grant authority over this table are **conjunctive**, not
+alternative (`RBAC_MODEL.md` R2: "Neither alone is sufficient"):
 
-| Action | Global `can_manage_keys` | Per-group `can_manage` |
+| Caller holds | Create a row, or add/widen a verb | Remove a verb, lower a row, or delete a row |
 | :--- | :--- | :--- |
-| Create a permission row, or add/widen a verb on one | ✅ (plus a row on the group, and only up to the verbs the caller itself holds) | ❌ |
-| Remove a verb, lower a row, or delete a row | ✅ (plus a row on the group) | ✅ (on that group only) |
+| Global `can_manage_keys` only | ❌ | ❌ |
+| Per-group `can_manage` only | ❌ | ❌ |
+| **Both** | ✅, and only up to the verbs the caller itself holds | ✅, with no proof over the verb removed |
+| `api_keys.is_master` | ✅ | ✅ |
 
-Removing a permission cannot raise anyone's authority, so it is safe behind a resource-scoped flag;
-conferring one can, so it stays behind the global scope. `can_manage` is itself treated as a verb on
-the grant path, so it cannot be conferred by a caller that does not already hold it.
+`can_manage_keys` is authority over **credentials** and says nothing about which groups the caller may
+reach — on its own it made per-group RBAC advisory. `can_manage` is authority over **one resource** and
+says nothing about whether the caller is trusted with credentials at all — on its own it admitted a key
+holding no global scope to rewriting other keys' access.
+
+The asymmetry that remains is *within* the grant direction, not between the two columns: conferring a
+verb can raise authority above the caller's own, so each verb is checked against the caller's own row
+(R1/R7), while removing one raises nobody's and needs no such proof (R6). `can_manage` is itself
+treated as a verb on the grant path, which is what implements R5 — manage may propagate sideways
+between parents and never upward to a daughter, since the recipient still needs `can_manage_keys`.
 
 ---
 

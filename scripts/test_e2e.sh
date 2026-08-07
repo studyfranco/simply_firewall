@@ -1919,6 +1919,11 @@ MANAGER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
 MANAGER_ID=$(echo "$RESP_BODY" | jq -r '.id')
 register_key_secret "$MANAGER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
+# An ordinary key for the scope-elevation checks to target.
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Scope Elevation Target"}'
+check "200" "create an ordinary key to attempt scope elevation against"
+VICTIM_NONMASTER_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
 # The master key it will attack. Previously a purpose-built second master; RBAC_MODEL.md §5 makes
 # that impossible, so the target is the real one — which is a strictly stronger test, since it is the
 # credential that actually matters.
@@ -1967,6 +1972,19 @@ check "403" "a non-master cannot grant can_manage_keys"
 
 api_call POST "/api/keys" "$MANAGER_KEY" '{"name":"Escalated Groups","can_create_groups":true}'
 check "403" "a non-master cannot grant can_create_groups"
+
+# R4/R1: can_manage_webhooks is a resource-creation right and joined the master-only set. It was
+# previously freely delegable — a parent that did not hold it could hand it out, which is the
+# plainest possible non-amplification violation.
+api_call POST "/api/keys" "$MANAGER_KEY" '{"name":"Escalated Webhooks","can_manage_keys":false,"can_manage_webhooks":true}'
+check "403" "a non-master cannot grant can_manage_webhooks"
+
+api_call PUT "/api/keys/$VICTIM_NONMASTER_ID" "$MANAGER_KEY" '{"can_manage_webhooks":true}'
+check "403" "nor elevate an existing key into can_manage_webhooks"
+
+# Lowering a scope is never an elevation, so the guard bounds direction rather than the field.
+api_call PUT "/api/keys/$VICTIM_NONMASTER_ID" "$MANAGER_KEY" '{"can_manage_webhooks":false}'
+check "200" "but it may still take can_manage_webhooks away"
 
 # Controls: the delegated scope still works against non-master targets, so the guards are scoped to
 # master escalation rather than having disabled key administration.
@@ -2402,8 +2420,11 @@ REVK_PEER_ID=$(echo "$RESP_BODY" | jq -r '.id')
 REVK_PEER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
 register_key_secret "$REVK_PEER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
 
+# `can_manage` is R2's resource half. With the manager's global `can_manage_keys` it is what admits
+# it to this group's permission rows at all; the tenant-mate below deliberately does NOT get it, so
+# the refusals further down are about which group is reachable, not about standing in general.
 api_call POST "/api/keys/$REVK_MGR_ID/permissions" "$MASTER_KEY" \
-    '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":true}'
+    '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":true,"can_manage":true}'
 check "200" "#27 grant the manager full rights on its own group"
 api_call POST "/api/keys/$REVK_PEER_ID/permissions" "$MASTER_KEY" \
     '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":true}'
@@ -2432,8 +2453,11 @@ check "204" "#27 a master key can still revoke anything"
 # Self-revocation is permitted: a manager may surrender its own access to a group it manages. The
 # block this replaces stopped only the least-privilege action, since the widening direction is
 # refused by the per-verb grant check regardless of who the target is.
+# `can_manage` is re-submitted rather than omitted: omitting it would also be a valid reduction
+# (surrendering the administrative role in the same call), but it would strip the authority the next
+# assertion needs. Reducing one verb while keeping the role is the interesting case.
 api_call POST "/api/keys/$REVK_MGR_ID/permissions" "$REVK_MGR_KEY" \
-    '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":false}'
+    '{"group_name":"revguard-tenant-a","can_read":true,"can_write":true,"can_delete":false,"can_manage":true}'
 check "200" "#27 a manager may reduce its own row on a group it manages"
 
 api_call DELETE "/api/keys/$REVK_MGR_ID/permissions/revguard-tenant-a" "$REVK_MGR_KEY"
@@ -2466,6 +2490,76 @@ check "200" "#27 a master can put an ungoverned group back under management"
 
 api_call GET "/api/ips?group_name=revguard-tenant-a" "$REVK_PEER_KEY"
 check "200" "#27 the restored manager can reach the group again"
+
+# --- 27c-ter. R2: neither half of the conjunction is sufficient alone -------------------------
+#
+# RBAC_MODEL.md R2 requires BOTH global can_manage_keys AND can_manage = true on the specific
+# resource, and says plainly that neither alone is sufficient. Both halves used to be sufficient on
+# their own for at least one direction: can_manage_keys + any row was the grant path, and can_manage
+# alone was the revoke path. Each is asserted here in isolation, then together as the control.
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"conjunction-group"}'
+check "200" "#27 create a group for the R2 conjunction checks"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Global Half","can_manage_keys":true}'
+check "200" "#27 create a caller holding only the global half"
+CONJ_GLOBAL_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+CONJ_GLOBAL_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$CONJ_GLOBAL_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Scoped Half"}'
+check "200" "#27 create a caller holding only the resource half"
+CONJ_SCOPED_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+CONJ_SCOPED_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$CONJ_SCOPED_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"Conjunction Victim"}'
+check "200" "#27 create a target for the conjunction checks"
+CONJ_VICTIM_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# A row on the group, but WITHOUT can_manage.
+api_call POST "/api/keys/$CONJ_GLOBAL_ID/permissions" "$MASTER_KEY" \
+    '{"group_name":"conjunction-group","can_read":true,"can_write":true,"can_delete":true}'
+check "200" "#27 give the global-half caller ordinary access to the group"
+
+# can_manage on the group, but NO global scope.
+api_call POST "/api/keys/$CONJ_SCOPED_ID/permissions" "$MASTER_KEY" \
+    '{"group_name":"conjunction-group","can_read":true,"can_write":true,"can_delete":true,"can_manage":true}'
+check "200" "#27 give the scoped-half caller can_manage on the group"
+
+api_call POST "/api/keys/$CONJ_VICTIM_ID/permissions" "$MASTER_KEY" \
+    '{"group_name":"conjunction-group","can_read":true,"can_write":false,"can_delete":false}'
+check "200" "#27 give the victim a row to be attacked"
+
+api_call POST "/api/keys/$CONJ_VICTIM_ID/permissions" "$CONJ_GLOBAL_KEY" \
+    '{"group_name":"conjunction-group","can_read":true,"can_write":true,"can_delete":false}'
+check "403" "#27 can_manage_keys plus a row, without can_manage, cannot grant"
+
+api_call DELETE "/api/keys/$CONJ_VICTIM_ID/permissions/conjunction-group" "$CONJ_GLOBAL_KEY"
+check "403" "#27 ...nor revoke"
+
+api_call POST "/api/keys/$CONJ_VICTIM_ID/permissions" "$CONJ_SCOPED_KEY" \
+    '{"group_name":"conjunction-group","can_read":true,"can_write":true,"can_delete":false}'
+check "403" "#27 can_manage without can_manage_keys cannot grant"
+
+api_call DELETE "/api/keys/$CONJ_VICTIM_ID/permissions/conjunction-group" "$CONJ_SCOPED_KEY"
+check "403" "#27 ...nor revoke"
+
+# The victim's row survived every refusal, so those 403s blocked writes rather than reporting them.
+api_call GET "/api/keys" "$MASTER_KEY"
+check_true "[.[] | select(.id == \"$CONJ_VICTIM_ID\") | .group_permissions[] | select(.group_name == \"conjunction-group\")] | length == 1" \
+    "#27 the victim's row survived every refused attempt"
+
+# Control: give the scoped caller the missing global half, and the identical calls succeed.
+api_call PUT "/api/keys/$CONJ_SCOPED_ID" "$MASTER_KEY" '{"can_manage_keys":true}'
+check "200" "#27 a master adds the missing half"
+
+api_call POST "/api/keys/$CONJ_VICTIM_ID/permissions" "$CONJ_SCOPED_KEY" \
+    '{"group_name":"conjunction-group","can_read":true,"can_write":true,"can_delete":false}'
+check "200" "#27 both halves together grant"
+
+api_call DELETE "/api/keys/$CONJ_VICTIM_ID/permissions/conjunction-group" "$CONJ_SCOPED_KEY"
+check "204" "#27 both halves together revoke"
 
 # --- 27d. Stored secrets are opened strictly, or not at all -----------------------------------
 #

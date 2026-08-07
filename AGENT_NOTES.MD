@@ -4417,3 +4417,221 @@ records them. Phase 0 is scoped to §5 plus the dependency pin.
 | `cargo test` | **178 passed**, 0 failed (70 unit + 62 RBAC + 43 security + 3 frontend syntax) |
 | `./scripts/test_e2e.sh` | **427/427** |
 | `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |
+
+---
+
+## Session 36 — RBAC_MODEL Convergence, Phase 1: R1, R2, R4, R6, R7
+
+Closes the conjunction and non-amplification gaps from the gap analysis. This is the phase that
+**narrows** existing behaviour, so the breaking-change audit below is the most important part of it.
+
+### The conjunction (R2), and why the previous split was defensible but wrong
+
+Grant and revoke were gated differently on purpose. The reasoning ran: conferring a verb can raise
+authority above the caller's own, so granting must stay behind the global `can_manage_keys`; removing
+one raises nobody's authority, so revocation is safe behind a resource-scoped `can_manage` alone.
+
+That reasoning is sound *about escalation*, and escalation is not what R2 governs. Revocation is an
+**integrity** control, and R2's answer is that authority over anyone's credentials — in either
+direction — starts at `can_manage_keys`, with the resource half bounding it to one group. §1 draws the
+same line from the other side: a Daughter key (no `can_manage_keys`) "may never" manage resources.
+
+Both halves are now required, everywhere:
+
+| Caller holds | Grant / widen | Revoke / reduce | Previously |
+| :--- | :--- | :--- | :--- |
+| `can_manage_keys` + a row **without** `can_manage` | ❌ | ❌ | grant ✅, revoke ✅ |
+| `can_manage` row, **no** global scope | ❌ | ❌ | grant ❌, revoke ✅ |
+| Both | ✅ (verb-bounded) | ✅ | ✅ / ✅ |
+| `is_master` | ✅ | ✅ | unchanged |
+
+`guard_group_administration` and `guard_group_revocation` collapsed into one `guard_group_manage`,
+which is the *same call* on both paths — the classification by effect (`widens_permissions`) now only
+decides whether R1's per-verb ceiling applies **on top**, never whether R2 applies at all. That is
+endpoint parity in its strongest form: a reduction reached through `POST .../permissions` and one
+reached through `DELETE .../permissions/{group}` cannot diverge, because they share the admission test
+by construction rather than by two rules that happen to agree.
+
+R6's other two clauses are unchanged and asserted: the revoker still needs no proof over the verb it
+removes, and self-revocation is still permitted.
+
+**One deliberate fail-closed change.** `guard_delegated_group_grant` had a `let Some(held) =
+caller_perm else { return Ok(()) }` — unreachable, because the gate above it refused a non-master with
+no row. It now returns `Forbidden` instead. The branch is still unreachable; the point is that
+"unreachable" and "grants everything unchecked" were one loosened gate apart.
+
+### Non-amplification (R1/R4)
+
+`can_manage_webhooks` joined `MASTER_ONLY_SCOPES`. It was delegable on the reasoning that it "confers
+no authority over keys or groups, and is bounded by the caller's own group access" — recorded in
+`AGENT.MD` and in a comment in `src/api.rs`, and too narrow on both counts. A webhook is a standing
+export of everything happening in a group to a URL its creator chooses, and the scope was **freely
+amplifiable**: a parent that did *not* hold `can_manage_webhooks` could grant it. That is R1's
+plainest violation — "a caller may only grant rights it currently holds itself" — and R4 answers it
+more strongly, since §1 places resource-creation rights at the same tier as `can_manage_keys`,
+"granted strictly by Master" and "never implied by `can_manage_keys`".
+
+With all three globals master-only, R1 for global scopes is now satisfied by the strictly stronger R4:
+a non-master grants none of them at all. The dedicated `can_manage_webhooks` self-escalation check in
+`update_api_key` was removed as **exactly** subsumed — it fired when a non-master targeted itself with
+`can_manage_webhooks: true` while not holding it, and in that case `target` *is* the caller, so
+`guard_scope_elevation` sees `Some(true)` against `held = false` and refuses. Verified by mutation,
+below.
+
+### Breaking changes, and how to find who they hit
+
+Every change here narrows. Four classes of caller lose an ability they had.
+
+**1. Revocation via `can_manage` alone.** A key holding `can_manage = true` on a group but **not**
+`can_manage_keys` could revoke on that group; it now cannot do anything.
+
+```sql
+-- Keys whose only administrative authority was the resource half. Each loses revocation entirely.
+SELECT k.id, k.name, k.prefix, g.name AS group_name
+FROM api_key_group_permissions p
+JOIN api_keys  k ON k.id = p.api_key_id
+JOIN ip_groups g ON g.id = p.group_id
+WHERE p.can_manage = true
+  AND k.can_manage_keys = false
+  AND k.is_master = false;
+```
+
+*Remedy:* grant `can_manage_keys` (master only) if the key should keep the authority, or accept the
+narrowing. Granting it is a real widening — it is authority over every key — so the deliberate answer
+is usually to accept the narrowing and let a master handle revocations.
+
+**2. Granting via `can_manage_keys` plus any row.** A key holding `can_manage_keys` and a row on a
+group *without* `can_manage` could grant on that group; it now cannot.
+
+```sql
+-- Key/group pairs that could grant before and cannot now. The fix is one UPDATE per pair, from a
+-- master, after deciding each one is still wanted.
+SELECT k.id AS key_id, k.name AS key_name, g.id AS group_id, g.name AS group_name
+FROM api_key_group_permissions p
+JOIN api_keys  k ON k.id = p.api_key_id
+JOIN ip_groups g ON g.id = p.group_id
+WHERE p.can_manage = false
+  AND k.can_manage_keys = true
+  AND k.is_master = false;
+```
+
+*Remedy, per pair that should keep the authority:*
+`POST /api/keys/{key_id}/permissions` from the master with the row's existing verbs plus
+`"can_manage": true`.
+
+**3. `can_manage_webhooks` is no longer delegable.** Existing holders are unaffected — the scope still
+works exactly as before for anyone who has it. What changed is who may hand it out.
+
+```sql
+-- Non-master keys that can currently mint webhook-managers. After this change only the master can.
+SELECT id, name, prefix FROM api_keys
+WHERE can_manage_keys = true AND can_manage_webhooks = false AND is_master = false;
+-- (These could grant a scope they do not hold. That is the R1 violation being closed.)
+```
+
+**4. A group's creator cannot delegate access to it.** Auto-provisioning grants read/write/delete and
+not `can_manage`, and R2 requires the row. A Parent that creates a group can use it but cannot grant
+anyone else access until a Master gives it `can_manage`. Deliberate, and the one consequence of R2
+that is more awkward than it is obviously correct: it is recorded here rather than papered over,
+because `owner_key_id` (§3, Phase 2) is where creator authority is due to live, and widening
+auto-provisioning now only to rework it next phase would be churn.
+
+```sql
+-- Groups with no manager at all. After this change only a master can open these for delegation.
+SELECT g.id, g.name
+FROM ip_groups g
+WHERE NOT EXISTS (
+  SELECT 1 FROM api_key_group_permissions p
+  JOIN api_keys k ON k.id = p.api_key_id
+  WHERE p.group_id = g.id AND p.can_manage = true AND k.can_manage_keys = true
+);
+```
+
+### Test changes
+
+Two RBAC tests had their premise inverted rather than their fixtures adjusted, because R2 reversed
+what they assert:
+
+- `per_group_can_manage_permits_revoking_but_never_granting` →
+  `per_group_can_manage_alone_confers_no_authority`. It now asserts refusal in **both** directions and
+  through both routes, checks the victim's row survived every attempt, and ends with a control that
+  adds the missing global half and repeats the identical call — without which the test would pass just
+  as well against a build where revocation had been disabled outright.
+- `grant_and_revoke_authority_differs_by_caller_class` →
+  `grant_and_revoke_authority_requires_both_halves_of_the_conjunction`. Four classes now instead of
+  three: global-only, scoped-only, both, neither. The two middle rows are the ones R2 changed, and
+  each is asserted in both directions so the conjunction cannot regress into either of its halves.
+
+Five more needed only `"can_manage": true` added to the master's setup grant. Three security tests
+changed for R4 (`can_manage_webhooks` moved from the "still delegable" control into the master-only
+loop), and one needed a new `grant_manager` fixture helper, since `grant` hardcodes `can_manage:
+false` and every caller expected to grant or revoke now needs the resource half.
+
+The e2e suite gained **19 checks** (427 → 446): a new §27c-ter block asserting R2's "neither alone" in
+both directions from both single-half callers, with a survival check on the victim's row and a control
+that adds the missing half; and R4 coverage for `can_manage_webhooks` on both the create and update
+paths, including that *lowering* it is still permitted (a narrowing is never an elevation).
+
+### Mutation testing
+
+Each enforcement rule was disabled in turn, the full suite plus e2e run, and the change reverted.
+Three of the seven mutations were **not** caught on the first pass; all three are reported, and one
+of them produced a new test.
+
+| Mutation | `cargo test` | e2e | Verdict |
+| :--- | :--- | :--- | :--- |
+| M1a — `guard_group_manage`: drop the `can_manage_keys` conjunct | 0 | 0 | **not caught** |
+| M1b — pre-gate: drop the `can_manage_keys` conjunct | 0 | 0 | **not caught** |
+| M1c — drop it from **both** layers (revert to `can_manage` alone) | 3 | 3 | caught |
+| M2 — drop the `can_manage` conjunct from both layers (revert to any row) | 2 | 3 | caught |
+| M3 — remove `can_manage_webhooks` from `MASTER_ONLY_SCOPES` | 4 | 2 | caught |
+| M4 — restore the fail-open `else { return Ok(()) }` | 0 | 0 | **not caught** |
+| M5 — route reductions through the grant path (break endpoint parity) | 0 → **2** | 0 | caught *after a new test* |
+
+**M1a/M1b are masked by each other, and that is the honest reading.** `guard_may_administer_any_group`
+and `guard_group_manage` both test `can_manage_keys`, at different granularities — once
+group-independently before any lookup (for oracle discipline), once precisely once the group is known.
+Removing it from either alone leaves the other enforcing, so no request changes and no test can see it.
+M1c removes both and is caught immediately. The duplication is deliberate defence in depth rather than
+an accident, but it does mean single-site mutation understates the coverage here, and a reader of this
+table should not conclude that either site is untested.
+
+**M4 is unreachable by construction.** The branch fires only for a non-master with no permission row,
+which `guard_group_manage` refuses one line earlier. No test can distinguish `Ok(())` from `Forbidden`
+there without first breaking the gate above it — which is M1c/M2, both caught. It fails closed anyway,
+because "unreachable" and "grants everything unchecked" are one loosened gate apart.
+
+**M5 exposed a genuine gap and now has a test.** Every reduction the suite exercised was also within
+the caller's own verbs, so routing one through the grant path by mistake produced the same answer and
+nothing noticed. The distinguishing shape is a reduction that *leaves* a verb the caller does not
+hold: a read-only manager dropping `can_delete` from a worker while `can_write` survives. It adds no
+verb, so R6 makes it a revocation and it must succeed — but on the grant path the surviving
+`can_write` trips R1's per-verb ceiling and it would be refused. Added to
+`a_group_manager_may_remove_verbs_it_does_not_hold_itself`; M5 now fails 2 tests.
+
+### Gap analysis items resolved
+
+| Requirement | Was | Now |
+| :--- | :--- | :--- |
+| §1 Daughter may never manage resources | VIOLATES | **COMPLIES** |
+| §1 Resource-creation rights are Master-only | VIOLATES | **COMPLIES** |
+| R1 Non-amplification | VIOLATES | **COMPLIES** |
+| R2 Conjunction of management | VIOLATES | **COMPLIES** |
+| R4 Master-only elevation | VIOLATES | **COMPLIES** |
+| R7 Bounded granting (R1 ∧ R2) | VIOLATES | **COMPLIES** |
+| R5 Sideways manage delegation | COMPLIES | unchanged |
+| R6 Non-escalating revocation | COMPLIES | unchanged (and now shares its admission test with the grant path) |
+
+Still open, for Phases 2–4: R3 (`parent_key_id`), §3 (`owner_key_id`, lifecycle authority), §4
+(visibility scopes, oracle discipline), §6 (cascade deletion, pre-flight inventory), §7 (lineage and
+ownership indexes).
+
+### Validation
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean (exit 0) |
+| `cargo test` | **178 passed**, 0 failed |
+| `./scripts/test_e2e.sh` | **446/446** |
+| `./scripts/verify_convergence.sh` | 30 matching, 2 documented, 0 unexplained |

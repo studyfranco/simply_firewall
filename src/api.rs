@@ -127,77 +127,66 @@ async fn caller_group_permission(
         .map_err(AppError::DbError)
 }
 
-/// The entry gate for administering *any* key's permissions on one group: the caller must itself
-/// hold a grant on that group.
+/// **R2 — management of a resource is a conjunction.** The single authority test for touching *any*
+/// key's permissions on one group, in either direction.
 ///
-/// `can_manage_keys` says the caller may administer keys; it says nothing about *which groups* it
-/// may reach. Without this, a key scoped to one group could rewrite every other key's access to
-/// every group in the system, which makes per-group RBAC advisory rather than enforced.
+/// `RBAC_MODEL.md` R2: "Managing a specific resource requires holding both global `can_manage_keys`
+/// AND a `can_manage = true` row for that specific resource. Neither alone is sufficient.
+/// `can_manage_keys` is never a global bypass of per-resource RBAC."
 ///
-/// `action` names the operation being guarded (`"grant"` / `"revoke"`) and appears verbatim in the
-/// client-facing message, which is otherwise identical between the two paths so a caller probing
-/// them cannot tell which check refused it.
-fn guard_group_administration(
+/// Each half answers a different question, and each is useless without the other:
+///
+/// - `can_manage_keys` is authority over **credentials**. It says the caller may administer keys at
+///   all; it says nothing about *which* groups it may reach. On its own it made per-group RBAC
+///   advisory — a key scoped to one group could rewrite every other key's access to every group in
+///   the installation.
+/// - `can_manage` is authority over **one resource**. It says which group. On its own it admitted a
+///   key holding no global scope whatsoever to rewriting other keys' credentials, which is exactly
+///   the tier boundary §1 draws: a Daughter key "may never" manage resources.
+///
+/// `action` names the operation (`"grant"` / `"revoke"`) and appears verbatim in the client-facing
+/// message, which is otherwise identical between the two paths so a caller probing them cannot tell
+/// which one refused it. The message states the *rule*, never the caller's state: "you hold one half
+/// but not the other" would be a usable oracle.
+///
+/// # What this replaced, and why the previous split was wrong
+///
+/// Until now grant and revoke were gated differently on purpose: revocation accepted `can_manage`
+/// alone, on the reasoning that removing a verb cannot raise anyone's authority and so needs no
+/// anti-escalation proof. That reasoning is sound as far as it goes, and it is not what R2 governs.
+/// Revocation is an **integrity** operation — stripping the credential another tenant's `fail2ban`
+/// writes with stops that tenant's blocking, and the symptom sits several audit-log pages from the
+/// cause — and R2's answer is that authority over *anyone's* credentials, in either direction, starts
+/// at `can_manage_keys`. The resource-scoped half then bounds it to one group. R6 still holds and is
+/// unchanged: the revoker need not hold the verb being removed, and may revoke its own permissions.
+fn guard_group_manage(
     caller: &api_key::Model,
     caller_perm: Option<&api_key_group_permission::Model>,
     group_name: &str,
     action: &str,
 ) -> Result<(), AppError> {
-    if caller.is_master || caller_perm.is_some() {
+    if caller.is_master {
+        return Ok(());
+    }
+
+    if caller.can_manage_keys && caller_perm.is_some_and(|p| p.can_manage) {
         return Ok(());
     }
 
     Err(AppError::Forbidden(format!(
-        "Permission denied: you have no access to group '{group_name}' and cannot {action} it"
+        "Permission denied: you cannot {action} permissions on group '{group_name}'. Managing a \
+         group's permissions requires both the global can_manage_keys scope and can_manage = true \
+         on your own grant for that group; neither alone is sufficient."
     )))
 }
 
-/// The authority test for **removing** access: global `can_manage_keys`, or `can_manage` on this
-/// specific group.
-///
-/// Two routes to the same operation, and the second is the point of the column. `can_manage_keys` is
-/// system-wide — it reaches every key and every group — so before `can_manage` existed, delegating
-/// "you may take a verb away from one key on one group" meant handing over authority across the
-/// entire installation. `can_manage` is that delegation at the size it was actually wanted.
-///
-/// # Why revoking gets the narrower gate and granting does not
-///
-/// Removing a verb cannot raise anyone's authority: after the operation no key in the system holds
-/// more than before, the caller included. What it threatens is **integrity** — stripping the
-/// credential another tenant's `fail2ban` writes with stops that tenant's blocking — and that threat
-/// is bounded by *which group* the caller can reach, which is exactly what a resource-scoped flag
-/// expresses. Granting is the opposite: conferring a verb can raise authority above the caller's
-/// own, so it must stay behind the global flag. A resource-scoped right that could mint new grants
-/// would be a way to escalate out of the resource it is scoped to.
-///
-/// The `can_manage_keys` route still requires the entry gate (a row on the group), because that flag
-/// on its own says nothing about which groups the caller may reach. The `can_manage` route needs no
-/// separate entry gate: holding the flag *is* holding a row.
-fn guard_group_revocation(
-    caller: &api_key::Model,
-    caller_perm: Option<&api_key_group_permission::Model>,
-    group_name: &str,
-) -> Result<(), AppError> {
-    if caller.is_master || caller_perm.is_some_and(|p| p.can_manage) {
-        return Ok(());
-    }
-
-    if caller.can_manage_keys {
-        return guard_group_administration(caller, caller_perm, group_name, "revoke");
-    }
-
-    Err(AppError::Forbidden(format!(
-        "Permission denied: you have no access to group '{group_name}' and cannot revoke it"
-    )))
-}
-
-/// Whether the caller holds administrative authority over group grants **anywhere**.
+/// Whether the caller holds a `can_manage` row on **any** group.
 ///
 /// A cheap pre-gate, run before any group is resolved so that a caller with no administrative
-/// standing at all is refused without learning whether a group or a grant exists. Before
-/// `can_manage` existed, the handlers could answer this from `can_manage_keys` alone with no query;
-/// now that per-group authority is a second route in, the question needs one indexed lookup — but it
-/// has to stay ahead of the group lookup, or the 403 would start depending on what exists.
+/// standing at all is refused without learning whether a group or a grant exists. It is deliberately
+/// the *weaker* half of [`guard_group_manage`] — "does this caller administer anything?" — because a
+/// pre-gate that consulted the target group would make the `403` depend on what exists. The precise
+/// test runs later, once the group is known.
 async fn holds_any_group_manage(
     db: &sea_orm::DatabaseConnection,
     key_id: Uuid,
@@ -212,6 +201,27 @@ async fn holds_any_group_manage(
         .await
         .map(|found| found.is_some())
         .map_err(AppError::DbError)
+}
+
+/// The pre-gate both permission-administration endpoints run before touching any group.
+///
+/// Both halves of R2 are checked here in their group-independent form — `can_manage_keys` costs
+/// nothing, and the `can_manage`-anywhere lookup is one indexed query issued only for callers that
+/// already passed the first half. A caller failing this is refused without a single lookup against
+/// the group or the target key, which is what keeps the `403` from confirming that either exists.
+async fn guard_may_administer_any_group(
+    db: &sea_orm::DatabaseConnection,
+    caller: &api_key::Model,
+) -> Result<(), AppError> {
+    if caller.is_master {
+        return Ok(());
+    }
+
+    if caller.can_manage_keys && holds_any_group_manage(db, caller.id).await? {
+        return Ok(());
+    }
+
+    Err(AppError::Forbidden("Permission denied".to_owned()))
 }
 
 /// Whether `requested` would give the target any verb it does not already hold.
@@ -237,29 +247,23 @@ fn widens_permissions(
         || (requested.can_manage && !held.can_manage)
 }
 
-/// Enforces that a non-master cannot hand out access it does not itself hold.
+/// **R1 + R7 — granting is bounded by non-amplification on top of the R2 conjunction.**
 ///
-/// Layered on [`guard_group_administration`]: managing the group is necessary to touch its grants at
-/// all, and *additionally* each verb being conferred is checked independently against the caller's
-/// own row — holding `can_read` on a group does not confer the right to grant `can_write` on it.
-///
-/// Reaching this at all requires global `can_manage_keys`; the caller's per-group `can_manage` does
-/// **not** admit a caller to the grant path. See [`guard_group_revocation`] for why the two
-/// directions are gated differently.
+/// Layered on [`guard_group_manage`]: R2 is necessary to touch a group's grants at all, and
+/// *additionally* each verb being conferred is checked independently against the caller's own row —
+/// holding `can_read` on a group does not confer the right to grant `can_write` on it. R7 states
+/// exactly this composition: "Granting is bounded by R1 and R2 together, simultaneously and without
+/// exception."
 ///
 /// # Only the granting direction is checked per verb
 ///
 /// `over_grants` tests `requested && !held`, so a verb being set to **false** is never examined.
-/// Reducing a permission therefore needs no proof of authority over the verb removed, and that
-/// asymmetry with granting is deliberate: conferring a verb can raise someone's authority above the
-/// caller's own, and removing one cannot raise anyone's at all. The dedicated revoke path applies
-/// the same rule, so "revoke the row" and "update the row to a lower value" are governed identically
-/// rather than by two rules that happen to disagree.
-///
-/// The integrity concern that once argued for a per-verb revocation check — a key manager stripping
-/// the credential another tenant's `fail2ban` writes with — is answered by the entry gate, which is
-/// what confines the damage to groups the caller already manages. See
-/// [`revoke_key_group_permission`].
+/// Reducing a permission therefore needs no proof of authority over the verb removed, which is R6:
+/// "the revoker need not hold the verb being removed". That asymmetry with granting is the whole
+/// point — conferring a verb can raise someone's authority above the caller's own, and removing one
+/// cannot raise anyone's at all. The dedicated revoke route applies the same rule, so "revoke the
+/// row" and "update the row to a lower value" are governed identically rather than by two rules that
+/// happen to disagree (R6, final sentence).
 fn guard_delegated_group_grant(
     caller: &api_key::Model,
     caller_perm: Option<&api_key_group_permission::Model>,
@@ -267,23 +271,32 @@ fn guard_delegated_group_grant(
     action: &str,
     requested: &GroupPermInput,
 ) -> Result<(), AppError> {
-    guard_group_administration(caller, caller_perm, group_name, action)?;
+    guard_group_manage(caller, caller_perm, group_name, action)?;
 
     if caller.is_master {
         return Ok(());
     }
 
-    // Guaranteed `Some` by the gate above, which refuses a non-master with no row.
+    // Guaranteed `Some` by the R2 gate above, which refuses a non-master holding no `can_manage` row.
+    // Fails **closed** rather than returning `Ok`: this branch is unreachable today, and the one way
+    // it becomes reachable is a future edit that loosens the gate — at which point "unreachable" and
+    // "grants everything unchecked" would be one refactor apart.
     let Some(held) = caller_perm else {
-        return Ok(());
+        return Err(AppError::Forbidden(format!(
+            "Permission denied: you cannot {action} permissions on group '{group_name}'"
+        )));
     };
 
     let over_grants = (requested.can_read && !held.can_read)
         || (requested.can_write && !held.can_write)
         || (requested.can_delete && !held.can_delete)
         // `can_manage` is a verb like any other here: a caller may only confer the administrative
-        // right over a group if it holds that right itself, which is what stops the flag from
-        // propagating outward from whoever a master originally trusted with it.
+        // right over a group if it holds that right itself. Redundant against the R2 gate as written
+        // — a non-master reaching this line necessarily holds `can_manage` — and kept because R1
+        // states the rule per verb, and a verb list that quietly omits one is how the next verb added
+        // to this table gets forgotten. It is also what implements R5: manage may propagate sideways
+        // between parents, bounded by R1 and R2, and never upward to a daughter (which the
+        // conjunction blocks, since the recipient still needs `can_manage_keys`).
         || (requested.can_manage && !held.can_manage);
 
     if over_grants {
@@ -305,22 +318,37 @@ fn guard_delegated_group_grant(
     Ok(())
 }
 
-/// The global scopes only a master key may hand out.
+/// **R4 — only Master creates parents.** Every global scope, and only a master key may hand any of
+/// them out.
 ///
-/// `is_master` is **not** on this list, because it is no longer grantable by anyone: `RBAC_MODEL.md`
-/// §5 makes master status a bootstrap-only property, and both key payloads reject the field outright
-/// rather than gating it (see [`guard_no_master_flag`]). A scope nobody can request does not need a
-/// rule about who may request it.
+/// `RBAC_MODEL.md` R4: "Only the Master key may grant `can_manage_keys` or resource-creation rights.
+/// A parent key can never mint another parent key." §1 puts resource-creation rights "at the same
+/// tier as `can_manage_keys`", granted strictly by Master and "never implied by `can_manage_keys`" —
+/// managing keys and being able to point a dispatch target at an arbitrary URL are separate powers.
 ///
-/// The two that remain are here because each is a *path back to* master authority rather than a leaf
-/// capability:
+/// `is_master` is **not** on this list, because it is no longer grantable by anyone: §5 makes master
+/// status a bootstrap-only property, and both key payloads reject the field outright rather than
+/// gating it (see [`guard_no_master_flag`]). A scope nobody can request does not need a rule about
+/// who may request it.
+///
+/// Each entry is a *path back to* master authority rather than a leaf capability:
 ///
 /// - `can_manage_keys` is the scope that reaches every other key — granting it creates a second
 ///   administrator, so a non-master able to grant it could multiply itself without limit and, in
 ///   combination with any future gap in [`guard_master_target`], reach a master key.
-/// - `can_create_groups` mints groups whose creator is auto-granted full read/write/delete
+/// - `can_create_groups` mints managed resources whose creator is auto-granted full read/write/delete
 ///   (`AGENT.MD` §2), which is the one way to obtain group access without a master signing off.
-const MASTER_ONLY_SCOPES: [&str; 2] = ["can_manage_keys", "can_create_groups"];
+/// - `can_manage_webhooks` mints dispatch targets. This service's spelling of the specification's
+///   `can_create_webhooks`, and the last of the three to be locked down: it was previously delegable
+///   on the reasoning that it "confers no authority over keys or groups". That reasoning was too
+///   narrow. A webhook is a standing export of everything that happens in a group to a URL its
+///   creator chooses, and the scope was freely amplifiable — a parent that did **not** hold it could
+///   hand it out (R1's plainest violation, since a caller may only grant rights it holds itself).
+///
+/// Because every global scope is now master-only, R1's "may only grant rights it currently holds"
+/// is satisfied for globals by the strictly stronger R4: a non-master grants none of them at all.
+const MASTER_ONLY_SCOPES: [&str; 3] =
+    ["can_manage_keys", "can_create_groups", "can_manage_webhooks"];
 
 /// Rejects any attempt by a non-master to grant one of [`MASTER_ONLY_SCOPES`].
 ///
@@ -329,8 +357,8 @@ const MASTER_ONLY_SCOPES: [&str; 2] = ["can_manage_keys", "can_create_groups"];
 /// refusing an actual elevation. Revoking is always allowed — removing authority is not escalation.
 fn guard_scope_elevation(
     caller: &api_key::Model,
-    requested: [Option<bool>; 2],
-    held: [bool; 2],
+    requested: [Option<bool>; 3],
+    held: [bool; 3],
 ) -> Result<(), AppError> {
     if caller.is_master {
         return Ok(());
@@ -1652,8 +1680,8 @@ pub async fn create_api_key(
     // A brand-new key holds none of these, so `held` is all-false: every `true` here is a grant.
     guard_scope_elevation(
         &key,
-        [payload.can_manage_keys, payload.can_create_groups],
-        [false, false],
+        [payload.can_manage_keys, payload.can_create_groups, payload.can_manage_webhooks],
+        [false, false, false],
     )?;
 
     if let Some(bips) = &payload.bound_ips {
@@ -1889,27 +1917,15 @@ pub async fn update_api_key(
     // is a no-op rather than a rejection.
     guard_scope_elevation(
         &key,
-        [payload.can_manage_keys, payload.can_create_groups],
-        [target.can_manage_keys, target.can_create_groups],
+        [payload.can_manage_keys, payload.can_create_groups, payload.can_manage_webhooks],
+        [target.can_manage_keys, target.can_create_groups, target.can_manage_webhooks],
     )?;
 
-    // `can_manage_webhooks` is delegable, but still not to *yourself*: `can_manage_keys` is
-    // authority over other keys, and letting it rewrite the caller's own flags makes every scope
-    // reachable from any one of them. Narrowing your own is fine — dropping a scope you hold is not
-    // an escalation.
-    if id == key.id
-        && !key.is_master
-        && payload.can_manage_webhooks == Some(true)
-        && !key.can_manage_webhooks
-    {
-        tracing::warn!(
-            "Blocked self-escalation: key {} attempted to widen its own global scopes",
-            key.prefix
-        );
-        return Err(AppError::Forbidden(
-            "A key cannot grant itself additional scopes; ask a master key".to_owned(),
-        ));
-    }
+    // A dedicated self-escalation check for `can_manage_webhooks` stood here. It is now subsumed
+    // exactly, not dropped: it fired when a non-master targeted itself with `can_manage_webhooks:
+    // true` while not holding it, and in that case `target` *is* the caller, so the guard above sees
+    // `requested = Some(true)` against `held = false` and refuses on R4 grounds. The scope moved onto
+    // MASTER_ONLY_SCOPES, which makes the narrower rule redundant rather than merely usually-true.
 
     if let Some(bips) = &payload.bound_ips {
         for cidr in bips.split(',') {
@@ -2072,17 +2088,10 @@ pub async fn update_key_group_permissions(
     Json(payload): Json<GroupPermInput>,
 ) -> Result<impl IntoResponse, AppError> {
 
-    // Admission is the union of the two authorities, because this one endpoint expresses both
-    // directions: a payload that only lowers a row is a revocation, and per-group `can_manage`
-    // satisfies those. Which of the two rules actually applies is decided below, once the target's
-    // current row is known and the request can be classified. Run before any group lookup so a
-    // caller with no administrative standing anywhere cannot probe what exists.
-    if !key.is_master
-        && !key.can_manage_keys
-        && !holds_any_group_manage(&state.db, key.id).await?
-    {
-        return Err(AppError::Forbidden("Permission denied".to_owned()));
-    }
+    // R2 in its group-independent form, run before any lookup so a caller with no administrative
+    // standing anywhere cannot probe what exists. The precise per-group test runs below, once the
+    // group is resolved.
+    guard_may_administer_any_group(&state.db, &key).await?;
 
     let target_key = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
 
@@ -2129,35 +2138,28 @@ pub async fn update_key_group_permissions(
     // Checked after the group is resolved (so the name in the error is the real one) but before any
     // write.
     //
-    // A group the caller just created via the `group_name` auto-create path above is covered
-    // without a special case — that path grants the creator full read/write/delete first, so the
-    // lookup below finds a row that legitimately permits the delegation.
+    // The `group_name` auto-create path above creates the group but provisions **no** permission row
+    // for the creator, so a non-master arriving that way holds no `can_manage` on it and the R2 gate
+    // below refuses. That is the specification's answer, not an oversight: R2 requires a
+    // `can_manage = true` row and creating a resource does not mint one. Only a master can open a
+    // brand-new group up for delegation.
     let caller_perm = caller_group_permission(&state.db, key.id, target_group_id).await?;
     let target_perm = caller_group_permission(&state.db, id, target_group_id).await?;
 
-    // Which rule applies is a property of the *request*, not of the endpoint. A payload that adds
-    // any verb the target lacks — or creates the row at all — is a grant and needs global
-    // `can_manage_keys` plus the per-verb ceiling. A payload that only lowers an existing row is a
-    // revocation reached through this endpoint instead of the dedicated one, and is governed by
-    // exactly the rule that governs that one. Splitting on the request rather than the route is what
-    // keeps "revoke the row" and "update the row to a lower value" from drifting apart.
+    // **Endpoint parity (R6, final sentence).** Which rule applies is a property of the *request*,
+    // not of the route it arrived on. Both directions now share the same R2 admission test; the
+    // classification decides whether the per-verb R1 ceiling applies on top.
+    //
+    // A payload that adds any verb the target lacks — or creates the row at all — is a grant, and
+    // gets R2 + R1. A payload that only lowers an existing row is a **revocation reached through the
+    // general update endpoint**, which R6 says must be classified as revocation "regardless of which
+    // endpoint it arrives at", and gets R2 alone: no proof of authority over the verb being removed,
+    // and self-targeting permitted. Splitting on the request rather than the route is what keeps
+    // "revoke the row" and "update the row to a lower value" from drifting apart.
     if widens_permissions(&payload, target_perm.as_ref()) {
-        if !key.is_master && !key.can_manage_keys {
-            tracing::warn!(
-                "Blocked grant: key {} holds can_manage on group '{}' but not the global \
-                 can_manage_keys, and attempted to widen permissions",
-                key.prefix,
-                resolved_group_name
-            );
-            return Err(AppError::Forbidden(format!(
-                "Permission denied: granting or widening permissions on group \
-                 '{resolved_group_name}' requires the global can_manage_keys scope; per-group \
-                 can_manage only permits revoking"
-            )));
-        }
         guard_delegated_group_grant(&key, caller_perm.as_ref(), &resolved_group_name, "grant", &payload)?;
     } else {
-        guard_group_revocation(&key, caller_perm.as_ref(), &resolved_group_name)?;
+        guard_group_manage(&key, caller_perm.as_ref(), &resolved_group_name, "revoke")?;
     }
 
     let now = Utc::now().naive_utc();
@@ -2204,42 +2206,32 @@ pub async fn update_key_group_permissions(
 ///
 /// # Managing the group is the whole authority test
 ///
-/// A caller that manages this group may remove **any** verb from **any** key's row on it, including
-/// its own, without holding the verbs being removed. Two spellings of "manages this group" qualify,
-/// and [`guard_group_revocation`] is where they are defined:
+/// Admission is [`guard_group_manage`] — R2's conjunction, the same test the grant path starts from:
+/// **Master**, or **global `can_manage_keys` together with `can_manage = true` on the caller's own
+/// row for this group**. Neither half alone.
 ///
-/// - **Master**, or **global `can_manage_keys` plus a grant on the group** — the original route.
-/// - **`can_manage = true` on the caller's own row for the group** — the resource-scoped route,
-///   which requires no global scope at all. This is the narrower gate: it admits a caller to
-///   *revocation on one group* and to nothing else, where `can_manage_keys` admits it to every key
-///   and every group in the installation.
+/// What revocation does *not* require is anything about the verbs themselves. R6: "Removing a
+/// permission requires manage rights on the resource only; the revoker need not hold the verb being
+/// removed, and may revoke its own permissions." Both are load-bearing:
 ///
-/// The grant path deliberately does **not** accept the second route; see
-/// [`guard_delegated_group_grant`].
+/// **Per-verb revocation** would conflate two controls. Guarding a *grant* per verb is an
+/// anti-escalation control: conferring `can_write` when you hold only `can_read` manufactures
+/// authority that did not exist. Removing `can_write` manufactures nothing — no key anywhere ends up
+/// with more access than before, the caller included. What removal genuinely threatens is
+/// **integrity**: this service keeps `fail2ban`-style automation writing to shared banlists, so
+/// stripping the key that maintains another tenant's list stops that tenant's blocking, and the
+/// symptom ("bans stopped landing") sits several audit-log pages from the cause. R2's conjunction is
+/// what bounds that threat — it confines every revocation to a group the caller was explicitly given
+/// `can_manage` on, *and* to a caller trusted with credentials at all. A per-verb test on top would
+/// buy no further containment while producing a genuinely strange shape: a grant you were trusted to
+/// create could be one you were forbidden to undo.
 ///
-/// # Why the stricter rule this replaces was relaxed
-///
-/// An earlier revision required the caller to hold each verb it removed, and refused self-targeting
-/// outright. Both were dropped, for different reasons.
-///
-/// **Per-verb revocation** conflated two controls. Guarding a *grant* per verb is an anti-escalation
-/// control: conferring `can_write` when you hold only `can_read` manufactures authority that did not
-/// exist. Removing `can_write` manufactures nothing — no key anywhere ends up with more access than
-/// before, including the caller. What removal genuinely threatens is **integrity**: this service
-/// keeps `fail2ban`-style automation writing to shared banlists, so stripping the key that maintains
-/// another tenant's list stops that tenant's blocking, and the symptom ("bans stopped landing") sits
-/// several audit-log pages from the cause. That threat is answered by *which groups* a caller can
-/// reach, not by which verbs it holds within them — and the entry gate answers it exactly, confining
-/// every revocation to groups the caller already manages. The per-verb test bought no additional
-/// containment while producing a genuinely strange shape: a grant you were trusted to create could
-/// be one you were forbidden to undo.
-///
-/// **Self-targeting** was refused to prevent a ratchet — grant yourself what you already hold, then
-/// use the fresh row to widen. The ratchet does not exist:
-/// [`guard_delegated_group_grant`] compares a self-directed request against the caller's *own* row,
-/// which is the very row being written, so the result can never exceed what was already held. With
-/// escalation impossible, all the block did was forbid a manager from dropping its own access —
-/// making the least-privilege action require a master.
+/// **Self-targeting** is permitted for a related reason. It was once refused to prevent a ratchet —
+/// grant yourself what you already hold, then widen from the fresh row — but the ratchet does not
+/// exist: [`guard_delegated_group_grant`] compares a self-directed request against the caller's *own*
+/// row, which is the very row being written, so the result can never exceed what was already held.
+/// With escalation impossible, the block only forbade a manager from dropping its own access, making
+/// the least-privilege action require a master.
 ///
 /// The counterpart safeguard is that a master's view never depends on a permission row existing, so
 /// a group whose last manager revokes itself stays visible and re-grantable rather than becoming
@@ -2250,15 +2242,10 @@ pub async fn revoke_key_group_permission(
     Extension(client_ip): Extension<ClientIp>,
     Path((id, group_identifier)): Path<(Uuid, String)>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Cheap pre-gate, kept ahead of the group lookup so a caller with no administrative standing
-    // anywhere is refused without learning whether the group exists. It admits per-group managers as
-    // a class; *which* group they manage is checked precisely below.
-    if !key.is_master
-        && !key.can_manage_keys
-        && !holds_any_group_manage(&state.db, key.id).await?
-    {
-        return Err(AppError::Forbidden("Permission denied".to_owned()));
-    }
+    // R2 in its group-independent form, kept ahead of the group lookup so a caller with no
+    // administrative standing anywhere is refused without learning whether the group exists. *Which*
+    // group it manages is checked precisely below.
+    guard_may_administer_any_group(&state.db, &key).await?;
 
     let group = resolve_group_by_identifier(&state.db, &group_identifier)
         .await?
@@ -2273,7 +2260,7 @@ pub async fn revoke_key_group_permission(
     }
 
     let caller_perm = caller_group_permission(&state.db, key.id, group.id).await?;
-    guard_group_revocation(&key, caller_perm.as_ref(), &group.name)?;
+    guard_group_manage(&key, caller_perm.as_ref(), &group.name, "revoke")?;
 
     let result = api_key_group_permission::Entity::delete_many()
         .filter(
