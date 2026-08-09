@@ -3193,8 +3193,8 @@ async fn sqlite_pragma_failures_never_stop_the_service() {
 
     // Returns unit: there is no error channel to propagate, by construction. Calling it twice also
     // proves it is idempotent, since it runs before migrations on every boot.
-    simply_ip_vault::state::apply_sqlite_pragmas(&db).await;
-    simply_ip_vault::state::apply_sqlite_pragmas(&db).await;
+    simply_ip_vault::db::apply_sqlite_pragmas(&db).await.expect("pragmas are never fatal");
+    simply_ip_vault::db::apply_sqlite_pragmas(&db).await.expect("pragmas are never fatal");
 
     // The database is still fully usable afterwards.
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
@@ -3245,7 +3245,7 @@ async fn wal_engages_on_a_file_backed_database_and_survives_reconnection() {
     let url = format!("sqlite://{}?mode=rwc", path.display());
 
     let db = Database::connect(&url).await.expect("file-backed sqlite opens");
-    simply_ip_vault::state::apply_sqlite_pragmas(&db).await;
+    simply_ip_vault::db::apply_sqlite_pragmas(&db).await.expect("pragmas are never fatal");
 
     let mode: String = pragma(&db, "PRAGMA journal_mode;", "journal_mode").await;
     assert_eq!(

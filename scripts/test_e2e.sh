@@ -1873,9 +1873,13 @@ check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
 # Asserted from the startup log rather than by querying, because the pragma is applied once at
 # connection setup and this is the only place its actual effect is reported.
 
-log_section "24b. SQLite WAL Mode & Busy Timeout"
+log_section "24b. SQLite Session PRAGMAs"
 
-if grep -q "journal_mode=WAL enabled" "$SERVER_LOG"; then
+# The four pragmas `src/db.rs` applies. These greps track the log wording in `apply_sqlite_pragmas`;
+# if that wording changes, update these rather than deleting them — the point is that a real boot
+# reports what actually took effect, which no unit test on `sqlite::memory:` can show (an in-memory
+# database legitimately cannot use WAL).
+if grep -q "SQLite journal mode: WAL" "$SERVER_LOG"; then
     PASS_COUNT=$((PASS_COUNT + 1))
     echo -e "$(ts)   ${GREEN}✓ PASS${RESET} SQLite journal_mode=WAL is enabled at startup" >&2
 else
@@ -1883,12 +1887,28 @@ else
     echo -e "$(ts)   ${RED}✗ FAIL${RESET} SQLite WAL mode was not reported at startup" >&2
 fi
 
-if grep -q "busy_timeout set to 5000ms" "$SERVER_LOG"; then
+if grep -q "busy_timeout=5000ms" "$SERVER_LOG"; then
     PASS_COUNT=$((PASS_COUNT + 1))
     echo -e "$(ts)   ${GREEN}✓ PASS${RESET} SQLite busy_timeout is set to 5000ms" >&2
 else
     FAIL_COUNT=$((FAIL_COUNT + 1))
     echo -e "$(ts)   ${RED}✗ FAIL${RESET} SQLite busy_timeout was not reported at startup" >&2
+fi
+
+if grep -q "foreign_keys=ON" "$SERVER_LOG"; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} SQLite foreign_keys=ON is reported at startup" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} SQLite foreign_keys was not reported at startup" >&2
+fi
+
+if grep -q "synchronous=NORMAL" "$SERVER_LOG"; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} SQLite synchronous=NORMAL is reported at startup" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} SQLite synchronous was not reported at startup" >&2
 fi
 
 # WAL leaves a -wal sidecar next to the database file while connections are open.

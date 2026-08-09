@@ -424,3 +424,49 @@ unless the id matches the pin, so a promoted row arrives at every guard as the o
 The flag is demoted rather than the request rejected: a promoted key is still a valid credential
 holding whatever scopes it legitimately has, and a `401` would make the column observable to the
 caller.
+
+---
+
+## 🔌 Connection setup (`src/db.rs`)
+
+Connection construction, session pragmas, and migration execution live in `src/db.rs` — mirroring
+`simply_hook_executor`'s module of the same name — rather than inside `state.rs`.
+
+### The SQLite pool holds exactly one connection
+
+Not a tuning choice. SQLite permits a single writer, and a DDL sequence spread across connections
+does not survive: `m20260808_000009` drops `master_marker` and re-adds it as a generated column, and
+at any pool size ≥ 2 the `ADD` reaches a connection whose schema still holds the old one —
+`duplicate column name: master_marker`, deterministically. One connection: nine migrations applied.
+Two: eight, then failure.
+
+SeaORM's `Database::connect` pins `max_connections = 1` for SQLite. Building a pool by hand opts out
+of that default **silently**, which is exactly how this was broken while `db.rs` was being written.
+`SQLITE_MAX_CONNECTIONS` restores it, and a test asserts it against the live pool rather than against
+the constant.
+
+### Session pragmas
+
+| Pragma | Value | Scope | Already the SQLx default? |
+| :--- | :--- | :--- | :--- |
+| `foreign_keys` | `ON` | per-connection | **yes** — measured, so this is an assertion |
+| `journal_mode` | `WAL` | **persistent** (file header) | no (`delete`) |
+| `synchronous` | `NORMAL` | per-connection | no (`FULL`) |
+| `busy_timeout` | `5000` ms | per-connection | **yes** — same value |
+
+All four are declared on `SqliteConnectOptions` so SQLx applies them as each connection opens,
+including a connection it reopens after one is closed or invalidated — a `PRAGMA` issued once through
+the pool would not survive that. `apply_sqlite_pragmas` still runs at startup and is still never
+fatal; its job is to read `journal_mode` back so the log reports what actually took effect rather
+than what was requested. An in-memory database legitimately cannot use WAL, and the entire test suite
+runs on one.
+
+`synchronous=NORMAL` is the standard companion to WAL: full durability against process crashes,
+giving up only the last transactions on power loss, in exchange for not fsyncing every commit.
+
+**Foreign keys are enforced, not merely enabled.** `PRAGMA foreign_keys` returning `1` says the
+switch is set, not that the engine acts on it, so the test inserts an `api_key_group_permissions` row
+naming a key that does not exist and requires the write to be refused.
+
+URL query parameters were tried and rejected: SQLx answers `unknown query parameter 'synchronous'
+while parsing connection URL`.

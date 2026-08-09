@@ -1,9 +1,8 @@
 use std::net::SocketAddr;
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectOptions, Database, DatabaseConnection, EntityTrait, QueryFilter};
-use sea_orm_migration::MigratorTrait;
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use tokio::net::TcpListener;
 use uuid::Uuid;
-use simply_ip_vault::{create_app, setup_state, api, migration, entities};
+use simply_ip_vault::{create_app, setup_state, api, entities};
 
 /// Waits for a Ctrl+C or (on Unix) SIGTERM signal so `axum::serve` can shut down gracefully.
 ///
@@ -224,19 +223,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     tracing::info!("Connecting to database...");
-    let mut opt = ConnectOptions::new(db_url);
-    opt.sqlx_logging_level(log::LevelFilter::Debug);
-    let db: DatabaseConnection = Database::connect(opt).await?;
+    // `db::connect` rather than `Database::connect`: for SQLite it builds the pool from
+    // `SqliteConnectOptions` so the session pragmas apply to *every* connection as it opens.
+    // Applying them afterwards through the pool reaches only whichever connection serves the
+    // statement — measured, and the reason this indirection exists. See `src/db.rs`.
+    let db: DatabaseConnection = simply_ip_vault::db::connect(&db_url).await?;
 
     // Before migrations: the migration itself writes, and should already benefit from WAL and the
     // busy timeout rather than being the one write that still takes an exclusive lock.
     //
     // Never fatal — every failure inside is logged and swallowed. A concurrency pragma that could
     // not be applied is a performance regression; refusing to boot over it would be an outage.
-    simply_ip_vault::state::apply_sqlite_pragmas(&db).await;
+    simply_ip_vault::db::apply_sqlite_pragmas(&db).await?;
 
-    tracing::info!("Running database migrations...");
-    migration::Migrator::up(&db, None).await?;
+    simply_ip_vault::db::run_migrations(&db).await?;
 
     bootstrap_master_key(&db, &cipher).await?;
 

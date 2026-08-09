@@ -401,9 +401,26 @@ check_no_raw_sql() {
                     line = L[i]
                     if (line !~ /execute_unprepared|Statement::from_(string|sql)|(query_one|query_all|execute)_raw/) continue
                     if (line ~ /^[ \t]*(\/\/|\/\*|\*)/) continue          # a comment about it
-                    exempt = 0
-                    for (j = i; j <= i + 4 && j <= NR; j++) if (L[j] ~ /PRAGMA/) exempt = 1
-                    if (!exempt) printf "%s:%d:%s\n", path, i, line
+                    # Outside `db.rs` there is no exemption at all: any raw-SQL call is a finding.
+                    #
+                    # Inside `db.rs` the test is what the statement *does*, not what sits near it.
+                    # An earlier version exempted anything within six lines of the word "pragma",
+                    # which that file contains almost everywhere — a planted
+                    # `execute_unprepared("DELETE FROM api_keys")` appended to it was reported CLEAN.
+                    # Looking for DML keywords instead cannot be satisfied by adjacent prose: the
+                    # rule being enforced is "no raw SQL for SELECT/INSERT/UPDATE/DELETE", so that
+                    # is literally what is matched. The window looks both ways because the statement
+                    # text may sit below the call (`Statement::from_string(` opens, backend follows,
+                    # SQL lands third) or above it (a table of pragmas iterated in a loop).
+                    flag = 1
+                    if (path == "src/db.rs") {
+                        flag = 0
+                        lo = i - 6; if (lo < 1) lo = 1
+                        hi = i + 6; if (hi > NR) hi = NR
+                        for (j = lo; j <= hi; j++)
+                            if (toupper(L[j]) ~ /SELECT |INSERT INTO|UPDATE |DELETE FROM/) flag = 1
+                    }
+                    if (flag) printf "%s:%d:%s\n", path, i, line
                 }
             }
         ' "$file")
@@ -528,12 +545,17 @@ echo
 
 # ─────────────────────────────────────────────────────────────
 echo "${BOLD}Pillar 4 — Database resilience & retention${RESET}"
+# Both services now keep this in `src/db.rs`, so the *module* difference that used to explain the
+# divergence is gone. What remains is a real behavioural difference, stated plainly rather than left
+# as "wording": this service applies **four** pragmas (adding `foreign_keys=ON` and
+# `synchronous=NORMAL`) where the peer applies two. The shared half — WAL, the busy timeout, and the
+# never-fatal handling of both — is what this comparison is still watching.
 compare_fn "SQLite pragma initialization" \
-    "src/state.rs" "apply_sqlite_pragmas" \
     "src/db.rs" "apply_sqlite_pragmas" \
-    "same pragmas and same non-fatal handling; different module and log wording"
+    "src/db.rs" "apply_sqlite_pragmas" \
+    "this service applies 4 pragmas (adds foreign_keys, synchronous); the peer applies 2"
 # The pragmas must not be able to abort startup. A `?` inside would make a read-only mount fatal.
-if grep -A40 "pub async fn apply_sqlite_pragmas" "$PROJECT_ROOT/src/state.rs" | grep -qE '\?;\s*$'; then
+if grep -A40 "pub async fn apply_sqlite_pragmas" "$PROJECT_ROOT/src/db.rs" | grep -qE '\?;\s*$'; then
     echo "  ${RED}✗ FATAL${RESET}   apply_sqlite_pragmas propagates an error — it must degrade, not abort"
     DRIFT_COUNT=$((DRIFT_COUNT + 1))
 else

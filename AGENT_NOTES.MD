@@ -5723,3 +5723,184 @@ that is already running.
 | `./scripts/verify_convergence.sh` | **exit 0** |
 | `git diff RBAC_MODEL.md` | **empty** — untouched, byte-identical with the peer |
 | raw SQL in `src/` outside migrations | **none** (PRAGMA excepted), gated and proven to fail |
+
+---
+
+## Session 40 — `src/db.rs` Unification, PRAGMA Standardization, and `api.rs` Modularization
+
+`RBAC_MODEL.md` untouched: `git diff RBAC_MODEL.md` empty, Pillar 0 byte-identity active and passing.
+
+### 1. PRAGMA standardization — the brief's premise was wrong, and it matters
+
+The brief asked to "strictly match `simply_hook_executor`" on four pragmas. Checked against the peer
+tree: **`simply_hook_executor` applies two** — `journal_mode=WAL` and `busy_timeout`. It has no
+`foreign_keys` and no `synchronous` anywhere outside its migrations.
+
+So "match the peer" and "apply these four" are different instructions. Implemented the **four**, since
+that list was explicit, and recorded the consequence honestly: this now *diverges* from the peer
+rather than matching it, and `verify_convergence.sh` says so in as many words —
+`this service applies 4 pragmas (adds foreign_keys, synchronous); the peer applies 2`. The previous
+divergence note claimed the difference was "different module and log wording", which stopped being
+true the moment both services kept the function in `src/db.rs`.
+
+**Two of the four were already in force.** Measured rather than assumed, on a live pool:
+
+```
+DEFAULT foreign_keys = 1        DEFAULT synchronous  = 2
+DEFAULT busy_timeout = 5000     DEFAULT journal_mode = delete
+```
+
+SQLx enables `foreign_keys` and sets a 5000 ms `busy_timeout` on every connection it opens. Those two
+calls are therefore assertions that survive a future SQLx default change, not fixes. Only
+`journal_mode` and `synchronous` change anything.
+
+**Scope matters and is not uniform.** On a deliberately-built five-connection pool, applying
+`PRAGMA synchronous=NORMAL` once through the pool and then sampling twenty-five times returned *both*
+`1` and `2` — the statement lands on whichever connection served it. `journal_mode` returned both
+`delete` and `wal` for the same reason. Hence `SqliteConnectOptions` rather than post-hoc `PRAGMA`
+statements: SQLx replays connection options when it reopens a connection, and `PRAGMA` statements it
+does not.
+
+URL query parameters were tried first: SQLx rejects them outright
+(`unknown query parameter 'synchronous' while parsing connection URL`).
+
+### 2. A regression I introduced, and the test that now prevents it
+
+Building the pool by hand with `SqlitePoolOptions::new()` takes SQLx's default of **ten**
+connections. SeaORM's `Database::connect` pins SQLite to **one** — verified directly:
+
+```
+OLD  Database::connect -> max_connections = 1
+NEW  db::connect       -> max_connections = 10
+```
+
+With ten, `Migrator::up` fails: `m20260808_000009` drops `master_marker` and re-adds it as a
+generated column, and the `ADD` reaches a connection whose schema still has the old one.
+Deterministic by pool size:
+
+| max_connections | result | migrations applied |
+| :--- | :--- | :--- |
+| 1 | OK | 9 |
+| 2 / 5 / 10 | `duplicate column name: master_marker` | 8 |
+
+**No existing test could have caught this.** Every suite in the repository runs on `sqlite::memory:`,
+where there is nothing to pool. It surfaced only because `db.rs`'s own test used a file-backed
+database — and then the e2e suite, which runs a real server against a real file, would have caught it
+next. `SQLITE_MAX_CONNECTIONS = 1` restores SeaORM's behaviour;
+`migrations_apply_cleanly_on_a_file_backed_pool` is the regression test.
+
+A second lesson from the same episode: the first version of
+`connect_applies_every_pragma_to_every_pooled_connection` sampled twenty-five times and asserted the
+values were *uniform*. That reads like a pool-wide guarantee and is not one — with a single connection
+every sample hits the same connection and uniformity is tautological. Renamed to
+`connect_applies_all_four_pragmas`, with the pool-size invariant asserted separately and explicitly.
+
+### 3. Codebase line-count audit
+
+Before:
+
+| File | Lines |
+| :--- | ---: |
+| **`src/api.rs`** | **3674** |
+| `src/config.rs` | 1274 |
+| `src/crypto.rs` | 839 |
+| `src/webhooks.rs` | 519 |
+| `src/replay.rs` | 440 |
+| `src/state.rs` | 404 |
+| everything else | < 340 each |
+
+One file was 2.9× the next largest and 35% of `src/`. `config.rs` and `crypto.rs` are large but
+cohesive — one is proxy/address resolution, the other is the AEAD and signing primitives — and
+neither mixes domains, so neither was split.
+
+After:
+
+| File | Lines |
+| :--- | ---: |
+| `src/api/keys.rs` | 1372 |
+| `src/api/records.rs` | 965 |
+| `src/api/webhooks.rs` | 585 |
+| `src/api/guards.rs` | 467 |
+| `src/db.rs` | 376 |
+| `src/api/mod.rs` | 271 |
+| `src/api/groups.rs` | 200 |
+| `src/api/audit.rs` | 68 |
+
+### 4. Assessment of the proposed split
+
+The brief's baseline — `keys.rs`, `groups.rs`, `records.rs`, `webhooks.rs`, `guards.rs`, `mod.rs` —
+is **confirmed**, with two refinements:
+
+- **Added `audit.rs`.** `list_audit_logs` is the one read surface spanning every domain; filing it
+  under any single one would be arbitrary, and leaving it in `mod.rs` would mix a handler into a file
+  that otherwise holds only shared helpers.
+- **`reassign_webhook_owner` moved to `webhooks.rs`.** It sat beside `reassign_group_owner` in the
+  original file, so a pure line-range split would have left a webhook handler in `groups.rs`. Its
+  shared `ReassignOwnerPayload` lives in `mod.rs`, since §3 ownership is cross-domain.
+
+`mod.rs` holds exactly what more than one domain needs — key hashing, address normalisation,
+audit-log writing, group resolution. Pushing any of it into a domain module would make every other
+domain depend on that one.
+
+**`keys.rs` is the largest at 1372 lines and was deliberately not split further.** R1–R7 are about how
+keys delegate to other keys, so subtree walking, visibility scoping, lifecycle and permission grants
+are one subject. Splitting them would put a rule's mechanism in one file and its guard in another,
+which is the arrangement this refactor exists to undo.
+
+**`guards.rs` is the load-bearing one.** Every authorization decision is now in a single 467-line file
+holding no handler logic and no response types, so it can be read against `RBAC_MODEL.md` without
+opening an endpoint.
+
+### 5. Zero-regression method
+
+`mod.rs` re-exports every item **flat**, so `api::create_api_key` resolves exactly as before. The
+router in `lib.rs`, all four test suites, and `scripts/` needed **no changes whatsoever** — which is
+what makes this reviewable as a move rather than a rewrite. Handler signatures, extractors, error
+types and guard order are untouched; the split was performed by parsing item boundaries and
+reassembling, not by retyping.
+
+Two mechanical consequences worth recording:
+
+- Items that were private and are now used across sibling modules were raised to `pub(crate)`. They
+  are not part of the crate's public surface, so `#![warn(missing_docs)]` does not apply.
+- `pub(crate) use guards::*;` rather than `pub use`: every item in `guards` is internal, and a `pub`
+  glob would re-export nothing — clippy says so directly.
+
+### 6. Convergence checker
+
+- `compare_fn "SQLite pragma initialization"` now reads `src/db.rs` on both sides, with the
+  divergence reason restated as the real one (four pragmas vs two).
+- The `✓ SOFT` check that `apply_sqlite_pragmas` cannot abort startup follows it to `db.rs`.
+- **The raw-SQL gate was hardened after it failed a planted test.** It had exempted anything within
+  six lines of the word "pragma" in `db.rs` — a file that contains that word almost everywhere — and
+  reported CLEAN against an appended `execute_unprepared("DELETE FROM api_keys")`. It now flags every
+  raw-SQL call outside `db.rs` unconditionally, and inside `db.rs` flags on **DML keywords** in the
+  window. Re-verified in both files:
+
+  | Planted violation | Result |
+  | :--- | :--- |
+  | `execute_unprepared("SELECT 1")` in `src/api/keys.rs` | ✗ FOUND, exit 1 |
+  | `execute_unprepared("DELETE FROM api_keys")` in `src/db.rs` | ✗ FOUND, exit 1 |
+  | clean tree | ✓ CLEAN, exit 0 |
+
+That is the third gate in four sessions to pass for a mechanical reason rather than a real one
+(after `ENDFILE` under mawk, and the `s5_` tests against a defective schema). The pattern is
+consistent enough to state as a rule: **a new check is not evidence until it has been seen to fail.**
+
+### 7. e2e alignment
+
+`test_e2e.sh` grepped the server log for `journal_mode=WAL enabled` and `busy_timeout set to 5000ms`,
+neither of which the rewritten `apply_sqlite_pragmas` emits. Updated to the current wording and
+extended to cover the two new pragmas, so all four are asserted against a real boot: 490 → **492**
+checks.
+
+### Verification
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **223 passed, 0 failed** (79 unit + 3 frontend + 74 integration + 18 compliance + 49 security) |
+| `./scripts/test_e2e.sh` | **492 passed, 0 failed** |
+| `./scripts/verify_convergence.sh` | **exit 0** |
+| `git diff RBAC_MODEL.md` | **empty** |

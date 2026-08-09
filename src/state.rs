@@ -18,84 +18,10 @@ use crate::config::TrustedProxies;
 use crate::crypto::SecretCipher;
 use crate::replay::ReplayGuard;
 
-/// Milliseconds SQLite waits on a locked database before returning `SQLITE_BUSY`.
-const SQLITE_BUSY_TIMEOUT_MS: u32 = 5000;
-
-/// Applies SQLite's concurrency pragmas, if and only if the backend is SQLite.
-///
-/// Two settings, both about the same problem — SQLite's default rollback journal takes a database-
-/// wide exclusive lock for every write:
-///
-/// - **`journal_mode=WAL`** lets readers proceed during a write instead of blocking on it. This
-///   service reads far more than it writes (every authenticated request does a key lookup; the
-///   dashboard polls listings) while the webhook worker and retention sweep write from background
-///   tasks, so without WAL a single slow write stalls unrelated reads.
-/// - **`busy_timeout=5000`** makes a writer that finds the database locked wait up to 5s rather
-///   than failing instantly with `SQLITE_BUSY`. Concurrent writes are rare here but not impossible
-///   (a burst of bans, or a sweep overlapping a dispatch), and a transient lock should cost latency,
-///   not a `500`.
-///
-/// The two differ in scope, which is worth stating precisely rather than implying both are
-/// pool-wide: **`journal_mode` is persistent** — recorded in the database file header, so setting it
-/// once applies to every future connection and every future run — while **`busy_timeout` is
-/// per-connection**, and the pool-wide guarantee comes from SQLx applying its own five-second
-/// default to each SQLite connection it opens. This call makes that intent explicit rather than
-/// being the sole mechanism.
-///
-/// Guarded on the backend rather than on the URL string: `PRAGMA` is SQLite-specific and would be a
-/// syntax error on PostgreSQL or MySQL. This is the one deliberate exception to the SQL-agnostic
-/// rule in `AGENT.MD` — it configures the *engine*, not a query, and every other backend skips it.
-///
-/// # Failure handling
-///
-/// **Never fatal.** Every failure is logged and swallowed, and the function still returns `Ok`. Two
-/// reasons. The benign one: an in-memory database (`sqlite::memory:`, which the whole test suite
-/// uses) reports `journal_mode=memory` and cannot be switched to WAL, since there is no file to
-/// write a log beside — SQLite declines silently rather than erroring, which is why the mode is read
-/// back instead of inferred from a clean return. The important one: refusing to boot over a
-/// concurrency setting that did not apply would trade a real outage for a theoretical slowdown, on a
-/// read-only mount or an exotic filesystem that is otherwise perfectly serviceable.
-pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) {
-    use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
-
-    if db.get_database_backend() != DatabaseBackend::Sqlite {
-        return;
-    }
-
-    match db
-        .query_one_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            "PRAGMA journal_mode=WAL;",
-        ))
-        .await
-    {
-        Ok(Some(row)) => match row.try_get::<String>("", "journal_mode") {
-            Ok(mode) if mode.eq_ignore_ascii_case("wal") => {
-                tracing::info!("SQLite journal_mode=WAL enabled (readers proceed during writes).");
-            }
-            Ok(mode) => tracing::info!(
-                "SQLite journal_mode is '{mode}' rather than WAL; this is normal for in-memory and \
-                 read-only databases. Continuing."
-            ),
-            Err(e) => tracing::warn!("Could not read back the SQLite journal mode: {e}. Continuing."),
-        },
-        Ok(None) => tracing::warn!("PRAGMA journal_mode returned no row; leaving the default."),
-        Err(e) => tracing::warn!("Could not enable SQLite WAL mode: {e}. Continuing without it."),
-    }
-
-    match db
-        .execute_raw(Statement::from_string(
-            DatabaseBackend::Sqlite,
-            format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};"),
-        ))
-        .await
-    {
-        Ok(_) => tracing::info!("SQLite busy_timeout set to {SQLITE_BUSY_TIMEOUT_MS}ms."),
-        Err(e) => tracing::warn!(
-            "Could not set the SQLite busy timeout: {e}. Continuing with the driver default."
-        ),
-    }
-}
+// SQLite pragmas and pool construction used to live here. They are now `crate::db`, which puts
+// "how the database is opened" in one module beside migrations rather than inside application
+// state — and mirrors `simply_hook_executor`'s `src/db.rs`, which is what
+// `scripts/verify_convergence.sh` diffs against.
 
 /// Represents a webhook event triggered by the system
 #[derive(Clone, Debug, Serialize, Deserialize)]
