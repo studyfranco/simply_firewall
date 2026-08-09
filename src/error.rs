@@ -52,6 +52,16 @@ pub enum AppError {
         details: serde_json::Value,
     },
 
+    /// A request body an extractor refused, carrying the extractor's own status verbatim.
+    ///
+    /// Exists so [`crate::extract::StrictJson`] can normalize the response *shape* — every failure on
+    /// these routes is `{"error": …}` — without also normalizing the response *meaning*. A payload
+    /// over the router-wide body limit arrives as the same rejection type as a payload with an
+    /// unknown field, and flattening both to `400` would tell a caller that sent 4 MiB that its
+    /// fields were wrong. The status is the extractor's to decide; only the body is ours.
+    #[error("Request rejected: {1}")]
+    BodyRejected(StatusCode, String),
+
     /// Internal server error
     #[error("Internal Server Error")]
     Internal,
@@ -84,6 +94,7 @@ impl IntoResponse for AppError {
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg),
             // Returned above; repeated here only because the match must stay exhaustive.
             AppError::ConflictWithDetails { message, .. } => (StatusCode::CONFLICT, message),
+            AppError::BodyRejected(status, msg) => (status, msg),
             AppError::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "An internal server error occurred".to_string()),
         };
 

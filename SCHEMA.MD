@@ -56,8 +56,8 @@ Stores authentication tokens, global access rights, and CIDR network binding rul
 | `key_hash` | `String` | Not Null, Unique | Argon2 / SHA-256 hash of the secret API key |
 | `signing_secret` | `Text` | Nullable | Per-key HMAC-SHA256 secret used to verify the `X-Signature-256` request header. Encrypted with XChaCha20-Poly1305 when `VAULT_ENCRYPTION_KEY` (alias `SIGNING_SECRET_KEY`, exactly 64 hex characters) is set, stored as `v1.xchacha20poly1305.<hex nonce>.<hex ciphertext‖tag>`; hex-encoded but unencrypted as `v1.plain.<hex>` otherwise. **Those two prefixes are the complete set** — any other value, including the retired `aesgcm256:` shape and an unprefixed bare secret, is rejected as `MalformedCiphertext` (`500`) rather than read; see the fail-closed note below. `NULL` only for keys created before this column existed — such keys cannot authenticate and must be rotated. Never returned by any read endpoint |
 | `prefix` | `String` | Not Null, Indexed | First 8 characters of key for display and fast lookup |
-| `is_master` | `Boolean` | Default: `false` | Bypasses all group permission checks. **Bootstrap-only** — not settable or clearable through any API payload (`RBAC_MODEL.md` §5); a request carrying the field is rejected with `400` |
-| `master_marker` | `String(16)` | Nullable, **Unique** | Uniqueness marker for the Master key: `'master'` on the one Master row, `NULL` on every other. Carries no authority and is read by no guard — it exists so a plain unique index can express "at most one Master" in the schema itself, which `RBAC_MODEL.md` §5 requires be enforced by the database rather than by application logic. A **nullable marker column** rather than a partial unique index on `is_master = true`, because MySQL has no partial indexes and the data layer must stay SQL-agnostic; NULLs do not collide in a unique index on any supported engine. Written only by `bootstrap_master_key` |
+| `is_master` | `Boolean` | Default: `false` | Bypasses all group permission checks. **Bootstrap-only** — the field is not present on `CreateApiKeyPayload` or `UpdateApiKeyPayload` at all, and both carry `#[serde(deny_unknown_fields)]`, so a request naming it is refused by deserialization with `400` before any handler runs (`RBAC_MODEL.md` §5: "Removing the field from the payload type is required; rejecting it at the handler is not sufficient"). Written by `bootstrap_master_key` and nowhere else |
+| `master_marker` | `Integer` | **Generated**, Nullable, **Unique** | `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` — derived by the **database engine**, never written by anything. Carries no authority and is read by no guard; it exists so a plain unique index can express "at most one Master" in the schema itself, which `RBAC_MODEL.md` §5 requires be enforced by the database rather than by application logic. A **marker column** rather than a partial unique index on `is_master = true`, because MySQL has no partial indexes and the data layer must stay SQL-agnostic; NULLs do not collide in a unique index on any supported engine, so every non-master row coexists freely. **Deliberately absent from `api_key::Model`**: SeaORM builds column lists from the entity, so omitting it is what guarantees no query names it — and every engine rejects an `INSERT`/`UPDATE` that does. Storage class is per-engine (Postgres `STORED`, SQLite/MySQL `VIRTUAL`) and pinned by unit test. See the migration note below |
 | `can_manage_keys` | `Boolean` | Default: `false` | Global privilege to create/edit/delete API keys. Grantable **only by the Master key** (`RBAC_MODEL.md` R4). Confers no authority over any group on its own — see the conjunction under `api_key_group_permissions` |
 | `can_manage_webhooks` | `Boolean` | Default: `false` | Global privilege to manage webhook configurations. Grantable **only by the Master key** — this service's spelling of the specification's `can_create_webhooks`, a resource-creation right, which §1 places at the same tier as `can_manage_keys` and R4 makes Master-only. Previously delegable, which made it freely amplifiable (a parent that did not hold it could hand it out) |
 | `can_create_groups` | `Boolean` | Default: `false` | Global privilege to create new IP groups. Grantable **only by the Master key** (R4) |
@@ -329,3 +329,53 @@ what makes "data is never destroyed implicitly" true at the schema level rather 
 `idx-webhook_configs-owner_key_id`, `idx-akgp-group_id` (the permission join from the group side,
 which the existing `(api_key_id, group_id)` composite cannot serve), and `idx-api_keys-key_hash` (a
 restatement of the existing unique constraint under an explicit name).
+
+---
+
+## 🔐 Master Uniqueness: a generated column, not a maintained one
+
+`api_keys.master_marker` is the schema's answer to `RBAC_MODEL.md` §5, "exactly one Master key exists,
+enforced by a database constraint rather than by application logic alone". Its current shape is the
+result of getting that wrong once, and the wrong version is documented here because it looked correct.
+
+**What it is now** (`m20260808_000009_derive_master_marker`):
+
+```sql
+ALTER TABLE api_keys ADD COLUMN master_marker INTEGER
+    GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END) VIRTUAL;  -- STORED on PostgreSQL
+CREATE UNIQUE INDEX "idx-api_keys-master_marker" ON api_keys (master_marker);
+```
+
+Two halves, and both are load-bearing. `ELSE NULL` is what lets an unlimited number of non-master rows
+coexist, because NULLs do not collide in a unique index on any supported engine. `GENERATED ALWAYS AS`
+is what makes the value unforgeable: every engine rejects an `INSERT` or `UPDATE` naming a generated
+column, so the marker is a pure function of `is_master` evaluated by the engine.
+
+**What it was** (`m20260807_000007_add_api_key_master_marker`): the same unique index over a
+`VARCHAR(16)` column that `bootstrap_master_key` populated with `'master'`. That is not a database
+constraint on Master uniqueness — it is a database constraint on the marker, plus an application
+convention that the marker tracks `is_master`. Any writer that set `is_master = true` and omitted the
+marker was accepted, because NULLs do not collide, and the database then held two masters. Confirmed
+against a live database, not inferred.
+
+**Why nothing caught it.** The §5 compliance test passed and its mutation fired. Both were blind for
+the same reason: the test *supplied the marker*, so it exercised a cooperative writer, and a
+cooperative writer cannot distinguish "the marker cannot be wrong" from "we always set it right". The
+generalisable rule, now enforced by `scripts/verify_convergence.sh`: **any guarantee claimed at the
+database, type, or extractor layer needs at least one test that goes around the application entirely.**
+Those tests are marked `ADVERSARIAL(§N)` in `tests/rbac_model_compliance.rs`.
+
+**Consequences for anyone touching the schema:**
+
+- The column **must not** be declared on `api_key::Model`. SeaORM builds explicit column lists from the
+  entity, so declaring it — even read-only — puts it into every generated `INSERT` and breaks all key
+  creation. Its absence is the mechanism, not an omission.
+- Storage class differs by engine: PostgreSQL accepts only `STORED` (`VIRTUAL` arrived in 18), SQLite
+  accepts only `VIRTUAL` for a column added by `ALTER TABLE`, MySQL takes either. The pairing is pinned
+  by a unit test in the migration, because getting it backwards fails only against a live server.
+- Upgrading a database that already holds two masters — reachable via the old bypass — **aborts** at
+  `m20260808_000009` with both rows named, before any DDL runs. The pre-upgrade check is:
+
+  ```sql
+  SELECT id, name, prefix FROM api_keys WHERE is_master = true;   -- must return exactly one row
+  ```

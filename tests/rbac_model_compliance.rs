@@ -139,6 +139,43 @@ fn sign_with(
     builder.body(Body::from(body)).unwrap()
 }
 
+/// Attempts to write a second Master **the way an attacker or a careless operator would**: straight
+/// at the table, with `is_master` set and `master_marker` simply not mentioned.
+///
+/// This helper exists so the adversarial shape is written once and cannot drift into a cooperative
+/// one. Two properties are load-bearing and neither is obvious:
+///
+/// - **No `ActiveModel`.** SeaORM builds column lists from the entity, and `master_marker` is not on
+///   the entity, so an `ActiveModel` insert is adversarial only by accident of our own type
+///   definitions. Raw SQL is adversarial by construction, and stays adversarial if someone
+///   reintroduces the field.
+/// - **The marker is omitted, not set to NULL.** Both are refused now, but omission is the shape that
+///   was *accepted* under the previous schema, so it is the shape worth regressing against.
+///
+/// Returns the driver's result rather than asserting, so callers can assert on the error text.
+async fn adversarial_master_insert(
+    db: &DatabaseConnection,
+    name: &str,
+    prefix: &str,
+) -> Result<sea_orm::ExecResult, sea_orm::DbErr> {
+    use sea_orm::ConnectionTrait;
+    // `x'…'` for the id: SeaORM stores `Uuid` as a 16-byte BLOB on SQLite, so a hyphenated literal
+    // would insert fine and then fail to decode on read — which would look like the constraint
+    // working when it had not.
+    db.execute_raw(sea_orm::Statement::from_string(
+        db.get_database_backend(),
+        format!(
+            "INSERT INTO api_keys (id, name, key_hash, prefix, is_master, can_manage_keys, \
+             can_manage_webhooks, can_create_groups, created_at, updated_at) \
+             VALUES (x'{}', '{name}', '{}', '{prefix}', true, true, true, true, \
+              '2026-08-08 00:00:00', '2026-08-08 00:00:00')",
+            Uuid::new_v4().simple(),
+            simply_ip_vault::api::hash_key(&simply_ip_vault::api::generate_random_key()),
+        ),
+    ))
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn key(
     db: &DatabaseConnection,
@@ -157,7 +194,6 @@ async fn key(
         name: Set(name.to_owned()),
         bound_ips: Set(None),
         is_master: Set(is_master),
-        master_marker: Set(is_master.then(|| simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(can_manage_keys),
         can_manage_webhooks: Set(can_manage_webhooks),
         can_create_groups: Set(can_create_groups),
@@ -940,27 +976,16 @@ async fn s5_master_is_unique_unsettable_immutable_and_undeletable() {
     let (db, app) = setup().await;
     let (master_id, master) = key(&db, "Master", true, true, true, true).await;
 
-    // Uniqueness is a schema invariant, proven by bypassing every guard in `src/api.rs`.
-    let plaintext = simply_ip_vault::api::generate_random_key();
-    let second = simply_ip_vault::entities::api_key::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        key_hash: Set(simply_ip_vault::api::hash_key(&plaintext)),
-        signing_secret: Set(Some(stored_secret(&plaintext))),
-        name: Set("Usurper".to_owned()),
-        bound_ips: Set(None),
-        is_master: Set(true),
-        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
-        can_manage_keys: Set(true),
-        can_manage_webhooks: Set(true),
-        can_create_groups: Set(true),
-        parent_key_id: Set(None),
-        prefix: Set("usurper1".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
-    }
-    .insert(&db)
-    .await;
-    assert!(second.is_err(), "the database must refuse a second master");
+    // Uniqueness is a schema invariant, and §5 requires it be proven by an **adversarial write**:
+    // a direct insert setting `is_master` with the marker absent. Raw SQL rather than an
+    // `ActiveModel`, deliberately — an `ActiveModel` cannot name `master_marker` (the field is not on
+    // the entity), so it would demonstrate the constraint only for writers that happen to be built
+    // from our own entity definitions. The statement below is what an operator at a `psql` prompt, a
+    // restored backup, or a future migration would issue, and it is the exact statement that was
+    // **accepted** against the previous application-maintained marker.
+    assert!(adversarial_master_insert(&db, "Usurper", "usurper1").await.is_err(),
+        "an insert setting is_master with master_marker absent must be refused by the engine; \
+         accepting it is how this codebase came to hold two masters while every test passed");
 
     // `is_master` is unsettable and unclearable, from every caller including the master.
     for value in [true, false] {
@@ -1040,6 +1065,213 @@ async fn s5_master_is_unique_unsettable_immutable_and_undeletable() {
             .unwrap()
             .is_some()
     );
+}
+
+/// **§5.** ADVERSARIAL(§5) — the marker column is unwritable by *any* client, not merely unwritten by
+/// ours.
+///
+/// Distinct from the uniqueness assertion, and not implied by it. Uniqueness says two markers cannot
+/// coexist; this says nobody chooses what the marker is. A schema could satisfy the first and fail
+/// the second — that is exactly what `m20260807_000007` did — and the failure mode is silent, because
+/// a writer that supplies the right value looks identical to one that cannot supply a wrong one.
+///
+/// Both write verbs are tried. `UPDATE` matters independently of `INSERT`: a generated column that
+/// somehow accepted an update could be desynchronised from `is_master` *after* the row passed every
+/// check, which is the one ordering no insert-time constraint can catch.
+#[tokio::test]
+async fn s5_the_derived_marker_is_unwritable_by_any_client() {
+    use sea_orm::ConnectionTrait;
+
+    let (db, _app) = setup().await;
+    let (master_id, _master) = key(&db, "Master", true, true, true, true).await;
+
+    let attempt = |sql: String| {
+        let db = db.clone();
+        async move {
+            db.execute_raw(sea_orm::Statement::from_string(db.get_database_backend(), sql)).await
+        }
+    };
+
+    // Setting the marker while claiming master status — the cooperative shape the old schema
+    // *required*, and which must now be refused outright rather than honoured.
+    let err = attempt(format!(
+        "INSERT INTO api_keys (id, name, key_hash, prefix, is_master, master_marker, \
+         can_manage_keys, can_manage_webhooks, can_create_groups, created_at, updated_at) \
+         VALUES (x'{}', 'Forger', 'forged-hash', 'forger01', true, 1, true, true, true, \
+          '2026-08-08 00:00:00', '2026-08-08 00:00:00')",
+        Uuid::new_v4().simple()
+    ))
+    .await
+    .expect_err("a generated column must refuse an INSERT that names it");
+    assert!(
+        format!("{err:?}").to_lowercase().contains("generated"),
+        "the refusal must come from the column being generated, not from something incidental: \
+         {err:?}"
+    );
+
+    // Clearing the marker on the sitting Master — the shape that would free the unique index for a
+    // second master while leaving `is_master` true on both.
+    attempt(format!(
+        "UPDATE api_keys SET master_marker = NULL WHERE id = x'{}'",
+        master_id.simple()
+    ))
+    .await
+    .expect_err("a generated column must refuse an UPDATE that names it");
+
+    // And the marker still says what `is_master` says.
+    let rows = db
+        .query_all_raw(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            "SELECT master_marker FROM api_keys WHERE is_master = true".to_owned(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].try_get::<Option<i32>>("", "master_marker").unwrap(),
+        Some(1),
+        "the marker must remain derived from is_master after both attempts"
+    );
+}
+
+/// **§5.** ADVERSARIAL(§5) — `is_master` is refused by the payload **type**, not by a handler check.
+///
+/// §5: "Removing the field from the payload type is required; rejecting it at the handler is not
+/// sufficient, since a later handler can reintroduce the path." A status assertion alone cannot tell
+/// the two apart — both spell `400` — so this asserts on *where the refusal came from*: serde's own
+/// ``unknown field `is_master` `` names the field it could not deserialize, which no handler-side
+/// guard produces.
+///
+/// The second half is what keeps that assertion honest. An unrelated unknown field must be refused
+/// the same way, proving the rejection is `deny_unknown_fields` covering the whole struct rather than
+/// a special case for one name that a future edit could carve an exception into.
+#[tokio::test]
+async fn s5_is_master_is_refused_by_the_payload_type_not_by_a_handler() {
+    let (db, app) = setup().await;
+    let (_master_id, master) = key(&db, "Master", true, true, true, true).await;
+
+    let mut nonce = 0i64;
+    let mut post = |uri: &str, method: &str, body: String| {
+        nonce += 1;
+        signed(
+            peer(Request::builder()
+                .method(method)
+                .uri(uri.to_owned())
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json")),
+            nonce,
+            body,
+        )
+    };
+
+    for (label, body) in [
+        ("is_master true", json!({ "name": "n", "is_master": true })),
+        ("is_master false", json!({ "name": "n", "is_master": false })),
+        ("an unrelated unknown field", json!({ "name": "n", "can_do_anything": true })),
+    ] {
+        let (status, text) = send(&app, post("/api/keys", "POST", body.to_string())).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{label} must be refused");
+        assert!(
+            text.contains("unknown field"),
+            "{label} must be refused by deserialization, not by a handler guard — a handler-side \
+             check produces the same status and is one deleted line from not existing: {text}"
+        );
+    }
+
+    // The update payload is the other half of "no key-creation or key-update payload may carry it",
+    // and it is a separate struct with its own attribute.
+    let (_daughter_id, _daughter) = key(&db, "Daughter", false, false, false, false).await;
+    let target = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::Name.eq("Daughter"))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    let (status, text) = send(
+        &app,
+        post(
+            &format!("/api/keys/{}", target.id),
+            "PUT",
+            json!({ "is_master": true }).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(text.contains("unknown field"), "the update payload must refuse it in the type too: {text}");
+}
+
+/// **§5.** ADVERSARIAL(§5) — the Master's immutability holds **per row**, not because there happens to
+/// be only one master.
+///
+/// §5: "The Master key cannot be deleted through the API, and that guarantee must not rest on the
+/// uniqueness constraint holding." Those are two independent controls, and a suite that only ever
+/// sees one master cannot tell whether the second one exists. If `guard_master_immutable` were ever
+/// rewritten as "refuse when the target is *the* master" — a count, a lookup of "the" master row —
+/// every existing test would still pass, and the guarantee would quietly become a corollary of the
+/// constraint it is supposed to be independent of.
+///
+/// So this test removes the constraint at runtime and builds the state §5 says must never exist, in
+/// order to prove the *other* guarantee survives it. Dropping the index is the point, not a shortcut.
+#[tokio::test]
+async fn s5_master_immutability_does_not_rest_on_the_uniqueness_constraint() {
+    use sea_orm::ConnectionTrait;
+
+    let (db, app) = setup().await;
+    let (master_id, master) = key(&db, "Master", true, true, true, true).await;
+
+    // Take the constraint away, then build the forbidden state underneath the application.
+    db.execute_raw(sea_orm::Statement::from_string(
+        db.get_database_backend(),
+        "DROP INDEX \"idx-api_keys-master_marker\"".to_owned(),
+    ))
+    .await
+    .unwrap();
+    adversarial_master_insert(&db, "Second Master", "second01")
+        .await
+        .expect("without the unique index the second master is accepted — that is the premise");
+    let second_id = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::Name.eq("Second Master"))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    // Every mutating operation §5 names, against *both* masters, from a master caller.
+    let mut nonce = 0i64;
+    for target in [master_id, second_id] {
+        for (method, path, body) in [
+            ("DELETE", format!("/api/keys/{target}"), String::new()),
+            ("POST", format!("/api/keys/{target}/rotate"), String::new()),
+            ("POST", format!("/api/keys/{target}/rotate-secret"), String::new()),
+            ("PUT", format!("/api/keys/{target}"), json!({ "name": "Renamed" }).to_string()),
+        ] {
+            nonce += 1;
+            let req = signed(
+                peer(Request::builder()
+                    .method(method)
+                    .uri(path.clone())
+                    .header("X-API-Key", &master)
+                    .header("Content-Type", "application/json")),
+                nonce,
+                body,
+            );
+            assert_eq!(
+                send(&app, req).await.0,
+                StatusCode::FORBIDDEN,
+                "{method} {path} must be refused on the target's own is_master, with no regard for \
+                 how many masters exist"
+            );
+        }
+    }
+
+    // Both rows survive: the refusals were refusals, not deletions that happened to error late.
+    let masters = simply_ip_vault::entities::prelude::ApiKey::find()
+        .filter(simply_ip_vault::entities::api_key::Column::IsMaster.eq(true))
+        .all(&db)
+        .await
+        .unwrap();
+    assert_eq!(masters.len(), 2, "the test's own premise must still hold at the end");
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1136,9 +1368,9 @@ async fn s6_cascade_requires_a_complete_pre_flight_resolution_map() {
 // §7 — Database constraints & indexing
 // ─────────────────────────────────────────────────────────────
 
-/// **§7.** "A database-level constraint guaranteeing Master uniqueness, per §5. Indexes on
-/// `parent_key_id`, `owner_key_id`, the key-hash lookup column, and the permission-table join
-/// columns — every column the authenticated hot paths search on."
+/// **§7.** ADVERSARIAL(§7) — "A database-level constraint guaranteeing Master uniqueness, per §5.
+/// Indexes on `parent_key_id`, `owner_key_id`, the key-hash lookup column, and the permission-table
+/// join columns — every column the authenticated hot paths search on."
 ///
 /// Asserted against the live schema rather than against the migration source: a migration that was
 /// edited after being applied, or one whose `create_index` silently no-ops, would still read
@@ -1197,27 +1429,150 @@ async fn s7_the_schema_carries_the_required_constraints_and_indexes() {
         "§5/§7 require a database-level constraint guaranteeing master uniqueness: {indexes:?}"
     );
 
-    // And the constraint actually bites — asserted by behaviour, since an index that exists but is
-    // not unique would satisfy every name check above.
+    // The marker must be *engine-derived*, asserted against the table's own DDL. This is the
+    // assertion whose absence let a bypassable constraint pass for six phases: every check above is
+    // satisfied by a plain nullable column under a unique index, which is exactly what was there.
+    let table = db
+        .query_all_raw(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'api_keys'".to_owned(),
+        ))
+        .await
+        .unwrap();
+    let ddl = table[0].try_get::<String>("", "sql").unwrap();
+    assert!(
+        ddl.contains("GENERATED ALWAYS AS") && ddl.contains("master_marker"),
+        "§5 requires the marker be derived by the engine from is_master, not maintained by the \
+         application — an assignable marker can be left NULL, and NULLs do not collide: {ddl}"
+    );
+
+    // And the constraint actually bites, against an **adversarial** writer — an index that exists but
+    // is not unique would satisfy every name check above, and a marker the writer supplies would
+    // satisfy even a behavioural check while leaving the bypass wide open.
     let (_id, _plain) = key(&db, "First master", true, true, true, true).await;
-    let plaintext = simply_ip_vault::api::generate_random_key();
-    let second = simply_ip_vault::entities::api_key::ActiveModel {
-        id: Set(Uuid::new_v4()),
-        key_hash: Set(simply_ip_vault::api::hash_key(&plaintext)),
-        signing_secret: Set(Some(stored_secret(&plaintext))),
-        name: Set("Second master".to_owned()),
-        bound_ips: Set(None),
-        is_master: Set(true),
-        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
-        can_manage_keys: Set(true),
-        can_manage_webhooks: Set(true),
-        can_create_groups: Set(true),
-        parent_key_id: Set(None),
-        prefix: Set("second01".to_owned()),
-        created_at: Set(chrono::Utc::now().naive_utc()),
-        updated_at: Set(chrono::Utc::now().naive_utc()),
+    assert!(
+        adversarial_master_insert(&db, "Second master", "second01").await.is_err(),
+        "the uniqueness constraint must refuse a second master written directly at the table"
+    );
+}
+
+/// **§7.** ADVERSARIAL(§7) — where the engine cannot express a constraint in DDL, the application's
+/// substitute is real, and the invariant it stands in for actually holds in the data.
+///
+/// §7: "Where a target engine cannot express a constraint in DDL (for example SQLite's lack of
+/// `ALTER TABLE ADD CONSTRAINT` for foreign keys), the application-level equivalent must be covered by
+/// a test that runs in CI. A constraint that holds only in production is one CI never checks."
+///
+/// `parent_key_id` and both `owner_key_id` columns were added by `ALTER TABLE` and therefore carry no
+/// foreign key on SQLite. Every reference they hold is kept honest by handler code, which is the
+/// arrangement most likely to be quietly correct in review and quietly wrong at runtime — nothing
+/// fails loudly when it drifts, the rows simply start pointing at keys that are gone.
+///
+/// Three claims, in the order they can fail:
+///
+/// 1. **The premise.** There is genuinely no DDL foreign key here. If one appeared, the rest of this
+///    test would be asserting against belt *and* braces while claiming to test the belt.
+/// 2. **The write path refuses a dangling reference** — asserted through the API, since that is the
+///    only writer that is supposed to check.
+/// 3. **The data has no orphans after a cascade**, asserted by anti-join in raw SQL rather than by
+///    re-reading through the entities. An ORM query that joins on the reference cannot see a row
+///    whose reference is broken; only asking the table directly can.
+#[tokio::test]
+async fn s7_referential_integrity_holds_where_ddl_cannot_express_it() {
+    use sea_orm::ConnectionTrait;
+
+    let (db, app) = setup().await;
+    let (_master_id, master) = key(&db, "Master", true, true, true, true).await;
+
+    // 1. The premise: these columns really are unconstrained at the schema level.
+    for table in ["api_keys", "ip_groups", "webhook_configs"] {
+        let fks = db
+            .query_all_raw(sea_orm::Statement::from_string(
+                db.get_database_backend(),
+                format!("PRAGMA foreign_key_list('{table}')"),
+            ))
+            .await
+            .unwrap();
+        let referencing: Vec<String> = fks
+            .iter()
+            .filter_map(|r| r.try_get::<String>("", "from").ok())
+            .filter(|c| c == "parent_key_id" || c == "owner_key_id")
+            .collect();
+        assert!(
+            referencing.is_empty(),
+            "{table} gained a DDL foreign key on {referencing:?} — good, but this test and the \
+             application-side checks it covers now need revisiting rather than silently duplicating it"
+        );
     }
-    .insert(&db)
-    .await;
-    assert!(second.is_err(), "the uniqueness constraint must actually refuse a second master");
+
+    // 2. The write path refuses a reference to a key that does not exist. This is the substitute for
+    // the missing `REFERENCES api_keys(id)`, so it is the thing under test.
+    let orphan_group = group(&db, "s7-group", None).await;
+    let ghost = Uuid::new_v4();
+    let req = signed(
+        peer(Request::builder()
+            .method("PUT")
+            .uri(format!("/api/groups/{orphan_group}/owner"))
+            .header("X-API-Key", &master)
+            .header("Content-Type", "application/json")),
+        1,
+        json!({ "owner_key_id": ghost.to_string() }).to_string(),
+    );
+    let (status, body) = send(&app, req).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "assigning ownership to a nonexistent key must be refused by the application, because the \
+         schema will not: {body}"
+    );
+
+    // 3. No orphans after a real cascade. The subtree is built with lineage, given an owned resource,
+    // and deleted with a complete resolution map — the path that rewrites the most references at once.
+    let (root_id, _r) = key(&db, "s7-root", false, true, false, false).await;
+    let (child_id, _c) = key(&db, "s7-child", false, false, false, false).await;
+    set_parent(&db, child_id, Some(root_id)).await;
+    let owned = group(&db, "s7-owned", Some(child_id)).await;
+
+    let req = signed(
+        peer(Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/keys/{root_id}"))
+            .header("X-API-Key", &master)
+            .header("Content-Type", "application/json")),
+        2,
+        json!({
+            "resolutions": [{
+                "entity_type": "group",
+                "id": owned.to_string(),
+                "action": "delete"
+            }]
+        })
+        .to_string(),
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::NO_CONTENT);
+
+    // The anti-joins. `IS NOT NULL` matters: a NULL reference is "unowned", which is a legitimate
+    // state, not a dangling pointer.
+    for (table, column) in [
+        ("api_keys", "parent_key_id"),
+        ("ip_groups", "owner_key_id"),
+        ("webhook_configs", "owner_key_id"),
+    ] {
+        let orphans = db
+            .query_all_raw(sea_orm::Statement::from_string(
+                db.get_database_backend(),
+                format!(
+                    "SELECT t.id FROM {table} t LEFT JOIN api_keys k ON t.{column} = k.id \
+                     WHERE t.{column} IS NOT NULL AND k.id IS NULL"
+                ),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            orphans.is_empty(),
+            "{table}.{column} has {} row(s) referencing a key that no longer exists; with no DDL \
+             foreign key, nothing else would have noticed",
+            orphans.len()
+        );
+    }
 }

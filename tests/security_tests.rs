@@ -94,7 +94,6 @@ async fn insert_key(
         name: Set(name.to_owned()),
         bound_ips: Set(bound_ips.map(str::to_owned)),
         is_master: Set(is_master),
-        master_marker: Set(is_master.then(|| simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(can_manage_keys),
         can_manage_webhooks: Set(can_manage_webhooks),
         can_create_groups: Set(can_create_groups),
@@ -206,7 +205,6 @@ async fn insert_master_key(db: &DatabaseConnection, name: &str) -> String {
         name: Set(name.to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
-        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -1444,7 +1442,6 @@ async fn attack_a_second_master_cannot_be_written_even_bypassing_the_api() {
         name: Set("Usurper".to_owned()),
         bound_ips: Set(None),
         is_master: Set(true),
-        master_marker: Set(Some(simply_ip_vault::api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),
@@ -1456,7 +1453,11 @@ async fn attack_a_second_master_cannot_be_written_even_bypassing_the_api() {
     .insert(&db)
     .await;
 
-    let err = second.expect_err("the unique index on master_marker must refuse a second master");
+    // Note what this insert does *not* contain: `master_marker`. It cannot — the field is not on the
+    // entity, because the column is engine-generated. That absence is what makes this an adversarial
+    // write rather than a cooperative one, and it is the exact shape that used to be accepted.
+    let err = second
+        .expect_err("the unique index over the derived master_marker must refuse a second master");
     assert!(
         format!("{err:?}").to_lowercase().contains("unique"),
         "the refusal must come from the uniqueness constraint, not from something incidental: {err:?}"
@@ -1470,46 +1471,63 @@ async fn attack_a_second_master_cannot_be_written_even_bypassing_the_api() {
     assert_eq!(masters.len(), 1, "exactly one master survives the attempt");
 }
 
-/// The upgrade path: an existing database with one master gets its `master_marker` backfilled, and
-/// the value the migration writes is the one `MASTER_MARKER` names.
+/// The upgrade path: a database that predates §5 comes out the far side with its existing master
+/// carrying the derived marker, and every other key carrying `NULL`.
 ///
-/// The migration keeps its own private copy of the literal deliberately — an applied migration is
-/// history and must not change when the API constant is refactored — which leaves exactly one way for
-/// the two to drift apart silently. This closes it by asserting against the value actually in the
-/// column after a real migration run, rather than comparing two constants.
+/// Nothing backfills this — that is the point. The value is produced by the engine from `is_master`
+/// the instant the generated column exists, so the assertion is about what the *schema* computes for
+/// rows that were written long before it, not about what any migration remembered to write.
 ///
-/// Migrations 1–6 run first, a master is seeded as it would have existed before §5, then 7 runs.
+/// Migrations 1–6 run first, two keys are seeded as they would have existed before §5, then the rest
+/// of the chain runs.
 #[tokio::test]
-async fn the_master_marker_migration_backfills_an_existing_master() {
+async fn the_master_marker_migration_derives_the_marker_for_pre_existing_rows() {
     let db = Database::connect("sqlite::memory:").await.unwrap();
     migration::Migrator::up(&db, Some(6)).await.unwrap();
 
-    let id = Uuid::new_v4();
-    let plaintext = simply_ip_vault::api::generate_random_key();
-    db.execute_unprepared(&format!(
-        // `x'...'` rather than a quoted string: SeaORM stores `Uuid` as a 16-byte BLOB on SQLite,
-        // and a 36-character hyphenated literal fails to decode on read.
-        "INSERT INTO api_keys (id, name, key_hash, prefix, bound_ips, is_master, can_manage_keys, \
-         can_manage_webhooks, can_create_groups, created_at, updated_at) VALUES \
-         (x'{}', 'Legacy Master', '{}', 'legacy01', NULL, true, true, true, true, \
-          '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
-        id.simple(),
-        simply_ip_vault::api::hash_key(&plaintext),
-    ))
-    .await
-    .unwrap();
+    for (name, prefix, is_master) in
+        [("Legacy Master", "legacy01", true), ("Legacy Daughter", "legacy02", false)]
+    {
+        let plaintext = simply_ip_vault::api::generate_random_key();
+        db.execute_unprepared(&format!(
+            // `x'...'` rather than a quoted string: SeaORM stores `Uuid` as a 16-byte BLOB on
+            // SQLite, and a 36-character hyphenated literal fails to decode on read.
+            "INSERT INTO api_keys (id, name, key_hash, prefix, bound_ips, is_master, \
+             can_manage_keys, can_manage_webhooks, can_create_groups, created_at, updated_at) \
+             VALUES (x'{}', '{name}', '{}', '{prefix}', NULL, {is_master}, true, true, true, \
+              '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            Uuid::new_v4().simple(),
+            simply_ip_vault::api::hash_key(&plaintext),
+        ))
+        .await
+        .unwrap();
+    }
 
     migration::Migrator::up(&db, None).await.unwrap();
 
-    let migrated = simply_ip_vault::entities::prelude::ApiKey::find_by_id(id)
-        .one(&db)
+    // Read through raw SQL: the column is absent from `api_key::Model` by design, so the entity
+    // cannot see it. That is the same reason no `INSERT` can name it.
+    let rows = db
+        .query_all_raw(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            "SELECT name, master_marker FROM api_keys ORDER BY prefix".to_owned(),
+        ))
         .await
-        .unwrap()
         .unwrap();
+    let derived: Vec<(String, Option<i32>)> = rows
+        .iter()
+        .map(|r| {
+            (r.try_get::<String>("", "name").unwrap(), r.try_get("", "master_marker").unwrap())
+        })
+        .collect();
     assert_eq!(
-        migrated.master_marker.as_deref(),
-        Some(simply_ip_vault::api::MASTER_MARKER),
-        "the pre-existing master must be marked, with the value the API constant names"
+        derived,
+        vec![
+            ("Legacy Master".to_owned(), Some(1)),
+            ("Legacy Daughter".to_owned(), None)
+        ],
+        "the engine must derive 1 for the pre-existing master and NULL for everyone else — the NULL \
+         half is what lets every non-master row coexist under the unique index"
     );
 }
 
@@ -1557,6 +1575,76 @@ async fn the_master_marker_migration_refuses_a_database_with_two_masters() {
     assert!(
         db.execute_unprepared("SELECT master_marker FROM api_keys").await.is_err(),
         "the column must not have been added before the check refused"
+    );
+}
+
+/// The upgrade that has to cope with the damage: a database that reached `m20260807_000008` while
+/// holding **two** masters must stop at `m20260808_000009` rather than crash into the unique index.
+///
+/// This state is not hypothetical, and that is why the test builds it the hard way instead of seeding
+/// it. `m20260807_000007`'s marker was application-maintained, so any writer could set
+/// `is_master = true` and leave the marker NULL — NULLs do not collide — and the second master was
+/// accepted. Every deployment that ran the old chain could be sitting on exactly this today.
+///
+/// What the migration owes such an operator is a legible refusal: both rows named, and the `UPDATE`
+/// that resolves it. Letting `CREATE UNIQUE INDEX` fail instead would surface a driver-level
+/// constraint error naming an index, not the rows, and would do it after the column had already been
+/// swapped — a half-applied schema on top of an ambiguous database.
+#[tokio::test]
+async fn the_derived_marker_migration_refuses_a_database_the_old_marker_let_through() {
+    let db = Database::connect("sqlite::memory:").await.unwrap();
+
+    // Through 000008 — the old, bypassable regime — with one legitimate master.
+    migration::Migrator::up(&db, Some(6)).await.unwrap();
+    let seed = |name: &str, prefix: &str| {
+        format!(
+            "INSERT INTO api_keys (id, name, key_hash, prefix, bound_ips, is_master, \
+             can_manage_keys, can_manage_webhooks, can_create_groups, created_at, updated_at) \
+             VALUES (x'{}', '{name}', '{}', '{prefix}', NULL, true, true, true, true, \
+              '2026-01-01 00:00:00', '2026-01-01 00:00:00')",
+            Uuid::new_v4().simple(),
+            simply_ip_vault::api::hash_key(&simply_ip_vault::api::generate_random_key()),
+        )
+    };
+    db.execute_unprepared(&seed("Legitimate Master", "legit001")).await.unwrap();
+    // `Some(2)` is two *further* migrations, not "up to number 2": `up` counts pending ones. That
+    // lands exactly on 000008 — the last state before the marker became engine-derived.
+    migration::Migrator::up(&db, Some(2)).await.unwrap();
+
+    // The bypass itself, replayed: `is_master = true`, marker omitted. Under the old schema this is
+    // simply accepted, which is the defect `m20260808_000009` exists to close.
+    db.execute_unprepared(&seed("Usurper", "usurper1"))
+        .await
+        .expect("the old application-maintained marker accepts this — that is the bug");
+
+    let err = migration::Migrator::up(&db, None)
+        .await
+        .expect_err("two masters must stop the migration rather than fail on the index");
+    let message = format!("{err}");
+    for expected in ["RBAC_MODEL.md §5", "UPDATE api_keys", "Legitimate Master", "Usurper"] {
+        assert!(
+            message.contains(expected),
+            "the refusal must name both offending rows and the fix, missing {expected:?}: {message}"
+        );
+    }
+    assert!(
+        !message.contains("<unreadable id>"),
+        "the offending ids must be legible — they are what the operator's UPDATE targets: {message}"
+    );
+
+    // Left as found: still the old plain column, not a half-swapped generated one. A retry after the
+    // operator's `UPDATE` therefore starts from a coherent schema.
+    let ddl = db
+        .query_all_raw(sea_orm::Statement::from_string(
+            db.get_database_backend(),
+            "SELECT sql FROM sqlite_master WHERE name = 'api_keys'".to_owned(),
+        ))
+        .await
+        .unwrap();
+    let ddl = ddl[0].try_get::<String>("", "sql").unwrap();
+    assert!(
+        !ddl.contains("GENERATED"),
+        "the schema must be untouched when the migration refuses: {ddl}"
     );
 }
 

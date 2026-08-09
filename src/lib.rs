@@ -38,6 +38,7 @@ pub mod config;
 pub mod crypto;
 pub mod entities;
 pub mod error;
+pub mod extract;
 pub mod middleware;
 pub mod migration;
 pub mod replay;

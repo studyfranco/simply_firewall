@@ -5280,3 +5280,277 @@ rule is genuinely pinned, bringing this service to **12/12 rules with a confirme
 
 `SECURITY_COMPARISON_REPORT.md` (rewritten), `AGENT_NOTES.MD` (this section). No file under `src/`,
 `tests/`, `migration/` or `./example` was modified; no commit was created.
+
+---
+
+## Session 38 — §5 Master Uniqueness: Proof, Fix, and Adversarial Fortification
+
+Session 37's audit found that §5 was **not enforced** and recorded it as action required. This session
+does the work. `RBAC_MODEL.md` §5 and §7 were also rewritten by the operator before implementation
+began, adding requirements beyond the fix itself; those are folded in below.
+
+### The specification changed first, and by more than §5
+
+`RBAC_MODEL.md` went from `42c0c8bd…` to `cb0b76ab…` (66 insertions, 35 deletions). Byte-identity with
+the peer was re-established by the operator, so Pillar 0 passes.
+
+Beyond mandating an engine-derived marker, the update **resolved all three specification defects**
+Session 37 reported: `can_create_webhooks`/`can_create_executor` (named columns existing in neither
+service) are gone in favour of "resource-creation rights" plural, matching this service's
+`can_create_groups` + `can_manage_webhooks`; "dispatch target" became "creator-private entity"; and a
+new "Dispatch configuration" paragraph in §1 covers the peer's case, where dispatch config lives on a
+shared Hook row and is therefore governed by R2 in full.
+
+Four *new* obligations landed on this service, all implemented here:
+
+| New §5/§7 requirement | Status before | Action |
+| :--- | :--- | :--- |
+| Marker derived by the engine | Application-maintained | `m20260808_000009` (below) |
+| `is_master` removed from the payload **type** | Present, rejected by a handler guard | Field removed + `deny_unknown_fields` + `StrictJson` |
+| Rotation refused for every caller including Master | Already held (`guard_master_immutable`) | Verified; test already existed |
+| Master-undeletable not resting on the uniqueness constraint | Held, but **untested** | New adversarial test `s5_master_immutability_does_not_rest_on_the_uniqueness_constraint` |
+| §7: DDL-inexpressible constraints covered by a CI test | Uncovered | New `s7_referential_integrity_holds_where_ddl_cannot_express_it` |
+
+### 1. Pre-fix reproduction — the baseline
+
+Run against a live SQLite database built from the then-current migration chain (1–8). Statement and
+output verbatim:
+
+```sql
+-- accepted, changes: 1
+INSERT INTO api_keys (id, name, key_hash, prefix, is_master, can_manage_keys,
+                      can_manage_webhooks, can_create_groups, created_at, updated_at)
+VALUES (x'5243071b4f32497fa11b0f8f06e79683', 'Usurper', 'hash-second', 'second01',
+        1, 1, 1, 1, '2026-08-08 00:00:00', '2026-08-08 00:00:00');
+```
+
+```
+--- outcome ---
+Ok(ExecResult { result: SqlxSqlite(SqliteQueryResult { changes: 1, last_insert_rowid: 2 }) })
+--- masters now present: 2 ---
+    name="Master"  master_marker=Some("master")
+    name="Usurper" master_marker=None
+--- api_keys DDL ---
+CREATE TABLE "api_keys" ( ... "is_master" boolean NOT NULL DEFAULT FALSE,
+                          ... "master_marker" varchar(16) NULL, ... )
+```
+
+Two masters. The unique index never fired because NULLs do not collide, and the marker was written by
+`bootstrap_master_key` rather than by the engine — §5's "application logic alone" exactly.
+
+Post-fix, the same two statements against the same chain plus `m20260808_000009`:
+
+| Write | Pre-fix | Post-fix |
+| :--- | :--- | :--- |
+| `INSERT … is_master=1` (marker **omitted**) | `Ok(changes: 1)` → **2 masters** | `SqliteError 2067: UNIQUE constraint failed: api_keys.master_marker` |
+| `INSERT … is_master=1, master_marker='master'` (marker **named**) | `Ok(changes: 1)` | `SqliteError 1: cannot INSERT into generated column "master_marker"` |
+| `UPDATE … SET master_marker = NULL` on the sitting Master | would have succeeded | `SqliteError 1: cannot UPDATE generated column` |
+
+Both write verbs are now refused, and the surviving master count is 1.
+
+### 2. `m20260808_000009_derive_master_marker`
+
+Drops the plain column and its index, re-adds the column as engine-derived, recreates the unique index
+under the same name:
+
+```sql
+ALTER TABLE api_keys ADD COLUMN master_marker INTEGER
+    GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END) VIRTUAL;
+CREATE UNIQUE INDEX "idx-api_keys-master_marker" ON api_keys (master_marker);
+```
+
+`ELSE NULL` is as load-bearing as `GENERATED ALWAYS AS`: it is what lets every non-master row coexist
+under a unique index. A unit test asserts both, on all three backends.
+
+**Storage class is pinned per backend** and unit-tested, because the wrong pairing fails only against a
+live server the suite never starts: PostgreSQL `STORED` (VIRTUAL arrived in 18), SQLite `VIRTUAL`
+(the only class `ALTER TABLE ADD COLUMN` accepts), MySQL `VIRTUAL` (accepts either; avoids a rewrite).
+
+**No backfill.** The engine evaluates the expression for existing rows the moment the column exists —
+which is the entire point, and is asserted by
+`the_master_marker_migration_derives_the_marker_for_pre_existing_rows` (master → `1`, daughter → `NULL`).
+
+**Abort on multiple masters.** Checked before any DDL, so an inconsistent database is left exactly as
+found rather than half-migrated. The error names every offending row (id, name, prefix) and the
+`UPDATE` that resolves it. Operator pre-upgrade query:
+
+```sql
+SELECT id, name, prefix FROM api_keys WHERE is_master = true;   -- must return exactly one row
+```
+
+This path is not hypothetical: a database that ran the old chain could already hold two masters via the
+bypass above. `the_derived_marker_migration_refuses_a_database_the_old_marker_let_through` builds that
+exact state — migrate to 000008, exploit the bypass, then migrate — and asserts the refusal names both
+rows and leaves the schema untouched (no `GENERATED` in the DDL afterwards).
+
+`m20260807_000007`'s module doc previously claimed schema-level enforcement. It is corrected in place,
+with the reasoning left visible rather than rewritten away; the migration itself is untouched, since
+`sea-orm` records migrations by name and would not re-run an edited one.
+
+### 3. Removed marker write paths
+
+| Location | What it was |
+| :--- | :--- |
+| `src/entities/api_key.rs` | `pub master_marker: Option<String>` field — **removed**; a comment explains that its absence is the mechanism (SeaORM builds column lists from the entity) |
+| `src/api.rs` | `pub const MASTER_MARKER: &str = "master"` — removed |
+| `src/api.rs::create_api_key` | `master_marker: Set(None)` — removed |
+| `src/main.rs::bootstrap_master_key` | `master_marker: Set(Some(api::MASTER_MARKER.to_owned()))` — removed |
+| `tests/rbac_integration_tests.rs` | 11 fixture assignments — removed |
+| `tests/security_tests.rs` | 4 fixture assignments + 2 tests rewritten |
+| `tests/rbac_model_compliance.rs` | 3 fixture assignments — removed |
+
+Grep for surviving writers is now a **convergence gate**: `assert_absent "no code writes the master
+marker" 'master_marker:[[:space:]]*Set\('`. Every remaining mention in `src/` is a comment.
+
+### 4. `is_master` moved from a handler guard into the type
+
+§5 now requires the field be removed from the payload type, "rejecting it at the handler is not
+sufficient, since a later handler can reintroduce the path".
+
+- `CreateApiKeyPayload` / `UpdateApiKeyPayload`: field removed, `#[serde(deny_unknown_fields)]` added.
+  **Both halves are required** — removing the field alone makes serde *ignore* it, which is worse than
+  either accepting or rejecting, because the caller gets a `200` and believes it minted a master.
+- `guard_no_master_flag` **deleted**, with a comment where it stood saying not to reintroduce it: an
+  unreachable guard reads like the control, which is how someone later deletes `deny_unknown_fields`
+  believing something else still holds the line.
+- New `src/extract.rs::StrictJson<T>` maps the rejection to `400` with serde's own message, preserving
+  the documented contract. **Only the content errors are remapped** — a blanket remap would demote
+  `413 Payload Too Large` (which arrives as the same rejection type) to an indistinguishable `400`.
+  New `AppError::BodyRejected(StatusCode, String)` passes every other status through.
+
+*Divergence, deliberate:* `simply_hook_executor` passes **every** status through, so a payload carrying
+`is_master` answers `422` there and `400` here. This service documented `400` for that case before the
+control moved into the type. The peer's status-preservation reasoning is what prompted the split
+treatment here — it was found by reading their `StrictJson` during the Phase 3 peer assessment.
+
+### 5. Compliance suite classification (Phase 2.1)
+
+`Cooperative` = reaches the guarantee through our own handlers, entities or fixtures; proves the
+application behaves. `Adversarial` = bypasses the application entirely; proves the guarantee holds
+against a writer that does not cooperate.
+
+| Rule | Test | Target layer | Cooperative | Adversarial |
+| :--- | :--- | :--- | :---: | :---: |
+| R1 | `r1_non_amplification_a_caller_cannot_grant_a_verb_it_does_not_hold` | Application (handler) | ✅ | — *(n/a)* |
+| R2 | `r2_conjunction_neither_half_alone_confers_management` | Application (handler) | ✅ | — *(n/a)* |
+| R3 | `r3_lineage_confers_no_authority` | Application (handler) | ✅ | — *(n/a)* |
+| R4 | `r4_only_master_grants_global_scopes` | Application (handler) | ✅ | — *(n/a)* |
+| R5 | `r5_manage_propagates_sideways_without_creating_parents` | Application (handler) | ✅ | — *(n/a)* |
+| R6 | `r6_revocation_needs_no_verb_and_permits_self_revocation` | Application (handler) | ✅ | — *(n/a)* |
+| R7 | `r7_granting_requires_r1_and_r2_simultaneously` | Application (handler) | ✅ | — *(n/a)* |
+| §3 | `s3_lifecycle_authority_belongs_to_master_and_owner_only` | Application (handler) | ✅ | — *(n/a)* |
+| §4 | `s4_visibility_scopes_bound_what_a_key_listing_returns` | Application (handler) | ✅ | — *(n/a)* |
+| §4 | `s4_oracle_discipline_out_of_scope_is_indistinguishable_from_nonexistent` | Application (handler) | ✅ | — *(n/a)* |
+| §4 | `s4_authenticate_then_authorize_ordering_survives_oracle_discipline` | Middleware | ✅ | — *(n/a)* |
+| §5 | `s5_master_is_unique_unsettable_immutable_and_undeletable` | **Schema** + handler | ✅ | ✅ **rewritten** |
+| §5 | `s5_the_derived_marker_is_unwritable_by_any_client` | **Schema** | — | ✅ **new** |
+| §5 | `s5_is_master_is_refused_by_the_payload_type_not_by_a_handler` | **Type / extractor** | — | ✅ **new** |
+| §5 | `s5_master_immutability_does_not_rest_on_the_uniqueness_constraint` | **Schema** + handler | — | ✅ **new** |
+| §6 | `s6_cascade_requires_a_complete_pre_flight_resolution_map` | Application (handler) | ✅ | — *(n/a)* |
+| §7 | `s7_the_schema_carries_the_required_constraints_and_indexes` | **Schema** | — | ✅ **strengthened** |
+| §7 | `s7_referential_integrity_holds_where_ddl_cannot_express_it` | **Schema** + handler | ✅ | ✅ **new** |
+
+*(n/a)* is a claim, not an omission: R1–R7, §3, §4 and §6 are authorization *decisions* made by
+handlers. "Bypass the application" has no meaning for them — there is no lower layer holding the
+guarantee — so the convergence gate deliberately does not demand adversarial coverage there.
+
+**What "strengthened" means for `s7_…constraints_and_indexes`:** it previously satisfied itself with an
+index named over `master_marker` plus a behavioural probe that *supplied the marker*. Both passed
+against the defective schema. It now also asserts `GENERATED ALWAYS AS` in the table DDL and probes
+with the adversarial insert. The DDL assertion is the one whose absence let the bypass through: every
+other check in that test is satisfied by a plain nullable column under a unique index.
+
+**Shared helper.** `adversarial_master_insert()` writes the attack once so it cannot drift into a
+cooperative form. It uses **raw SQL, not an `ActiveModel`** — deliberately. An `ActiveModel` cannot name
+`master_marker` because the field is not on the entity, which makes it adversarial only by accident of
+our own type definitions; it would silently become cooperative the day someone re-adds the field. Raw
+SQL is adversarial by construction. It also **omits** the marker rather than setting it `NULL`, because
+omission is the shape that was historically *accepted*.
+
+### 6. Proof-of-failure results (Phase 1.4 / 2.3)
+
+Every new or rewritten adversarial test was run against a deliberately broken mechanism. A test that
+does not fail here has not earned its name.
+
+| # | Mutation | Expected to fire | Result |
+| :--- | :--- | :--- | :--- |
+| M-A | Unregister `m20260808_000009` (the old application-maintained marker) | §5 uniqueness, §5 unwritability, §7 schema | ✅ **3 failed**: `s5_master_is_unique…`, `s5_the_derived_marker_is_unwritable…`, `s7_…constraints_and_indexes` |
+| M-B | Remove `#[serde(deny_unknown_fields)]` from `CreateApiKeyPayload` | §5 payload type | ✅ **2 failed**: `s5_is_master_is_refused_by_the_payload_type…`, `s5_master_is_unique…` |
+| M-C | Rewrite the delete guard to resolve "*the*" master and compare ids, instead of reading the target row's own `is_master` | §5 immutability-independence | ✅ **1 failed**, uniquely |
+| M-D | `resolve_owner_assignment` trusts the caller's id instead of checking the key exists | §7 referential integrity | ✅ **1 failed**, uniquely |
+| M-E | Resolution `delete` counts the group as handled but leaves the row, orphaning `owner_key_id` | §7 orphan scan | ✅ **1 failed**, uniquely |
+| M-F | Drop `.unique()` from the index in `m20260808_000009` | §5 uniqueness, §7 | ✅ **2 failed** |
+
+**M-C is the result worth keeping.** It is the *plausible* rewrite — "find the master, compare ids" is
+how someone would naturally implement "is this the master key?" — and with one master in the database
+it is behaviourally identical, so all 17 other tests pass. Only the test that drops the unique index
+and builds a two-master state catches it. That is the marginal value of an adversarial test stated
+precisely: not a rule nobody tested, but a rule whose test could not reach the state that breaks it.
+
+M-A and M-B fire for more than one test, which is expected and not a defect — a broken mechanism
+should break everything that depends on it.
+
+**Also verified: the new convergence gate itself fails.** Renaming `ADVERSARIAL(§7)` →
+`ADVERSARIALX(§7)` produces `✗ GAP … no adversarial test for: §7` and exit 1. A gate nobody has seen
+fail is not known to work.
+
+### 7. Convergence checker (Phase 3.1)
+
+Added to Pillar 0, all active and passing:
+
+- `check_adversarial_coverage` — every infrastructure-level rule (§5, §7) must have at least one test
+  marked `ADVERSARIAL(§N)`. The marker is a doc-comment convention rather than an attribute because it
+  is a claim about what the test does and should read as one.
+- `assert_present` — `GENERATED ALWAYS AS` in `m20260808_000009`.
+- `assert_absent` — no `master_marker: Set(` anywhere in `src/`.
+
+Pillar 0's byte-identity check and `check_rule_coverage` remain untouched and green.
+
+### 8. Peer assessment (Phase 3.2, read-only)
+
+`./example/simply_hook_executor` was inspected, not modified.
+
+**The peer was already right on the thing we were wrong about.** Its
+`m20230106_000001_master_key_uniqueness` has used a generated column since it was written, and its
+`is_master` has not been a payload field. Both fixes here are this service catching up, and its
+`StrictJson` is where the status-preservation improvement above came from.
+
+**Gaps expected to exist in the peer**, by the same reasoning that found ours — each is a *lead to
+check in that repository*, not a finding, since only its own suite can confirm behaviour:
+
+| Gap | Evidence in the peer tree | Why it matters there |
+| :--- | :--- | :--- |
+| §5 uniqueness proven via `ActiveModel`, not raw SQL | `tests/rbac_model_compliance.rs:664-680`; **0** occurrences of `execute_unprepared`/`Statement::from_string` in the whole compliance suite | Adversarial only by accident of entity shape. Re-adding `master_marker` to their entity turns the test cooperative with nothing failing — precisely how ours stayed green for six phases |
+| §7 asserts index **existence**, not **uniqueness or derivation** | `s7_every_required_index_and_constraint_exists` uses `manager.has_index(table, index)` | An index that exists but lost `UNIQUE`, or a marker that stopped being generated, passes. Their master-uniqueness row is checked by name only; the `key_hash` row *is* checked behaviourally, so the technique is already in the file |
+| No adversarial-coverage gate | **0** occurrences of `ADVERSARIAL` in their suite; their `scripts/verify_convergence.sh` has no equivalent check | Nothing distinguishes a test that bypasses the application from one that does not |
+| No §7 referential-integrity/orphan coverage | No anti-join or `PRAGMA foreign_key_list` probe found | The new §7 bullet ("application-level equivalent must be covered by a test that runs in CI") applies to their `parent_key_id`/`owner_key_id` too |
+| §5 does not attempt an `UPDATE` naming the marker | Only an insert is attempted | Insert-time constraints cannot catch a desynchronisation applied *after* the row passed every check |
+
+**Not a gap:** the peer's R2 weakness reported in Session 37 (`require_manage` omitting the
+`can_manage_keys` conjunct) is now explicitly governed by the new §1 "Dispatch configuration"
+paragraph, which states that editing dispatch config held on a shared managed resource "is a management
+action on that resource and is governed by R2 in full". The specification now names their case
+directly; the remediation is theirs to make.
+
+### Verification
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **211 passed, 0 failed** (72 unit + 3 frontend + 74 integration + 18 compliance + 44 security) |
+| `./scripts/test_e2e.sh` | **490 passed, 0 failed** |
+| `./scripts/verify_convergence.sh` | **exit 0** — 35 matching, 1 documented divergence, 0 unexplained |
+
+Compliance suite grew 14 → 18. `RBAC_MODEL.md` byte-identical at `cb0b76ab…` on both sides.
+
+### One process note
+
+Three gate runs mid-session (`cargo check`, `clippy`, `test`) silently measured the **peer** crate: the
+shell's working directory persists between commands, and an earlier `cd example/simply_hook_executor`
+for the peer assessment was still in effect. It surfaced only because the test counts changed shape
+(84/129/14 instead of 72/74/18). The reads taken in that window were peer files too — one of them led
+to adding `AppError::BodyRejected` on the belief this crate already had it, which it did not.
+
+Use absolute paths for anything whose result is a claim about *this* repository. The failure mode is
+not an error; it is a green run of the wrong thing.

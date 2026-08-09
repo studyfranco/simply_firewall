@@ -112,12 +112,13 @@ async fn bootstrap_master_key(
         name: Set("System Master".to_owned()),
         prefix: Set(prefix),
         bound_ips: Set(Some(bound_ip.clone())),
+        // This is the only write of `is_master = true` anywhere in the service, and it is also, by
+        // construction, the only thing that can claim the master slot: the engine derives
+        // `api_keys.master_marker` from this value and a unique index covers it. A second bootstrap
+        // racing this one therefore loses at the database rather than producing a second master
+        // (`RBAC_MODEL.md` §5) — uniqueness rests on the schema, not on the `find` above happening
+        // to run first, and not on this function remembering to populate a marker.
         is_master: Set(true),
-        // The only write of this column anywhere in the service. A unique index covers it, so a
-        // second bootstrap racing this one loses at the database rather than producing a second
-        // master — `RBAC_MODEL.md` §5 wants uniqueness enforced by the schema, not by the `find`
-        // above happening to run first.
-        master_marker: Set(Some(api::MASTER_MARKER.to_owned())),
         can_manage_keys: Set(true),
         can_manage_webhooks: Set(true),
         can_create_groups: Set(true),

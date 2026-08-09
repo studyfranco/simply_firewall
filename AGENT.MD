@@ -81,8 +81,9 @@ To keep this context clean and modular, responsibilities are split across three 
 
 - **Global Rights:** An `ApiKey` can be `is_master` (bypasses all checks) or hold global booleans (`can_manage_keys`, `can_manage_webhooks`, `can_create_groups`).
 - **Master Key Guarantees (`RBAC_MODEL.md` §5):** exactly one Master key exists, and the API cannot create, alter, or remove it.
-  - **Uniqueness is a schema invariant.** `api_keys.master_marker` is nullable, carries the single value `'master'` on the Master row, and has a **plain unique index** over it. A nullable marker rather than a partial unique index on `is_master = true`, because MySQL has no partial indexes and the data layer stays SQL-agnostic; NULLs do not collide on any supported engine. Application logic alone was never sufficient — `bootstrap_master_key` checks then inserts, which two processes starting together both pass.
-  - **`is_master` is bootstrap-only.** No key-creation or key-update payload may carry the field, in either direction, from any caller including a master. It is **rejected with `400`**, not silently dropped: a caller that posts `is_master: true` and gets a `200` walks away believing it holds a master key. The dashboard's "Master Access" checkbox was removed for the same reason.
+  - **Uniqueness is a schema invariant, and the engine derives it.** `api_keys.master_marker` is `INTEGER GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` under a **plain unique index**. A marker column rather than a partial unique index on `is_master = true`, because MySQL has no partial indexes and the data layer stays SQL-agnostic; NULLs do not collide on any supported engine. Application logic alone was never sufficient — `bootstrap_master_key` checks then inserts, which two processes starting together both pass.
+    - **The marker must never be application-maintained.** It was, until `m20260808_000009`, and that did not satisfy §5: a writer could set `is_master = true` and omit the marker, NULLs do not collide, and the database accepted a second master. Verified live. The column is deliberately **absent from `api_key::Model`** — SeaORM builds column lists from the entity, so its absence is what keeps it out of every `INSERT`, and every engine rejects a write naming a generated column. Do not add the field back. See `SCHEMA.MD`, "Master Uniqueness".
+  - **`is_master` is bootstrap-only, and the *type* is what enforces it.** The field is absent from `CreateApiKeyPayload` and `UpdateApiKeyPayload`, both of which carry `#[serde(deny_unknown_fields)]`, so a payload naming it is refused during deserialization and never reaches a handler. `crate::extract::StrictJson` renders that as **`400`** with serde's own message. §5 requires exactly this shape — "rejecting it at the handler is not sufficient, since a later handler can reintroduce the path" — and a handler guard (`guard_no_master_flag`) did the job until it was deleted in favour of the type. Note the two halves are both needed: removing the field without `deny_unknown_fields` makes serde *ignore* it, which is worse than either accepting or rejecting, because a caller that posts `is_master: true` and gets a `200` walks away believing it holds a master key. The dashboard's "Master Access" checkbox was removed for the same reason.
   - **The Master is immutable through the API except for its own `bound_ips`,** which it alone may edit. Renaming, re-scoping, both rotation endpoints, and deletion are all refused (`guard_master_immutable`). A payload mixing `bound_ips` with any other field is refused whole rather than partially applied.
   - **Why rotation is refused, when it is the one credential most worth rotating.** `POST /keys/{id}/rotate` returns the new plaintext in its response body, so an API-reachable master rotation is an API-reachable way to mint a working master credential from any session that already holds one. Re-minting is instead: delete the row directly in the database; the service re-mints at next boot. That requires database access, which an HTTP-only compromise does not have.
   - **Upgrade path.** The migration backfills a single existing master and **refuses to run** on a database that already holds two, naming the offending ids and the `UPDATE` that resolves it rather than silently demoting someone.
@@ -213,6 +214,24 @@ To keep this context clean and modular, responsibilities are split across three 
   4. **Multi-Group & Temporal Querying:** Validate `GET /api/ips` with group filters and `max_age`/`since` constraints.
   5. **Request Authentication (HMAC):** each of the three auth headers is individually mandatory (`401` when any is dropped — in particular the pre-HMAC "key + timestamp only" shape); the anti-replay window is enforced symmetrically at ±300s using *correctly signed* stale/future timestamps, so the rejection provably comes from the freshness check and not the HMAC; and the signature binds method, path, and body (replaying an authentic signature over a tampered body, or onto a different route, MUST fail).
   6. **Signing Secret Handling:** a `NULL` `signing_secret` fails closed; `signing_secret` never appears in any read endpoint's response; and with `VAULT_ENCRYPTION_KEY` set, the stored value is ciphertext yet still authenticates (round trip through the real request path).
+
+- **Adversarial tests for infrastructure claims (mandatory).** Any guarantee this codebase claims at
+  the **database, type-system, or extractor** layer requires at least one test written from the
+  perspective of an **uncooperative writer** — one that bypasses the application entirely (raw SQL, or
+  a payload the type cannot express). A test that reaches the guarantee through our own handlers,
+  entities, or fixtures can only ever prove that *our* code behaves; it cannot distinguish "this is
+  impossible" from "we always do it correctly".
+
+  This is not a style preference. §5's master-uniqueness constraint was bypassable for six phases while
+  every signal said otherwise: the compliance test passed, the mutation fired, `AGENT_NOTES.MD` and the
+  migration's own doc comment both asserted schema-level enforcement. All of them were blind for one
+  reason — the test supplied the uniqueness marker itself, so it exercised a cooperative writer. A
+  direct `INSERT` setting `is_master` with the marker omitted was accepted on a live database.
+
+  Mark such tests `ADVERSARIAL(§N)` in their doc comment. `scripts/verify_convergence.sh` fails when an
+  infrastructure-level rule (currently §5 and §7) has none. Application *decisions* — R1–R7, §3, §4,
+  §6 — are deliberately exempt: they are made by handlers, so exercising the API is the correct way to
+  test them, and demanding impossible evidence is how a gate gets switched off.
 
 *Test-suite convention:* keys seeded directly into the database use a deterministic signing secret derived from their plaintext key, so the request-building helper can rediscover it from the `X-API-Key` header. Keys minted through `POST /api/keys` or `/rotate` carry a server-generated random secret and must be signed with it explicitly.
 

@@ -9,6 +9,7 @@ mod m20260801_000005_add_ip_record_soft_delete;
 mod m20260804_000006_add_group_permission_can_manage;
 mod m20260807_000007_add_api_key_master_marker;
 mod m20260807_000008_add_lineage_and_ownership;
+mod m20260808_000009_derive_master_marker;
 
 /// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
@@ -25,6 +26,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260804_000006_add_group_permission_can_manage::Migration),
             Box::new(m20260807_000007_add_api_key_master_marker::Migration),
             Box::new(m20260807_000008_add_lineage_and_ownership::Migration),
+            Box::new(m20260808_000009_derive_master_marker::Migration),
         ]
     }
 }

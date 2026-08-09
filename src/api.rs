@@ -21,6 +21,7 @@ use crate::entities::{
     ip_record_group_membership, prelude::*, webhook_config,
 };
 use crate::error::AppError;
+use crate::extract::StrictJson;
 use crate::middleware::ClientIp;
 use crate::state::{AppState, WebhookEvent};
 
@@ -28,13 +29,12 @@ use crate::state::{AppState, WebhookEvent};
 /// `audit_log::Model::action` and `webhook_config::Model::events`.
 const IP_EVENT_ACTIONS: [&str; 3] = ["IP_ADD", "IP_UPDATE", "IP_DELETE"];
 
-/// The single non-null value `api_keys.master_marker` ever carries.
-///
-/// A unique index covers that column, and null values do not collide on any supported backend, so
-/// writing this string is what makes "at most one Master key" a schema-level fact rather than a
-/// convention — `RBAC_MODEL.md` §5. Only `bootstrap_master_key` writes it; a second insert carrying
-/// the same value is refused by the database.
-pub const MASTER_MARKER: &str = "master";
+// `MASTER_MARKER` used to live here: the string `bootstrap_master_key` wrote into
+// `api_keys.master_marker` to claim the unique index. It is gone because the column is now
+// `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` and no client may write it
+// (`RBAC_MODEL.md` §5, `migration::m20260808_000009_derive_master_marker`). Application code holding
+// a constant for a value the engine derives is the arrangement that let a writer set `is_master`
+// and leave the marker NULL. There is nothing here to keep in step any more.
 
 // ─────────────────────────────────────────────────────────────
 // Helpers
@@ -405,9 +405,9 @@ fn guard_delegated_group_grant(
 /// managing keys and being able to point a dispatch target at an arbitrary URL are separate powers.
 ///
 /// `is_master` is **not** on this list, because it is no longer grantable by anyone: §5 makes master
-/// status a bootstrap-only property, and both key payloads reject the field outright rather than
-/// gating it (see [`guard_no_master_flag`]). A scope nobody can request does not need a rule about
-/// who may request it.
+/// status a bootstrap-only property, and neither key payload can express the field at all — the
+/// structs omit it and deny unknown fields, so serde refuses the request before any scope is
+/// considered. A scope nobody can request does not need a rule about who may request it.
 ///
 /// Each entry is a *path back to* master authority rather than a leaf capability:
 ///
@@ -484,8 +484,12 @@ fn guard_master_target(caller: &api_key::Model, target: &api_key::Model) -> Resu
 ///
 /// This is strictly stronger than [`guard_master_target`], which only ever blocked *non*-masters and
 /// therefore left the Master free to rotate, rename and re-scope itself. Uniqueness (§5, enforced by
-/// the `master_marker` unique index) means "the Master key" is unambiguous: there is no second master
-/// for this to be relative to.
+/// the unique index over the engine-derived `master_marker`) means "the Master key" is unambiguous:
+/// there is no second master for this to be relative to.
+///
+/// The dependency runs one way only. §5 requires that the Master's undeletability "must not rest on
+/// the uniqueness constraint holding", and it does not: this guard refuses on the target row's own
+/// `is_master`, so it would refuse each of two masters independently if a database ever held two.
 ///
 /// # Why rotation is refused too, when it looks like routine hygiene
 ///
@@ -513,31 +517,20 @@ fn guard_master_immutable(target: &api_key::Model, operation: &str) -> Result<()
     )))
 }
 
-/// Rejects any key payload that carries `is_master` at all, in either direction.
-///
-/// `RBAC_MODEL.md` §5: "`is_master` must not be settable or clearable through any API endpoint […]
-/// no key-creation or key-update payload may carry it."
-///
-/// Refused rather than silently dropped. Ignoring the field would satisfy the letter of the rule —
-/// the flag would still never change — while leaving a caller that posted `is_master: true` holding a
-/// `200` and an ordinary key it believes is a master. A security-relevant field that quietly means
-/// nothing is how a deployment ends up with no master at all and nobody noticing until the day it is
-/// needed. `400` says so.
-///
-/// Both directions, including `false`: "cleared" is named explicitly in the rule, and a payload that
-/// carries the field is asserting authority over it either way.
-fn guard_no_master_flag(is_master: Option<bool>) -> Result<(), AppError> {
-    if is_master.is_none() {
-        return Ok(());
-    }
-
-    Err(AppError::InvalidInput(
-        "'is_master' cannot be set or cleared through the API. Master status is established at \
-         bootstrap only and is enforced by a database uniqueness constraint; remove the field from \
-         this payload."
-            .to_owned(),
-    ))
-}
+// `guard_no_master_flag` used to live here. It took `payload.is_master: Option<bool>` and returned
+// `400` whenever the field was present in either direction, satisfying `RBAC_MODEL.md` §5's
+// "`is_master` must not be settable or clearable through any API endpoint".
+//
+// It is gone because §5 now says the field must be removed from the payload *type*, and "rejecting it
+// at the handler is not sufficient, since a later handler can reintroduce the path". The guard was
+// exactly that: correct, and one deleted line away from not existing. `CreateApiKeyPayload` and
+// `UpdateApiKeyPayload` now omit the field and carry `#[serde(deny_unknown_fields)]`, so the request
+// never reaches a handler at all — serde refuses it, and `StrictJson` renders that as the same `400`
+// with serde's own field-level message.
+//
+// Do not reintroduce a handler-side check for this. A guard would be unreachable, and an unreachable
+// guard reads like the control, which is how the next person deletes `deny_unknown_fields` believing
+// something else still holds the line.
 
 /// Helper to insert an audit log entry. `key` denormalizes the acting key's name/prefix into the
 /// row so the audit trail stays legible even after that key is later deleted (its `api_key_id` FK
@@ -1705,17 +1698,26 @@ pub struct GroupPermInput {
     pub can_manage: bool,
 }
 
-/// Payload for creating an API Key
+/// Payload for creating an API Key.
+///
+/// `deny_unknown_fields` is a §5 control, not tidiness: it is what makes the *absence* of `is_master`
+/// a refusal rather than a silent discard. Serde ignores unknown fields by default, so without it a
+/// struct that simply lacks the field would accept `{"is_master": true}`, drop it, and report
+/// success — the one outcome worse than either accepting or rejecting it. Paired with
+/// [`crate::extract::StrictJson`], which renders the rejection as `400`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateApiKeyPayload {
     /// Name
     pub name: String,
     /// Bound CIDRs
     pub bound_ips: Option<String>,
-    /// Accepted only so it can be **rejected**. Master status is bootstrap-only (`RBAC_MODEL.md`
-    /// §5); a payload carrying this field in either direction is refused with `400` by
-    /// [`guard_no_master_flag`] rather than being silently ignored.
-    pub is_master: Option<bool>,
+    // No `is_master`, and `deny_unknown_fields` above is what makes that absence mean something.
+    // §5: "Removing the field from the payload type is required; rejecting it at the handler is not
+    // sufficient, since a later handler can reintroduce the path." It briefly lived here as an
+    // `Option<bool>` that a guard rejected — which worked, and put the only thing standing between a
+    // payload and master status inside a function call any refactor could drop. Now the type cannot
+    // carry it and serde refuses the request outright.
     /// Manage keys flag
     pub can_manage_keys: Option<bool>,
     /// Manage webhooks flag
@@ -1746,16 +1748,16 @@ pub async fn create_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Json(payload): Json<CreateApiKeyPayload>,
+    StrictJson(payload): StrictJson<CreateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
 
-    // Nobody mints a master any more, master included: the flag is bootstrap-only and the unique
-    // index on `master_marker` would refuse a second row regardless. Checked before the scope guard
-    // so a payload carrying both `is_master` and an over-reach gets the specific answer.
-    guard_no_master_flag(payload.is_master)?;
+    // Nobody mints a master any more, master included. There is no check for it here because there is
+    // nothing left to check: `CreateApiKeyPayload` cannot carry `is_master`, the request is refused
+    // before this function runs, and the unique index over the engine-derived `master_marker` would
+    // refuse a second row even if it were not (`RBAC_MODEL.md` §5).
 
     // Only a master key may mint a key carrying master-only scopes. Without this,
     // `can_manage_keys` was transitively equivalent to `is_master`: a key manager could create a
@@ -1792,9 +1794,9 @@ pub async fn create_api_key(
         prefix: Set(prefix),
         bound_ips: Set(payload.bound_ips.clone()),
         // Hardcoded, not derived from the payload: the field that once fed this is now rejected
-        // above. `master_marker` stays `NULL` so this row does not contend for the unique index.
+        // above. The engine derives `master_marker` from this `false`, so the row leaves the marker
+        // NULL and does not contend for the unique index — no application write is involved.
         is_master: Set(false),
-        master_marker: Set(None),
         // R3: recorded for cascade deletion and visibility scoping, and read by no permission guard.
         // A daughter of the Master is an ordinary daughter key.
         parent_key_id: Set(Some(key.id)),
@@ -2466,17 +2468,17 @@ pub async fn delete_api_key(
 
 /// Payload for updating an existing API key's name, `bound_ips`, and global scope flags.
 ///
-/// `is_master` is present but unassignable: see the field's own note, and `RBAC_MODEL.md` §5.
+/// Carries no `is_master`, and denies unknown fields so that saying so is enforceable — the same §5
+/// arrangement as [`CreateApiKeyPayload`], for the same reason. This struct has now held the field in
+/// all three possible ways: absent and silently discarded, present and rejected by a guard, and
+/// absent and rejected by the type. Only the last one cannot be undone by editing a handler.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateApiKeyPayload {
     /// New name, if changing it
     pub name: Option<String>,
     /// New bound CIDRs, if changing them
     pub bound_ips: Option<String>,
-    /// Accepted only so it can be **rejected**, exactly as on [`CreateApiKeyPayload`]. It was
-    /// previously absent from this struct, which meant serde discarded it silently; a field that is
-    /// refused out loud is the difference between "you cannot do that" and "nothing happened".
-    pub is_master: Option<bool>,
     /// New value for the "manage keys" global scope, if changing it
     pub can_manage_keys: Option<bool>,
     /// New value for the "manage webhooks" global scope, if changing it
@@ -2491,13 +2493,11 @@ pub async fn update_api_key(
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
-    Json(payload): Json<UpdateApiKeyPayload>,
+    StrictJson(payload): StrictJson<UpdateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
     }
-
-    guard_no_master_flag(payload.is_master)?;
 
     let target = find_administrable_key(&state.db, &key, id).await?;
     guard_master_target(&key, &target)?;

@@ -42,20 +42,20 @@ pub struct Model {
     /// bootstrap-only property, and `create_api_key`/`update_api_key` reject a request that carries
     /// the field at all. The only writer is `bootstrap_master_key`.
     pub is_master: bool,
-    /// Uniqueness marker, kept in lockstep with [`Self::is_master`]: [`MASTER_MARKER`] on the Master
-    /// key, `NULL` on every other key.
-    ///
-    /// Carries no authority and is read by no guard — [`Self::is_master`] remains the flag every
-    /// permission check consults. This column exists so a **unique index** can express "at most one
-    /// Master" in the schema itself, which `RBAC_MODEL.md` §5 requires be enforced by the database
-    /// rather than by application logic alone. See
-    /// `migration::m20260807_000007_add_api_key_master_marker` for why a marker column rather than a
-    /// partial unique index (MySQL has no partial indexes).
-    ///
-    /// `serde(default)` so a payload that omits it — every payload, since it is never settable —
-    /// still deserializes.
-    #[serde(default)]
-    pub master_marker: Option<String>,
+    // `api_keys.master_marker` is deliberately **not declared here**, and its absence is the
+    // enforcement mechanism rather than an oversight.
+    //
+    // The column exists — `INTEGER GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)`
+    // under a unique index — and is what makes "exactly one Master" a schema fact rather than a
+    // convention (`RBAC_MODEL.md` §5, `migration::m20260808_000009_derive_master_marker`). Because
+    // the engine generates it, every backend rejects an `INSERT` or `UPDATE` that names it. SeaORM
+    // builds explicit column lists from this struct, so leaving the field out is what guarantees no
+    // query ever names it. Declaring it — even as a read-only `Option` — would put it back into every
+    // generated `INSERT` and break all key creation.
+    //
+    // It previously lived here as an application-maintained `Option<String>`, which is precisely the
+    // arrangement §5 rules out: a writer could set `is_master` and leave the marker NULL, and NULLs
+    // do not collide in a unique index. Do not reintroduce the field.
     /// Global privilege to create/edit/delete other API keys.
     pub can_manage_keys: bool,
     /// Global privilege to manage webhook configurations.

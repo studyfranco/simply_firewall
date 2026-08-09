@@ -1,25 +1,45 @@
-//! Adds `api_keys.master_marker` — the database-level guarantee that exactly one Master key exists.
+//! Adds `api_keys.master_marker` as an **application-maintained** column. Superseded by
+//! `m20260808_000009_derive_master_marker`, which is what actually enforces `RBAC_MODEL.md` §5.
 //!
-//! `RBAC_MODEL.md` §5 requires Master uniqueness to be "enforced by a database constraint rather than
-//! by application logic alone". Until now it was convention: `bootstrap_master_key` skips minting
-//! when a master already exists, and `guard_scope_elevation` refuses a non-master handing out
-//! `is_master` — but a master could mint a second master through `POST /api/keys`, and a direct
-//! `UPDATE` could mint any number. Neither the application nor the schema said "one".
+//! # This migration did not do what it claimed
+//!
+//! Its original text said this column gave the database-level guarantee that exactly one Master key
+//! exists. It did not, and the correction is left here rather than rewritten away because the
+//! reasoning below is the exact shape of the mistake.
+//!
+//! The unique index is real, but it constrains `master_marker`, not `is_master`, and the two were
+//! kept in step by `bootstrap_master_key` — application logic. NULLs do not collide in a unique
+//! index, so a writer that sets `is_master = true` and omits the marker is accepted, and the
+//! database then holds two masters. Demonstrated live, not inferred:
+//!
+//! ```sql
+//! INSERT INTO api_keys (id, name, key_hash, prefix, is_master, can_manage_keys,
+//!                       can_manage_webhooks, can_create_groups, created_at, updated_at)
+//! VALUES (x'…', 'Usurper', 'hash', 'usurper1', 1, 1, 1, 1, '…', '…');
+//! -- accepted; 2 rows now have is_master = true
+//! ```
+//!
+//! §5 says "enforced by a database constraint rather than by application logic alone", and a marker
+//! the application must remember to populate is application logic in a schema costume. The fix is to
+//! let the engine derive the marker from `is_master` — see `m20260808_000009_derive_master_marker`,
+//! which drops this column and re-adds it as `GENERATED ALWAYS AS (…)`.
+//!
+//! This migration is retained unmodified because it has already been applied to real databases;
+//! `sea-orm` records migrations by name and would not re-run an edited one. Only its documentation
+//! is corrected.
 //!
 //! # Why a marker column and not a partial unique index
 //!
-//! The obvious spelling is `CREATE UNIQUE INDEX ... ON api_keys (is_master) WHERE is_master = true`.
-//! PostgreSQL and SQLite both support that; **MySQL does not**, and `AGENT.MD` requires the data
-//! layer to stay SQL-agnostic across all three drivers this crate enables. `RBAC_MODEL.md` §5
-//! anticipates exactly this and names the portable substitute: a nullable column carrying a single
-//! non-null value under a plain unique index. Null values do not collide in a unique index on any of
-//! the three engines, so every non-master row is free to leave it `NULL` while at most one row may
-//! ever hold `'master'`.
+//! Still correct, and still the reason 000009 keeps a marker column. The obvious spelling is
+//! `CREATE UNIQUE INDEX ... ON api_keys (is_master) WHERE is_master = true`. PostgreSQL and SQLite
+//! both support that; **MySQL does not**, and `AGENT.MD` requires the data layer to stay SQL-agnostic
+//! across all three drivers this crate enables. The portable substitute is a nullable column carrying
+//! a single non-null value under a plain unique index. Null values do not collide in a unique index on
+//! any of the three engines, so every non-master row is free to leave it `NULL` while at most one row
+//! may ever hold the marker.
 //!
-//! The column is *derived* from `is_master`, not a replacement for it: `is_master` remains the flag
-//! every guard reads, and `master_marker` exists solely so the database can refuse a second one.
-//! [`crate::api::MASTER_MARKER`] is the single non-null value, and `bootstrap_master_key` is now the
-//! only writer of either column — `is_master` is no longer reachable through any API payload.
+//! What 000009 changes is not the shape but the *writer*: the marker becomes a generated column, and
+//! no client can set or omit it.
 //!
 //! # A pre-existing second master stops the migration
 //!
@@ -31,10 +51,11 @@
 use sea_orm_migration::prelude::*;
 use sea_orm_migration::sea_orm::{ConnectionTrait, Statement};
 
-/// The one non-null value `master_marker` ever carries. Duplicated from [`crate::api::MASTER_MARKER`]
-/// rather than imported so this migration stays a self-contained description of the schema at this
-/// point in history — a later refactor of the API constant must not silently rewrite what an already
-/// applied migration did. A unit test in `src/api.rs` asserts the two agree.
+/// The one non-null value this migration's `master_marker` ever carried. Local to this module: the
+/// API-side constant it once mirrored has been deleted along with every write path, because the
+/// column is generated from `is_master` after `m20260808_000009_derive_master_marker` and nothing may
+/// assign it. An already-applied migration must keep describing what it actually did, so the literal
+/// stays here rather than being re-pointed at anything current.
 const MASTER_MARKER: &str = "master";
 
 /// Identifiers this migration touches. `Table` is re-declared locally rather than imported from the
