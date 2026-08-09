@@ -3380,3 +3380,273 @@ fn a_malformed_encryption_key_fails_closed_instead_of_degrading() {
     assert!(!sealed.contains("round-trip"), "the plaintext must not survive");
     assert_eq!(good.open(&sealed).expect("opening succeeds"), "round-trip");
 }
+
+// ═════════════════════════════════════════════════════════════
+// Master key pinning — identity, not just uniqueness
+// ═════════════════════════════════════════════════════════════
+
+/// The attack §5's uniqueness constraint cannot see: **swap** the master rather than add one.
+///
+/// The derived `master_marker` guarantees at most one row carries `is_master`. An attacker with
+/// database access does not need two. Demoting the legitimate master and promoting itself leaves the
+/// count at exactly one, the unique index perfectly satisfied, and — before the key was pinned at
+/// startup — the attacker holding every master-only power in the service.
+///
+/// No index is dropped here and no constraint is violated. That is the point: this sequence is
+/// available on a fully compliant §5 database, which is why uniqueness and identity have to be
+/// defended separately.
+#[tokio::test]
+async fn attack_promoting_a_key_in_a_live_database_does_not_make_it_master() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state.clone());
+
+    let real_master = insert_master_key(&db, "The Master").await;
+    let (impostor_id, impostor) =
+        insert_key(&db, "Impostor", false, false, false, false, None).await;
+
+    // Boot: the service pins the master before serving anything. `main.rs` does this explicitly;
+    // here it is the same call, and it is what makes everything below a no-op for the attacker.
+    let pinned = state.pin_master_key().await.expect("exactly one master exists at boot");
+
+    // The attacker, holding a database prompt, performs the swap.
+    let demote: simply_ip_vault::entities::api_key::ActiveModel =
+        simply_ip_vault::entities::prelude::ApiKey::find()
+            .filter(simply_ip_vault::entities::api_key::Column::Id.eq(pinned))
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    let mut demote = demote;
+    demote.is_master = Set(false);
+    demote.update(&db).await.unwrap();
+
+    let promote: simply_ip_vault::entities::api_key::ActiveModel =
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(impostor_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    let mut promote = promote;
+    promote.is_master = Set(true);
+    promote.update(&db).await.unwrap();
+
+    // The database now says the impostor is master, and says so legally — one master, marker derived,
+    // index satisfied. Confirmed rather than assumed, because if this write had failed the rest of
+    // the test would pass for the wrong reason.
+    let row = simply_ip_vault::entities::prelude::ApiKey::find_by_id(impostor_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(row.is_master, "the premise: the database really does call the impostor master");
+
+    // The service does not. `/auth/me` reports what the request actually carries, and the impostor
+    // arrives demoted.
+    let req = signed(
+        inject_connect_info(Request::builder().uri("/api/auth/me").header("X-API-Key", &impostor)),
+        &test_signing_secret(&impostor),
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "the impostor is still a valid key");
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        body["is_master"],
+        serde_json::json!(false),
+        "a key promoted after boot must not be reported as master: {body}"
+    );
+
+    // And master-only authority is genuinely absent, not merely mislabelled. The audit log is
+    // master-only, so a 403 here is the whole guarantee in one status code.
+    let req = signed_later(
+        inject_connect_info(Request::builder().uri("/api/audit-logs").header("X-API-Key", &impostor)),
+        &test_signing_secret(&impostor),
+        1,
+        "",
+    );
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "the impostor must not reach a master-only endpoint"
+    );
+
+    // The pin is immovable for the life of the process, even though the row it names no longer
+    // claims to be master. Re-resolving would hand the attacker exactly what pinning denies.
+    assert_eq!(
+        state.pin_master_key().await.unwrap(),
+        pinned,
+        "the pin must not move once set"
+    );
+
+    // The real master is now demoted in the database, so it is not master either — the conjunction
+    // cuts both ways, and neither key inherits the authority.
+    let req = signed_later(
+        inject_connect_info(Request::builder().uri("/api/audit-logs").header("X-API-Key", &real_master)),
+        &test_signing_secret(&real_master),
+        2,
+        "",
+    );
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "a demoted master is not master either; is_master AND pinned-id, both required"
+    );
+}
+
+/// Startup refuses a database holding more than one master, rather than picking one.
+///
+/// Only reachable if the §5 uniqueness index was dropped, which is why the index is dropped here.
+/// The service cannot know which of the two rows an operator intended, and choosing by row order
+/// would make the most powerful credential in the system a function of physical layout.
+#[tokio::test]
+async fn startup_refuses_to_pin_a_master_when_the_database_holds_two() {
+    use sea_orm::ConnectionTrait;
+
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+
+    let _first = insert_master_key(&db, "Master A").await;
+    db.execute_unprepared("DROP INDEX \"idx-api_keys-master_marker\"").await.unwrap();
+    let _second = insert_master_key(&db, "Master B").await;
+
+    let err = state.pin_master_key().await.expect_err("two masters must refuse to pin");
+    let message = format!("{err}");
+    assert!(
+        message.contains("2 keys have is_master = true"),
+        "the refusal must say how many and which: {message}"
+    );
+    assert!(
+        message.contains("RBAC_MODEL.md §5"),
+        "the refusal must name the rule it is enforcing: {message}"
+    );
+
+    // Fail closed while unpinned: no caller is master, rather than every caller being one.
+    assert_eq!(state.resolve_master_key_id().await, None);
+}
+
+/// Startup refuses a database with no master at all.
+///
+/// Distinct from the two-master case and reported separately, because the remedies have nothing in
+/// common: this one means the bootstrap never ran or the row was deleted, and starting anyway would
+/// leave every master-only operation permanently unreachable with no way to recover through the API.
+#[tokio::test]
+async fn startup_refuses_to_pin_a_master_when_the_database_holds_none() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+
+    let _ordinary = insert_key(&db, "Just a key", false, true, false, false, None).await;
+
+    let err = state.pin_master_key().await.expect_err("no master must refuse to pin");
+    assert!(
+        format!("{err}").contains("No master key exists"),
+        "the refusal must distinguish 'none' from 'several': {err}"
+    );
+    assert_eq!(state.resolve_master_key_id().await, None);
+}
+
+/// Startup refuses when §5's uniqueness index is missing, even though exactly one master exists.
+///
+/// Checked *after* the master count. Two masters is only reachable once this index is gone, so
+/// checking the index first made `MultipleMasters` unreportable — the operator would be told to
+/// recreate an index while two masters sat in the table unmentioned. This case is what remains once
+/// the count is unambiguous: one master today, and nothing stopping a second tomorrow.
+#[tokio::test]
+async fn startup_refuses_to_pin_a_master_without_the_uniqueness_index() {
+    use sea_orm::ConnectionTrait;
+
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+
+    let _only = insert_master_key(&db, "The Master").await;
+    db.execute_unprepared("DROP INDEX \"idx-api_keys-master_marker\"").await.unwrap();
+
+    let err = state.pin_master_key().await.expect_err("a missing index must refuse to pin");
+    assert!(
+        format!("{err}").contains("idx-api_keys-master_marker"),
+        "the refusal must name the missing index: {err}"
+    );
+    assert_eq!(state.resolve_master_key_id().await, None);
+}
+
+/// R4 through the pin: a Parent key cannot grant a Master-only scope on create **or** update.
+///
+/// `guard_scope_elevation` short-circuits on `caller.is_master`, so its correctness now rests on the
+/// caller's flag being trustworthy — which is exactly what the middleware's demotion provides. Both
+/// verbs are covered because they are separate handlers reading separate payload types, and a fix
+/// applied to one has been forgotten on the other before.
+#[tokio::test]
+async fn a_parent_key_cannot_grant_master_only_scopes_on_create_or_update() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let _master = insert_master_key(&db, "The Master").await;
+    let (parent_id, parent) =
+        insert_key(&db, "Parent", false, true, false, false, None).await;
+    let (daughter_id, _daughter) =
+        insert_key(&db, "Daughter", false, false, false, false, None).await;
+
+    // Lineage matters, and its absence is what this test got wrong first time round. `insert_key`
+    // leaves `parent_key_id` null, so the daughter sat outside the parent's subtree and `PUT` came
+    // back 404 rather than 403 — correct §4 oracle discipline, and useless as evidence about R4. A
+    // 404 would have proved only that the parent could not see the key. Making it a real daughter is
+    // what puts the request in front of `guard_scope_elevation`.
+    let mut adopt: simply_ip_vault::entities::api_key::ActiveModel =
+        simply_ip_vault::entities::prelude::ApiKey::find_by_id(daughter_id)
+            .one(&db)
+            .await
+            .unwrap()
+            .unwrap()
+            .into();
+    adopt.parent_key_id = Set(Some(parent_id));
+    adopt.update(&db).await.unwrap();
+
+    let mut nonce = 0i64;
+    for scope in ["can_manage_keys", "can_create_groups", "can_manage_webhooks"] {
+        nonce += 1;
+        let req = signed_later(
+            inject_connect_info(Request::builder().method("POST").uri("/api/keys").header("X-API-Key", &parent))
+                .header("Content-Type", "application/json"),
+            &test_signing_secret(&parent),
+            nonce,
+            &json!({ "name": format!("escalated-via-{scope}"), scope: true }).to_string(),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "R4: a parent must not mint a key holding '{scope}'"
+        );
+
+        nonce += 1;
+        let req = signed_later(
+            inject_connect_info(Request::builder().method("PUT").uri(format!("/api/keys/{daughter_id}")).header("X-API-Key", &parent))
+                .header("Content-Type", "application/json"),
+            &test_signing_secret(&parent),
+            nonce,
+            &json!({ scope: true }).to_string(),
+        );
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::FORBIDDEN,
+            "R4: a parent must not grant '{scope}' to an existing key"
+        );
+    }
+
+    // Nothing leaked through: the daughter is exactly as it was created.
+    let after = simply_ip_vault::entities::prelude::ApiKey::find_by_id(daughter_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!after.can_manage_keys && !after.can_create_groups && !after.can_manage_webhooks);
+}

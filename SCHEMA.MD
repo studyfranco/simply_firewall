@@ -56,7 +56,7 @@ Stores authentication tokens, global access rights, and CIDR network binding rul
 | `key_hash` | `String` | Not Null, Unique | Argon2 / SHA-256 hash of the secret API key |
 | `signing_secret` | `Text` | Nullable | Per-key HMAC-SHA256 secret used to verify the `X-Signature-256` request header. Encrypted with XChaCha20-Poly1305 when `VAULT_ENCRYPTION_KEY` (alias `SIGNING_SECRET_KEY`, exactly 64 hex characters) is set, stored as `v1.xchacha20poly1305.<hex nonce>.<hex ciphertext‖tag>`; hex-encoded but unencrypted as `v1.plain.<hex>` otherwise. **Those two prefixes are the complete set** — any other value, including the retired `aesgcm256:` shape and an unprefixed bare secret, is rejected as `MalformedCiphertext` (`500`) rather than read; see the fail-closed note below. `NULL` only for keys created before this column existed — such keys cannot authenticate and must be rotated. Never returned by any read endpoint |
 | `prefix` | `String` | Not Null, Indexed | First 8 characters of key for display and fast lookup |
-| `is_master` | `Boolean` | Default: `false` | Bypasses all group permission checks. **Bootstrap-only** — the field is not present on `CreateApiKeyPayload` or `UpdateApiKeyPayload` at all, and both carry `#[serde(deny_unknown_fields)]`, so a request naming it is refused by deserialization with `400` before any handler runs (`RBAC_MODEL.md` §5: "Removing the field from the payload type is required; rejecting it at the handler is not sufficient"). Written by `bootstrap_master_key` and nowhere else |
+| `is_master` | `Boolean` | Default: `false` | Bypasses all group permission checks. **Bootstrap-only** — the field is not present on `CreateApiKeyPayload` or `UpdateApiKeyPayload` at all, and both carry `#[serde(deny_unknown_fields)]`, so a request naming it is refused by deserialization with `400` before any handler runs (`RBAC_MODEL.md` §5: "Removing the field from the payload type is required; rejecting it at the handler is not sufficient"). Written by `bootstrap_master_key` and nowhere else. **Not sufficient on its own at runtime:** the service pins the Master's `id` at boot and treats this column as authoritative only for that id, so setting it on another row in a live database has no effect — see "Master Uniqueness" below |
 | `master_marker` | `Integer` | **Generated**, Nullable, **Unique** | `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` — derived by the **database engine**, never written by anything. Carries no authority and is read by no guard; it exists so a plain unique index can express "at most one Master" in the schema itself, which `RBAC_MODEL.md` §5 requires be enforced by the database rather than by application logic. A **marker column** rather than a partial unique index on `is_master = true`, because MySQL has no partial indexes and the data layer must stay SQL-agnostic; NULLs do not collide in a unique index on any supported engine, so every non-master row coexists freely. **Deliberately absent from `api_key::Model`**: SeaORM builds column lists from the entity, so omitting it is what guarantees no query names it — and every engine rejects an `INSERT`/`UPDATE` that does. Storage class is per-engine (Postgres `STORED`, SQLite/MySQL `VIRTUAL`) and pinned by unit test. See the migration note below |
 | `can_manage_keys` | `Boolean` | Default: `false` | Global privilege to create/edit/delete API keys. Grantable **only by the Master key** (`RBAC_MODEL.md` R4). Confers no authority over any group on its own — see the conjunction under `api_key_group_permissions` |
 | `can_manage_webhooks` | `Boolean` | Default: `false` | Global privilege to manage webhook configurations. Grantable **only by the Master key** — this service's spelling of the specification's `can_create_webhooks`, a resource-creation right, which §1 places at the same tier as `can_manage_keys` and R4 makes Master-only. Previously delegable, which made it freely amplifiable (a parent that did not hold it could hand it out) |
@@ -379,3 +379,48 @@ Those tests are marked `ADVERSARIAL(§N)` in `tests/rbac_model_compliance.rs`.
   ```sql
   SELECT id, name, prefix FROM api_keys WHERE is_master = true;   -- must return exactly one row
   ```
+
+---
+
+## 📌 Master Identity: pinned at boot, not read per request
+
+The generated `master_marker` guarantees **at most one** row carries `is_master`. It does not
+guarantee **which** row, and those are different properties with different attacks.
+
+An attacker holding a database prompt does not need two masters. This sequence needs no dropped
+index, violates no constraint, and leaves the schema perfectly §5-compliant throughout:
+
+```sql
+UPDATE api_keys SET is_master = false WHERE id = <the real master>;   -- marker becomes NULL
+UPDATE api_keys SET is_master = true  WHERE id = <mine>;              -- marker becomes 1
+-- one master, unique index satisfied, and it is now the attacker's key
+```
+
+So the identity is fixed before anything is served. `AppState::pin_master_key()` runs in `main.rs`
+after migrations and `bootstrap_master_key`, and **before `TcpListener::bind`**:
+
+1. Exactly one row has `is_master = true` — `MasterPinError::NoMaster` / `MultipleMasters` otherwise.
+2. The unique index `idx-api_keys-master_marker` still exists — `MissingUniquenessIndex` otherwise.
+3. That row's id is stored in a write-once `OnceLock` and never re-resolved.
+
+All three are fatal. A service that cannot say which key is Master would answer with whichever row a
+query happened to return.
+
+**Ordering note.** The master count is checked *before* the index, and this was the other way round
+until a test showed why it should not be: two masters is only reachable once the index is gone, so
+checking the index first made `MultipleMasters` unreportable — the operator would be told to recreate
+an index while two masters sat in the table unmentioned.
+
+**Recreating a dropped index.** Re-running migrations will **not** restore it:
+`m20260808_000009_derive_master_marker` is already recorded as applied and will be skipped. Recreate
+it directly, which is what the error message says:
+
+```sql
+CREATE UNIQUE INDEX "idx-api_keys-master_marker" ON api_keys (master_marker);
+```
+
+**At runtime**, `middleware.rs` clears `is_master` on the key model before it reaches any handler
+unless the id matches the pin, so a promoted row arrives at every guard as the ordinary key it is.
+The flag is demoted rather than the request rejected: a promoted key is still a valid credential
+holding whatever scopes it legitimately has, and a `401` would make the column observable to the
+caller.

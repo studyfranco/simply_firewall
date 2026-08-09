@@ -5554,3 +5554,172 @@ to adding `AppError::BodyRejected` on the belief this crate already had it, whic
 
 Use absolute paths for anything whose result is a claim about *this* repository. The failure mode is
 not an error; it is a green run of the wrong thing.
+
+---
+
+## Session 39 — Master Identity Pinning, Raw-SQL Elimination, and Tier-Aware UI
+
+Session 38 made master uniqueness a schema fact. This session addresses the property uniqueness does
+*not* provide — identity — plus a raw-SQL audit and the frontend alignment that follows from the
+Parent/Daughter simplification.
+
+`RBAC_MODEL.md` was **not modified**: `git diff RBAC_MODEL.md` is empty and Pillar 0 byte-identity is
+active and passing at `cb0b76ab…` on both sides.
+
+### 1. Raw SQL audit (Task 1) — nothing to refactor
+
+Audited every file in `src/` for `execute_unprepared`, `Statement::from_string`, `*_raw`, and
+string-built queries.
+
+| Location | Finding | Action |
+| :--- | :--- | :--- |
+| `src/` handlers, API, repositories | **Zero** raw DML. Every database interaction already uses typed entity methods or SeaQuery | None needed |
+| `src/migration/` (2 files) | Raw DDL for the generated column and its index | Exempt — DDL is not portably expressible here, and is reviewed as schema |
+| `src/state.rs::apply_sqlite_pragmas` | `PRAGMA journal_mode` / `busy_timeout` via `Statement::from_string` | **Retained.** Not DML; configures the *engine*, not a query; SQLite-only; no typed representation exists in SeaORM; and it is convergence-tracked against the peer's identical function |
+
+The one `format!` involved interpolates a compile-time `const u32`, not a runtime value, so no
+dynamic string concatenation reaches a database operation anywhere in `src/`.
+
+Since there was nothing to fix, the deliverable is the **gate**: `check_no_raw_sql` in
+`scripts/verify_convergence.sh` scans `src/` outside `migration/` and clears a hit only when the
+statement it opens is a `PRAGMA` — a window check, because the SQL text sits three lines below the
+call and a line-wise `grep -v PRAGMA` cannot see it.
+
+**The first version of that gate was broken and reported CLEAN against a planted violation.** It used
+`ENDFILE`, a gawk extension; the awk here is **mawk**, where `ENDFILE` is not a pattern but an
+ordinary always-false variable reference, so the block never ran. Rewritten to one file per `awk`
+invocation using `END`. Verified in both directions afterwards:
+
+```
+clean tree                        → ✓ CLEAN                       exit 0
+planted db.execute_unprepared(…)  → ✗ FOUND  src/api.rs:46:…      exit 1
+```
+
+A gate that cannot fail is worse than no gate, because it is reported as evidence. This is the second
+time in three sessions that a check passed for a mechanical reason rather than a real one (cf.
+Session 38's M-A/M-B, and the `s5_` tests that passed against a defective schema).
+
+### 2. Master identity pinning (Task 2)
+
+**The gap.** §5's derived marker guarantees at most one master row. It says nothing about *which*
+row. An attacker with database access does not need two masters — demoting the real one and promoting
+itself keeps the count at one, satisfies the unique index, and requires no dropped constraint:
+
+```sql
+UPDATE api_keys SET is_master = false WHERE id = <real master>;
+UPDATE api_keys SET is_master = true  WHERE id = <mine>;
+```
+
+Uniqueness defends cardinality; nothing defended identity.
+
+**Startup (`src/state.rs`, `src/main.rs`).** `AppState::pin_master_key()` runs after migrations and
+`bootstrap_master_key`, and **before `TcpListener::bind`**. It asserts exactly one `is_master` row,
+asserts `idx-api_keys-master_marker` still exists, and stores the id in a write-once `OnceLock`. All
+three failures abort startup. The field is `Arc<OnceLock<Uuid>>` rather than a plain `Uuid`
+deliberately: write-once is the property being bought, and a plain field would be assignable by
+anything holding `&mut AppState`.
+
+Both queries are typed — `ApiKey::find().select_only().column(Id).filter(IsMaster.eq(true))` and
+`SchemaManager::has_index` — so Task 2 introduced no raw SQL.
+
+**Ordering correction.** The index check originally came first, on the reasoning that its absence
+explains any multi-master state. A test disproved that: two masters is *only* reachable once the index
+is gone, so index-first made `MultipleMasters` unreportable — the operator would be told to recreate
+an index while two masters sat in the table unmentioned. Count now precedes index.
+
+**A wrong remediation, found the same way.** `MissingUniquenessIndex` originally said "Re-run
+migrations." That does not work: `m20260808_000009` is already recorded as applied and
+`Migrator::up` skips it. The message now gives the `CREATE UNIQUE INDEX` statement directly.
+
+**Runtime (`src/middleware.rs`).** The check lives at the single point a key model enters the request
+extensions, not in the guards. There are ~40 downstream reads of `key.is_master`; per-guard checks
+would mean the first guard written without one is a silent hole. Clearing the flag at the boundary
+makes a promoted impostor arrive at every existing *and future* handler as the ordinary key it is,
+with no per-handler cooperation. Logged at `error!` — reaching it means the database was edited
+behind the service's back.
+
+Demoted rather than rejected: a promoted row is still a valid key with whatever scopes it legitimately
+holds, and a `401` would make the column observable to the caller, which is the sort of oracle §4
+closes elsewhere. Only keys *claiming* master pay for the lookup, and the pin is a `OnceLock` read
+after first resolution.
+
+**R4 handler verification (Task 2, second half).** The brief asks that creation/update "force
+`can_manage_keys = false` … unless the caller is the pinned Master". Verified: `guard_scope_elevation`
+already **refuses with 403** rather than silently forcing, and it short-circuits on `caller.is_master`
+— which the boundary demotion now makes trustworthy. Refusing is retained over forcing, and matches
+the brief's own Task 4 requirement (403). Silently forcing would leave a caller holding a `200` and a
+key it believes has scopes it does not — the same failure mode as the `is_master` field removed in
+Session 38.
+
+### 3. Frontend (Task 3)
+
+`keyTier(k)` derives Master / Parent / Daughter from the flags `/auth/me` already returns, rather than
+adding a `tier` field that could disagree with the flags beside it.
+
+| Element | Master | Parent | Daughter |
+| :--- | :--- | :--- | :--- |
+| `#form-create-apikey` | shown | shown | **hidden** |
+| `#apikey-scope-grid` (3 Master-only toggles) | shown | **hidden**, note shown | hidden |
+| `#edit-key-scope-grid` | shown | **hidden**, note shown | n/a |
+| `#form-create-group` | shown | shown iff `can_create_groups` | hidden |
+| `#form-create-webhook` | shown | shown iff `can_manage_webhooks` | hidden |
+| Tier badge, keys table + header chip | ✅ | ✅ | ✅ |
+
+Three decisions worth recording:
+
+- **Hidden, not disabled.** A disabled *unchecked* checkbox beside a key that holds the scope reads as
+  "this key does not have it" — a false statement rendered in UI. The note names the rule (R4) and
+  says what to do instead.
+- **No tier badge on `view: "minimal"` rows.** Tier is derived from global flags and §4 withholds
+  those in the minimal view, so labelling such a key "Daughter" would assert the absence of scopes the
+  caller was never shown.
+- **A latent bug the UI change would have introduced.** `submitEditKey` sent all three scope
+  checkboxes unconditionally. `update_api_key` treats a present field as an assignment, and
+  `guard_scope_elevation` permits `Some(false)` as a *revocation* (it blocks only `Some(true)` over a
+  currently-false scope). So a Parent renaming a Daughter that Master had granted `can_create_groups`
+  would have silently revoked it — the hidden checkbox reads `false` because it is hidden, not because
+  the key lacks the scope. Both forms now **omit** the fields rather than sending `false`.
+
+`403` handling: unchanged in its most important respect (it does not log the user out, and it surfaces
+the server's specific message), plus a new `resyncCapabilities()` that re-reads `/auth/me` and
+re-applies gating in the background. Guarded against recursion and never throws, so a failed refresh
+cannot replace the server's actual message.
+
+### 4. Tests (Task 4)
+
+Five added to `tests/security_tests.rs` (44 → 49):
+
+| Test | Proves |
+| :--- | :--- |
+| `attack_promoting_a_key_in_a_live_database_does_not_make_it_master` | The swap attack. Pins, demotes the real master, promotes an impostor — **no index dropped, no constraint violated** — then asserts the impostor gets `is_master: false` from `/auth/me`, `403` on a master-only endpoint, that the pin does not move, and that the demoted real master is *also* not master (the conjunction cuts both ways) |
+| `startup_refuses_to_pin_a_master_when_the_database_holds_two` | `MultipleMasters`, naming the count and the rule |
+| `startup_refuses_to_pin_a_master_when_the_database_holds_none` | `NoMaster`, reported distinctly because the remedy differs |
+| `startup_refuses_to_pin_a_master_without_the_uniqueness_index` | `MissingUniquenessIndex`, naming the index |
+| `a_parent_key_cannot_grant_master_only_scopes_on_create_or_update` | R4 on both verbs × all three scopes, plus that the daughter is unchanged afterwards |
+
+Each startup test also asserts `resolve_master_key_id() == None` — fail-closed while unpinned means
+*no* caller is master, never every caller.
+
+**A test bug worth recording, because it would have passed for the wrong reason.** The R4 test first
+seeded the daughter with `parent_key_id: NULL`, so it sat outside the parent's subtree and `PUT`
+returned **404**, not 403 — correct §4 oracle discipline, and useless as evidence about R4. A 404
+would have proved only that the parent could not see the key. The daughter is now genuinely adopted,
+which is what puts the request in front of `guard_scope_elevation`.
+
+Also updated: `s5_master_immutability_does_not_rest_on_the_uniqueness_constraint` now makes one
+authenticated request **before** tampering, pinning the master exactly as a real boot does. Without
+that the test tampered first, resolution saw two masters, the caller was demoted, and the assertions
+still passed — for the wrong reason. The ordering is the threat model: an attacker edits a database
+that is already running.
+
+### Verification
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **216 passed, 0 failed** (72 unit + 3 frontend + 74 integration + 18 compliance + 49 security) |
+| `./scripts/test_e2e.sh` | **490 passed, 0 failed** — which also exercises the real boot pin, since `main.rs` pins before binding |
+| `./scripts/verify_convergence.sh` | **exit 0** |
+| `git diff RBAC_MODEL.md` | **empty** — untouched, byte-identical with the peer |
+| raw SQL in `src/` outside migrations | **none** (PRAGMA excepted), gated and proven to fail |

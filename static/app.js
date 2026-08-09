@@ -638,6 +638,17 @@ class FirewallClient {
                 throw new Error("Session expired or invalid API key — please log in again.");
             }
 
+            // A 403 is also a signal that this UI's picture of the key's rights is out of date: the
+            // gating below is built from a profile fetched at login, and scopes can be changed by
+            // Master, or revoked, at any point afterwards. Re-sync in the background so the offending
+            // control disappears instead of staying there to be clicked again.
+            //
+            // Deliberately not awaited and deliberately guarded: the caller's own error path should
+            // not wait on a refresh, and `/auth/me` failing must not recurse back into here.
+            if (res.status === 403) {
+                this.resyncCapabilities();
+            }
+
             // Read the body as text first and only attempt to parse it when there's actually
             // something to parse. Several endpoints (e.g. POST /api/keys/:id/groups) return a
             // bare 200 with no body at all — exactly as "empty" as a real 204 as far as parsing
@@ -695,6 +706,33 @@ class FirewallClient {
         this.showLogin();
     }
 
+    /**
+     * Re-reads the signed-in key's capabilities and re-applies the UI gating.
+     *
+     * Called after a 403, on the assumption that the refusal is real and this UI is the thing that
+     * is wrong. Every control gated by `enforceRBACUI()` is drawn from a profile captured at login,
+     * so a scope revoked by Master mid-session leaves a button on screen that cannot work; refreshing
+     * removes it rather than letting the user find out by clicking twice.
+     *
+     * Two safety properties, both needed:
+     *   - **Never recurses.** `/auth/me` goes through `apiFetch`, which is what called this. The
+     *     in-flight flag means a 403 from the refresh itself cannot start another one.
+     *   - **Never throws.** It runs detached from the caller's error path; a failure here must not
+     *     replace the server's actual message with a refresh error.
+     */
+    async resyncCapabilities() {
+        if (this._resyncing) return;
+        this._resyncing = true;
+        try {
+            this.state.profile = await this.apiFetch('/auth/me');
+            this.enforceRBACUI();
+        } catch {
+            // The original 403 is the message worth showing; this is best-effort.
+        } finally {
+            this._resyncing = false;
+        }
+    }
+
     async verifyAuth() {
         try {
             this.state.profile = await this.apiFetch('/auth/me');
@@ -715,6 +753,32 @@ class FirewallClient {
     logout() {
         this.handleAuthFailure();
         this.showToast("Logged out successfully", 'success');
+    }
+
+    /**
+     * The RBAC tier of a key, as `RBAC_MODEL.md` defines it.
+     *
+     * Three tiers, and the boundary between the lower two is a single flag:
+     *   - **Master**  — `is_master`. Exactly one exists (§5), and it is pinned at startup, so a row
+     *                   promoted in the database is *not* Master at runtime and will not be reported
+     *                   as one by `/auth/me`.
+     *   - **Parent**  — `can_manage_keys`. May create keys, but only Daughters (R4).
+     *   - **Daughter** — everything else. Cannot create keys at all.
+     *
+     * Derived rather than sent by the server on purpose: the tier is a *reading* of flags the API
+     * already returns, and inventing a `tier` field would create a second source of truth that could
+     * disagree with the flags beside it. Every gate below reads the flags directly for the same
+     * reason; this exists for labelling.
+     */
+    keyTier(k) {
+        if (!k) return 'daughter';
+        if (k.is_master) return 'master';
+        return k.can_manage_keys ? 'parent' : 'daughter';
+    }
+
+    /** Whether the signed-in key may grant global scopes — Master only, per R4. */
+    canGrantGlobalScopes() {
+        return this.state.profile?.is_master === true;
     }
 
     enforceRBACUI() {
@@ -751,6 +815,66 @@ class FirewallClient {
         // Audit Logs Tab — the backend restricts GET /audit-logs to master keys, so hide the tab
         // entirely rather than show it and let every request 403.
         auditTab.style.display = p.is_master ? 'inline-block' : 'none';
+
+        // ── Key creation: Parent and Master only ────────────────────────────
+        //
+        // A Daughter key (can_manage_keys = false) cannot create keys at all, so the form is removed
+        // rather than disabled. Offering a form whose only possible outcome is 403 teaches the user
+        // that the UI is unreliable, which is worse than not offering it.
+        const createKeyForm = document.getElementById('form-create-apikey');
+        const mayCreateKeys = p.is_master || p.can_manage_keys;
+        if (createKeyForm) createKeyForm.classList.toggle('hidden', !mayCreateKeys);
+
+        // ── Master-only global scopes (R4) ──────────────────────────────────
+        //
+        // Only Master may grant `can_manage_keys`, `can_manage_webhooks` or `can_create_groups`, so a
+        // Parent sees an explanation in place of the toggles. Hidden rather than disabled,
+        // deliberately: a disabled *unchecked* checkbox beside a key that in fact holds the scope
+        // reads as "this key does not have it", and a disabled checkbox with no explanation reads as
+        // a bug. The note says which rule applies and what to do instead.
+        //
+        // The inputs are also cleared, so nothing stale can be submitted if a later edit ever
+        // re-shows the grid within the same session.
+        const scopeGrid = document.getElementById('apikey-scope-grid');
+        const scopeNote = document.getElementById('apikey-scope-note');
+        const mayGrantScopes = this.canGrantGlobalScopes();
+        if (scopeGrid) scopeGrid.classList.toggle('hidden', !mayGrantScopes);
+        if (scopeNote) scopeNote.classList.toggle('hidden', mayGrantScopes);
+        if (!mayGrantScopes) {
+            ['apikey-can-manage-keys', 'apikey-can-manage-webhooks', 'apikey-can-create-groups']
+                .forEach(id => { const el = document.getElementById(id); if (el) el.checked = false; });
+        }
+
+        // Same rule on the edit form. Gated here as well as in `openEditKeyModal` so the state is
+        // correct even if the modal is opened before a profile refresh completes.
+        const editGrid = document.getElementById('edit-key-scope-grid');
+        const editNote = document.getElementById('edit-key-scope-note');
+        if (editGrid) editGrid.classList.toggle('hidden', !mayGrantScopes);
+        if (editNote) editNote.classList.toggle('hidden', mayGrantScopes);
+
+        // ── Resource creation ───────────────────────────────────────────────
+        //
+        // `can_create_groups` and `can_manage_webhooks` are Master-granted rights (R4); a key without
+        // them cannot create the resource, so the creating form goes away while the listing below it
+        // stays. A Daughter that can read a group it was granted access to should still see it.
+        const groupForm = document.getElementById('form-create-group');
+        if (groupForm) groupForm.classList.toggle('hidden', !(p.is_master || p.can_create_groups));
+
+        const webhookForm = document.getElementById('form-create-webhook');
+        if (webhookForm) webhookForm.classList.toggle('hidden', !(p.is_master || p.can_manage_webhooks));
+
+        // ── Tier badge for the signed-in key ────────────────────────────────
+        const tier = this.keyTier(p);
+        const banner = document.getElementById('current-key-tier');
+        if (banner) {
+            banner.className = `badge badge-tier badge-tier-${tier}`;
+            banner.textContent = tier.charAt(0).toUpperCase() + tier.slice(1);
+            banner.title = {
+                master: 'The Master key: full access, unique, and pinned at startup.',
+                parent: 'A Parent key: may create Daughter keys, but cannot grant global scopes (R4).',
+                daughter: 'A Daughter key: no key management, no resource creation.',
+            }[tier];
+        }
     }
 
     // ───────────────────────────────────────────────────────
@@ -1175,8 +1299,21 @@ class FirewallClient {
     renderKeyScopes(k) {
         const scopes = [];
         // Global flags are withheld entirely in the minimal view, so nothing is claimed about them.
-        if (k.view === 'minimal') scopes.push('<span class="badge badge-scope" title="Global scopes are outside your visibility for this key">scopes hidden</span>');
-        if (k.is_master) scopes.push('<span class="badge badge-scope badge-scope-master">Master</span>');
+        // No tier badge either, for the same reason: tier is *derived* from those flags, so labelling
+        // a minimal-view key "Daughter" would be asserting the absence of scopes we were not shown.
+        // §4's whole point is that a minimal view reveals nothing beyond the shared resource.
+        if (k.view === 'minimal') {
+            scopes.push('<span class="badge badge-scope" title="Global scopes are outside your visibility for this key">scopes hidden</span>');
+        } else {
+            const tier = this.keyTier(k);
+            const label = tier.charAt(0).toUpperCase() + tier.slice(1);
+            const why = {
+                master: 'Master key — unique (§5) and pinned at startup',
+                parent: 'Parent key — holds can_manage_keys, so it may create Daughter keys',
+                daughter: 'Daughter key — cannot create or manage keys',
+            }[tier];
+            scopes.push(`<span class="badge badge-tier badge-tier-${tier}" title="${why}">${label}</span>`);
+        }
         if (k.can_manage_keys) scopes.push('<span class="badge badge-scope">Manage Keys</span>');
         if (k.can_manage_webhooks) scopes.push('<span class="badge badge-scope">Manage Webhooks</span>');
         if (k.can_create_groups) scopes.push('<span class="badge badge-scope">Create Groups</span>');
@@ -1548,12 +1685,20 @@ class FirewallClient {
         const payload = {
             name: document.getElementById('apikey-name').value,
             bound_ips: document.getElementById('apikey-bound-ips').value,
-            // No `is_master`: master status is established at bootstrap only (RBAC_MODEL.md §5) and
-            // the API now rejects the field outright, so sending it would fail every creation.
-            can_manage_keys: document.getElementById('apikey-can-manage-keys').checked,
-            can_manage_webhooks: document.getElementById('apikey-can-manage-webhooks').checked,
-            can_create_groups: document.getElementById('apikey-can-create-groups').checked
+            // No `is_master`: master status is established at bootstrap only (RBAC_MODEL.md §5). The
+            // field is not on the payload type at all and the struct denies unknown fields, so
+            // sending it is a 400 — not a silently ignored no-op.
         };
+
+        // Master-only scopes are *omitted*, not sent as `false`, when the caller cannot grant them.
+        // Every key a Parent creates is a Daughter either way (the server defaults these to false),
+        // so this changes nothing on create — it is written this way to match `submitEditKey`, where
+        // the distinction is load-bearing, so the two cannot drift into disagreeing.
+        if (this.canGrantGlobalScopes()) {
+            payload.can_manage_keys = document.getElementById('apikey-can-manage-keys').checked;
+            payload.can_manage_webhooks = document.getElementById('apikey-can-manage-webhooks').checked;
+            payload.can_create_groups = document.getElementById('apikey-can-create-groups').checked;
+        }
 
         try {
             const res = await this.apiFetch('/keys', { method: 'POST', body: JSON.stringify(payload) });
@@ -1655,10 +1800,24 @@ class FirewallClient {
         const payload = {
             name: document.getElementById('edit-key-name').value,
             bound_ips: document.getElementById('edit-key-bound-ips').value,
-            can_manage_keys: document.getElementById('edit-key-can-manage-keys').checked,
-            can_manage_webhooks: document.getElementById('edit-key-can-manage-webhooks').checked,
-            can_create_groups: document.getElementById('edit-key-can-create-groups').checked
         };
+
+        // Omitted, not `false`, when the caller is not Master — and here that distinction is a bug
+        // if it goes the other way.
+        //
+        // `update_api_key` treats an absent field as "leave unchanged" and a present one as an
+        // assignment. `guard_scope_elevation` only blocks *granting* (`Some(true)` over a currently
+        // false scope), so `Some(false)` is a permitted revocation for a Parent. If this form kept
+        // sending the hidden checkboxes' values, a Parent opening a Daughter that Master had granted
+        // `can_create_groups`, changing only its name, and pressing Save would silently revoke that
+        // scope — the checkbox reads `false` because it is hidden, not because the key lacks it.
+        // Omitting the fields is what makes "the scopes are left unchanged" true rather than a claim
+        // the note in the modal makes on the UI's behalf.
+        if (this.canGrantGlobalScopes()) {
+            payload.can_manage_keys = document.getElementById('edit-key-can-manage-keys').checked;
+            payload.can_manage_webhooks = document.getElementById('edit-key-can-manage-webhooks').checked;
+            payload.can_create_groups = document.getElementById('edit-key-can-create-groups').checked;
+        }
 
         try {
             await this.apiFetch(`/keys/${id}`, { method: 'PUT', body: JSON.stringify(payload) });

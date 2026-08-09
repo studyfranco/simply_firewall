@@ -891,6 +891,61 @@ body {
     border: 1px solid rgba(28, 220, 154, 0.3);
 }
 
+/* ─── RBAC tier badges ──────────────────────────────────────
+   Master / Parent / Daughter, per RBAC_MODEL.md §2. Coloured by authority rather than by mood: the
+   three share one shape and differ only in hue and weight, so a row's tier is readable at a glance
+   without any one of them looking like a warning. Daughter is the common case and is deliberately
+   the quietest — most keys are Daughters, and a list where every row shouts reads as noise.
+
+   `badge-tier` also styles the header chip showing the signed-in key's own tier, which is why the
+   border is solid enough to stand alone outside a table cell. */
+.badge-tier {
+    background-color: rgba(189, 195, 199, 0.1);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+}
+
+.badge-tier-master {
+    background-color: rgba(28, 220, 154, 0.15);
+    color: var(--accent);
+    border: 1px solid rgba(28, 220, 154, 0.4);
+}
+
+.badge-tier-parent {
+    background-color: rgba(61, 174, 233, 0.14);
+    color: var(--highlight);
+    border: 1px solid rgba(61, 174, 233, 0.4);
+}
+
+.badge-tier-daughter {
+    background-color: rgba(189, 195, 199, 0.1);
+    color: var(--text-muted);
+    border: 1px solid var(--border);
+}
+
+/* Explanatory text shown in place of Master-only toggles a Parent may not use. Styled as guidance
+   rather than as an error: nothing has gone wrong, the control simply is not theirs to operate, and
+   an amber or red panel here would read as a failure the user should try to fix. */
+.rbac-note {
+    padding: 0.7rem 0.9rem;
+    border-radius: 8px;
+    background-color: rgba(61, 174, 233, 0.07);
+    border: 1px solid rgba(61, 174, 233, 0.22);
+    border-left: 3px solid var(--highlight);
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    line-height: 1.5;
+}
+
+.rbac-note strong {
+    color: var(--text-main);
+}
+
+.rbac-note em {
+    color: var(--highlight);
+    font-style: normal;
+}
+
 /* ─── Pagination ────────────────────────────────────────── */
 
 .pagination {

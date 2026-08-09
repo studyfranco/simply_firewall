@@ -255,6 +255,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (state, tx, worker_handle) = setup_state(db)?;
 
+    // Fix the Master's identity before anything can be served.
+    //
+    // Ordering is the entire control, so it is stated here rather than left to be inferred: this
+    // runs after migrations and `bootstrap_master_key` (so the master and its uniqueness index both
+    // exist) and before `TcpListener::bind` (so no request can be answered against an unpinned
+    // state). From this line on, `is_master` is authoritative for exactly one id, and promoting a
+    // row in the live database has no runtime effect at all.
+    //
+    // Fatal on every failure. The three ways this fails — no master, several, or a missing
+    // uniqueness index — are each a database that cannot answer "who is Master?", and a service that
+    // starts anyway would answer it with whichever row a query happened to return. Refusing to start
+    // is loud, immediate, and leaves the evidence intact; the alternative is a running service whose
+    // most powerful credential is decided by row order.
+    let master_key_id = state.pin_master_key().await.map_err(|e| {
+        tracing::error!("Refusing to start: {e}");
+        e
+    })?;
+    tracing::info!(
+        "Master key pinned for the life of this process: {master_key_id}. A key promoted in the \
+         database from now on will be treated as an ordinary key."
+    );
+
     let app = create_app(state);
 
     let addr = simply_ip_vault::config::resolve_bind_addr();

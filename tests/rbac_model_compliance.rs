@@ -1219,6 +1219,19 @@ async fn s5_master_immutability_does_not_rest_on_the_uniqueness_constraint() {
     let (db, app) = setup().await;
     let (master_id, master) = key(&db, "Master", true, true, true, true).await;
 
+    // One authenticated request *before* any tampering, which pins the master exactly as a real boot
+    // would (`main.rs` pins before binding the listener). The ordering is not incidental to this
+    // test — it is the threat model. An attacker edits a database that is already running, so the
+    // pin is always established first; a test that tampered first would be checking a state
+    // production cannot reach, and would silently pass for the wrong reason once the demotion in
+    // `middleware.rs` started firing.
+    let req = signed(
+        peer(Request::builder().uri("/api/auth/me").header("X-API-Key", &master)),
+        0,
+        "",
+    );
+    assert_eq!(send(&app, req).await.0, StatusCode::OK, "the master is master before tampering");
+
     // Take the constraint away, then build the forbidden state underneath the application.
     db.execute_raw(sea_orm::Statement::from_string(
         db.get_database_backend(),
