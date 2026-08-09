@@ -3,26 +3,23 @@
 //! The specification's *managed resource* — shared, carrying per-key permission rows, and governed
 //! by the R2 conjunction.
 
-
-use axum::{
-    extract::{Json, State, Path},
-    response::IntoResponse,
-    Extension,
-};
+use axum::{Extension, extract::{Json, Path, State}, response::IntoResponse};
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, Condition, ActiveModelTrait, SqlErr,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter, SqlErr,
 };
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::entities::{
-    api_key, api_key_group_permission, ip_group,
-};
+use crate::entities::prelude::IpGroup;
+use crate::entities::{api_key, api_key_group_permission, ip_group};
 use crate::error::AppError;
 use crate::middleware::ClientIp;
 use crate::state::AppState;
-use super::*;
 
+use super::{
+    create_audit_log, guard_resource_lifecycle, ReassignOwnerPayload, resolve_owner_assignment,
+    resource_owner,
+};
 
 // ─────────────────────────────────────────────────────────────
 // Admin CRUD — IP Groups

@@ -3,26 +3,21 @@
 //! The specification's *creator-private entity* — visible only to its `owner_key_id` and Master,
 //! never exposed by the shared-resource visibility rule (§4).
 
-
-use axum::{
-    extract::{Json, State, Path},
-    response::IntoResponse,
-    Extension,
-};
-use sea_orm::{
-    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, ActiveModelTrait,
-};
+use axum::{Extension, extract::{Json, Path, State}, response::IntoResponse};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::entities::{
-    api_key, webhook_config,
-};
+use crate::entities::prelude::WebhookConfig;
+use crate::entities::{api_key, webhook_config};
 use crate::error::AppError;
 use crate::middleware::ClientIp;
 use crate::state::AppState;
-use super::*;
 
+use super::{
+    caller_group_permission, create_audit_log, IP_EVENT_ACTIONS, ReassignOwnerPayload,
+    resolve_owner_assignment, resource_owner,
+};
 
 /// Handles PUT /api/v1/webhooks/:id/owner — the dispatch-target counterpart to
 /// [`reassign_group_owner`], and the only way a pre-migration webhook becomes visible to anyone but

@@ -3,23 +3,13 @@
 //! Master-only, and its own module rather than a tail on another: it is the one read surface that
 //! spans every domain, so filing it under any single one would be arbitrary.
 
-
-use axum::{
-    extract::{Json, Query, State},
-    response::IntoResponse,
-    Extension,
-};
-use sea_orm::{
-    ColumnTrait, EntityTrait, QueryFilter, QuerySelect, QueryOrder,
-};
+use axum::{Extension, extract::{Json, Query, State}, response::IntoResponse};
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::Deserialize;
 
-use crate::entities::{
-    api_key, audit_log,
-};
+use crate::entities::{api_key, audit_log};
 use crate::error::AppError;
 use crate::state::AppState;
-
 
 // ─────────────────────────────────────────────────────────────
 // Audit Logs

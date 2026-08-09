@@ -4,18 +4,14 @@
 //! They hold no handler logic and touch no response type, which is what makes them reviewable
 //! against the specification without reading an endpoint. R1, R2, R4, R5, R7 and §3/§5 all land here.
 
-
-use sea_orm::{
-    ColumnTrait, EntityTrait, QueryFilter, Condition,
-};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter};
 use uuid::Uuid;
 
-use crate::entities::{
-    api_key, api_key_group_permission,
-};
+use crate::entities::prelude::ApiKey;
+use crate::entities::{api_key, api_key_group_permission};
 use crate::error::AppError;
-use super::*;
 
+use super::GroupPermInput;
 
 /// Formats a target API key for a human-readable audit log `details` string, e.g.
 /// `"'worker_bot' (65cf11ce...)"` — pairs the name (what an operator actually recognizes) with a

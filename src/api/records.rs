@@ -3,30 +3,27 @@
 //! The specification's *resource data* — records live inside IP Groups and inherit their
 //! authorization from the group's permission row rather than carrying one of their own.
 
-
-use axum::{
-    extract::{Json, Query, State, Path},
-    response::IntoResponse,
-    Extension,
-};
+use axum::{Extension, extract::{Json, Path, Query, State}, response::IntoResponse};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter,
-    sea_query::OnConflict, Condition, QuerySelect, QueryOrder, ActiveModelTrait, SqlErr,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect, sea_query::OnConflict, SqlErr,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entities::{
-    api_key, api_key_group_permission, ip_group, ip_record,
-    ip_record_group_membership,
+    api_key, api_key_group_permission, ip_group, ip_record, ip_record_group_membership,
 };
 use crate::error::AppError;
 use crate::middleware::ClientIp;
 use crate::state::{AppState, WebhookEvent};
-use super::*;
 
+use super::{
+    create_audit_log, format_key_reference, get_or_create_group, normalize_ip_or_cidr,
+    resolve_group_ref, resource_owner,
+};
 
 // ─────────────────────────────────────────────────────────────
 // IP Ban / Whitelist

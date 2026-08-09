@@ -4,30 +4,30 @@
 //! delegate to other keys, so subtree walking, visibility scoping and permission grants are one
 //! subject. Splitting them would put a rule's mechanism in one file and its guard in another.
 
-
-use axum::{
-    extract::{Json, State, Path},
-    response::IntoResponse,
-    Extension,
-};
+use axum::{Extension, extract::{Json, Path, State}, response::IntoResponse};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter,
-    sea_query::OnConflict, Condition, ActiveModelTrait,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
+    sea_query::OnConflict,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::entities::{
-    api_key, api_key_group_permission, ip_group, webhook_config,
-};
+use crate::entities::prelude::{ApiKey, IpGroup, WebhookConfig};
+use crate::entities::{api_key, api_key_group_permission, ip_group, webhook_config};
 use crate::error::AppError;
 use crate::extract::StrictJson;
 use crate::middleware::ClientIp;
 use crate::state::AppState;
-use super::*;
 
+use super::{
+    caller_group_permission, create_audit_log, format_key_reference, generate_random_key,
+    get_or_create_group, guard_delegated_group_grant, guard_group_manage, guard_master_immutable,
+    guard_master_target, guard_may_administer_any_group, guard_scope_elevation, hash_key,
+    resolve_group_by_identifier, resolve_group_ref_flexible, resolve_owner_assignment,
+    resource_owner, widens_permissions,
+};
 
 // ─────────────────────────────────────────────────────────────
 // Auth Handlers

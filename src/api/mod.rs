@@ -3,17 +3,12 @@
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use rand::RngExt;
-use sea_orm::{
-    ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter,
-    sea_query::OnConflict, 
-};
+use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, sea_query::OnConflict};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::entities::{
-    api_key, audit_log, ip_group, prelude::*,
-};
+use crate::entities::{api_key, audit_log, ip_group};
 use crate::error::AppError;
 
 // ─────────────────────────────────────────────────────────────
