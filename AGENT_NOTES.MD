@@ -6516,3 +6516,115 @@ replay guard, SQLite pragmas — all byte-identical function bodies), module lay
 names. The four remaining differences are each a deliberate, recorded, one-way choice — `extract.rs`
 placement, the typed readiness query, the Master-pin readiness check, and strict `INITIAL_MASTER_KEY`
 validation — and in every case this service is the stricter of the two. Nothing diverges by accident.
+
+---
+
+## Session 45 — Read-only ecosystem audit: security resolution + structural convergence
+
+Two deliverables, both strictly read-only: `SECURITY_COMPARISON_REPORT.md` (replacing its 2026-08-07
+edition) and the new `STRUCTURAL_CONVERGENCE_REPORT.md`. `FILE_MAP.MD` was also made exhaustive.
+No file under `src/`, `tests/` or `scripts/` was touched.
+
+### 1. Scoping — what is actually in the workspace
+
+The brief said "all related project directories", so the workspace was enumerated before anything was
+compared rather than assuming the two known services.
+
+| Directory | Crate | Verdict |
+| :--- | :--- | :--- |
+| `simply_ip_vault` | `simply_ip_vault` | ✅ In scope |
+| `simply_hook_executor` | `simply_hook_executor` | ✅ In scope |
+| `simply_firewall` | `simply_firewall` | ❌ **Not a third service** — see below |
+| `proxy_index_arr` | `torznab_nfo_proxy` | ❌ Unrelated domain, no `RBAC_MODEL.md` |
+| `VMSAM` | `audio_sync` | ❌ Unrelated domain |
+
+`simply_firewall` initially looked like a third, unconverged ecosystem member: same table names as the
+vault, a monolithic 1,641-line `src/api.rs`, no `RBAC_MODEL.md`, no `guards.rs`/`crypto.rs`/`master.rs`,
+no `deny_unknown_fields`, no inbound HMAC, no anti-replay, and an `auth_middleware` that trusts
+`X-Forwarded-For` unconditionally and exempts master keys from `bound_ips`.
+
+**It is none of those things.** `git log` shows its HEAD is `71767a4 refactor: rename project from
+simply_firewall to simply_ip_vault`, its README is titled `simply_ip_vault`, and commit `71767a4`
+**exists in this repository's own history**. Both repositories share the initial commit `372fdb6`.
+`simply_firewall/` is a **stale working copy of this repository, 36 commits behind** (44 vs 80),
+frozen at the rename. Reporting it as an unconverged third service would have been a serious error.
+
+> Housekeeping note, not a finding: that stale checkout still carries a `firewall.db`. It is a
+> pre-campaign build sitting in the workspace; worth deleting so nobody runs it.
+
+The user subsequently confirmed the comparison scope as `simply_hook_executor` only, which matches
+what the enumeration had already established.
+
+### 2. Reference integrity — checked before trusting it
+
+`verify_convergence.sh` diffs against the flat snapshot at `example/simply_hook_executor`. An audit
+built on a stale snapshot proves nothing, so the snapshot was compared to the live peer checkout
+first: `diff -rq` excluding `target/`, `.git/`, `example/`, `Cargo.lock` reports **no differences**
+under `src/`, `tests/`, `scripts/` or `RBAC_MODEL.md`. Only repository furniture differs. The gate is
+comparing against current code.
+
+### 3. Method — verification, not restatement
+
+The 2026-08-07 report's 4 divergences and 3 specification defects were each re-tested against current
+source. Prior reports and `AGENT_NOTES.MD` were treated as leads only.
+
+| Finding | How it was checked |
+| :--- | :--- |
+| D1 §5 uniqueness | **By execution.** Ran the `s5_` suite; `s5_the_derived_marker_is_unwritable_by_any_client` replays the exact raw-SQL attack the old report used to demonstrate the bypass (INSERT naming the marker, and `UPDATE … SET master_marker = NULL`). Both now refused, refusal text asserted to contain `generated` |
+| D2 peer R2 conjunction | Read `simply_hook_executor/src/api/guards.rs:669` — conjunction now enforced |
+| D3 peer dormant column | `api_keys.owner_key_id` absent from the entity; dropped by `m20260810_000001_drop_api_key_owner_key_id` |
+| D4 payload strictness | Located every `is_master` occurrence in both `keys.rs` files and confirmed each is a **response** DTO, not a payload; both payload types carry `deny_unknown_fields` |
+| S1–S3 spec defects | Read `RBAC_MODEL.md` line 20 — the terminology table now names the real columns |
+
+**One prior-report claim was found overstated and is corrected in the new report.** Counting
+`ADVERSARIAL(` markers gives vault 5, peer 0, which reads as a serious asymmetry. It is wrong: the
+peer encodes the same property in the *function name* (`s5_adversarial_direct_sql_insert_cannot_mint_a_second_master`)
+and makes that load-bearing in its own gate (`verify_convergence.sh:609`, `grep -qE "^${prefix}_adversarial_"`).
+Both run raw-SQL bypass tests; both carry a negative control against passing for the wrong reason.
+Equivalent rigour, divergent convention — recorded so it is not re-raised.
+
+Checking that one saved the report from a fabricated finding, and it is the same failure mode as the
+original D1: a marker being mistaken for the property it marks.
+
+### 4. Structural data gathered
+
+Module trees, `api/` and `entities/` file lists, per-module line counts, the `AppError` variant sets
+and their status mappings, the error response body shape, `audit_log` field lists, test-suite
+inventories, and the `scripts/` inventory — each collected from both trees and tabulated rather than
+described.
+
+Headline numbers: **11/13 top-level modules** share name and role; **3/3** `api/` structural modules
+(`mod`, `guards`, `support`) are identical; **24/24** shared security symbols carry identical names;
+**9/11** error variants shared with identical status mappings; error body shape identical; **8/10**
+audit fields identical; **7/7** verification gates present on both sides.
+
+### 5. `FILE_MAP.MD` made exhaustive
+
+The brief required an index of **all** `src/` files. An automated check found **16 of 41 unlisted** —
+the 7 entity files and 9 migration files were covered only by directory-level prose. Both directories
+now carry per-file tables (entity → table → field count → contents; migration → ordinal → what it
+adds), and the check now reports 41/41. Three migrations carry reasoning worth reading before editing
+and are called out individually.
+
+### 6. Verification
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo test` | **248 passed**, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 — 62 matching, 0 divergences, 0 unexplained |
+| `git diff RBAC_MODEL.md` | empty |
+| `git status --porcelain src/ tests/` | **empty** — read-only compliance |
+
+### 7. Outcome
+
+**7 of 7 prior findings closed** — 4 divergences and 3 specification defects. The three spec defects
+required a coordinated edit to a byte-identical normative document, and that file is still
+byte-identical across both repositories, which is the harder half.
+
+**One open item, and it is on the peer:** `simply_hook_executor` still accepts any non-empty
+`INITIAL_MASTER_KEY`. The vault closed this in Session 44. Recommended as a ~20-line port; the peer's
+`generate_random_key` already emits exactly 64 hex characters, so the rule would demand of an operator
+precisely what the service already demands of itself.
+
+**One unforced structural divergence:** the peer mixes `require_` and `guard_` prefixes on its
+authorization guards where the vault uses `guard_` uniformly. Cosmetic, blocks nothing.

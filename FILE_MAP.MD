@@ -426,16 +426,30 @@ spanning every domain — filing it under any single one would be arbitrary. It 
 
 ## `src/entities/` — SeaORM models
 
-One file per table (`api_key`, `api_key_group_permission`, `ip_group`, `ip_record`,
-`ip_record_group_membership`, `webhook_config`, `audit_log`), plus `mod.rs` and `prelude.rs`.
+One file per table, plus `mod.rs` (declarations) and `prelude.rs` (the `Entity` re-export set). Every
+file is generated-shaped: `Model`, `ActiveModel`, `Column`, `Relation`, `ActiveModelBehavior`.
 
-**Must not hold** business logic, defaults that encode policy, or authorization helpers.
+**Must not hold** business logic, defaults that encode policy, or authorization helpers. A field's
+presence or absence here is a schema statement, not a convenience.
 
-**Rationale worth knowing.** `api_key::Model` deliberately **omits** `master_marker`. The column
-exists and is `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` under a unique index;
-SeaORM builds explicit column lists from the entity, so leaving the field out is what guarantees no
-query ever names it — and every engine rejects a write to a generated column. Declaring it, even
-read-only, would put it into every `INSERT` and break all key creation. **Do not add it back.**
+| File | Table | Fields | Holds |
+| :--- | :--- | ---: | :--- |
+| `api_key.rs` | `api_keys` | 13 | Credentials and authority: `key_hash`, `prefix`, `signing_secret` (sealed), `bound_ips`, `is_master`, the three global scopes, `parent_key_id` |
+| `api_key_group_permission.rs` | `api_key_group_permissions` | 8 | The M:N grant row — `can_read`, `can_write`, `can_delete`, `can_manage`. What every §2 check reads |
+| `ip_group.rs` | `ip_groups` | 6 | Named collections (`fail2ban`, `sshd`), `group_type`, `owner_key_id` (§3) |
+| `ip_record.rs` | `ip_records` | 10 | The addresses themselves, plus the soft-delete triple `is_deleted` / `deleted_at` / `deleted_by` |
+| `ip_record_group_membership.rs` | `ip_record_group_memberships` | 2 | Composite-PK join of record ↔ group. Both columns cascade |
+| `webhook_config.rs` | `webhook_configs` | 14 | Dispatch targets: `target_url`, `secret_token`, `auth_mode`, `hmac_template`, `events`, `owner_key_id` |
+| `audit_log.rs` | `audit_logs` | 10 | The trail. `api_key_id` is `ON DELETE SET NULL`; `api_key_name`/`api_key_prefix` are denormalised so it stays legible after the key is gone |
+| `mod.rs` | — | — | Module declarations only |
+| `prelude.rs` | — | — | `pub use …::Entity as X` for each table |
+
+**The one rule that is not obvious.** `api_key::Model` deliberately **omits** `master_marker`. The
+column exists and is `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` under a unique
+index; SeaORM builds explicit column lists from the entity, so leaving the field out is what
+guarantees no query ever names it — and every engine rejects a write to a generated column. Declaring
+it, even read-only, would put it into every `INSERT` and break all key creation.
+**Do not add it back** — `scripts/verify_convergence.sh` fails if you do.
 
 ---
 
@@ -443,20 +457,29 @@ read-only, would put it into every `INSERT` and break all key creation. **Do not
 
 Ordered in `mod.rs`; each file is one applied migration and is **immutable history** — `sea-orm`
 records migrations by name and will not re-run an edited one. Only documentation may be corrected in
-place.
+place. This is the one directory where raw SQL is permitted, because DDL for generated columns and
+per-engine storage classes cannot be expressed portably through SeaQuery.
 
-This is the one directory where raw SQL is permitted, because DDL for generated columns and per-engine
-storage classes cannot be expressed portably through SeaQuery.
+| # | File | Adds |
+| ---: | :--- | :--- |
+| 1 | `m20230101_000001_initial_schema` | All seven tables and their foreign keys. CASCADE on the two join tables and on `webhook_configs.group_id`; **SET NULL** on `audit_logs.api_key_id` |
+| 2 | `m20260729_000002_add_api_key_signing_secret` | `api_keys.signing_secret` — the per-key HMAC secret behind `X-Signature-256` |
+| 3 | `m20260730_000003_add_webhook_signature_mode` | `webhook_configs.signature_mode` |
+| 4 | `m20260730_000004_add_webhook_auth_modes` | Generalises the above into the four-valued `auth_mode`, plus `api_key` and `hmac_template` |
+| 5 | `m20260801_000005_add_ip_record_soft_delete` | `is_deleted`, `deleted_at`, `deleted_by` on `ip_records` |
+| 6 | `m20260804_000006_add_group_permission_can_manage` | `api_key_group_permissions.can_manage` — R2's per-resource half |
+| 7 | `m20260807_000007_add_api_key_master_marker` | **Superseded, and documents its own defect.** An application-maintained marker that did *not* satisfy §5 |
+| 8 | `m20260807_000008_add_lineage_and_ownership` | `api_keys.parent_key_id` (§4 subtree) and `owner_key_id` on groups and webhooks (§3) |
+| 9 | `m20260808_000009_derive_master_marker` | **The actual §5 enforcement.** Engine-derived marker under a unique index |
 
-Migrations of particular note:
+Three carry reasoning worth reading before touching them:
 
-- `m20260807_000007_add_api_key_master_marker` — **superseded, and documents its own defect.** It
-  added an application-maintained marker, which did not satisfy §5: a writer could set `is_master` and
-  omit the marker, and NULLs do not collide in a unique index. Retained unmodified with the reasoning
-  intact.
-- `m20260808_000009_derive_master_marker` — the actual §5 enforcement. Engine-derived marker, per-
-  backend storage class pinned by unit test (Postgres `STORED`, SQLite/MySQL `VIRTUAL`), and an abort
-  with both offending rows named if the database already holds two Masters.
-- `m20260807_000008_add_lineage_and_ownership` — `parent_key_id` and both `owner_key_id` columns. No
-  DDL foreign keys: SQLite has no `ALTER TABLE … ADD CONSTRAINT`, so the application-level equivalents
-  are covered by a CI test instead (§7).
+- **#7 is kept unmodified on purpose.** It added a marker the application wrote, which a writer could
+  simply omit — and NULLs do not collide in a unique index, so the constraint never fired. Retained
+  with its (wrong) claim intact, because deleting the record of a defect deletes the reason the fix
+  looks the way it does.
+- **#9** pins the per-backend storage class by unit test (Postgres `STORED`, SQLite/MySQL `VIRTUAL`)
+  and **aborts before any DDL** if the database already holds two Masters, naming both rows.
+- **#8** adds no DDL foreign keys. SQLite has no `ALTER TABLE … ADD CONSTRAINT`, so the constraint
+  would exist on two backends and silently not on the one CI runs. The application-level equivalents
+  are covered by `tests/schema_integrity_tests.rs` instead.
