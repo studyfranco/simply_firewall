@@ -614,3 +614,247 @@ async fn deletes_across_the_whole_schema_leave_no_orphans() {
         "no audit row is destroyed by deleting the key that wrote it"
     );
 }
+
+// ─────────────────────────────────────────────────────────────
+// Join tables: no orphan may survive a delete
+// ─────────────────────────────────────────────────────────────
+
+/// Every row in both join tables whose referenced parent no longer exists.
+///
+/// Deliberately **not** `PRAGMA foreign_key_check`. That pragma asks SQLite whether SQLite is
+/// satisfied, which is a circular question to put to the engine whose enforcement is under test — if
+/// the constraints were declared wrongly, or dropped by a table rebuild, `foreign_key_check` would
+/// walk whatever constraints remain and cheerfully report nothing. This walks the data instead, from
+/// the application's own idea of what the parents are, so it holds an opinion the schema cannot
+/// silently change. Both checks are worth having; they fail for different reasons.
+async fn join_table_orphans(db: &DatabaseConnection) -> Vec<String> {
+    let mut orphans = Vec::new();
+
+    let key_ids: Vec<Uuid> = api_key::Entity::find()
+        .all(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|k| k.id)
+        .collect();
+    let group_ids: Vec<Uuid> = ip_group::Entity::find()
+        .all(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|g| g.id)
+        .collect();
+    let record_ids: Vec<Uuid> = ip_record::Entity::find()
+        .all(db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+
+    for perm in api_key_group_permission::Entity::find().all(db).await.unwrap() {
+        if !key_ids.contains(&perm.api_key_id) {
+            orphans.push(format!("api_key_group_permissions {} -> missing key {}", perm.id, perm.api_key_id));
+        }
+        if !group_ids.contains(&perm.group_id) {
+            orphans.push(format!("api_key_group_permissions {} -> missing group {}", perm.id, perm.group_id));
+        }
+    }
+
+    for m in ip_record_group_membership::Entity::find().all(db).await.unwrap() {
+        if !record_ids.contains(&m.ip_record_id) {
+            orphans.push(format!("ip_record_group_memberships -> missing record {}", m.ip_record_id));
+        }
+        if !group_ids.contains(&m.group_id) {
+            orphans.push(format!("ip_record_group_memberships -> missing group {}", m.group_id));
+        }
+    }
+
+    orphans
+}
+
+/// Deleting a key, then a group, leaves **no orphan row in either join table** — checked by walking
+/// the data rather than by asking the engine.
+///
+/// The two join tables are where a missed cascade does the most damage, and they fail differently.
+/// A stale `api_key_group_permissions` row is *live authority*: it is what every §2 check reads, so
+/// it grants access again the moment its id is reused. A stale `ip_record_group_memberships` row is
+/// a phantom membership — the address still appears in a group that no longer exists, and because
+/// the table's primary key spans both columns, it also blocks ever re-adding that record to a group
+/// with the same id.
+#[tokio::test]
+async fn deleting_a_key_and_a_group_leaves_no_orphans_in_either_join_table() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    let doomed_key = seed_key(&db, "doomed_key", None).await;
+    let surviving_key = seed_key(&db, "surviving_key", None).await;
+    let doomed_group = seed_group(&db, "doomed_group", Some(surviving_key)).await;
+    let surviving_group = seed_group(&db, "surviving_group", Some(surviving_key)).await;
+
+    // Four grants across the two-by-two matrix, so each delete has both a victim and a bystander.
+    seed_permission(&db, doomed_key, doomed_group).await;
+    seed_permission(&db, doomed_key, surviving_group).await;
+    seed_permission(&db, surviving_key, doomed_group).await;
+    seed_permission(&db, surviving_key, surviving_group).await;
+
+    let record = seed_record_in_group(&db, "198.51.100.40", doomed_group).await;
+    ip_record_group_membership::Entity::insert(ip_record_group_membership::ActiveModel {
+        ip_record_id: Set(record),
+        group_id: Set(surviving_group),
+    })
+    .exec(&db)
+    .await
+    .expect("the record joins the surviving group too");
+
+    assert_eq!(api_key_group_permission::Entity::find().count(&db).await.unwrap(), 4);
+    assert_eq!(ip_record_group_membership::Entity::find().count(&db).await.unwrap(), 2);
+    assert!(join_table_orphans(&db).await.is_empty(), "the fixture starts clean");
+
+    api_key::Entity::delete_by_id(doomed_key).exec(&db).await.expect("the key deletes");
+    assert_eq!(
+        join_table_orphans(&db).await,
+        Vec::<String>::new(),
+        "deleting a key must leave no grant pointing at it"
+    );
+    assert_eq!(
+        api_key_group_permission::Entity::find().count(&db).await.unwrap(),
+        2,
+        "exactly the two grants belonging to the deleted key are gone"
+    );
+
+    ip_group::Entity::delete_by_id(doomed_group).exec(&db).await.expect("the group deletes");
+    assert_eq!(
+        join_table_orphans(&db).await,
+        Vec::<String>::new(),
+        "deleting a group must leave no grant and no membership pointing at it"
+    );
+    assert_eq!(
+        api_key_group_permission::Entity::find().count(&db).await.unwrap(),
+        1,
+        "only the surviving key's grant on the surviving group remains"
+    );
+    assert_eq!(
+        ip_record_group_membership::Entity::find().count(&db).await.unwrap(),
+        1,
+        "only the membership in the surviving group remains"
+    );
+
+    // The record itself is untouched by either delete: an address is not owned by a key, and it
+    // belongs to more than one group.
+    assert!(ip_record::Entity::find_by_id(record).one(&db).await.unwrap().is_some());
+}
+
+/// Deleting a key does **not** disturb `ip_record_group_memberships`.
+///
+/// The complement of the cascades above, and it guards a plausible over-correction rather than an
+/// omission. `api_keys` has no relationship to memberships at all — a key *administers* groups, it
+/// does not own the addresses in them — so a future migration that added a cascade from keys to
+/// memberships would silently erase banlist entries when a credential was rotated out. That would
+/// look tidy and be data loss, exactly what §6 forbids.
+#[tokio::test]
+async fn deleting_a_key_does_not_touch_ip_record_memberships() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    let key = seed_key(&db, "operator", None).await;
+    let group = seed_group(&db, "blocked", Some(key)).await;
+    seed_permission(&db, key, group).await;
+    let record = seed_record_in_group(&db, "198.51.100.50", group).await;
+
+    api_key::Entity::delete_by_id(key).exec(&db).await.expect("the key deletes");
+
+    assert_eq!(
+        api_key_group_permission::Entity::find().count(&db).await.unwrap(),
+        0,
+        "the key's own grant is gone"
+    );
+    assert_eq!(
+        ip_record_group_membership::Entity::find()
+            .filter(ip_record_group_membership::Column::GroupId.eq(group))
+            .count(&db)
+            .await
+            .unwrap(),
+        1,
+        "the membership survives: deleting a credential must never erase the banlist it maintained"
+    );
+    assert!(ip_record::Entity::find_by_id(record).one(&db).await.unwrap().is_some());
+    assert!(ip_group::Entity::find_by_id(group).one(&db).await.unwrap().is_some());
+    assert!(join_table_orphans(&db).await.is_empty());
+}
+
+/// **The control.** With `foreign_keys` OFF, the same delete leaves orphans behind.
+///
+/// Every other test in this file asserts that a cascade happened. None of them, alone, says *why* —
+/// and "SQLite would have done that anyway" is a real possibility a reader is entitled to rule out.
+/// This opens a pool identical to the production one except for `.foreign_keys(false)`, runs the same
+/// group delete, and shows the grants and memberships surviving as dangling rows.
+///
+/// That makes the pragma the attributable cause rather than a setting the suite merely happens to
+/// have on. It is worth the extra test because the failure it guards is silent in the worst way:
+/// SQLite does not warn when foreign keys are off, it simply stops enforcing them, and the resulting
+/// `api_key_group_permissions` rows are live authority that no application-level test would notice.
+///
+/// This is also the one place in the suite that builds a connection by hand rather than through
+/// `db::connect`, which is precisely the point — it is demonstrating what `db::connect` buys.
+#[tokio::test]
+async fn with_foreign_keys_off_the_same_delete_leaves_dangling_rows() {
+    use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    let tmp = TempDb::new();
+
+    // Identical to `db::connect` except for the one line under test. `max_connections(1)` is kept
+    // because migrations need it; the journal and synchronous settings are irrelevant here.
+    let options = SqliteConnectOptions::from_str(&tmp.url())
+        .expect("the url parses")
+        .create_if_missing(true)
+        .foreign_keys(false);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("the pool opens");
+    let db = sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool);
+    simply_ip_vault::db::run_migrations(&db).await.expect("every migration applies");
+
+    // Sanity: the switch really is off. Without this the test could pass because the fixture broke.
+    let pragma = db
+        .query_one_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            "PRAGMA foreign_keys;".to_owned(),
+        ))
+        .await
+        .expect("the pragma reads")
+        .expect("a row is returned");
+    assert_eq!(
+        pragma.try_get::<i32>("", "foreign_keys").unwrap(),
+        0,
+        "this test is meaningless unless foreign keys are genuinely off"
+    );
+
+    let key = seed_key(&db, "operator", None).await;
+    let group = seed_group(&db, "doomed", Some(key)).await;
+    seed_permission(&db, key, group).await;
+    seed_record_in_group(&db, "198.51.100.60", group).await;
+
+    ip_group::Entity::delete_by_id(group).exec(&db).await.expect("the group deletes");
+
+    assert_eq!(
+        api_key_group_permission::Entity::find().count(&db).await.unwrap(),
+        1,
+        "with foreign keys off the grant survives its group — this is the orphan the pragma prevents"
+    );
+    assert_eq!(
+        ip_record_group_membership::Entity::find().count(&db).await.unwrap(),
+        1,
+        "and so does the membership"
+    );
+
+    let orphans = join_table_orphans(&db).await;
+    assert_eq!(
+        orphans.len(),
+        2,
+        "both join tables are left dangling; with the pragma on this list is empty: {orphans:?}"
+    );
+}

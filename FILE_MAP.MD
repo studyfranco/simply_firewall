@@ -314,17 +314,24 @@ error goes to the log, where an operator can read it and an anonymous caller can
 **Role & scope.** The single place a permission decision is *made*. Each function answers one question
 from `RBAC_MODEL.md` and returns `Ok(())` or a refusal.
 
-**Must not hold** handler logic, response types, or database writes.
+**Must not hold** handler logic, response types, or database writes. Nor the §4 **subtree mechanics**
+(`collect_key_subtree`, `find_administrable_key`, and friends), which are in `keys.rs` — see below.
 
 **Key exports.** `guard_group_manage` (R2), `guard_delegated_group_grant` (R1/R7),
 `guard_scope_elevation` (R4), `guard_resource_lifecycle` (§3), `guard_master_target`,
 `guard_master_immutable` (§5), `caller_group_permission`, `resource_owner`,
 `resolve_owner_assignment`, `widens_permissions`, `MASTER_ONLY_SCOPES`.
 
-**Rationale.** This file is the point of the whole `api/` split. 463 lines holding no handler logic
+**Rationale.** This file is the point of the whole `api/` split. ~457 lines holding no handler logic
 and no response types means it can be read straight against `RBAC_MODEL.md` without opening an
 endpoint — which is the only way to check the specification is actually enforced rather than merely
 cited.
+
+**Membership here is decided by "does it make an authorization decision?", never by how many domains
+call it.** Most of these are called only from `keys.rs` today, and that is not a reason to move them.
+They enforce named rules of the specification, and scattering R1/R4/R7 into the handler files is
+precisely what the `api/` split undid. `holds_any_group_manage` is private to this module and used
+only within it — also fine, for the same reason.
 
 ### `src/api/keys.rs` — API key endpoints
 
@@ -333,12 +340,21 @@ with §6 cascade and pre-flight inventory, both rotation endpoints, and per-grou
 
 **Key exports.** `get_me`, `create_api_key`, `list_api_keys`, `update_api_key`, `delete_api_key`,
 `rotate_api_key`, `rotate_signing_secret`, `update_key_group_permissions`,
-`revoke_key_group_permission`, plus their payload/response DTOs.
+`revoke_key_group_permission`, plus their payload/response DTOs. Also the §4 visibility mechanics:
+`collect_key_subtree`, `groups_the_caller_manages`, `caller_can_administer_key`,
+`find_administrable_key`.
 
-**Rationale.** The largest module (1,372 lines) and deliberately **not** split further. R1–R7 are about
-how keys delegate to other keys, so subtree walking, visibility scoping, lifecycle and permission
-grants are one subject; splitting them would put a rule's mechanism in one file and its guard in
-another, which is the arrangement the `api/` split exists to undo.
+**Rationale.** The largest module (~1,365 lines) and deliberately **not** split further. R1–R7 are
+about how keys delegate to other keys, so subtree walking, visibility scoping, lifecycle and
+permission grants are one subject; splitting them would put a rule's mechanism in one file and its
+guard in another, which is the arrangement the `api/` split exists to undo.
+
+**On the four subtree helpers.** They have lived here since the original split (`036794a`) and belong
+here: they *resolve* the caller's §4 subtree — a recursive walk of `parent_key_id`, and a database
+traversal rather than a rule — and every one of their call sites is a key handler. `guards.rs` holds
+the predicates that answer yes/no from an already-resolved pair. A Session 43 proposal to move them
+*out of* `guards.rs` was checked and found to be describing a state that already held; recorded here
+so the same move is not proposed a third time.
 
 ### `src/api/records.rs` — IP record endpoints
 

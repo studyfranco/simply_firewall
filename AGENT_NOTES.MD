@@ -6259,3 +6259,90 @@ Module sizes after: `api/mod.rs` 267 → **69**; `state.rs` 330 → **169**; new
 `generate_signing_secret` stays in `crypto.rs`. It is a cryptographic primitive with no HTTP concern,
 and the peer's placement in `api/support.rs` is the weaker of the two. Recorded again so a future
 audit does not "converge" it in the wrong direction.
+
+---
+
+## Session 43 — Verifying a proposed relocation, and strengthening the cascade suite
+
+Two tasks. The first turned out to be already done and is recorded as such rather than performed; the
+second was partly covered by Session 42 and is extended where it was genuinely thin.
+
+### 1. Task 1 — the relocation was already the current state
+
+The brief asked to move `collect_key_subtree`, `groups_the_caller_manages`,
+`caller_can_administer_key` and `find_administrable_key` **from `src/api/guards.rs` to
+`src/api/keys.rs`**. All four are already defined in `src/api/keys.rs` (lines 427, 456, 485, 513) and
+`guards.rs` contains none of them. `git log -S` confirms they were placed in `keys.rs` at the original
+modularization commit `036794a` and have never lived in `guards.rs`.
+
+**No code was changed.** Every call site is already a key handler, so the stated goal — "exclusively
+consumed by key handlers, so put them there" — holds today.
+
+The converse was then checked, since it is the version of the task that could still have had work in
+it: is anything *remaining* in `guards.rs` single-domain and better moved out? Mapping every export
+to its consuming modules:
+
+| Consumed by | Functions |
+| :--- | :--- |
+| 2–4 domains | `caller_group_permission`, `resource_owner`, `resolve_owner_assignment` |
+| `keys.rs` only | `guard_group_manage`, `guard_may_administer_any_group`, `widens_permissions`, `guard_delegated_group_grant`, `guard_scope_elevation`, `guard_master_target`, `guard_master_immutable`, `MASTER_ONLY_SCOPES` |
+| `groups.rs` only | `guard_resource_lifecycle` |
+| `guards.rs` only | `holds_any_group_manage` |
+
+**Nothing should move.** Single-consumer is not the criterion for this module and never was — the
+criterion is *does it make an authorization decision*. Those single-consumer entries are R1, R2, R4,
+R7 and §3/§5 enforcement, and relocating them would scatter named rules of `RBAC_MODEL.md` across the
+handler files, which is exactly what the `api/` split undid and what `check_rule_coverage` in the
+convergence script depends on being able to read in one place.
+
+The distinction that makes both halves consistent: `keys.rs` holds the code that *resolves* a subtree
+(a recursive `parent_key_id` walk — a database traversal), `guards.rs` holds the predicates that
+answer yes/no about an already-resolved pair. Both are now written into `FILE_MAP.MD` under each
+module's **Must not hold**, so the same relocation is not proposed a third time.
+
+### 2. Task 2 — cascade coverage extended from 8 tests to 11
+
+Session 42 already added `tests/schema_integrity_tests.rs` covering the cascades this task names:
+`api_key_group_permissions` on key delete, and permissions + memberships + webhooks on group delete,
+plus two `PRAGMA foreign_key_check` sweeps. Rather than restate those, three genuinely missing tests
+were added.
+
+**`with_foreign_keys_off_the_same_delete_leaves_dangling_rows` — the control, and the valuable one.**
+Every existing test asserts a cascade *happened*; none of them said *why*, and "SQLite would have done
+that anyway" was a possibility a reader could not rule out. This opens a pool identical to the
+production one except for `.foreign_keys(false)`, runs the same group delete, and shows the grants and
+memberships surviving as dangling rows. That makes the pragma the attributable cause rather than a
+setting the suite happens to have on. It is the one test in the file that builds a connection by hand
+instead of through `db::connect`, which is the point — it demonstrates what `db::connect` buys. It
+asserts `PRAGMA foreign_keys` reads back as `0` first, so it cannot pass because its own fixture broke.
+
+**`deleting_a_key_and_a_group_leaves_no_orphans_in_either_join_table`.** Walks the data through a new
+`join_table_orphans` helper rather than asking `PRAGMA foreign_key_check`. That pragma asks SQLite
+whether SQLite is satisfied, which is circular for the engine under test: if a constraint were
+declared wrongly or dropped by a table rebuild, it would walk whatever remains and report nothing.
+The helper holds the application's own idea of what the parents are. Both checks are kept; they fail
+for different reasons.
+
+**`deleting_a_key_does_not_touch_ip_record_memberships`.** Guards a plausible over-correction rather
+than an omission: `api_keys` has no relationship to memberships, and a future migration adding one
+would silently erase banlist entries whenever a credential was rotated out — tidy-looking data loss,
+which §6 forbids.
+
+**Mutation-tested.** Flipping `.foreign_keys(true)` to `false` in `src/db.rs` fails **8 of the 11**
+tests. The three that stay green are correct to: the control does not use `db::connect`, and the two
+asserting *absence* of a cascade (daughters surviving a parent delete; a freshly migrated database
+being clean) hold either way.
+
+### 3. Verification
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **244 passed**, 0 failed (241 before; +3 schema integrity) |
+| `./scripts/test_e2e.sh` | **504 passed**, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 — 48 matching, 1 documented divergence, 0 unexplained |
+| `git diff RBAC_MODEL.md` | empty |
+
+No file under `src/` was modified this session; the changes are `tests/schema_integrity_tests.rs`,
+`FILE_MAP.MD` and this log.
