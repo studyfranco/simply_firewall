@@ -105,9 +105,18 @@ pub fn create_app(state: AppState) -> Router {
         // outside `auth_middleware`. That placement is the entire point: the callers are Docker's
         // `HEALTHCHECK`, a Kubernetes probe, and a load balancer, none of which can compute an
         // HMAC over a body with a rolling timestamp. Both handlers are written to be safe without a
-        // caller identity — no data, no error detail, no writes. See [`api::system`].
+        // caller identity — no data, no error detail, no writes. See [`api::health`].
+        //
+        // Declared as routes rather than left to the static fallback, so a file dropped into
+        // `static/health` could never shadow a probe.
         .route("/health", get(api::health_check))
         .route("/ready", get(api::readiness_check))
+        // `/healthz` and `/readyz` are the Kubernetes-idiomatic spellings and cost nothing to
+        // accept. Matching `simply_hook_executor` here matters more than usual: an operator writing
+        // one set of manifests for both services should not have to remember which of the pair uses
+        // which spelling.
+        .route("/healthz", get(api::health_check))
+        .route("/readyz", get(api::readiness_check))
         .nest("/api", api_routes)
         // Applied *outside* the nest so it covers `/api/*` and the static fallback alike. Inside,
         // it would leave the SPA path — which never reaches the auth middleware — unbounded, and a

@@ -88,6 +88,64 @@ pub fn parse_bind_addr(host: Option<&str>, port: Option<&str>) -> SocketAddr {
 /// deployment **must** set this variable. See [`resolve_client_ip`].
 pub const TRUSTED_PROXIES_ENV: &str = "TRUSTED_PROXIES";
 
+/// Environment variable overriding the generated bootstrap master key.
+pub const INITIAL_MASTER_KEY_ENV: &str = "INITIAL_MASTER_KEY";
+
+/// Required length of a master key in hex characters — 32 bytes of entropy.
+///
+/// Not an arbitrary policy number: it is exactly what [`crate::api::generate_random_key`] produces
+/// (`[u8; 32]`, hex-encoded), so the rule below demands of an operator precisely what the service
+/// demands of itself. A validator that accepted less than the generator emits would be a rule the
+/// service does not follow.
+pub const MASTER_KEY_HEX_LEN: usize = 64;
+
+/// [`INITIAL_MASTER_KEY_ENV`] was set to something that is not a 32-byte hex key.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "{INITIAL_MASTER_KEY_ENV} must be exactly {MASTER_KEY_HEX_LEN} hexadecimal characters (32 bytes \
+     of entropy) — the same shape this service generates for itself. Got {got} character(s){detail}. \
+     Generate one with `openssl rand -hex 32`, or unset the variable to have one generated. \
+     Refusing to start: a weak master key is the single credential that can administer everything."
+)]
+pub struct InvalidInitialMasterKey {
+    /// How many characters were supplied.
+    pub got: usize,
+    /// `", and it contains non-hexadecimal characters"` when that is also true, else empty.
+    pub detail: &'static str,
+}
+
+/// Validates an operator-supplied bootstrap master key, or explains why it is unusable.
+///
+/// # Why this is fatal rather than a warning
+///
+/// `INITIAL_MASTER_KEY` exists for deterministic test and CI bootstrap, and until now it accepted
+/// **any** non-empty string with only a log line objecting. That log line already said the right
+/// thing — "a human-chosen, low-entropy secret defeats the point of generating a random 256-bit
+/// key" — and then let it through anyway, which is the shape of control that reads like a safeguard
+/// and stops nothing. A warning in a startup log is not read by the person who set
+/// `INITIAL_MASTER_KEY=changeme` in a compose file.
+///
+/// The credential this guards is the one that can administer every other credential, so the failure
+/// direction has to be refusal. There is no legitimate deployment that needs a short master key: an
+/// operator who wants a *deterministic* one still gets it, they just have to supply 64 hex
+/// characters, and one that wants a *strong* one leaves the variable unset.
+///
+/// Checked before any of it reaches the database, so a rejected key never becomes the master row.
+///
+/// > **Deliberate divergence.** `simply_hook_executor` accepts any non-empty
+/// > `INITIAL_MASTER_KEY`. This service is stricter on purpose, and the asymmetry is recorded in
+/// > `AGENT_NOTES.MD` rather than being converged away.
+pub fn validate_initial_master_key(raw: &str) -> Result<(), InvalidInitialMasterKey> {
+    let is_hex = raw.chars().all(|c| c.is_ascii_hexdigit());
+    if raw.len() == MASTER_KEY_HEX_LEN && is_hex {
+        return Ok(());
+    }
+    Err(InvalidInitialMasterKey {
+        got: raw.chars().count(),
+        detail: if is_hex { "" } else { ", and it contains non-hexadecimal characters" },
+    })
+}
+
 /// How long a successful hostname resolution is reused before being looked up again.
 ///
 /// Short on purpose. A container that is recreated keeps its name and gets a new address, and until
@@ -688,6 +746,71 @@ pub fn resolve_client_ip(
     }
 
     peer
+}
+
+#[cfg(test)]
+mod master_key_tests {
+    use super::*;
+
+    /// What the service generates for itself must satisfy the rule it imposes on operators.
+    ///
+    /// The important assertion in this file. If `generate_random_key` and `MASTER_KEY_HEX_LEN` ever
+    /// drift apart, a deployment that let the service pick its own key would still boot while an
+    /// operator supplying an identically-shaped one would be refused — a rule the service does not
+    /// follow itself, and the kind of inconsistency that gets "fixed" by deleting the check.
+    #[test]
+    fn a_self_generated_key_passes_the_operator_rule() {
+        for _ in 0..64 {
+            let generated = crate::api::generate_random_key();
+            assert_eq!(generated.len(), MASTER_KEY_HEX_LEN);
+            assert!(validate_initial_master_key(&generated).is_ok());
+        }
+    }
+
+    #[test]
+    fn exactly_64_hex_characters_are_accepted_in_either_case() {
+        assert!(validate_initial_master_key(&"a".repeat(64)).is_ok());
+        assert!(validate_initial_master_key(&"F".repeat(64)).is_ok());
+        assert!(validate_initial_master_key(&"0123456789abcdefABCDEF".repeat(3)[..64]).is_ok());
+    }
+
+    /// Both failure directions, and the boundary on each side — 63 and 65 are the off-by-ones a
+    /// length check gets wrong.
+    #[test]
+    fn wrong_length_or_non_hex_is_refused() {
+        for bad in [
+            "".to_owned(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "changeme".to_owned(),
+            "e2e_master_secret_key_for_testing_123456789".to_owned(),
+            // 64 characters, but `g` is not a hex digit — the case a bare length check would pass.
+            format!("{}g", "a".repeat(63)),
+        ] {
+            assert!(
+                validate_initial_master_key(&bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    /// The refusal has to tell an operator what to do; a bare "invalid" would send them guessing.
+    #[test]
+    fn the_refusal_names_the_requirement_and_the_remedy() {
+        let text = validate_initial_master_key("changeme").unwrap_err().to_string();
+        assert!(text.contains("64 hexadecimal characters"), "{text}");
+        assert!(text.contains("openssl rand -hex 32"), "{text}");
+        assert!(text.contains("Refusing to start"), "{text}");
+        assert!(text.contains("Got 8 character(s)"), "the actual length is reported: {text}");
+        assert!(
+            text.contains("non-hexadecimal"),
+            "a non-hex value says so, rather than only complaining about length: {text}"
+        );
+
+        // A right-length, wrong-alphabet key must not be told it is the wrong length.
+        let hex_only = validate_initial_master_key(&"a".repeat(63)).unwrap_err().to_string();
+        assert!(!hex_only.contains("non-hexadecimal"), "{hex_only}");
+    }
 }
 
 #[cfg(test)]

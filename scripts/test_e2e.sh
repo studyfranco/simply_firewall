@@ -51,7 +51,7 @@ VAULT_PORT="$(printf '%s' "$BASE_URL" | sed -n 's|.*:\([0-9]\{1,5\}\)$|\1|p')"
 VAULT_PORT="${VAULT_PORT:-3000}"
 # Deterministic bootstrap secret: passed to the server as INITIAL_MASTER_KEY so this script never
 # needs to scrape the master key back out of the (buffered, redirected) server log.
-MASTER_KEY="e2e_master_secret_key_for_testing_123456789"
+MASTER_KEY="e2eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 # Its HMAC counterpart, passed as INITIAL_MASTER_SIGNING_SECRET for the same reason: every request
 # must now carry an X-Signature-256, so the script needs the bootstrap key's signing secret up front.
 MASTER_SIGNING_SECRET="e2e_master_signing_secret_for_testing_987654321"
@@ -2297,7 +2297,7 @@ check_local "$([ -s "$BADKEY_DB" ] && echo created || echo absent)" "absent" \
 DEADNS_PORT=$((VAULT_PORT + 62))
 DEADNS_DB="$WORK_DIR/deadns.db"
 DEADNS_LOG="$WORK_DIR/deadns_server.log"
-DEADNS_MASTER="e2e_deadns_master_key_for_testing_123456789"
+DEADNS_MASTER="deadbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 log "Booting an instance whose TRUSTED_PROXIES names an unresolvable host alongside a good one..."
 DATABASE_URL="sqlite://$DEADNS_DB?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$DEADNS_MASTER" \
@@ -2795,7 +2795,7 @@ STRICT_PORT=$((VAULT_PORT + 63))
 STRICT_DB="$WORK_DIR/strict.db"
 STRICT_LOG_A="$WORK_DIR/strict_server_a.log"
 STRICT_LOG_B="$WORK_DIR/strict_server_b.log"
-STRICT_MASTER="e2e_strict_master_key_for_testing_1234567"
+STRICT_MASTER="5717c7cccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 STRICT_KEY_1="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
 STRICT_KEY_2="ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
 
@@ -2908,27 +2908,40 @@ check_local "$(echo "$RESP_BODY" | jq -r '.status // "missing"')" "ok" \
     "#28 /health reports status=ok"
 check_local "$(echo "$RESP_BODY" | jq -r '.service // "missing"')" "simply_ip_vault" \
     "#28 /health names the service"
-check_local "$(echo "$RESP_BODY" | jq -r 'if .version then "present" else "missing" end')" "present" \
-    "#28 /health reports a build version"
+# Asserted *absent*: a version string tells an anonymous caller which build is deployed, which is
+# the first thing worth knowing before looking up what that build is vulnerable to.
+check_local "$(echo "$RESP_BODY" | jq -r 'if .version then "present" else "absent" end')" "absent" \
+    "#28 /health discloses no build version"
+check_local "$(echo "$RESP_BODY" | jq -r 'keys | length')" "2" \
+    "#28 the liveness body is exactly two constant fields"
 
 RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" "$BASE_URL/ready")
 RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
 check "200" "#28 GET /ready answers with no credential at all"
 check_local "$(echo "$RESP_BODY" | jq -r '.status // "missing"')" "ready" \
     "#28 /ready reports status=ready once the master is pinned"
-check_local "$(echo "$RESP_BODY" | jq -r '.database // "missing"')" "ok" \
+check_local "$(echo "$RESP_BODY" | jq -r '.database // "missing"')" "up" \
     "#28 /ready confirms the database answered"
-check_local "$(echo "$RESP_BODY" | jq -r '.master_pinned // "missing"')" "true" \
-    "#28 /ready confirms the master identity is pinned"
 
 # A forged credential must be *ignored*, not rejected. An endpoint that merely tolerated a missing
 # header could still branch on a present one, which would put it back behind authentication for
 # exactly the callers most likely to send stale credentials.
-for probe_path in /health /ready; do
+for probe_path in /health /ready /healthz /readyz; do
     RESP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
         -H "X-API-Key: not-a-real-key" -H "X-Timestamp: 0" -H "X-Signature-256: sha256=deadbeef" \
         "$BASE_URL$probe_path")
     check "200" "#28 $probe_path ignores a forged credential rather than rejecting it"
+done
+
+# The Kubernetes-idiomatic aliases must be the *same handler*, not stubs that happen to answer 200.
+# Matching the peer's spellings means one set of manifests works against both services.
+for probe_path in /healthz /readyz; do
+    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" "$BASE_URL$probe_path")
+    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+    check "200" "#28 $probe_path answers"
+    if [ "$probe_path" == "/healthz" ]; then EXPECT="ok"; else EXPECT="ready"; fi
+    check_local "$(echo "$RESP_BODY" | jq -r '.status // "missing"')" "$EXPECT" \
+        "#28 $probe_path returns the real handler's body, not a stub"
 done
 
 # The complement: the probes are the exception, not a hole in the wall. An unsigned request to any
@@ -2944,6 +2957,62 @@ if echo "$RESP_BODY" | grep -qiE "sqlite|\.db|/tmp/|password|secret"; then
 else
     check_local "clean" "clean" "#28 /ready leaks no path, driver, or credential detail"
 fi
+
+
+log_section "29. A weak INITIAL_MASTER_KEY is refused at startup"
+
+# The master key is the one credential that can administer every other credential. The variable used
+# to accept any non-empty string with only a log line objecting — a safeguard that read like one and
+# stopped nothing, since nobody reads a startup warning about the value they just set on purpose.
+#
+# Booted as a throwaway instance on its own port and database, so a refusal here cannot affect the
+# main run. Each case asserts the process **exits**, not merely that it logs.
+WEAKKEY_PORT=$((VAULT_PORT + 64))
+WEAKKEY_DB="$WORK_DIR/weakkey.db"
+WEAKKEY_LOG="$WORK_DIR/weakkey_server.log"
+
+for BAD_KEY in "changeme" "e2e_master_secret_key_for_testing_123456789" "$(printf 'a%.0s' $(seq 1 63))" "$(printf 'a%.0s' $(seq 1 63))g"; do
+    rm -f "$WEAKKEY_DB"
+    DATABASE_URL="sqlite://$WEAKKEY_DB?mode=rwc" RUST_LOG=info \
+        INITIAL_MASTER_KEY="$BAD_KEY" \
+        PORT="$WEAKKEY_PORT" \
+        "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$WEAKKEY_LOG" 2>&1 &
+    WEAK_PID=$!
+    WEAK_EXITED=0
+    for _ in $(seq 1 40); do
+        if ! kill -0 "$WEAK_PID" 2>/dev/null; then WEAK_EXITED=1; break; fi
+        sleep 0.25
+    done
+    if [ "$WEAK_EXITED" -ne 1 ]; then kill "$WEAK_PID" 2>/dev/null; wait "$WEAK_PID" 2>/dev/null; fi
+    check_local "$WEAK_EXITED" "1" "#29 a ${#BAD_KEY}-char INITIAL_MASTER_KEY aborts startup"
+done
+
+# The refusal has to be actionable: an operator reading only this log must know the shape required
+# and how to produce one.
+if grep -q "64 hexadecimal characters" "$WEAKKEY_LOG" && grep -q "openssl rand -hex 32" "$WEAKKEY_LOG"; then
+    check_local "actionable" "actionable" "#29 the refusal states the requirement and the remedy"
+else
+    check_local "unclear" "actionable" "#29 the refusal states the requirement and the remedy"
+fi
+
+# And the control: a well-formed 64-hex key still boots. Without this the section above would pass
+# for a binary that refused every key, including valid ones.
+rm -f "$WEAKKEY_DB"
+GOOD_KEY="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+DATABASE_URL="sqlite://$WEAKKEY_DB?mode=rwc" RUST_LOG=info \
+    INITIAL_MASTER_KEY="$GOOD_KEY" \
+    PORT="$WEAKKEY_PORT" \
+    "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$WEAKKEY_LOG" 2>&1 &
+GOOD_PID=$!
+GOOD_READY=0
+for _ in $(seq 1 60); do
+    if ! kill -0 "$GOOD_PID" 2>/dev/null; then break; fi
+    SC=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$WEAKKEY_PORT/health" 2>/dev/null)
+    if [ "$SC" == "200" ]; then GOOD_READY=1; break; fi
+    sleep 0.5
+done
+check_local "$GOOD_READY" "1" "#29 a well-formed 64-hex INITIAL_MASTER_KEY still boots"
+kill "$GOOD_PID" 2>/dev/null; wait "$GOOD_PID" 2>/dev/null
 
 
 log_section "Summary"

@@ -2,7 +2,7 @@
 //!
 //! Every handler here runs behind [`crate::middleware::auth_middleware`], so it can rely on an
 //! authenticated [`crate::entities::api_key::Model`] and a resolved [`crate::middleware::ClientIp`]
-//! being present in the request extensions. The two exceptions are in [`system`], which is mounted
+//! being present in the request extensions. The two exceptions are in [`health`], which is mounted
 //! outside that layer on purpose. Authorization, by contrast, is per-handler and explicit — see
 //! [`guards`].
 //!
@@ -20,7 +20,7 @@
 //! | [`groups`] | IP group lifecycle and ownership reassignment |
 //! | [`webhooks`] | Webhook *configuration* — the dispatcher itself is [`crate::dispatch`] |
 //! | [`audit`] | Audit log reads |
-//! | [`system`] | Unauthenticated liveness and readiness probes |
+//! | [`health`] | Unauthenticated liveness and readiness probes. **The only unauthenticated routes** |
 //!
 //! **`guards` is one module rather than one per domain on purpose.** The rules in `RBAC_MODEL.md`
 //! are cross-cutting: R2's conjunction governs groups, records and webhooks alike, and §3's
@@ -42,10 +42,10 @@
 mod audit;
 mod groups;
 mod guards;
+mod health;
 mod keys;
 mod records;
 mod support;
-mod system;
 mod webhooks;
 
 // `pub(crate)` rather than `pub` for the two internal modules: every item in `guards` is internal,
@@ -57,9 +57,9 @@ pub(crate) use support::*;
 
 pub use audit::*;
 pub use groups::*;
+pub use health::*;
 pub use keys::*;
 pub use records::*;
-pub use system::*;
 pub use webhooks::*;
 
 // The credential primitives and the shared owner payload are public because the integration suites

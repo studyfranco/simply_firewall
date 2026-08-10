@@ -95,12 +95,22 @@ automatically if present):
 | Variable | Default | Purpose |
 | :--- | :--- | :--- |
 | `DATABASE_URL` | `sqlite://simply_ip_vault.db?mode=rwc` | SeaORM connection string. |
-| `BOOTSTRAP_SUBNET` | `0.0.0.0/0` | `bound_ips` assigned to the auto-generated master key. |
+| `BIND_HOST` / `HOST` | `0.0.0.0` | Address to bind. `BIND_HOST` wins if both are set. |
+| `PORT` | `3000` | Port to bind. |
+| `VAULT_ENCRYPTION_KEY` | *(unset)* | **Exactly 64 hex characters** (32 bytes) — generate with `openssl rand -hex 32`. Encrypts each API key's HMAC `signing_secret` at rest with **XChaCha20-Poly1305**. A malformed value **aborts startup** rather than degrading to plaintext. **Unset means signing secrets are stored in plaintext** — the zero-config development default, warned about at startup. Keep it: losing it makes every existing key unauthenticatable. |
+| `SIGNING_SECRET_KEY` | *(unset)* | Accepted alias for the above, matching the name `simply_hook_executor` uses so one provisioning system can supply both. `VAULT_ENCRYPTION_KEY` wins when both are set. |
+| `TRUSTED_PROXIES` | *(empty)* | Comma-separated CIDRs and/or hostnames permitted to set `X-Forwarded-For`/`X-Real-IP`. **Empty means no proxy is trusted** and forwarding headers are ignored entirely. A malformed entry aborts startup. Behind a reverse proxy this **must** be set, or every request resolves to the proxy's own address. |
+| `BOOTSTRAP_SUBNET` | `0.0.0.0/0,::/0` | `bound_ips` assigned to the auto-generated master key. Both families by default: an IPv4-only value locks you out of a dual-stack deployment on the first request. |
+| `INITIAL_MASTER_KEY` | *(unset)* | Deterministic bootstrap master key, for test/CI only. **Must be exactly 64 hex characters**; anything else aborts startup. Unset is the correct production setting — the service generates a random 256-bit key and prints it once. |
+| `INITIAL_MASTER_SIGNING_SECRET` | *(unset)* | The bootstrap key's HMAC signing secret. Test/CI only, same as above. |
 | `ALLOW_PRIVATE_WEBHOOKS` | `false` | Set to `true` to allow webhook targets on private/loopback/link-local addresses (useful for local testing; leave `false` in production to keep SSRF protection active). |
-| `VAULT_ENCRYPTION_KEY` | *(unset)* | Passphrase (any length) used to encrypt each API key's HMAC `signing_secret` at rest with AES-GCM-256. **Unset means signing secrets are stored in plaintext** — the zero-config development default, warned about at startup. Set it for any real deployment, and keep it: losing it makes every existing key unauthenticatable (they must then be rotated). |
+| `IP_RETENTION_DAYS` | `92` | How long a soft-deleted IP record is kept before the purge worker removes it. |
+| `IP_RETENTION_SWEEP_SECONDS` | `3600` | Interval between purge sweeps. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter, e.g. `debug`, `simply_ip_vault=debug`. |
 
-The listen address is currently fixed at `0.0.0.0:3000`.
+Three of these abort startup rather than falling back when malformed — `VAULT_ENCRYPTION_KEY`,
+`TRUSTED_PROXIES`, and `INITIAL_MASTER_KEY`. Each configures a security boundary, and the only
+alternative to refusing is silently applying a boundary different from the one you wrote down.
 
 ### Docker
 
@@ -123,21 +133,29 @@ endpoints in the service:
 
 | Route | Meaning |
 | :--- | :--- |
-| `GET /health` | **Liveness.** `200` whenever the process is answering. Touches no dependency. |
-| `GET /ready` | **Readiness.** `200` when the database answers *and* the Master identity is pinned; `503` otherwise, naming which check failed but never why. |
+| `GET /health` (`/healthz`) | **Liveness.** `200` whenever the process is answering. Touches no dependency. |
+| `GET /ready` (`/readyz`) | **Readiness.** `200` when the database answers *and* the Master identity is pinned; `503` otherwise. |
+
+The `z` spellings are the Kubernetes-idiomatic aliases and are the same handlers, matching
+`simply_hook_executor` so one set of manifests works against both services.
 
 They are unauthenticated because the callers — Docker's `HEALTHCHECK`, a Kubernetes probe, a load
 balancer — cannot compute an HMAC over a body with a rolling timestamp, and minting a long-lived key
-for the platform to hold would be the worse trade. Neither returns data, an error detail, or anything
-naming a key, group, or record.
+for the platform to hold would be the worse trade. Requiring a credential would also make the probe
+fail exactly when the credential store is what broke.
+
+Because they are public they disclose as little as possible: no data, no counts, no names, **no build
+version**, and never the underlying error. A failing `/ready` reports `"database":"down"` and nothing
+more; the driver message goes to the log, where an operator can read it and an anonymous caller
+cannot.
 
 Keep them apart when wiring an orchestrator. A liveness probe that checked the database would make a
 dependency outage trigger repeated container *restarts* — replacing a partial outage with a crash
 loop. The bundled `Dockerfile` and `docker-compose.yml` probe `/ready`.
 
 ```bash
-curl -s http://127.0.0.1:3000/health   # {"status":"ok","service":"simply_ip_vault","version":"0.1.0"}
-curl -s http://127.0.0.1:3000/ready    # {"status":"ready","database":"ok","master_pinned":true}
+curl -s http://127.0.0.1:3000/health   # {"status":"ok","service":"simply_ip_vault"}
+curl -s http://127.0.0.1:3000/ready    # {"status":"ready","database":"up"}
 ```
 
 ### Authenticated routes
@@ -284,7 +302,7 @@ src/
 │   ├── mod.rs           module wiring and flat re-exports — no executable code
 │   ├── support.rs       plumbing used by three or more domains; decides nothing
 │   ├── guards.rs        every authorization decision, and nothing else
-│   ├── system.rs        unauthenticated /health and /ready probes
+│   ├── health.rs        unauthenticated /health and /ready probes
 │   ├── keys.rs          API key identity, lifecycle, rotation, permission grants
 │   ├── records.rs       ban/whitelist, listing, soft delete, restore, purge
 │   ├── groups.rs        IP Group CRUD and owner reassignment

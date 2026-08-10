@@ -146,17 +146,32 @@ convergence script forbids any `==` on a signature, MAC, or digest anywhere in `
 ### `src/config.rs` — environment parsing and client-address resolution
 
 **Role & scope.** `TrustedProxies` (CIDR/hostname parsing, DNS resolution with TTLs and a boot grace
-period), `resolve_client_ip` (the `X-Forwarded-For` chain walk), `normalize_ip`, bind-address parsing.
+period), `resolve_client_ip` (the `X-Forwarded-For` chain walk), `normalize_ip`, bind-address parsing,
+and `validate_initial_master_key`.
 
-**Must not hold** anything requiring a database or application state.
+**Must not hold** anything requiring a database or application state. Every function here is pure
+enough to unit-test without a process, which is why the master-key rule lives here rather than inline
+in `main.rs` — the branch that refuses a weak credential is worth being able to test directly.
 
 **Key exports.** `TrustedProxies`, `ProxyMatcher`, `InvalidTrustedProxies`, `resolve_client_ip`,
-`normalize_ip`, `is_trusted`, `resolve_bind_addr`, `parse_bind_addr`, `parse_trusted_proxies`.
+`normalize_ip`, `is_trusted`, `resolve_bind_addr`, `parse_bind_addr`, `parse_trusted_proxies`,
+`validate_initial_master_key`, `InvalidInitialMasterKey`, `INITIAL_MASTER_KEY_ENV`,
+`MASTER_KEY_HEX_LEN`.
 
 **Rationale.** The chain walk is meant to be character-for-character identical to the peer's, and
 `verify_convergence.sh` diffs it: a difference means one service trusts an address the other would
 not. Walked right-to-left skipping trusted hops, which is what makes a client-supplied prefix
 unforgeable. An unresolvable hostname disables *that entry only* and never the service.
+
+`MASTER_KEY_HEX_LEN = 64` is not a policy number picked here — it is exactly what
+`api::generate_random_key` emits, so the rule demands of an operator precisely what the service
+demands of itself, and a unit test asserts that correspondence rather than restating the constant. The
+refusal is fatal: `INITIAL_MASTER_KEY` accepted any non-empty string until Session 44, with a startup
+warning as its only objection, and the credential it guards is the one that administers every other
+credential.
+
+> **Deliberate divergence.** `simply_hook_executor` accepts any non-empty `INITIAL_MASTER_KEY`. This
+> service is stricter on purpose.
 
 ### `src/replay.rs` — anti-replay guard
 
@@ -287,27 +302,39 @@ once. `format_key_reference` came from `guards.rs` in Session 42: it renders a s
 decides nothing, and five of its seven call sites were already outside that module. Closes proposal
 **P2**. Mirrors `simply_hook_executor::api::support`.
 
-### `src/api/system.rs` — unauthenticated liveness and readiness probes
+### `src/api/health.rs` — unauthenticated liveness and readiness probes
 
-**Role & scope.** `health_check` (`GET /health`) and `readiness_check` (`GET /ready`). The only two
-endpoints in the service that answer without a credential.
+**Role & scope.** `health_check` (`GET /health`, `/healthz`) and `readiness_check` (`GET /ready`,
+`/readyz`). The only endpoints in the service that answer without a credential.
 
-**Must not hold** anything that returns data, names a resource, or reports an error in detail. Both
-handlers are reachable by anyone who can open a socket.
+**Must not hold** anything that returns data, names a resource, discloses a build identifier, or
+reports an error in detail. Both handlers are reachable by anyone who can open a socket, so they are
+held to a rule the authenticated routes are not: **disclose nothing an anonymous caller could not
+already infer.**
 
 **Key exports.** `health_check`, `readiness_check`.
 
 **Rationale.** Mounted in `lib.rs` on the **root** router, outside the `/api` nest and therefore
 outside `auth_middleware` — the callers are Docker's `HEALTHCHECK`, a Kubernetes probe and a load
-balancer, none of which can compute an HMAC over a body with a rolling timestamp. The convergence
+balancer, none of which can compute an HMAC over a body with a rolling timestamp. Requiring a
+credential would make the probe fail exactly when the credential store is what broke. The convergence
 script asserts that placement, because moving them inside the nest would make them uncallable in a way
 that looks like a broken healthcheck rather than a misplaced route.
 
-Liveness and readiness are kept apart deliberately. `/health` touches nothing; `/ready` proves the
-database answers and the Master identity is pinned. An orchestrator *restarts* a container whose
-liveness probe fails, so a liveness check that consulted the database would turn a dependency outage
-into an unbounded restart loop. A failing `/ready` names which check failed and never why — the driver
-error goes to the log, where an operator can read it and an anonymous caller cannot.
+Liveness and readiness are kept apart deliberately. `/health` takes no `State` at all — the compiler,
+not a comment, is what stops it depending on the database — while `/ready` proves the database answers
+and the Master identity is pinned. An orchestrator *restarts* a container whose liveness probe fails,
+so a liveness check that consulted the database would turn a dependency outage into an unbounded
+restart loop.
+
+Named `health.rs` to match the peer. It was `system.rs` until the Session 44 parity audit, which is
+the peer's name for a *different* module — its effective-configuration endpoint — so the old name was
+actively misleading rather than merely different.
+
+> **Deliberate divergences.** The peer probes with a literal `SELECT 1`; this service uses a typed
+> SeaORM query, because `verify_convergence.sh` bans raw SQL for DML anywhere in `src/` and an
+> allowlisted exception would be a hole in a gate worth more than one saved query. The peer also does
+> not check the Master pin. Both make this side stricter.
 
 ### `src/api/guards.rs` — every authorization decision
 

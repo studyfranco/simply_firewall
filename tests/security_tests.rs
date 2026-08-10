@@ -3698,7 +3698,16 @@ async fn health_check_answers_an_unauthenticated_caller() {
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ok");
     assert_eq!(json["service"], "simply_ip_vault");
-    assert!(json["version"].is_string(), "the build version is reported: {json}");
+    // No version string. It told an anonymous caller which build is deployed — the first thing
+    // worth knowing before looking up what that build is vulnerable to — on a route designed to be
+    // polled by machines. Asserted as *absent* so it cannot be reintroduced as a convenience.
+    assert!(json.get("version").is_none(), "a public probe must not disclose the build: {json}");
+    assert_eq!(
+        json.as_object().map(serde_json::Map::len),
+        Some(2),
+        "the liveness body is exactly two constant fields; anything varying with runtime state \
+         can leak it: {json}"
+    );
 }
 
 /// `GET /health` does not depend on the database — the distinction that keeps a database outage
@@ -3748,8 +3757,7 @@ async fn readiness_check_answers_an_unauthenticated_caller_when_the_service_can_
     let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "ready");
-    assert_eq!(json["database"], "ok");
-    assert_eq!(json["master_pinned"], true);
+    assert_eq!(json["database"], "up");
 }
 
 /// `GET /ready` answers `503` while no master identity is pinned.
@@ -3772,7 +3780,13 @@ async fn readiness_check_refuses_while_no_master_is_pinned() {
     let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(json["status"], "unavailable");
-    assert_eq!(json["reason"], "master identity not pinned");
+    // The body reports the *database* dimension only. An unpinned master leaves it "up" — honest,
+    // and it does not tell an anonymous caller which internal check refused.
+    assert_eq!(json["database"], "up");
+    assert!(
+        json.get("reason").is_none(),
+        "a failing public probe must not name the check that failed: {json}"
+    );
 }
 
 /// `GET /ready` answers `503` when the database is unreachable, and leaks nothing about why.
@@ -3795,7 +3809,7 @@ async fn readiness_check_refuses_when_the_database_is_unreachable_without_leakin
 
     let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
-    assert!(text.contains("database unreachable"), "the failing check is named: {text}");
+    assert!(text.contains("\"database\":\"down\""), "the database dimension is reported: {text}");
     assert!(
         !text.contains("sqlite") && !text.contains("Connection") && !text.contains("pool"),
         "the underlying error must stay in the log, not the response body: {text}"
@@ -3819,7 +3833,8 @@ async fn the_probes_bypass_authentication_and_nothing_else_does() {
     insert_master_key(&db, "The Master").await;
     state.master_pin.pin_at_boot(&state.db).await.expect("the master pins");
 
-    for path in ["/health", "/ready"] {
+    // All four spellings, including the Kubernetes-idiomatic `z` aliases that mirror the peer.
+    for path in ["/health", "/ready", "/healthz", "/readyz"] {
         let req = Request::builder()
             .uri(path)
             .header("X-API-Key", "not-a-real-key")
@@ -3832,6 +3847,14 @@ async fn the_probes_bypass_authentication_and_nothing_else_does() {
             StatusCode::OK,
             "{path} must ignore a forged credential rather than reject it — it never authenticates"
         );
+
+        // And the alias is the same handler, not a stub that merely returns 200.
+        let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let expected = if path.starts_with("/health") { "ok" } else { "ready" };
+        assert_eq!(json["status"], expected, "{path} answers with the real handler's body");
     }
 
     let req = inject_connect_info(Request::builder().uri("/api/audit-logs"))

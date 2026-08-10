@@ -6346,3 +6346,173 @@ being clean) hold either way.
 
 No file under `src/` was modified this session; the changes are `tests/schema_integrity_tests.rs`,
 `FILE_MAP.MD` and this log.
+
+---
+
+## Session 44 — Security remediation, and a parity audit against the peer's new modules
+
+Five tasks. **Three were already implemented** and are recorded as verified rather than redone; two
+were real work. The parity audit then found four genuine divergences, three of which were fixed.
+
+### 1. What was already done (verified, not re-implemented)
+
+| Task | State | Evidence |
+| :--- | :--- | :--- |
+| §5 engine-generated `master_marker` | **Done** (Session ~39) | `m20260808_000009_derive_master_marker.rs` emits `INTEGER GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` with `STORED` on Postgres and `VIRTUAL` elsewhere |
+| No application write of `master_marker` | **Done** | `grep` across `src/` finds only doc comments; `api_key::Model` deliberately omits the field, so `ActiveModel` has no slot to assign |
+| `s5_` adversarial tests | **Done** | four `s5_*` tests, including one that inserts a second master via raw SQL *without* naming the marker |
+| XChaCha20-Poly1305 | **Done** | `chacha20poly1305 0.11` in `Cargo.toml`, no `aes-gcm`, `NONCE_LEN = 24`, plus `the_retired_aes_gcm_format_is_no_longer_readable` |
+| 64-hex validation of the **encryption** key | **Done** | `SecretCipher::from_hex_key` refuses anything but 32 decoded bytes, and it is fatal at startup |
+
+The brief named a report file `SECURITY_COMPARISON_REPORT_ip_vault.md`; the repository has
+`SECURITY_COMPARISON_REPORT.md`. Read the latter; no file by the first name exists.
+
+### 2. Task 1 — strict `INITIAL_MASTER_KEY` validation *(real work)*
+
+The genuine gap. `VAULT_ENCRYPTION_KEY` was already strictly validated; **`INITIAL_MASTER_KEY` was
+not**. It accepted any non-empty string, with a startup warning as its only objection — and that
+warning already said the right thing ("a human-chosen, low-entropy secret defeats the point of
+generating a random 256-bit key") and then let it through. A control that reads like a safeguard and
+stops nothing is worse than none, because it is counted as coverage. Nobody reads a startup warning
+about a value they set on purpose.
+
+`config::validate_initial_master_key` now requires exactly 64 ASCII hex characters and is **fatal**.
+Placed in `config.rs` rather than inline in `main.rs` so the branch that refuses a weak credential is
+directly unit-testable.
+
+`MASTER_KEY_HEX_LEN = 64` is not a policy number chosen here: it is exactly what
+`api::generate_random_key` emits (`[u8; 32]`, hex-encoded). A unit test asserts that correspondence
+over 64 generated keys rather than restating the constant — if the two ever drift, a service-generated
+key would boot while an identically-shaped operator-supplied one was refused, which is a rule the
+service does not follow itself and the kind of inconsistency that gets "fixed" by deleting the check.
+
+**Implemented as a fatal `Result`, not `panic!`.** The brief said "hard startup error (panic)"; the
+effect is identical — the process refuses to start, before binding — and every other startup refusal
+in this codebase (`StartupConfigError`, `MasterPinError`) is a propagated error with an operator-facing
+message. A `panic!` would have printed a backtrace instead of the remedy.
+
+**A bug the tests caught.** The first version propagated the error with a bare `?`. `main` returns
+`Box<dyn Error>`, which the runtime renders with **`Debug`** — so the operator would have seen
+`InvalidInitialMasterKey { got: 8, detail: "..." }` and lost the entire message, remedy included. The
+e2e check "the refusal states the requirement and the remedy" failed on exactly that. Now logged
+before it is returned, matching the master-pin refusal.
+
+Three e2e fixtures (`MASTER_KEY`, `DEADNS_MASTER`, `STRICT_MASTER`) were 43-, 43- and 41-character
+non-hex strings and had to become real 64-hex keys — which is itself the point: the suite had been
+booting the service with exactly the sort of key this rule now refuses.
+
+### 3. Task 5 — parity audit against `simply_hook_executor`
+
+The peer has grown `src/api/health.rs`, `src/api/audit.rs` and `src/api/system.rs` since the Session 41
+audit. Four divergences found.
+
+**(a) Module name — fixed.** Our probes were in `src/api/system.rs`; the peer's are in
+`src/api/health.rs`, and `system.rs` is the peer's name for a **different** module (its
+effective-configuration endpoint). The old name was actively misleading, not merely different. Renamed
+via `git mv`; module declarations and re-exports re-sorted alphabetically.
+
+**(b) `/healthz` and `/readyz` — fixed.** The peer mounts the Kubernetes-idiomatic aliases; we did
+not. An operator writing one set of manifests for both services should not have to remember which of
+the pair answers which spelling. Added, with an e2e check that each alias returns the *real handler's
+body* rather than a stub that happens to answer `200`.
+
+**(c) `/health` disclosed a build version — fixed, and it is a security fix.** Ours returned
+`{"status","service","version"}`. The peer's module doc makes the argument plainly: a public probe
+that leaks a version string is a free reconnaissance endpoint, and the version is the first thing
+worth knowing before looking up what that build is vulnerable to. Removed. The test now asserts the
+field is **absent** and that the body has exactly two fields, so it cannot return as a convenience;
+`verify_convergence.sh` asserts the same structurally.
+
+**(d) Readiness body vocabulary — aligned.** Ours reported `"database":"ok"` plus
+`"master_pinned":true`, and on failure a `"reason"` naming which check failed. Now
+`{"status":"ready","database":"up"}` / `{"status":"unavailable","database":"up"|"down"}`, matching the
+peer exactly. The master-pin check is **kept** — it is stricter than the peer — but it is no longer
+described to an anonymous caller. The failing check goes to the log.
+
+**Naming parity — clean.** `health_check`, `readiness_check`, `generate_signing_secret`,
+`canonical_v1_payload`, `compute_signature`, `verify_signature`, `SIGNATURE_PREFIX`,
+`apply_sqlite_pragmas`, `MasterPin::{pin_at_boot, resolve, authenticate, pinned_to}` — all identical
+across both services. No renames needed.
+
+**Cryptography isolation — clean.** All of it is in `src/crypto.rs` on both sides, including
+`generate_signing_secret`, which the peer moved there and explicitly declines to re-export from
+`api/support.rs`. That closes Session 41's proposal **P6** in our favour: the peer converged to our
+placement.
+
+**Two divergences deliberately kept.**
+
+- **Extractors.** `StrictJson`/`OptionalStrictJson` live in our `src/extract.rs`; the peer keeps them
+  in `api/support.rs`. **Recommend no change.** These are a `RBAC_MODEL.md` §5 type-level control, and
+  `support.rs` is documented as "shared plumbing that decides nothing". Converging would bury a named
+  specification control inside a helper module — a worse outcome than the divergence.
+- **Readiness probe query.** The peer issues a literal `SELECT 1`, allowlisted in its own hygiene
+  test. We use a typed SeaORM query, because `verify_convergence.sh` bans raw SQL for DML anywhere in
+  `src/`, and an allowlisted exception would be a hole in a gate worth more than one saved query.
+
+**One missing concept, unchanged.** The peer's `api/system.rs::get_settings` (master-only
+effective-configuration readback) has no equivalent here. Recorded, not built — it is a feature, not a
+parity defect.
+
+### 4. Task 4 — convergence script hardening
+
+Nine new assertions. Each was verified by planting the regression it exists to catch and confirming
+it fails:
+
+| Assertion | Planted regression | Caught |
+| :--- | :--- | :--- |
+| `chacha20poly1305` is a declared dependency | swapped for `aes-gcm` in `Cargo.toml` | ✓ |
+| `aes-gcm` is **not** a dependency | same | ✓ |
+| master key must be 64 hex | `MASTER_KEY_HEX_LEN = 8` | ✓ |
+| the rule checks the alphabet | `is_ascii_hexdigit` → `true` | ✓ |
+| startup validates the key | call deleted from `main.rs` | ✓ |
+| `api_key::Model` does not model the marker | added `pub master_marker` to the entity | ✓ |
+| no raw DML names `master_marker` | — (clean) | n/a |
+| no public probe discloses the build | re-added `"version": env!(...)` | ✓ |
+| `/healthz` alias present | route deleted | ✓ |
+
+The entity assertion is the one worth calling out. `master_marker: Set(` was already banned, but that
+pattern only catches a spelling; the *field on the model* is what would make that spelling compile
+again. SeaORM cannot build a write for a column the model does not know about, so the absence of the
+field is what makes "nobody writes it" a guarantee rather than a convention — and reintroducing it
+would look like a routine entity sync.
+
+**The peer converged on SQLite pragmas.** `verify_convergence.sh` previously reported 1 documented
+divergence (we applied 4 pragmas, the peer 2). The peer now applies all four, including
+`foreign_keys(true)`, so `apply_sqlite_pragmas` is byte-identical and the divergence is gone. The run
+is now **62 matching, 0 divergences, 0 unexplained** — checked that this is real convergence and not a
+dropped assertion.
+
+### 5. Documentation corrections
+
+The README's configuration table was materially wrong and would have misled an operator:
+
+- `VAULT_ENCRYPTION_KEY` was documented as a "**Passphrase (any length)**" using "**AES-GCM-256**".
+  Both were false — it requires exactly 64 hex characters and uses XChaCha20-Poly1305, and a
+  passphrase now aborts startup. An operator following the README would have had a service that
+  refused to boot.
+- "The listen address is currently fixed at `0.0.0.0:3000`" — `BIND_HOST`/`HOST`/`PORT` have been
+  configurable for several sessions.
+- `TRUSTED_PROXIES`, `IP_RETENTION_DAYS`, `IP_RETENTION_SWEEP_SECONDS`, `SIGNING_SECRET_KEY`,
+  `INITIAL_MASTER_KEY` and `INITIAL_MASTER_SIGNING_SECRET` were absent entirely, including two that
+  abort startup and one that governs a trust boundary.
+- `BOOTSTRAP_SUBNET`'s default was listed as `0.0.0.0/0`; it is `0.0.0.0/0,::/0`.
+
+### 6. Verification
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **248 passed**, 0 failed (244 before; +4 master-key unit tests) |
+| `./scripts/test_e2e.sh` | **516 passed**, 0 failed (504 before; +6 alias/body checks in §28, +6 in the new §29) |
+| `./scripts/verify_convergence.sh` | exit 0 — **62 matching, 0 divergences, 0 unexplained** |
+| `git diff RBAC_MODEL.md` | empty |
+
+### 7. Final audit summary
+
+Strict parity holds on everything that should be identical: the specification (byte-identical
+`RBAC_MODEL.md`), the shared security primitives (proxy chain walk, cipher, signature verification,
+replay guard, SQLite pragmas — all byte-identical function bodies), module layout, and public function
+names. The four remaining differences are each a deliberate, recorded, one-way choice — `extract.rs`
+placement, the typed readiness query, the Master-pin readiness check, and strict `INITIAL_MASTER_KEY`
+validation — and in every case this service is the stricter of the two. Nothing diverges by accident.

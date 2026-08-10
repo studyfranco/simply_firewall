@@ -66,8 +66,21 @@ async fn bootstrap_master_key(
         return Ok(());
     }
 
-    let plaintext_key = match std::env::var("INITIAL_MASTER_KEY") {
+    let plaintext_key = match std::env::var(simply_ip_vault::config::INITIAL_MASTER_KEY_ENV) {
         Ok(fixed_key) if !fixed_key.is_empty() => {
+            // Strict, and fatal. Until this check existed the variable accepted any non-empty
+            // string, with the warning below as the only objection — a safeguard that reads like
+            // one and stops nothing. See `config::validate_initial_master_key`.
+            //
+            // Logged before it is returned, and that is not decoration. `main` returns
+            // `Box<dyn Error>`, which the runtime renders with **`Debug`** — so propagating this
+            // alone would print `InvalidInitialMasterKey { got: 8, detail: "..." }` and throw away
+            // the entire operator-facing message, remedy included. An e2e check caught exactly that.
+            // Same shape as the master-pin refusal further down, for the same reason.
+            simply_ip_vault::config::validate_initial_master_key(&fixed_key).map_err(|e| {
+                tracing::error!("Refusing to start: {e}");
+                e
+            })?;
             tracing::warn!(
                 "INITIAL_MASTER_KEY is set: using the provided value as the master key instead \
                  of generating a random one. This is intended for deterministic test/CI bootstrap \
