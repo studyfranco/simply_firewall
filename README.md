@@ -235,6 +235,44 @@ call DELETE "/api/ips?target_address=192.168.1.100&group_name=fail2ban"
 call POST /api/keys '{"name": "ci-bot", "bound_ips": "10.0.0.0/8", "can_create_groups": true}'
 ```
 
+## Project structure
+
+```
+src/
+├── main.rs              process entry point: startup order, graceful shutdown, master bootstrap
+├── lib.rs               router assembly (create_app), state wiring, body-limit constant
+├── db.rs                pool construction, SQLite session pragmas, migration execution
+├── state.rs             AppState, WebhookEvent, and the boot-time Master-identity pin
+├── middleware.rs        authentication: HMAC, anti-replay, bound_ips, Master-pin enforcement
+├── crypto.rs            at-rest cipher (XChaCha20-Poly1305) and CANONICAL_V1 request signing
+├── config.rs            env parsing, trusted proxies, X-Forwarded-For chain walk
+├── replay.rs            anti-replay guard (monotonic expiry)
+├── extract.rs           StrictJson — deserialization failures as typed API errors
+├── error.rs             AppError and its HTTP rendering
+├── webhooks.rs          outbound dispatch worker (the sender)
+├── retention.rs         background purge of expired soft-deleted records
+├── api/                 HTTP handlers, split by domain, re-exported flat
+│   ├── mod.rs           module wiring + helpers used by more than one domain
+│   ├── guards.rs        every authorization decision, and nothing else
+│   ├── keys.rs          API key identity, lifecycle, rotation, permission grants
+│   ├── records.rs       ban/whitelist, listing, soft delete, restore, purge
+│   ├── groups.rs        IP Group CRUD and owner reassignment
+│   ├── webhooks.rs      webhook config CRUD (the configuration surface)
+│   └── audit.rs         audit log listing (master-only)
+├── entities/            SeaORM models, one per table
+└── migration/           ordered schema migrations (immutable once applied)
+```
+
+Two pairs of names are worth disambiguating before reading:
+
+- **`src/webhooks.rs` vs `src/api/webhooks.rs`** — the first is the background worker that *sends*
+  webhooks; the second is the CRUD surface that *configures* them.
+- **`src/middleware.rs` vs `src/api/guards.rs`** — the first answers "who is calling, and may they
+  call at all"; the second answers "may this caller touch *this* resource".
+
+`FILE_MAP.MD` documents every file's role, its primary exports, and the reasoning behind its
+boundaries — including what each file must deliberately *not* contain.
+
 ## Development
 
 ```bash
@@ -247,7 +285,9 @@ Integration tests live in `tests/` and spin up a fresh in-memory SQLite database
 external services required.
 
 See `AGENT.MD` for the full architectural/security ruleset this project is built and audited
-against, `SCHEMA.MD` for the database schema, and `AGENT_NOTES.MD` for the running audit worklog.
+against, `FILE_MAP.MD` for a file-by-file map of `src/`, `SCHEMA.MD` for the database schema,
+`RBAC_MODEL.md` for the normative authorization specification (shared byte-identically with
+`simply_hook_executor`), and `AGENT_NOTES.MD` for the running audit worklog.
 
 ## License
 

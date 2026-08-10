@@ -5904,3 +5904,194 @@ checks.
 | `./scripts/test_e2e.sh` | **492 passed, 0 failed** |
 | `./scripts/verify_convergence.sh` | **exit 0** |
 | `git diff RBAC_MODEL.md` | **empty** |
+
+---
+
+## Session 41 — Structural & Functional Distribution Audit vs `simply_hook_executor`
+
+Read-only analysis plus documentation. **No file under `src/` was modified.** `RBAC_MODEL.md`
+untouched; Pillar 0 byte-identity active and passing.
+
+Deliverables: `FILE_MAP.MD` (new), `README.md` (new "Project structure" section — it previously had
+none), and this report.
+
+### 0. Two corrections to the brief's premises
+
+Both were checked against the peer tree before any analysis was built on them.
+
+| Brief says | Actual |
+| :--- | :--- |
+| peer has `system.rs`, `support.rs` | They exist, but under **`src/api/`**, not top level |
+| peer has `extract.rs` | **No such file.** The peer's `StrictJson` lives in `src/api/support.rs` |
+
+### 1. Size comparison
+
+| | `simply_ip_vault` | `simply_hook_executor` |
+| :--- | ---: | ---: |
+| `src/` total | 10,968 | 8,588 |
+| largest file | `api/keys.rs` 1,372 | `executor.rs` 1,389 |
+| `api/mod.rs` | **267** | **85** |
+| `state.rs` | **330** | **80** |
+| `crypto.rs` | 839 | 344 |
+| dedicated `master.rs` | — | 291 |
+| dedicated `api/support.rs` | — | 399 |
+
+The two outliers — `api/mod.rs` at 3.1× and `state.rs` at 4.1× the peer's — are the audit's principal
+finding, and both have the same cause: this service has no `support.rs` and no `master.rs`, so that
+code lives in the nearest general-purpose module instead.
+
+### 2. Comparative Function & Responsibility Matrix
+
+| Capability | `simply_ip_vault` | `simply_hook_executor` | Category |
+| :--- | :--- | :--- | :--- |
+| Router assembly | `lib.rs::create_app` | `lib.rs::create_app` | ✅ Identical |
+| Body-limit constant | `lib.rs::MAX_REQUEST_BODY_BYTES` | same | ✅ Identical |
+| Graceful shutdown | `main.rs::shutdown_signal` | `main.rs::shutdown_signal` | ✅ Identical |
+| Master bootstrap | `main.rs::bootstrap_master_key` | `main.rs` | ✅ Identical |
+| Pool + pragmas + migrations | `db.rs` | `db.rs` | ✅ Identical |
+| Auth middleware | `middleware.rs::auth_middleware` | `middleware.rs::auth_middleware` | ✅ Identical |
+| Anti-replay | `replay.rs::ReplayGuard` | `replay.rs::ReplayGuard` | ✅ Identical |
+| Proxy / client-IP resolution | `config.rs::resolve_client_ip` | `config.rs::resolve_client_ip` | ✅ Identical |
+| At-rest cipher | `crypto.rs::SecretCipher` | `crypto.rs::SecretCipher` | ✅ Identical |
+| Retention worker | `retention.rs::run_retention_worker` | `retention.rs::run_retention_worker` | ✅ Identical |
+| Authorization guards | `api/guards.rs` | `api/guards.rs` | ✅ Identical |
+| Per-domain handlers | `api/{keys,records,groups,webhooks}.rs` | `api/{keys,hooks,executions}.rs` | ✅ Identical pattern |
+| Audit log endpoint | `api/audit.rs` | `api/system.rs` | ⚠️ Different host |
+| **`StrictJson` extractor** | **`extract.rs`** (top level) | **`api/support.rs`** | ⚠️ Misplacement |
+| **`generate_random_key`, `hash_key`** | **`api/mod.rs`** | **`api/support.rs`** | ⚠️ Misplacement |
+| **`create_audit_log`** | **`api/mod.rs`** | **`api/support.rs`** | ⚠️ Misplacement |
+| **`normalize_ip_or_cidr`** | **`api/mod.rs`** | (n/a — no IP domain) | ⚠️ Misplacement |
+| **`format_key_reference`** | `api/guards.rs` | `api/support.rs::format_reference` | ⚠️ Misplacement |
+| `generate_signing_secret` | `crypto.rs` | `api/support.rs` | ⚠️ Different host |
+| Group/hook resolution helpers | `api/mod.rs` | `api/support.rs::resolve_hook` | ⚠️ Misplacement |
+| **Master pin type** | **`state.rs`** (fields + 3 methods) | **`master.rs::MasterPin`** | ❌ Missing module |
+| **Master pin error** | **`state.rs::MasterPinError`** | **`master.rs::MasterPinError`** | ❌ Missing module |
+| **Master demotion at auth** | **inline in `middleware.rs`** | **`MasterPin::authenticate`** | ❌ Missing module |
+| **Test-only pinned master** | — (lazy resolution instead) | `MasterPin::pinned_to`, `AppState::with_pinned_master` | ❌ Missing concept |
+| **Settings endpoint** | — | `api/system.rs::get_settings` | ❌ Missing concept |
+| Validators (`validate_bound_ips`, …) | inline per handler | `api/support.rs` | ⚠️ Misplacement |
+| `OptionalStrictJson` | — (hand-parsed body in `delete_api_key`) | `api/support.rs` | ❌ Missing concept |
+| Execution engine | `webhooks.rs` (dispatch) | `executor.rs` (process spawn) | ✅ Domain-appropriate |
+| `TooManyRequests` error | — | `error.rs` | ❌ Missing variant |
+| `ConflictWithDetails` error | `error.rs` | — | ➕ Vault-only (§6) |
+| **Health / readiness / version** | **absent** | **absent** | ⚖️ Shared gap |
+
+### 3. Infrastructure & health handlers — a shared gap, not an asymmetry
+
+The brief asked where healthchecks, readiness probes and version endpoints live. **Neither service has
+any.** No `/health`, `/healthz`, `/ready`, `/livez`, `/version`, or `/metrics` route exists in either
+tree; grepping both for route literals and handler names returns nothing.
+
+What *does* exist, identically in both: graceful shutdown via `main.rs::shutdown_signal` (Ctrl+C plus
+SIGTERM on Unix, with an unregisterable signal left pending forever rather than treated as "shut down
+now"), wired through `axum::serve(...).with_graceful_shutdown(...)`.
+
+This is worth recording as a finding in its own right: a container orchestrator has nothing to probe
+in either service, and `docker-compose.yml` cannot express a meaningful healthcheck today.
+
+### 4. Divergence categorization
+
+**✅ Identical Alignment (11 capabilities).** Everything security-critical that
+`verify_convergence.sh` already tracks — proxy resolution, cryptography, pipeline ordering, replay,
+retention, pragmas — plus router assembly, shutdown, and the `api/guards.rs` split. The two services
+agree on structure exactly where agreement is load-bearing.
+
+**⚠️ Functional Misplacement (8).** All of one shape: this service has no `api/support.rs`, so shared
+helpers accumulate in `api/mod.rs` (267 lines against the peer's 85, which is pure wiring). The peer's
+`api/mod.rs` declares modules and re-exports; ours declares modules, re-exports, **and** holds key
+generation, hashing, address normalisation, audit-log writing, group resolution, and a shared DTO.
+
+`extract.rs` is the interesting sub-case: it is not *wrong* — a top-level extractor module is arguably
+cleaner than burying `StrictJson` in `api/support.rs` — but it means the two services put the same
+type in different places, and neither is tracked by the convergence script.
+
+**❌ Missing Module / Concept (6).** The significant one is `master.rs`. Both services implemented
+boot-time Master pinning, and both did it correctly, but the peer factored it into a **type**
+(`MasterPin` with `new`, `pinned_to`, `get`, `pin_at_boot`, `resolve`, `authenticate`) while this
+service spread the same logic across `state.rs` (state + error + three methods) and `middleware.rs`
+(the demotion, written inline).
+
+The peer's shape is better in two concrete ways:
+
+1. `MasterPin::authenticate(&self, db, key: &mut Model)` encapsulates the demotion. Ours is ~15 lines
+   inline in `auth_middleware`, correct but reproducible only by remembering to write it.
+2. `MasterPin::pinned_to(id)` + `AppState::with_pinned_master(id)` let a test construct a pin fixed to
+   an arbitrary id, which makes the *negative* case cheap to assert: what a key does when it claims
+   mastery and is not the pinned identity. This service reaches that state by dropping the unique
+   index and inserting a second master — which works, and is a much longer setup.
+
+### 5. Prioritized non-destructive refactoring proposal
+
+Every item is a **move**, not a rewrite. None changes behaviour, and each is independently
+committable. Ordered by value-to-risk.
+
+#### P1 — Extract `src/master.rs` *(high value, low risk)*
+
+Move from `state.rs`: `MasterPinError`, `MASTER_MARKER_INDEX`, and the pin logic, behind a `MasterPin`
+type mirroring the peer's. Move the demotion out of `middleware.rs` into `MasterPin::authenticate`.
+
+| From | To |
+| :--- | :--- |
+| `state.rs::MasterPinError` | `master.rs::MasterPinError` |
+| `state.rs::MASTER_MARKER_INDEX` | `master.rs::MASTER_MARKER_INDEX` |
+| `state.rs::AppState::pin_master_key` | `master.rs::MasterPin::pin_at_boot` |
+| `state.rs::AppState::resolve_master_key_id` | `master.rs::MasterPin::resolve` |
+| `state.rs::AppState::is_effective_master` | folded into `MasterPin::authenticate` |
+| `middleware.rs` demotion block (~15 lines) | `master.rs::MasterPin::authenticate` |
+| — (new) | `master.rs::MasterPin::pinned_to` for tests |
+
+Brings `state.rs` from 330 to roughly 130 lines and makes the §5 identity control reviewable in one
+file. **Requires updating `verify_convergence.sh`**, which currently asserts `fn pin_master_key` in
+`src/state.rs` and `is_effective_master` in `src/middleware.rs`; both assertions must follow the code
+or they will pass vacuously.
+
+#### P2 — Extract `src/api/support.rs` *(high value, low risk)*
+
+Move from `api/mod.rs`: `generate_random_key`, `hash_key`, `normalize_ip_or_cidr`, `create_audit_log`,
+`get_or_create_group`, `resolve_group_ref`, `resolve_group_by_identifier`,
+`resolve_group_ref_flexible`, `IP_EVENT_ACTIONS`, `ReassignOwnerPayload`. Move
+`format_key_reference` from `api/guards.rs` (it formats a string; it decides nothing, and `guards.rs`
+should hold only decisions).
+
+Leaves `api/mod.rs` as pure wiring at ~40 lines, matching the peer, and tightens `guards.rs` to
+decisions only. The flat re-exports keep every external path working, so this is invisible outside
+`src/`.
+
+#### P3 — Add health and readiness endpoints *(medium value, low risk — both services)*
+
+`GET /api/health` (process alive) and `GET /api/ready` (database reachable, Master pinned). Unauth-
+enticated and deliberately uninformative on failure. Would let `docker-compose.yml` express a real
+healthcheck, which it currently cannot. **Coordinate with the peer** — this is the one proposal that
+should land in both trees or neither, since a shared spec for probe semantics is worth more than two
+independent guesses.
+
+#### P4 — Rename `src/webhooks.rs` → `src/dispatch.rs` *(medium value, low risk)*
+
+`src/webhooks.rs` (the sender) and `src/api/webhooks.rs` (the CRUD surface) is the only genuinely
+confusing pair of names in the tree. `dispatch.rs` states the role. Mechanical rename plus imports.
+
+#### P5 — Adopt `OptionalStrictJson` *(low value, low risk)*
+
+`delete_api_key` hand-parses an optional body via `axum::body::Bytes` + `serde_json::from_slice`
+because `Json` rejects an empty body. The peer solved this with an extractor. Removes hand-rolled
+parsing from a handler and puts the behaviour in the type.
+
+#### P6 — Consider moving `generate_signing_secret` *(low value — recommend NO change)*
+
+The peer keeps it in `api/support.rs`; we keep it in `crypto.rs`. **Ours is better placed** — it is a
+cryptographic primitive with no HTTP concern — and this is recorded as a deliberate divergence rather
+than a defect. Listed only so a future audit does not "fix" it.
+
+### 6. Verification
+
+Read-only session: `git status` shows changes to `AGENT_NOTES.MD`, `README.md`, and the new
+`FILE_MAP.MD` only. No file under `src/`, `tests/`, or `migration/` was modified.
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | 223 passed, 0 failed |
+| `./scripts/test_e2e.sh` | 492 passed, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 |
+| `git diff RBAC_MODEL.md` | empty |
