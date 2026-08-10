@@ -770,7 +770,7 @@ async fn test_webhook_hmac_signature_and_delivery() {
     let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
     let db_for_worker = db.clone();
     let _worker_handle = tokio::spawn(async move {
-        simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+        simply_ip_vault::dispatch::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
     let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
@@ -907,7 +907,7 @@ async fn test_webhook_event_filtering_skips_non_matching_actions() {
     let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
     let db_for_worker = db.clone();
     let _worker_handle = tokio::spawn(async move {
-        simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+        simply_ip_vault::dispatch::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
     let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
@@ -1675,7 +1675,7 @@ async fn test_webhook_dispatch_does_not_block_api_response() {
     let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
     let db_for_worker = db.clone();
     let _worker_handle = tokio::spawn(async move {
-        simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+        simply_ip_vault::dispatch::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
     let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
@@ -3816,7 +3816,7 @@ async fn setup_webhook_fixture(
     let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
     let db_for_worker = db.clone();
     tokio::spawn(async move {
-        simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+        simply_ip_vault::dispatch::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
 
     let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());

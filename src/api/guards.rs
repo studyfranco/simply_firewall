@@ -13,15 +13,9 @@ use crate::error::AppError;
 
 use super::GroupPermInput;
 
-/// Formats a target API key for a human-readable audit log `details` string, e.g.
-/// `"'worker_bot' (65cf11ce...)"` — pairs the name (what an operator actually recognizes) with a
-/// truncated id (for unambiguous cross-referencing against a `GET /api/keys` listing) instead of
-/// a bare UUID, which was cryptic on its own.
-pub(crate) fn format_key_reference(name: &str, id: Uuid) -> String {
-    let id_str = id.to_string();
-    format!("'{name}' ({}...)", &id_str[..8])
-}
-
+// `format_key_reference` used to live here and is now `super::support`. It renders a string for a
+// log line; it decides nothing and refuses nobody, which is the boundary this module holds to. Every
+// function below answers a question from the specification and returns `Ok(())` or a refusal.
 
 /// Guards any operation whose *target* is another API key, on top of the caller's `can_manage_keys`
 /// scope.

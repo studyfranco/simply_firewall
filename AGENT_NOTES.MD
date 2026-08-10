@@ -6095,3 +6095,167 @@ Read-only session: `git status` shows changes to `AGENT_NOTES.MD`, `README.md`, 
 | `./scripts/test_e2e.sh` | 492 passed, 0 failed |
 | `./scripts/verify_convergence.sh` | exit 0 |
 | `git diff RBAC_MODEL.md` | empty |
+
+---
+
+## Session 42 — Acting on the Session 41 audit: `master.rs`, `api/support.rs`, `dispatch.rs`, probes, FK coverage
+
+Session 41 was read-only and ended with six numbered proposals. This session implements P1, P2, P3,
+P4 and P5, adds foreign-key cascade coverage, and leaves P6 alone exactly as that audit recommended.
+
+### 1. P1 — `src/master.rs`
+
+`MasterPinError`, `MASTER_MARKER_INDEX` and the pinning logic moved out of `state.rs` behind a
+`MasterPin` type: `new`, `pinned_to`, `get`, `pin_at_boot`, `resolve`, `authenticate`. `AppState` now
+holds `master_pin: Arc<MasterPin>` and implements none of it; `state.rs` fell from 330 lines to 169.
+
+The inline demotion in `auth_middleware` — ~15 lines that read the pin, compared ids, logged, and
+cleared the flag — is now one call to `MasterPin::authenticate`. The behaviour is unchanged, including
+the two distinguishable log lines (a pin that names a *different* key, versus no pin at all).
+
+`MasterPin::pinned_to` is not merely a helper. It makes a state reachable that `pin_at_boot` cannot
+construct by definition: a process whose pin names an id the database does not agree with. Previously
+the only route to that state was dropping the §5 index and writing a second master row, which
+exercises two failures at once and cannot tell "the pin held" from "the missing index was noticed".
+The new test `a_legitimate_master_is_refused_when_this_process_pinned_another_identity` uses it to
+assert the clean case: a database with exactly one legitimate master, the index intact, nothing
+tampered with — and that master still refused, because *this process* pinned something else. That is
+the post-restore scenario.
+
+**Convergence assertions moved with the code.** Session 41 flagged this explicitly and it was the
+main risk in P1: `verify_convergence.sh` asserted `fn pin_master_key` in `src/state.rs` and
+`is_effective_master` in `src/middleware.rs`, and left pointing at the old files those would have gone
+on reporting MATCH against files that no longer held the mechanism. They now target `src/master.rs`,
+plus three new assertions (the `OnceLock` field, the runtime index check, and a count that the
+demotion appears in exactly one non-migration file).
+
+### 2. P2 — `src/api/support.rs`
+
+Ten helpers moved out of `api/mod.rs` and `format_key_reference` out of `guards.rs`. `api/mod.rs` is
+**69 lines of declarations and re-exports with no executable code**, down from 267. The peer's is 85.
+
+`format_key_reference` was the interesting one: it lived in `guards.rs`, it decides nothing and
+refuses nobody, and five of its seven call sites were already in other modules. Its presence was
+quietly widening what "guards" meant.
+
+Zero test changes were needed. The re-export surface is unchanged because `mod.rs` re-exports flat, so
+`api::hash_key` resolves exactly as before.
+
+### 3. P5 — `OptionalStrictJson`
+
+`delete_api_key` took `body: axum::body::Bytes` and called `serde_json::from_slice` by hand, because
+`DELETE` has always been callable with no body and `Json` rejects an empty one. That is now
+`OptionalStrictJson<DeleteKeyPayload>` in `src/extract.rs`. Emptiness is decided from the bytes rather
+than from `Content-Type` — axum's own `Option<Json<T>>` keys on the header and would not cover a
+client that sends `Content-Type` with no payload.
+
+The parse-failure message was deliberately made *generic* ("Failed to deserialize the JSON body")
+rather than carrying over the handler's "Invalid resolution map". The type serves any bodyless-optional
+payload; a message naming one caller's field would be wrong for the second adopter. Checked first that
+no test or script asserted the old string.
+
+### 4. P4 — `src/webhooks.rs` → `src/dispatch.rs`
+
+Mechanical rename via `git mv`, plus imports in `lib.rs`, `crypto.rs`, `entities/webhook_config.rs`
+and four test files. `src/dispatch.rs` (the sender) and `src/api/webhooks.rs` (the CRUD surface) no
+longer share a name. The module header now states the distinction, including the review argument: a
+diff header reading `webhooks.rs` did not say which of the two security models applied.
+
+### 5. P3 — health and readiness probes *(new `src/api/system.rs`)*
+
+Session 41 recorded that **neither service has any** health, readiness, or version endpoint, so
+`docker-compose.yml` could not express a real healthcheck in either repo. This adds `GET /health` and
+`GET /ready`, mounted on the **root** router — outside the `/api` nest and therefore outside
+`auth_middleware`.
+
+Liveness and readiness are kept separate on purpose. `/health` touches nothing; `/ready` proves the
+database answers and the Master identity is pinned. A liveness probe that consulted the database would
+make an orchestrator *restart* the container whenever the **database** was down, converting a partial
+outage into a crash loop.
+
+Both are written to be safe for an anonymous caller: no data, no counts, no names, and no error
+detail — a failing `/ready` names which check failed and never why, with the driver error going to the
+log. The `Dockerfile` gained a `HEALTHCHECK` against `/ready` (and `curl`), and `docker-compose.yml` a
+matching `healthcheck` block, which is the payoff Session 41 identified.
+
+> Note: this half is coordination-relevant. `simply_hook_executor` still has no probes, so the pair is
+> now asymmetric. The convergence script does not track these routes against the peer for that reason.
+
+### 6. Foreign-key cascade coverage — new `tests/schema_integrity_tests.rs`
+
+Eight tests, all against a **file-backed** database opened through `db::connect`. That detail is the
+point: `PRAGMA foreign_keys` is per-connection and off by default in SQLite, so a cascade is a property
+of the schema *plus the connection*, and a test using `Database::connect` would prove nothing.
+
+The brief for this task named the peer's tables (`Hook`, `hook_parameters`, `executions`,
+`api_key_hook_permissions`). Those do not exist here; the equivalents were tested instead —
+`ip_groups`, `ip_records`, `ip_record_group_memberships`, `api_key_group_permissions`,
+`webhook_configs`, `audit_logs`.
+
+What the tests pinned down:
+
+| Delete | Effect | Why it matters |
+| :--- | :--- | :--- |
+| `api_keys` row | CASCADE to `api_key_group_permissions` | a stale grant becomes live authority again if the id is recycled |
+| `api_keys` row | **SET NULL** on `audit_logs`, row preserved | CASCADE here would let an attacker erase their trail by deleting their own key |
+| `api_keys` row | **no effect** on daughters (`parent_key_id` has no FK) | CASCADE would destroy a subtree; even SET NULL would silently re-root daughters out of the §4 subtree that bounded them |
+| `ip_groups` row | CASCADE to permissions, memberships, webhooks | three constraints, asserted together so dropping one is not masked by the other two |
+| `ip_records` row | CASCADE to memberships | the composite PK means an orphan would block re-inserting the same record into the same group |
+
+Plus one adversarial test issuing raw `INSERT`s that bypass the entity layer entirely, and two
+`PRAGMA foreign_key_check` sweeps — one on a freshly migrated database, one after deletes across the
+whole schema. The `foreign_key_check` sweep is the one that catches what the others cannot: `PRAGMA
+foreign_keys` is a **no-op inside a transaction**, which is where migrations run.
+
+`src/db.rs` already set `foreign_keys=ON` and `synchronous=NORMAL` at connection-option level
+(Session 40); the convergence script now asserts both, since either is one deleted line away from
+disabling every cascade above.
+
+### 7. Two bugs found while verifying, both pre-existing
+
+**A flaky security test.** `attack_timestamp_forgery_outside_the_window_is_rejected_both_directions`
+captured `now` once and derived every offset from it, but the middleware re-reads the clock per
+request — so the effective skew was `offset - elapsed`, where `elapsed` was however long the earlier
+probes took. One second of accumulated runtime turned `probe(301)` into a skew of exactly 300, inside
+the inclusive window, answering `200`. It passed when the suite ran fast and failed under load, which
+is the worst way for a security test to behave: **the failure looks like the control it guards has
+broken.** `probe(-300)` was fragile in the same way, in the opposite direction. Fixed by reading the
+clock inside each probe and starting each one clear of a second boundary. Reproduced deterministically
+before the fix (1 in 4 clippy-then-test cycles), then 25 clean runs after.
+
+**A hardcoded port in `scripts/test_e2e.sh`.** Its own header documented `PORT` as configurable, but
+the preflight check, the throwaway instances, and the server's own environment all used a literal
+3000 — so `BASE_URL` moved curl and left the server behind. Now derived once from `BASE_URL`, which is
+what let this suite run beside a `simply_hook_executor` already holding 3000.
+
+### 8. A gate that failed correctly, and one that passed vacuously
+
+The new "the demotion lives in exactly one file" check reported DRIFT immediately — correctly by its
+own rule, wrongly by the intended one. Two migrations quote `UPDATE api_keys SET is_master = false`
+inside operator-facing error text. Narrowed to `key.is_master = false` with `src/migration/` excluded.
+
+More usefully, the assertion `pub async fn pin_at_boot` **passed** against a planted rename to
+`pin_at_boot_renamed` — it is a prefix match. Every `fn` pattern now carries the escaped opening paren.
+Each of the six new assertions was then verified by planting the regression it exists to catch and
+confirming it fails: duplicate demotion, probes unmounted, `foreign_keys(true)` removed,
+`pin_at_boot` renamed, the `authenticate` call deleted, and the runtime index check defeated.
+
+### 9. Verification
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **241 passed**, 0 failed (223 before; +8 schema integrity, +7 probes, +2 `MasterPin` unit, +1 pinned-master adversarial, +1 error-text) |
+| `./scripts/test_e2e.sh` | **504 passed**, 0 failed (492 before; +12 in new §28) |
+| `./scripts/verify_convergence.sh` | exit 0 — 48 matching, 1 documented divergence, 0 unexplained |
+| `git diff RBAC_MODEL.md` | empty |
+
+Module sizes after: `api/mod.rs` 267 → **69**; `state.rs` 330 → **169**; new `master.rs` 320,
+`api/support.rs` 260, `api/system.rs` 97.
+
+### 10. P6 — no change, as recommended
+
+`generate_signing_secret` stays in `crypto.rs`. It is a cryptographic primitive with no HTTP concern,
+and the peer's placement in `api/support.rs` is the weaker of the two. Recorded again so a future
+audit does not "converge" it in the wrong direction.

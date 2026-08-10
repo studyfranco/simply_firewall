@@ -37,15 +37,18 @@ pub mod api;
 pub mod config;
 pub mod crypto;
 pub mod db;
+/// The outbound webhook dispatcher. Named `dispatch` rather than `webhooks` so it is never confused
+/// with [`api::webhooks`], which configures them rather than sending them.
+pub mod dispatch;
 pub mod entities;
 pub mod error;
 pub mod extract;
+pub mod master;
 pub mod middleware;
 pub mod migration;
 pub mod replay;
 pub mod retention;
 pub mod state;
-pub mod webhooks;
 
 use state::{AppState, WebhookEvent};
 
@@ -98,6 +101,13 @@ pub fn create_app(state: AppState) -> Router {
     // Root Router
     Router::new()
         .fallback_service(ServeDir::new("static"))
+        // Liveness and readiness, mounted **here rather than inside `api_routes`** so they sit
+        // outside `auth_middleware`. That placement is the entire point: the callers are Docker's
+        // `HEALTHCHECK`, a Kubernetes probe, and a load balancer, none of which can compute an
+        // HMAC over a body with a rolling timestamp. Both handlers are written to be safe without a
+        // caller identity — no data, no error detail, no writes. See [`api::system`].
+        .route("/health", get(api::health_check))
+        .route("/ready", get(api::readiness_check))
         .nest("/api", api_routes)
         // Applied *outside* the nest so it covers `/api/*` and the static fallback alike. Inside,
         // it would leave the SPA path — which never reaches the auth middleware — unbounded, and a
@@ -124,7 +134,7 @@ pub fn setup_state(
     let (tx, rx) = mpsc::channel::<WebhookEvent>(100);
     let db_worker = db.clone();
     let worker_handle = tokio::spawn(async move {
-        webhooks::run_webhook_worker(db_worker, rx).await;
+        dispatch::run_webhook_worker(db_worker, rx).await;
     });
 
     let state = AppState::new(db, tx.clone())?;

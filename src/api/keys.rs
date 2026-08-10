@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::entities::prelude::{ApiKey, IpGroup, WebhookConfig};
 use crate::entities::{api_key, api_key_group_permission, ip_group, webhook_config};
 use crate::error::AppError;
-use crate::extract::StrictJson;
+use crate::extract::{OptionalStrictJson, StrictJson};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
@@ -747,7 +747,12 @@ pub async fn delete_api_key(
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
     Path(id): Path<Uuid>,
-    body: axum::body::Bytes,
+    // `OptionalStrictJson` rather than `Json<T>`: `DELETE` has always been callable with no body at
+    // all, and every existing client calls it that way — an empty body means "no resolutions", which
+    // is exactly the request that gets the inventory back. See [`crate::extract::OptionalStrictJson`]
+    // for why this is a type rather than a `Bytes` parameter parsed by hand, which is what it
+    // replaced.
+    OptionalStrictJson(payload): OptionalStrictJson<DeleteKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -756,18 +761,6 @@ pub async fn delete_api_key(
     if id == key.id {
         return Err(AppError::Forbidden("Cannot delete yourself".to_owned()));
     }
-
-    // `Bytes` rather than `Json<T>`: `DELETE` has always been callable with no body at all, and every
-    // existing client calls it that way. `Json` rejects an empty body outright, so an optional
-    // structured payload has to be parsed by hand — an empty body means "no resolutions", which is
-    // the request that gets the inventory back.
-    let payload: DeleteKeyPayload = if body.is_empty() {
-        DeleteKeyPayload::default()
-    } else {
-        serde_json::from_slice(&body).map_err(|e| {
-            AppError::InvalidInput(format!("Invalid resolution map: {e}"))
-        })?
-    };
 
     let target = find_administrable_key(&state.db, &key, id).await?;
     guard_master_target(&key, &target)?;

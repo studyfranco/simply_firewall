@@ -357,13 +357,74 @@ assert_absent "no code writes the master marker" \
 # The Master's *identity* is pinned at boot, which is a different guarantee from its *uniqueness*.
 # §5's index makes at most one row carry `is_master`; it does not say which row. An attacker with
 # database access does not need two masters — demoting the real one and promoting itself keeps the
-# count at exactly one and satisfies every constraint. These three assertions cover the identity half.
+# count at exactly one and satisfies every constraint. These assertions cover the identity half.
+#
+# They moved from `src/state.rs`/`src/middleware.rs` to `src/master.rs` when the mechanism was
+# extracted into a `MasterPin` type, mirroring the peer's `src/master.rs`. Moving the assertions with
+# the code is the whole point of writing them down: an assertion left pointing at the old file would
+# have gone on reporting MATCH against a `state.rs` that no longer contained the mechanism, which is
+# the vacuous-pass failure this repository has now hit three times. Each pattern below is checked
+# against the file that actually holds the code today.
+# Anchored on the opening paren. Without it the pattern is a *prefix* match, and a rename to
+# `pin_at_boot_renamed` still satisfied it — caught by planting exactly that edit and watching this
+# line report PRESENT. Every `fn` pattern below carries the paren for the same reason.
 assert_present "the master key id is pinned once at startup" \
-    "src/state.rs" "fn pin_master_key"
+    "src/master.rs" "pub async fn pin_at_boot\("
+assert_present "the pin is write-once, not a reassignable field" \
+    "src/master.rs" "cell: OnceLock<Uuid>"
 assert_present "startup aborts rather than serving with an unpinnable master" \
-    "src/main.rs" "state.pin_master_key\(\).await.map_err"
+    "src/main.rs" "state.master_pin.pin_at_boot\(&state.db\).await.map_err"
+assert_present "the demotion is applied at one choke point, in the middleware" \
+    "src/middleware.rs" "state.master_pin.authenticate\(&state.db, &mut key_record\)"
 assert_present "a key claiming master is demoted unless it is the pinned one" \
-    "src/middleware.rs" "is_effective_master"
+    "src/master.rs" "key\.is_master = false"
+assert_present "the §5 uniqueness index is re-checked at runtime, not just in the migration" \
+    "src/master.rs" "has_index\(API_KEYS_TABLE, MASTER_MARKER_INDEX\)"
+
+# The demotion must stay in exactly one place. A second copy is not a redundancy — it is a second
+# thing to keep correct, and the one that gets it wrong is invisible because the other still works.
+#
+# The pattern is `key.is_master = false` — the mutation on a model — and not the bare
+# `is_master = false`, which the first version of this check used. That version reported DRIFT
+# immediately, correctly by its own rule and wrongly by the intended one: two migrations quote
+# `UPDATE api_keys SET is_master = false WHERE id IN (...)` inside operator-facing error text, which
+# is advice for a human, not a demotion. `src/migration/` is excluded for the same reason.
+demotion_files=$(grep -rln "key\.is_master = false" "$PROJECT_ROOT/src" --include='*.rs' \
+    | grep -v "/src/migration/" | wc -l)
+if [ "$demotion_files" -eq 1 ]; then
+    echo "  ${GREEN}✓ MATCH${RESET}   the demotion has exactly one implementation in src/"
+    MATCH_COUNT=$((MATCH_COUNT + 1))
+else
+    echo "  ${RED}✗ DRIFT${RESET}   the demotion must live in exactly one file (found $demotion_files)"
+    grep -rn "key\.is_master = false" "$PROJECT_ROOT/src" --include='*.rs' \
+        | grep -v "/src/migration/" | sed 's/^/             /'
+    DRIFT_COUNT=$((DRIFT_COUNT + 1))
+fi
+
+# The two probes answer unauthenticated callers, so their placement *outside* the `/api` nest is a
+# security property rather than a routing detail. Mounted inside it they would sit behind
+# `auth_middleware` and become uncallable by any orchestrator — and, worse, the failure would look
+# like a broken healthcheck rather than a misplaced route.
+assert_present "liveness is mounted outside the authenticated nest" \
+    "src/lib.rs" 'route\("/health", get\(api::health_check\)\)'
+assert_present "readiness is mounted outside the authenticated nest" \
+    "src/lib.rs" 'route\("/ready", get\(api::readiness_check\)\)'
+if grep -n 'route("/health"' "$PROJECT_ROOT/src/lib.rs" | grep -q "$(grep -n 'let api_routes' "$PROJECT_ROOT/src/lib.rs" | cut -d: -f1)"; then
+    echo "  ${RED}✗ DRIFT${RESET}   the probes are inside the authenticated router"
+    DRIFT_COUNT=$((DRIFT_COUNT + 1))
+else
+    echo "  ${GREEN}✓ MATCH${RESET}   the probes are outside auth_middleware"
+    MATCH_COUNT=$((MATCH_COUNT + 1))
+fi
+
+# Foreign keys are the schema's half of RBAC_MODEL.md §6 ("data is never destroyed implicitly"), and
+# in SQLite they are per-connection and OFF by default — so this is a property of how the pool is
+# opened, not of the migrations. Asserted here because it is one deleted line away from silently
+# disabling every cascade and every orphan refusal in the database.
+assert_present "foreign key enforcement is set at connection time" \
+    "src/db.rs" "\.foreign_keys\(true\)"
+assert_present "synchronous=NORMAL is set at connection time" \
+    "src/db.rs" "SqliteSynchronous::Normal"
 
 # No raw SQL for DML anywhere in `src/`, migrations excepted.
 #

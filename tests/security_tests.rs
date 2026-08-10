@@ -291,17 +291,34 @@ async fn attack_timestamp_forgery_outside_the_window_is_rejected_both_directions
 
     let key = insert_master_key(&db, "Replay Attacker").await;
     let secret = test_signing_secret(&key);
-    let now = chrono::Utc::now().timestamp();
 
+    // The clock is read **inside** each probe, and only after waiting clear of a second boundary.
+    //
+    // Both details are load-bearing, and this test was intermittently red without them. It used to
+    // capture `now` once and derive every offset from it, but the middleware reads `Utc::now()` again
+    // when the request arrives — so the effective skew is `offset - elapsed`, where `elapsed` is
+    // however long the *previous* probes took. One second of accumulated runtime turned `probe(301)`
+    // into a skew of exactly 300, which is inside the inclusive window and answers `200`. It passed
+    // whenever the suite ran fast and failed under load, which is the worst way for a security test
+    // to behave: the failure looks like the control it guards has broken.
+    //
+    // Reading the clock per probe collapses `elapsed` to microseconds. The `sleep` then removes the
+    // remaining sub-second race — landing a few microseconds before a tick would reintroduce exactly
+    // the same off-by-one — by starting each probe at least 200 ms into a second, leaving ~800 ms of
+    // margin against a boundary that is otherwise invisible.
     let probe = |offset: i64| {
         let (app, key, secret) = (app.clone(), key.clone(), secret.clone());
         async move {
+            let subsec = u64::from(chrono::Utc::now().timestamp_subsec_millis());
+            if subsec > 800 {
+                tokio::time::sleep(std::time::Duration::from_millis(1_200 - subsec)).await;
+            }
             let req = signed_at(
                 inject_connect_info(
                     Request::builder().uri("/api/auth/me").header("X-API-Key", &key),
                 ),
                 &secret,
-                now + offset,
+                chrono::Utc::now().timestamp() + offset,
                 "",
             );
             app.oneshot(req).await.unwrap().status()
@@ -670,7 +687,7 @@ async fn attack_hmac_template_injection_via_payload_body_cannot_forge_canonical_
     let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(100);
     let db_for_worker = db.clone();
     tokio::spawn(async move {
-        simply_ip_vault::webhooks::run_webhook_worker(db_for_worker, webhook_rx).await;
+        simply_ip_vault::dispatch::run_webhook_worker(db_for_worker, webhook_rx).await;
     });
     let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
 
@@ -810,7 +827,7 @@ async fn attack_hmac_template_injection_via_payload_body_cannot_forge_canonical_
 #[test]
 fn attack_template_resolution_never_rescans_substituted_values() {
     use simply_ip_vault::{
-        entities::webhook_config::DEFAULT_HMAC_TEMPLATE, webhooks::resolve_hmac_template,
+        entities::webhook_config::DEFAULT_HMAC_TEMPLATE, dispatch::resolve_hmac_template,
     };
 
     // Both flavours of the attack: real newline characters, and literal backslash-n escapes.
@@ -3408,7 +3425,7 @@ async fn attack_promoting_a_key_in_a_live_database_does_not_make_it_master() {
 
     // Boot: the service pins the master before serving anything. `main.rs` does this explicitly;
     // here it is the same call, and it is what makes everything below a no-op for the attacker.
-    let pinned = state.pin_master_key().await.expect("exactly one master exists at boot");
+    let pinned = state.master_pin.pin_at_boot(&state.db).await.expect("exactly one master exists at boot");
 
     // The attacker, holding a database prompt, performs the swap.
     let demote: simply_ip_vault::entities::api_key::ActiveModel =
@@ -3480,7 +3497,7 @@ async fn attack_promoting_a_key_in_a_live_database_does_not_make_it_master() {
     // The pin is immovable for the life of the process, even though the row it names no longer
     // claims to be master. Re-resolving would hand the attacker exactly what pinning denies.
     assert_eq!(
-        state.pin_master_key().await.unwrap(),
+        state.master_pin.pin_at_boot(&state.db).await.unwrap(),
         pinned,
         "the pin must not move once set"
     );
@@ -3517,7 +3534,7 @@ async fn startup_refuses_to_pin_a_master_when_the_database_holds_two() {
     db.execute_unprepared("DROP INDEX \"idx-api_keys-master_marker\"").await.unwrap();
     let _second = insert_master_key(&db, "Master B").await;
 
-    let err = state.pin_master_key().await.expect_err("two masters must refuse to pin");
+    let err = state.master_pin.pin_at_boot(&state.db).await.expect_err("two masters must refuse to pin");
     let message = format!("{err}");
     assert!(
         message.contains("2 keys have is_master = true"),
@@ -3529,7 +3546,7 @@ async fn startup_refuses_to_pin_a_master_when_the_database_holds_two() {
     );
 
     // Fail closed while unpinned: no caller is master, rather than every caller being one.
-    assert_eq!(state.resolve_master_key_id().await, None);
+    assert_eq!(state.master_pin.resolve(&state.db).await, None);
 }
 
 /// Startup refuses a database with no master at all.
@@ -3545,12 +3562,12 @@ async fn startup_refuses_to_pin_a_master_when_the_database_holds_none() {
 
     let _ordinary = insert_key(&db, "Just a key", false, true, false, false, None).await;
 
-    let err = state.pin_master_key().await.expect_err("no master must refuse to pin");
+    let err = state.master_pin.pin_at_boot(&state.db).await.expect_err("no master must refuse to pin");
     assert!(
         format!("{err}").contains("No master key exists"),
         "the refusal must distinguish 'none' from 'several': {err}"
     );
-    assert_eq!(state.resolve_master_key_id().await, None);
+    assert_eq!(state.master_pin.resolve(&state.db).await, None);
 }
 
 /// Startup refuses when §5's uniqueness index is missing, even though exactly one master exists.
@@ -3570,12 +3587,12 @@ async fn startup_refuses_to_pin_a_master_without_the_uniqueness_index() {
     let _only = insert_master_key(&db, "The Master").await;
     db.execute_unprepared("DROP INDEX \"idx-api_keys-master_marker\"").await.unwrap();
 
-    let err = state.pin_master_key().await.expect_err("a missing index must refuse to pin");
+    let err = state.master_pin.pin_at_boot(&state.db).await.expect_err("a missing index must refuse to pin");
     assert!(
         format!("{err}").contains("idx-api_keys-master_marker"),
         "the refusal must name the missing index: {err}"
     );
-    assert_eq!(state.resolve_master_key_id().await, None);
+    assert_eq!(state.master_pin.resolve(&state.db).await, None);
 }
 
 /// R4 through the pin: a Parent key cannot grant a Master-only scope on create **or** update.
@@ -3649,4 +3666,249 @@ async fn a_parent_key_cannot_grant_master_only_scopes_on_create_or_update() {
         .unwrap()
         .unwrap();
     assert!(!after.can_manage_keys && !after.can_create_groups && !after.can_manage_webhooks);
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// Liveness and readiness probes
+// ─────────────────────────────────────────────────────────────
+//
+// These endpoints are the only two in the service that answer an *unauthenticated* caller, so every
+// test below sends no `X-API-Key`, no `X-Timestamp`, and no `X-Signature-256`. That is the property
+// under test, not an omission: a probe that needed a credential could not be called by Docker's
+// `HEALTHCHECK` or a Kubernetes readiness gate, which is what these exist for.
+//
+// Note also that none of them calls `inject_connect_info`. Every authenticated test in this file
+// must, because `auth_middleware` extracts `ConnectInfo` to resolve the client address — so a probe
+// that succeeds *without* it is direct evidence the middleware never ran.
+
+/// `GET /health` answers `200` with no credentials, no headers, and no connect-info extension.
+#[tokio::test]
+async fn health_check_answers_an_unauthenticated_caller() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db, webhook_tx, Vec::new()));
+
+    let req = Request::builder().uri("/health").body(Body::empty()).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK, "liveness must not require a credential");
+
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ok");
+    assert_eq!(json["service"], "simply_ip_vault");
+    assert!(json["version"].is_string(), "the build version is reported: {json}");
+}
+
+/// `GET /health` does not depend on the database — the distinction that keeps a database outage
+/// from becoming a crash loop.
+///
+/// An orchestrator restarts a container whose *liveness* probe fails. If liveness checked the
+/// database, a service whose database had gone away would be killed and restarted repeatedly, each
+/// new process failing the same probe — turning a recoverable dependency outage into an unbounded
+/// restart loop while the service itself was fine. Readiness is where a dependency belongs, and the
+/// test below asserts that half.
+///
+/// Closing the connection is the direct way to prove liveness is not consulting it.
+#[tokio::test]
+async fn health_check_still_answers_when_the_database_is_gone() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state);
+
+    db.close().await.expect("the connection closes");
+
+    let req = Request::builder().uri("/health").body(Body::empty()).unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "liveness must stay green while the database is unreachable, or a dependency outage \
+         becomes a restart loop"
+    );
+}
+
+/// `GET /ready` answers `200` without credentials once the master identity is pinned.
+#[tokio::test]
+async fn readiness_check_answers_an_unauthenticated_caller_when_the_service_can_serve() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state.clone());
+
+    insert_master_key(&db, "The Master").await;
+    state.master_pin.pin_at_boot(&state.db).await.expect("the master pins");
+
+    let req = Request::builder().uri("/ready").body(Body::empty()).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK, "readiness must not require a credential");
+
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "ready");
+    assert_eq!(json["database"], "ok");
+    assert_eq!(json["master_pinned"], true);
+}
+
+/// `GET /ready` answers `503` while no master identity is pinned.
+///
+/// Unreachable in production — `main.rs` pins before binding the listener — which is exactly why it
+/// is worth asserting. That ordering is a convention held up by one line, and an edit that bound the
+/// listener first would otherwise produce a service reporting itself ready while every master-only
+/// route quietly refused. Here the state is built and never pinned, which is that regression.
+#[tokio::test]
+async fn readiness_check_refuses_while_no_master_is_pinned() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db, webhook_tx, Vec::new()));
+
+    let req = Request::builder().uri("/ready").body(Body::empty()).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["status"], "unavailable");
+    assert_eq!(json["reason"], "master identity not pinned");
+}
+
+/// `GET /ready` answers `503` when the database is unreachable, and leaks nothing about why.
+///
+/// The response names *which* check failed and never the underlying error. A database URL, a file
+/// path, or a driver message in the body of an endpoint that answers anonymous callers is an
+/// information leak, and this endpoint is reachable by anyone who can open a socket.
+#[tokio::test]
+async fn readiness_check_refuses_when_the_database_is_unreachable_without_leaking_detail() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state);
+
+    db.close().await.expect("the connection closes");
+
+    let req = Request::builder().uri("/ready").body(Body::empty()).unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+    let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+    let text = String::from_utf8(body.to_vec()).unwrap();
+    assert!(text.contains("database unreachable"), "the failing check is named: {text}");
+    assert!(
+        !text.contains("sqlite") && !text.contains("Connection") && !text.contains("pool"),
+        "the underlying error must stay in the log, not the response body: {text}"
+    );
+}
+
+/// The probes are outside `auth_middleware`, and an authenticated route is inside it.
+///
+/// Asserted as a pair in one test on purpose. Either half alone is satisfiable by a mistake: a
+/// service with no authentication at all would pass the first two assertions, and a service that
+/// never mounted the probes would pass the third. Together they say the boundary is where it was
+/// meant to be — and that a bogus credential changes nothing about a probe, since an endpoint that
+/// merely *tolerated* a missing header might still branch on a present one.
+#[tokio::test]
+async fn the_probes_bypass_authentication_and_nothing_else_does() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state.clone());
+
+    insert_master_key(&db, "The Master").await;
+    state.master_pin.pin_at_boot(&state.db).await.expect("the master pins");
+
+    for path in ["/health", "/ready"] {
+        let req = Request::builder()
+            .uri(path)
+            .header("X-API-Key", "not-a-real-key")
+            .header("X-Timestamp", "0")
+            .header("X-Signature-256", "sha256=deadbeef")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "{path} must ignore a forged credential rather than reject it — it never authenticates"
+        );
+    }
+
+    let req = inject_connect_info(Request::builder().uri("/api/audit-logs"))
+        .body(Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED,
+        "every other route still demands a signed request; the probes are the exception, not a hole"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────
+// The pinned-master negative path
+// ─────────────────────────────────────────────────────────────
+
+/// **ADVERSARIAL(§5).** A key that is the sole, legitimate master in the database is still refused
+/// when this process pinned a *different* identity.
+///
+/// The complement of `attack_promoting_a_key_in_a_live_database_does_not_make_it_master`, and it
+/// isolates a property that test cannot. There, the attacker performs a swap and the pin is what the
+/// service resolved for itself. Here the database is perfectly §5-compliant — exactly one master, the
+/// index intact, nothing tampered with — and the *process* holds a pin from before. That is the state
+/// after a restore rolls the database back to a moment when a different key was master, and it cannot
+/// be constructed through `pin_at_boot`, which by definition only ever pins the row that really is
+/// the sole master.
+///
+/// `MasterPin::pinned_to` exists for precisely this. Without it the only way to reach the state is to
+/// drop the §5 index and write a second master row — which tests two failures at once and cannot
+/// distinguish "the pin held" from "the missing index was noticed".
+#[tokio::test]
+async fn a_legitimate_master_is_refused_when_this_process_pinned_another_identity() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+
+    let master = insert_master_key(&db, "The Master").await;
+
+    // Pin an id that belongs to no row at all: the process booted against a different database
+    // state, and nothing since has moved the pin.
+    let stale_pin = Uuid::new_v4();
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new())
+        .with_pinned_master(stale_pin);
+    let app = create_app(state.clone());
+
+    assert_eq!(state.master_pin.get(), Some(stale_pin), "the pin is fixed without a query");
+
+    let req = signed_later(
+        inject_connect_info(Request::builder().uri("/api/audit-logs").header("X-API-Key", &master)),
+        &test_signing_secret(&master),
+        1,
+        "",
+    );
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::FORBIDDEN,
+        "is_master is authoritative only for the pinned id — a real master that this process did \
+         not pin is an ordinary key"
+    );
+
+    // The pin did not move to accommodate the row it found, which is the whole guarantee.
+    assert_eq!(
+        state.master_pin.get(),
+        Some(stale_pin),
+        "resolving a request must never re-resolve the pin"
+    );
+
+    // And the demotion is a demotion, not a rejection: the key still authenticates and reaches
+    // routes its own scopes allow. §5 makes master status a property of one key, not a credential.
+    let req = signed_later(
+        inject_connect_info(Request::builder().uri("/api/keys").header("X-API-Key", &master)),
+        &test_signing_secret(&master),
+        2,
+        "",
+    );
+    assert_eq!(
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "the key is demoted, not revoked — it keeps every scope it legitimately holds"
+    );
 }

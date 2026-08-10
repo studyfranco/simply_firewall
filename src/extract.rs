@@ -11,6 +11,7 @@
 //! [`StrictJson`] is what turns that refusal into the same `400` the handler used to produce.
 
 use axum::{
+    body::Bytes,
     extract::{FromRequest, Request, rejection::JsonRejection},
     Json,
 };
@@ -67,5 +68,61 @@ where
                 Err(AppError::BodyRejected(other.status(), JsonRejection::body_text(&other)))
             }
         }
+    }
+}
+
+/// A [`StrictJson`] whose body may be absent entirely, yielding `T::default()`.
+///
+/// # Why this exists rather than `Option<Json<T>>`
+///
+/// `DELETE /api/keys/{id}` needs it. That endpoint is a *conversation*: the first request carries no
+/// body at all — it is a question, and the answer is §6's pre-flight inventory of owned entities —
+/// while the resubmission carries the resolution map. Axum's `Json` rejects an empty body outright,
+/// and its `Option<Json<T>>` keys on `Content-Type` rather than on emptiness, so neither expresses
+/// "absent means take no action". Demanding a literal `{}` on the first request would make the
+/// common case — deleting a key that owns nothing — require a body for no reason, and would break
+/// every existing client, since `DELETE` has always been callable bodyless.
+///
+/// # Why an extractor rather than parsing `Bytes` in the handler
+///
+/// It replaces exactly that: `delete_api_key` took `body: axum::body::Bytes` and called
+/// `serde_json::from_slice` itself. Two things were wrong with it, and neither was visible at the
+/// call site. The hand-rolled parse could not be reused, so the next bodyless endpoint would copy
+/// it; and being outside the extractor layer, it was the one JSON path in the service whose
+/// rejection shape nothing enforced. Moving it into a type puts the decision where
+/// [`StrictJson`]'s module header says such decisions belong — in the type, not in a handler a later
+/// edit can quietly rewrite.
+///
+/// # Emptiness is decided from the bytes
+///
+/// Not from `Content-Type`, so a client that sends the header without a payload behaves exactly like
+/// one that sends neither. Reading through [`Bytes`] keeps the request under the router's
+/// [`DefaultBodyLimit`](axum::extract::DefaultBodyLimit), so the `413` control still applies here as
+/// it does everywhere else — and, as in [`StrictJson`], that status is passed through rather than
+/// flattened into a `400`.
+pub struct OptionalStrictJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for OptionalStrictJson<T>
+where
+    T: DeserializeOwned + Default,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = Bytes::from_request(req, state)
+            .await
+            .map_err(|rejection| AppError::BodyRejected(rejection.status(), rejection.body_text()))?;
+
+        if bytes.is_empty() {
+            return Ok(Self(T::default()));
+        }
+
+        // Generic wording rather than the endpoint-specific "Invalid resolution map" the handler used
+        // to produce: this type serves any bodyless-optional payload, and a message naming one
+        // caller's field would be wrong for the second adopter and misleading in the meantime.
+        serde_json::from_slice(&bytes).map(Self).map_err(|e| {
+            AppError::InvalidInput(format!("Failed to deserialize the JSON body: {e}"))
+        })
     }
 }

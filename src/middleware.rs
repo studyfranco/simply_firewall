@@ -301,33 +301,15 @@ pub async fn auth_middleware(
 
     // The pinned-master check, applied at the one point a key model enters the request.
     //
-    // Every authorization guard downstream reads `key.is_master`, and there are dozens of them. If
-    // this check lived in the guards it would have to be repeated in each, and the first one written
-    // without it would be a silent hole. Clearing the flag here instead means a promoted impostor
-    // arrives at every existing handler — and every handler written after this — as the ordinary key
-    // it actually is, with no per-handler cooperation required.
-    //
-    // Demoted rather than rejected: §5 makes master status a property of one specific key, not a
-    // credential in its own right. A key whose `is_master` column was flipped is still a valid key
-    // with whatever scopes it legitimately holds, and it should keep exactly those. Returning 401
-    // here would also make the flag observable to the caller, which is the sort of oracle §4 spends
-    // considerable effort closing elsewhere.
-    //
-    // Only keys *claiming* master pay for the lookup, and the pin is a `OnceLock` read after the
-    // first resolution — so the common path costs one boolean test.
+    // This is the *only* call site, and it has to stay that way. Every authorization guard downstream
+    // reads `key.is_master`, and there are dozens of them; if the check lived in the guards it would
+    // have to be repeated in each, and the first one written without it would be a silent hole.
+    // Demoting the record here instead means a promoted impostor arrives at every existing handler —
+    // and every handler written after this — as the ordinary key it actually is, with no per-handler
+    // cooperation required. See [`crate::master::MasterPin::authenticate`] for why it demotes rather
+    // than rejects, and for the §5 reasoning behind the whole mechanism.
     let mut key_record = key_record;
-    if key_record.is_master && !state.is_effective_master(&key_record).await {
-        // Loud, and at error level: reaching here means a row was promoted in the database behind
-        // the service's back, which is either an intrusion or an operator editing production by
-        // hand. Both are worth waking someone up for.
-        tracing::error!(
-            "Key {} carries is_master = true but is not the master pinned at startup. Treating it \
-             as an ordinary key. This means the database was modified outside the service — see \
-             RBAC_MODEL.md §5.",
-            key_record.prefix
-        );
-        key_record.is_master = false;
-    }
+    state.master_pin.authenticate(&state.db, &mut key_record).await;
 
     let mut req = Request::from_parts(parts, Body::from(body_bytes));
     req.extensions_mut().insert(ClientIp(client_ip));

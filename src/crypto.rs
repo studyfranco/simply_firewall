@@ -9,7 +9,7 @@
 //!    query string**. See [`compute_signature`] and [`verify_signature`].
 //!
 //!    The same canonical string is used for outbound `CANONICAL_V1` webhook dispatches
-//!    (`crate::webhooks`), so a `simply_ip_vault` instance can sign a request that another instance
+//!    (`crate::dispatch`), so a `simply_ip_vault` instance can sign a request that another instance
 //!    — or `simply_hook_executor` — verifies with identical code.
 //! 2. **Secret confidentiality at rest** — unlike `key_hash` (a one-way hash), a `signing_secret`
 //!    must be recoverable verbatim to verify a signature, so it cannot be hashed. It is therefore

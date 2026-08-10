@@ -268,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // starts anyway would answer it with whichever row a query happened to return. Refusing to start
     // is loud, immediate, and leaves the evidence intact; the alternative is a running service whose
     // most powerful credential is decided by row order.
-    let master_key_id = state.pin_master_key().await.map_err(|e| {
+    let master_key_id = state.master_pin.pin_at_boot(&state.db).await.map_err(|e| {
         tracing::error!("Refusing to start: {e}");
         e
     })?;

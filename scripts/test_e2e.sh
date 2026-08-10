@@ -21,7 +21,8 @@
 # is logged with a timestamp, method, full URL, color-coded status, and jq-formatted body.
 #
 # Usage: ./scripts/test_e2e.sh
-# Requires: curl, jq. Needs port 3000 free (BIND_HOST/PORT configure the listen address;
+# Requires: curl, jq. Needs port 3000 free, or BASE_URL pointed at a free one (BIND_HOST/PORT
+# configure the listen address;
 # this suite uses the default and boots its throwaway instances on higher ports).
 # Optional: python3 (only for live webhook-delivery verification in §13; that one section degrades
 # to a skip + warning without it, everything else is unaffected).
@@ -38,6 +39,16 @@ PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 # 127.0.0.1 rather than "localhost": avoids any IPv6 (::1) resolution first-try delay against a
 # server that only ever binds the IPv4 wildcard address.
 BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
+# The port the main instance listens on, derived from BASE_URL so the two can never disagree.
+#
+# This used to be the literal 3000 in three unrelated places — the preflight check, the throwaway
+# instances below, and nothing at all in the server's own environment, which simply took the default.
+# The header above has always documented `PORT` as configurable, so the promise was there and only
+# the plumbing was missing: overriding BASE_URL pointed curl at a new port while the server stayed on
+# 3000. Deriving it once here makes `BASE_URL=http://127.0.0.1:3300 ./scripts/test_e2e.sh` work, which
+# is what lets this suite run beside a `simply_hook_executor` already holding 3000.
+VAULT_PORT="$(printf '%s' "$BASE_URL" | sed -n 's|.*:\([0-9]\{1,5\}\)$|\1|p')"
+VAULT_PORT="${VAULT_PORT:-3000}"
 # Deterministic bootstrap secret: passed to the server as INITIAL_MASTER_KEY so this script never
 # needs to scrape the master key back out of the (buffered, redirected) server log.
 MASTER_KEY="e2e_master_secret_key_for_testing_123456789"
@@ -310,9 +321,9 @@ for bin in curl jq cargo openssl; do
     log "Found $bin: $(command -v "$bin")"
 done
 
-if command -v fuser >/dev/null 2>&1 && fuser 3000/tcp >/dev/null 2>&1; then
-    err "Port 3000 is already in use (this suite boots the main instance on the default port)."
-    err "Stop whatever is bound to it and re-run this script."
+if command -v fuser >/dev/null 2>&1 && fuser "$VAULT_PORT/tcp" >/dev/null 2>&1; then
+    err "Port $VAULT_PORT is already in use (this suite boots the main instance there)."
+    err "Stop whatever is bound to it, or re-run with BASE_URL=http://127.0.0.1:<free port>."
     exit 1
 fi
 
@@ -362,6 +373,7 @@ DATABASE_URL="sqlite://$DB_PATH?mode=rwc" RUST_LOG=info INITIAL_MASTER_KEY="$MAS
     VAULT_ENCRYPTION_KEY="$E2E_ENCRYPTION_KEY" \
     ALLOW_PRIVATE_WEBHOOKS=true \
     TRUSTED_PROXIES="localhost" \
+    PORT="$VAULT_PORT" \
     "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
@@ -2245,7 +2257,7 @@ check "200" "#26 a freshly signed request from the same key still works"
 # `VAULT_ENCRYPTION_KEY=password` produced a key with the entropy of "password" and no signal that
 # anything was wrong. Booting a throwaway instance is the only way to assert a startup decision.
 
-BADKEY_PORT=$((3000 + 61))
+BADKEY_PORT=$((VAULT_PORT + 61))
 BADKEY_DB="$WORK_DIR/badkey.db"
 BADKEY_LOG="$WORK_DIR/badkey_server.log"
 
@@ -2282,7 +2294,7 @@ check_local "$([ -s "$BADKEY_DB" ] && echo created || echo absent)" "absent" \
 # retried on a short negative TTL rather than re-queried per request. The live instance is already
 # proof of the first half in the healthy direction; this asserts the failing one.
 
-DEADNS_PORT=$((3000 + 62))
+DEADNS_PORT=$((VAULT_PORT + 62))
 DEADNS_DB="$WORK_DIR/deadns.db"
 DEADNS_LOG="$WORK_DIR/deadns_server.log"
 DEADNS_MASTER="e2e_deadns_master_key_for_testing_123456789"
@@ -2337,7 +2349,7 @@ wait "$DEADNS_PID" 2>/dev/null || true
 #
 # `10.0.0.0/99` is the archetype: one character from a valid CIDR, impossible as a DNS name.
 
-BADPROXY_PORT=$((3000 + 63))
+BADPROXY_PORT=$((VAULT_PORT + 63))
 BADPROXY_DB="$WORK_DIR/badproxy.db"
 BADPROXY_LOG="$WORK_DIR/badproxy_server.log"
 
@@ -2779,7 +2791,7 @@ check_true '[.[] | select(.target_address == "203.0.113.211")] | length == 1' \
 # Asserted by sealing under one key and reading under another, which is the shape a botched key
 # rotation or a restored-from-the-wrong-vault deployment actually produces.
 
-STRICT_PORT=$((3000 + 63))
+STRICT_PORT=$((VAULT_PORT + 63))
 STRICT_DB="$WORK_DIR/strict.db"
 STRICT_LOG_A="$WORK_DIR/strict_server_a.log"
 STRICT_LOG_B="$WORK_DIR/strict_server_b.log"
@@ -2879,6 +2891,59 @@ check_local "$(journal_format_byte "$DB_PATH")" "2" \
 # anything re-applying the pragma on the second boot. Its header must still say WAL.
 check_local "$(journal_format_byte "$STRICT_DB")" "2" \
     "#27 WAL persists in the file header across a full restart of the service"
+
+
+log_section "28. Liveness & readiness probes (unauthenticated)"
+
+# The only two endpoints that answer without a credential, checked here against the *real binary*
+# rather than a `oneshot` router. That distinction matters more than it usually would: the Rust tests
+# drive the router directly, so they cannot see a mistake in how the layers are composed at startup —
+# and "is this route inside or outside `auth_middleware`?" is exactly a composition question. A curl
+# with no headers at all is the same call Docker's HEALTHCHECK makes.
+
+RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" "$BASE_URL/health")
+RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+check "200" "#28 GET /health answers with no credential at all"
+check_local "$(echo "$RESP_BODY" | jq -r '.status // "missing"')" "ok" \
+    "#28 /health reports status=ok"
+check_local "$(echo "$RESP_BODY" | jq -r '.service // "missing"')" "simply_ip_vault" \
+    "#28 /health names the service"
+check_local "$(echo "$RESP_BODY" | jq -r 'if .version then "present" else "missing" end')" "present" \
+    "#28 /health reports a build version"
+
+RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" "$BASE_URL/ready")
+RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+check "200" "#28 GET /ready answers with no credential at all"
+check_local "$(echo "$RESP_BODY" | jq -r '.status // "missing"')" "ready" \
+    "#28 /ready reports status=ready once the master is pinned"
+check_local "$(echo "$RESP_BODY" | jq -r '.database // "missing"')" "ok" \
+    "#28 /ready confirms the database answered"
+check_local "$(echo "$RESP_BODY" | jq -r '.master_pinned // "missing"')" "true" \
+    "#28 /ready confirms the master identity is pinned"
+
+# A forged credential must be *ignored*, not rejected. An endpoint that merely tolerated a missing
+# header could still branch on a present one, which would put it back behind authentication for
+# exactly the callers most likely to send stale credentials.
+for probe_path in /health /ready; do
+    RESP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+        -H "X-API-Key: not-a-real-key" -H "X-Timestamp: 0" -H "X-Signature-256: sha256=deadbeef" \
+        "$BASE_URL$probe_path")
+    check "200" "#28 $probe_path ignores a forged credential rather than rejecting it"
+done
+
+# The complement: the probes are the exception, not a hole in the wall. An unsigned request to any
+# other route must still be refused.
+RESP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE_URL/api/auth/me")
+check "401" "#28 every other route still demands a signed request"
+
+# Neither probe may leak operational detail to an anonymous caller.
+RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" "$BASE_URL/ready")
+RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
+if echo "$RESP_BODY" | grep -qiE "sqlite|\.db|/tmp/|password|secret"; then
+    check_local "leaked" "clean" "#28 /ready leaks no path, driver, or credential detail"
+else
+    check_local "clean" "clean" "#28 /ready leaks no path, driver, or credential detail"
+fi
 
 
 log_section "Summary"

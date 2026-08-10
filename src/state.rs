@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::config::TrustedProxies;
 use crate::crypto::SecretCipher;
+use crate::master::MasterPin;
 use crate::replay::ReplayGuard;
 
 // SQLite pragmas and pool construction used to live here. They are now `crate::db`, which puts
@@ -82,87 +83,19 @@ pub struct AppState {
     /// replay on any request served through a different clone, which is to say most of them. See
     /// [`crate::replay`].
     pub replay: Arc<ReplayGuard>,
-    /// The id of the one key permitted to act as Master, resolved once and then immutable.
+    /// The identity of the one key permitted to act as Master, fixed at boot.
     ///
-    /// # What this defends against
+    /// The rule this enforces, and the attack it closes, live in [`crate::master`] — the short form
+    /// is that §5's uniqueness index guarantees *at most one* master row but says nothing about
+    /// **which** row, so the cardinality and the identity need separate defences. `main.rs` calls
+    /// [`MasterPin::pin_at_boot`] before the listener binds, and
+    /// [`crate::middleware::auth_middleware`] calls [`MasterPin::authenticate`] on the way in.
     ///
-    /// `api_keys.is_master` is a column, and a column can be edited by anyone holding a database
-    /// prompt, a restored backup, or a stray migration. Every guard in `src/api.rs` reads that flag,
-    /// so before this existed, `UPDATE api_keys SET is_master = true WHERE id = <mine>` was a
-    /// complete privilege escalation that no amount of HTTP-layer authorization could see.
-    ///
-    /// §5's uniqueness constraint does not close it. The derived `master_marker` guarantees *at most
-    /// one* master row, which stops an attacker from **adding** a master — but it does not stop one
-    /// from demoting the legitimate master and promoting itself, which keeps the count at one and
-    /// satisfies the index perfectly. Uniqueness and identity are different properties.
-    ///
-    /// So the identity is fixed at boot, before the listener accepts anything, and the middleware
-    /// treats `is_master` as authoritative only for this id. A row promoted afterwards is an
-    /// ordinary key for the life of the process, no matter what its column says.
-    ///
-    /// # Why `OnceLock` rather than a plain `Uuid`
-    ///
-    /// Write-once is the property being bought, not laziness. A plain field would be assignable by
-    /// any code holding `&mut AppState`, and "the master is whoever we last decided it was" is the
-    /// mutable state this module's header rules out for exactly this class of value. `OnceLock`
-    /// makes a second assignment impossible rather than merely discouraged, so the pin cannot drift
-    /// under a running process even by accident.
-    ///
-    /// Shared behind an [`Arc`] so every clone of the state observes the same pin; a per-clone
-    /// `OnceLock` would let each handler resolve its own, which is the bug this field exists to
-    /// prevent, reintroduced one `#[derive(Clone)]` at a time.
-    master_key_id: Arc<std::sync::OnceLock<Uuid>>,
+    /// Shared behind an [`Arc`] so every clone of the state observes the same pin; a per-clone cell
+    /// would let each handler resolve its own, which is the bug the type exists to prevent,
+    /// reintroduced one `#[derive(Clone)]` at a time.
+    pub master_pin: Arc<MasterPin>,
 }
-
-/// Why [`AppState::pin_master_key`] refused to let the service start.
-///
-/// Every variant is a database state that makes "the Master key" ambiguous or absent. None is
-/// recoverable by retrying, and none should be papered over at runtime: a service that starts
-/// without knowing which key is Master is a service whose most powerful credential is decided by
-/// whichever row a query happens to return first.
-#[derive(Debug, thiserror::Error)]
-pub enum MasterPinError {
-    /// The `api_keys` table holds no row with `is_master = true`.
-    #[error(
-        "No master key exists. The service mints one at first boot; if this database was restored \
-         or edited, delete nothing and investigate — starting without a master would leave every \
-         master-only operation permanently unreachable."
-    )]
-    NoMaster,
-
-    /// More than one row claims `is_master`, so there is no single answer to pin.
-    #[error(
-        "{} keys have is_master = true ({}), but RBAC_MODEL.md §5 requires exactly one. This is \
-         only reachable if the uniqueness constraint was dropped or bypassed. Decide which key is \
-         legitimate and demote the others, then restart. Refusing to start rather than guessing.",
-        .0.len(),
-        .0.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
-    )]
-    MultipleMasters(Vec<Uuid>),
-
-    /// The unique index backing §5 is absent from the live schema.
-    #[error(
-        "The master-uniqueness index '{MASTER_MARKER_INDEX}' is missing from api_keys. RBAC_MODEL.md \
-         §5 requires master uniqueness to be enforced by the database rather than by application \
-         logic; without it a second master can be written at any time. Note that re-running \
-         migrations will NOT restore it — m20260808_000009_derive_master_marker is already recorded \
-         as applied and will be skipped. Recreate it directly:\n  \
-         CREATE UNIQUE INDEX \"{MASTER_MARKER_INDEX}\" ON api_keys (master_marker);"
-    )]
-    MissingUniquenessIndex,
-
-    /// The schema or key lookup itself failed.
-    #[error("Could not read the database while pinning the master key: {0}")]
-    Query(#[from] sea_orm::DbErr),
-}
-
-/// The unique index over the engine-derived `master_marker`, created by
-/// `migration::m20260808_000009_derive_master_marker`.
-///
-/// Named here as well as there because this is the one place that checks it still exists at
-/// *runtime*: a migration proves the index was created once, and this proves nobody has dropped it
-/// since.
-pub const MASTER_MARKER_INDEX: &str = "idx-api_keys-master_marker";
 
 impl AppState {
     /// Builds state with the trusted-proxy list and cipher read from the environment.
@@ -186,7 +119,7 @@ impl AppState {
             trusted_proxies: TrustedProxies::from_env()?,
             cipher: Arc::new(SecretCipher::from_env()?),
             replay: Arc::new(ReplayGuard::default()),
-            master_key_id: Arc::new(std::sync::OnceLock::new()),
+            master_pin: Arc::new(MasterPin::new()),
         })
     }
 
@@ -207,114 +140,20 @@ impl AppState {
             trusted_proxies: TrustedProxies::new(trusted_proxies),
             cipher: Arc::new(cipher),
             replay: Arc::new(ReplayGuard::default()),
-            master_key_id: Arc::new(std::sync::OnceLock::new()),
+            master_pin: Arc::new(MasterPin::new()),
         }
     }
 
-    /// Establishes which key is Master, once, and refuses to return anything else afterwards.
+    /// Builds state whose Master identity is fixed to `master_key_id` without a database lookup.
     ///
-    /// Called by `main.rs` **before the listener is bound**, so the pin is in place before a single
-    /// request can be served. Three checks, in the order that gives the most useful error:
-    ///
-    /// 1. Exactly one row has `is_master = true`. Zero and many are both fatal and are reported
-    ///    differently, because the remedies have nothing in common — one means the bootstrap never
-    ///    ran, the other means someone must decide which key is legitimate.
-    /// 2. The §5 uniqueness index still exists. A migration proves it was created once; this proves
-    ///    nobody has dropped it since.
-    /// 3. That row's id becomes the pin.
-    ///
-    /// # Why this is not redundant with the uniqueness constraint
-    ///
-    /// The constraint guarantees *at most one* master row. It says nothing about **which** row, and
-    /// an attacker with database access does not need two masters — demoting the real one and
-    /// promoting itself keeps the count at exactly one and leaves every constraint satisfied. The
-    /// index defends the cardinality; this defends the identity. Both are needed, and neither
-    /// substitutes for the other.
-    ///
-    /// # Idempotent by construction
-    ///
-    /// Calling it twice returns the already-pinned id and does not re-query. That is not a
-    /// convenience: it is what makes the guarantee hold. If a second call could re-resolve, then
-    /// anything able to trigger one — a reconnect, a reload, a future admin endpoint — would be able
-    /// to move the pin, and "fixed at boot" would be true only until the first such event.
-    pub async fn pin_master_key(&self) -> Result<Uuid, MasterPinError> {
-        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QuerySelect};
-        use sea_orm_migration::SchemaManager;
-
-        if let Some(pinned) = self.master_key_id.get() {
-            return Ok(*pinned);
-        }
-
-        // `select_only` + one column: the master row carries a signing secret, and there is no
-        // reason for a startup check to pull a credential into memory to count to one.
-        let masters: Vec<Uuid> = crate::entities::prelude::ApiKey::find()
-            .select_only()
-            .column(crate::entities::api_key::Column::Id)
-            .filter(crate::entities::api_key::Column::IsMaster.eq(true))
-            .into_tuple()
-            .all(&self.db)
-            .await?;
-
-        let pinned = match masters.as_slice() {
-            [only] => *only,
-            [] => return Err(MasterPinError::NoMaster),
-            many => return Err(MasterPinError::MultipleMasters(many.to_vec())),
-        };
-
-        // The index check comes *after* the count, and the ordering was the other way round until a
-        // test showed why it should not be. Two masters is only reachable once the index is gone, so
-        // checking the index first meant `MultipleMasters` could never be reported — the operator was
-        // told to recreate an index while two masters sat in the table unmentioned. Counting first
-        // surfaces the more urgent fact; the index error is then reported on the next start, once the
-        // ambiguity the service cannot resolve for itself has been resolved.
-        let manager = SchemaManager::new(&self.db);
-        if !manager.has_index("api_keys", MASTER_MARKER_INDEX).await? {
-            return Err(MasterPinError::MissingUniquenessIndex);
-        }
-
-        // `set` losing a race is not an error: two callers resolving concurrently necessarily read
-        // the same single row, so the winner's value is the loser's value. `get_or_init` would be
-        // equivalent; this spelling keeps the fallible query outside the closure.
-        let _ = self.master_key_id.set(pinned);
-        Ok(pinned)
-    }
-
-    /// The pinned Master id, resolving it on first use if `pin_master_key` has not already run.
-    ///
-    /// **Fail-closed.** Returns `None` — meaning *no key is Master* — whenever the identity cannot be
-    /// established: no master row, several, a missing index, or an unreadable database. `None` is
-    /// strictly more restrictive than any answer it replaces, so a failure here removes authority
-    /// rather than granting it.
-    ///
-    /// The lazy path exists for tests, which build their state before seeding any key and would
-    /// otherwise have to be rewritten around a startup sequence they are not testing. It is
-    /// unreachable in production: `main.rs` pins before binding the listener, so by the time any
-    /// request arrives the `OnceLock` is set and this is a load with no query behind it.
-    ///
-    /// That ordering is the whole defence, and it is worth being exact about what it buys. Tampering
-    /// *after* boot has zero effect, because the pin is already fixed. Tampering *before* boot is
-    /// caught by [`pin_master_key`](Self::pin_master_key), which aborts startup rather than pinning
-    /// a key the operator did not intend.
-    pub async fn resolve_master_key_id(&self) -> Option<Uuid> {
-        match self.pin_master_key().await {
-            Ok(id) => Some(id),
-            Err(e) => {
-                tracing::error!(
-                    "Master identity is unresolvable, so no caller will be treated as Master: {e}"
-                );
-                None
-            }
-        }
-    }
-
-    /// Whether this key may act as Master: it must claim the flag **and** be the pinned key.
-    ///
-    /// The conjunction is the point. `key.is_master` alone is a column an attacker with database
-    /// access can set on any row; `id == pinned` alone would promote whichever key was pinned even
-    /// if its flag were later cleared. Requiring both means a promoted impostor is an ordinary key
-    /// and a demoted master stops being one, which are the two directions tampering can go.
-    pub async fn is_effective_master(&self, key: &crate::entities::api_key::Model) -> bool {
-        key.is_master && self.resolve_master_key_id().await == Some(key.id)
+    /// For tests that need the *negative* case: a key that claims mastery and is not the pinned
+    /// identity. Reaching that through [`MasterPin::pin_at_boot`] is impossible by construction — it
+    /// only ever pins a row that really is the sole Master — so the alternative is dropping the §5
+    /// index and writing a second master row, which exercises two failures at once and cannot
+    /// distinguish them.
+    pub fn with_pinned_master(mut self, master_key_id: Uuid) -> Self {
+        self.master_pin = Arc::new(MasterPin::pinned_to(master_key_id));
+        self
     }
 
     /// Builds state with an explicit trusted-proxy list and the zero-config plaintext cipher.

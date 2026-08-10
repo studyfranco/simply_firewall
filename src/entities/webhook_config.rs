@@ -40,7 +40,7 @@ pub struct Model {
     /// The canonical string signed in `CANONICAL_V1` mode, with `{method}`, `{path}`,
     /// `{timestamp}` and `{body}` placeholders. `None` means [`DEFAULT_HMAC_TEMPLATE`].
     ///
-    /// See [`resolve_hmac_template`](crate::webhooks::resolve_hmac_template) for the substitution
+    /// See [`resolve_hmac_template`](crate::dispatch::resolve_hmac_template) for the substitution
     /// and escape rules.
     pub hmac_template: Option<String>,
     /// Custom JSON key-value object of HTTP headers to inject into requests.
@@ -75,7 +75,7 @@ pub struct Model {
 ///
 /// The `\n` are **two-character escape sequences**, not real newlines, because this value round-trips
 /// through a single-line HTML text input in the dashboard where a literal newline cannot be typed.
-/// [`resolve_hmac_template`](crate::webhooks::resolve_hmac_template) expands them, so the bytes
+/// [`resolve_hmac_template`](crate::dispatch::resolve_hmac_template) expands them, so the bytes
 /// actually signed are the same `METHOD\nPATH\nTIMESTAMP\nBODY` the inbound API verifies.
 pub const DEFAULT_HMAC_TEMPLATE: &str = r"{method}\n{path}\n{timestamp}\n{body}";
 

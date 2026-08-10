@@ -110,9 +110,37 @@ A `Dockerfile` and `docker-compose.yml` are included:
 docker compose up --build
 ```
 
-This persists the database under `./data` and exposes port `3000`.
+This persists the database under `./data` and exposes port `3000`. The container declares a
+`HEALTHCHECK` against `GET /ready`, so `docker compose ps` reports real health and
+`depends_on: condition: service_healthy` works against it.
 
 ## API Reference
+
+### Health & readiness
+
+Two routes sit **outside** `/api` and take no credentials at all — the only unauthenticated
+endpoints in the service:
+
+| Route | Meaning |
+| :--- | :--- |
+| `GET /health` | **Liveness.** `200` whenever the process is answering. Touches no dependency. |
+| `GET /ready` | **Readiness.** `200` when the database answers *and* the Master identity is pinned; `503` otherwise, naming which check failed but never why. |
+
+They are unauthenticated because the callers — Docker's `HEALTHCHECK`, a Kubernetes probe, a load
+balancer — cannot compute an HMAC over a body with a rolling timestamp, and minting a long-lived key
+for the platform to hold would be the worse trade. Neither returns data, an error detail, or anything
+naming a key, group, or record.
+
+Keep them apart when wiring an orchestrator. A liveness probe that checked the database would make a
+dependency outage trigger repeated container *restarts* — replacing a partial outage with a crash
+loop. The bundled `Dockerfile` and `docker-compose.yml` probe `/ready`.
+
+```bash
+curl -s http://127.0.0.1:3000/health   # {"status":"ok","service":"simply_ip_vault","version":"0.1.0"}
+curl -s http://127.0.0.1:3000/ready    # {"status":"ready","database":"ok","master_pinned":true}
+```
+
+### Authenticated routes
 
 Every route below is nested under `/api` and requires **three** headers — an API key alone is not
 enough:
@@ -242,18 +270,21 @@ src/
 ├── main.rs              process entry point: startup order, graceful shutdown, master bootstrap
 ├── lib.rs               router assembly (create_app), state wiring, body-limit constant
 ├── db.rs                pool construction, SQLite session pragmas, migration execution
-├── state.rs             AppState, WebhookEvent, and the boot-time Master-identity pin
+├── state.rs             AppState and WebhookEvent — shared, built once at startup
+├── master.rs            MasterPin: boot-time Master identity, and the demotion that enforces it
 ├── middleware.rs        authentication: HMAC, anti-replay, bound_ips, Master-pin enforcement
 ├── crypto.rs            at-rest cipher (XChaCha20-Poly1305) and CANONICAL_V1 request signing
 ├── config.rs            env parsing, trusted proxies, X-Forwarded-For chain walk
 ├── replay.rs            anti-replay guard (monotonic expiry)
-├── extract.rs           StrictJson — deserialization failures as typed API errors
+├── extract.rs           StrictJson / OptionalStrictJson — body rejections as typed API errors
 ├── error.rs             AppError and its HTTP rendering
-├── webhooks.rs          outbound dispatch worker (the sender)
+├── dispatch.rs          outbound webhook dispatch worker (the sender)
 ├── retention.rs         background purge of expired soft-deleted records
 ├── api/                 HTTP handlers, split by domain, re-exported flat
-│   ├── mod.rs           module wiring + helpers used by more than one domain
+│   ├── mod.rs           module wiring and flat re-exports — no executable code
+│   ├── support.rs       plumbing used by three or more domains; decides nothing
 │   ├── guards.rs        every authorization decision, and nothing else
+│   ├── system.rs        unauthenticated /health and /ready probes
 │   ├── keys.rs          API key identity, lifecycle, rotation, permission grants
 │   ├── records.rs       ban/whitelist, listing, soft delete, restore, purge
 │   ├── groups.rs        IP Group CRUD and owner reassignment
@@ -263,12 +294,16 @@ src/
 └── migration/           ordered schema migrations (immutable once applied)
 ```
 
-Two pairs of names are worth disambiguating before reading:
+Three pairs of names are worth disambiguating before reading:
 
-- **`src/webhooks.rs` vs `src/api/webhooks.rs`** — the first is the background worker that *sends*
-  webhooks; the second is the CRUD surface that *configures* them.
+- **`src/dispatch.rs` vs `src/api/webhooks.rs`** — the first is the background worker that *sends*
+  webhooks; the second is the CRUD surface that *configures* them. The worker was `src/webhooks.rs`
+  until the two names sitting one directory apart proved to be a reliable source of wrong imports.
 - **`src/middleware.rs` vs `src/api/guards.rs`** — the first answers "who is calling, and may they
   call at all"; the second answers "may this caller touch *this* resource".
+- **`src/api/support.rs` vs `src/api/guards.rs`** — the boundary is testable, not stylistic: nothing
+  in `support.rs` inspects who is calling or returns a refusal that depends on the caller. A helper
+  that starts deciding belongs in `guards.rs`.
 
 `FILE_MAP.MD` documents every file's role, its primary exports, and the reasoning behind its
 boundaries — including what each file must deliberately *not* contain.

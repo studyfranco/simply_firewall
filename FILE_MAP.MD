@@ -33,7 +33,7 @@ in production.
 
 **Key exports.** `main`, `shutdown_signal`, `bootstrap_master_key` (all private — this is a binary).
 
-**Rationale.** The ordering is a security control, not a convenience. `pin_master_key()` runs
+**Rationale.** The ordering is a security control, not a convenience. `MasterPin::pin_at_boot()` runs
 **after** migrations and bootstrap but **before** `TcpListener::bind`, so the Master's identity is
 fixed before a single request can be served. Moving it later reintroduces exactly the tampering
 window it exists to close.
@@ -72,33 +72,53 @@ hand opts out of that default *silently*, which is how it was broken once. The f
 declared on `SqliteConnectOptions` rather than issued as statements so SQLx replays them when it
 reopens a connection.
 
-### `src/state.rs` — shared application state and the Master pin
+### `src/state.rs` — shared application state
 
-**Role & scope.** `AppState` and its constructors, `WebhookEvent`, `StartupConfigError`, and the
-Master-identity pin (`master_key_id`, `pin_master_key`, `resolve_master_key_id`,
-`is_effective_master`, `MasterPinError`, `MASTER_MARKER_INDEX`).
+**Role & scope.** `AppState` and its constructors, `WebhookEvent`, and `StartupConfigError`.
 
-**Must not hold** database setup — that moved to `db.rs`.
+**Must not hold** database setup (that is `db.rs`) or the Master-pin *mechanism* (that is
+`master.rs`). `AppState` holds the pin as a field; it does not implement it.
 
-**Key exports.** `AppState`, `WebhookEvent`, `StartupConfigError`, `MasterPinError`,
-`MASTER_MARKER_INDEX`.
+**Key exports.** `AppState`, `WebhookEvent`, `StartupConfigError`, `AppState::with_pinned_master`.
 
 **Rationale.** Everything in `AppState` is built **once at startup** and carried, never re-derived
 per request, because each field is an input to an authorization decision and a value that can change
-under a running process cannot be reasoned about. `master_key_id` is `Arc<OnceLock<Uuid>>` rather than
-a plain `Uuid` specifically so a second assignment is impossible rather than merely discouraged.
+under a running process cannot be reasoned about. Every shared field is behind an `Arc` so that a
+`#[derive(Clone)]` cannot silently give a handler its own copy of a security primitive.
 
-> **Known divergence.** `simply_hook_executor` factors this into a dedicated `src/master.rs` with a
-> `MasterPin` type. See `AGENT_NOTES.MD` Session 41, proposal **P1**.
+### `src/master.rs` — the Master identity pin
+
+**Role & scope.** `MasterPin` (`new`, `pinned_to`, `get`, `pin_at_boot`, `resolve`, `authenticate`),
+`MasterPinError`, `MASTER_MARKER_INDEX`. Everything that decides *which* key is Master, and the
+demotion that enforces it.
+
+**Must not hold** any other authorization rule. This file answers exactly one question — "is this key
+the Master this process pinned?" — and §1–§4/§6/§7 all belong in `api/guards.rs`.
+
+**Key exports.** `MasterPin`, `MasterPinError`, `MASTER_MARKER_INDEX`.
+
+**Rationale.** §5's uniqueness index guarantees *at most one* master row and says nothing about
+**which** row. An attacker with database access does not need two masters — demoting the real one and
+promoting itself keeps the count at one and satisfies every constraint. The index defends the
+cardinality; this file defends the identity, and neither substitutes for the other.
+
+`MasterPin::authenticate` is the single choke point: it mutates the authenticated record so every
+downstream `key.is_master` read is automatically correct. `pinned_to` exists for the negative path —
+a pin fixed to an id the database does not agree with cannot be reached through `pin_at_boot`, which
+by construction only ever pins the row that really is the sole Master.
+
+Mirrors `simply_hook_executor::master`, closing proposal **P1** from `AGENT_NOTES.MD` Session 41.
+`scripts/verify_convergence.sh` asserts `pin_at_boot`, the `OnceLock` field, the runtime index check,
+and that `key.is_master = false` appears in **exactly one** non-migration file.
 
 ### `src/middleware.rs` — authentication, and the Master-pin boundary
 
 **Role & scope.** `auth_middleware`: key lookup, HMAC signature verification, anti-replay, `bound_ips`
-enforcement, and the demotion of any key claiming `is_master` that is not the pinned Master. Also
-`ClientIp`.
+enforcement, and the single call to `MasterPin::authenticate`. Also `ClientIp`.
 
 **Must not hold** per-resource authorization — that is `api/guards.rs`. This file answers "who is
-calling and may they call at all", never "may they touch *this* group".
+calling and may they call at all", never "may they touch *this* group". Nor the demotion *logic*:
+it calls `master.rs`, it does not reimplement it.
 
 **Key exports.** `auth_middleware`, `ClientIp`.
 
@@ -155,11 +175,14 @@ nowhere, because clearing would let every recorded signature replay at once.
 ### `src/extract.rs` — strict request extractors
 
 **Role & scope.** `StrictJson<T>`: `Json` whose deserialization failures become `AppError` with the
-correct status.
+correct status. `OptionalStrictJson<T>`: the same, for endpoints whose body may be absent entirely,
+yielding `T::default()`.
 
-**Must not hold** anything domain-specific.
+**Must not hold** anything domain-specific. `OptionalStrictJson`'s parse failure is worded generically
+for exactly this reason — it serves any bodyless-optional payload, so a message naming one caller's
+field would be wrong for the second adopter.
 
-**Key exports.** `StrictJson`.
+**Key exports.** `StrictJson`, `OptionalStrictJson`.
 
 **Rationale.** This is a `RBAC_MODEL.md` §5 control, not ergonomics. §5 requires `is_master` be
 removed from the payload *type*, "rejecting it at the handler is not sufficient". Removing a field
@@ -168,7 +191,14 @@ the absence into a refusal and `StrictJson` renders that refusal as `400` with s
 which is also what lets a test prove the control lives in the type rather than in a guard. Only the
 two *content* error variants are remapped, so a body over the size limit still answers `413`.
 
-### `src/webhooks.rs` — outbound dispatch worker
+`OptionalStrictJson` replaced a hand-rolled `axum::body::Bytes` + `serde_json::from_slice` in
+`delete_api_key`. `DELETE /api/keys/{id}` is a conversation — the first request carries no body and
+gets §6's inventory back, the resubmission carries the resolution map — and neither `Json` (which
+rejects an empty body) nor `Option<Json<T>>` (which keys on `Content-Type`, not emptiness) expresses
+that. Emptiness is decided from the **bytes**, and reading through `Bytes` keeps the request under the
+router's `DefaultBodyLimit`, so the `413` control still applies.
+
+### `src/dispatch.rs` — outbound dispatch worker
 
 **Role & scope.** The background task that consumes `WebhookEvent`s and dispatches signed HTTP calls:
 auth-mode handling, HMAC templating, SSRF checks, retry behaviour.
@@ -179,8 +209,11 @@ the sender; that one is the CRUD surface.
 **Key exports.** the dispatch worker entry point and `AuthMode` handling.
 
 **Rationale.** Dispatch is a background concern with its own failure semantics; a failed delivery must
-never fail the request that triggered it. The naming collision with `api/webhooks.rs` is the one
-genuinely confusing thing in the tree — see `AGENT_NOTES.MD` Session 41, proposal **P4**.
+never fail the request that triggered it. Named `dispatch` and not `webhooks` because it sat one
+directory from `src/api/webhooks.rs` and the two do opposite jobs — that one is the CRUD surface for
+webhook *configuration*, this one is the runtime that *sends*. Two files distinguished only by a path
+prefix get imported wrongly and, worse, reviewed wrongly: a diff header reading `webhooks.rs` does not
+say which of the two security models applies. Closes proposal **P4** from Session 41.
 
 ### `src/retention.rs` — soft-delete purge worker
 
@@ -218,19 +251,63 @@ Re-exported **flat** by `mod.rs`: `api::create_api_key` resolves exactly as it d
 **The paths are the API; the files are an implementation detail** — do not "tidy" the re-exports into
 module-qualified paths.
 
-### `src/api/mod.rs` — module wiring and cross-domain helpers
+### `src/api/mod.rs` — module wiring only
 
-**Role & scope.** Module declarations, the flat re-exports, and exactly those helpers that **more than
-one** domain needs: `generate_random_key`, `hash_key`, `normalize_ip_or_cidr`, `create_audit_log`, the
-group-resolution family, `IP_EVENT_ACTIONS`, `ReassignOwnerPayload`.
+**Role & scope.** Module declarations and the flat re-exports. Nothing else.
 
-**Must not hold** anything used by a single domain — that belongs in the domain's own file.
+**Must not hold** a single line of executable code. It held ~180 lines of helpers until Session 42;
+they are now `support.rs`. A helper added here is the beginning of the drawer re-filling.
+
+**Key exports.** the flat re-export surface — `pub(crate) use guards::*`, `pub(crate) use support::*`,
+and a `pub use` per domain module.
+
+**Rationale.** The re-export shape is deliberate. `guards` and most of `support` are `pub(crate)`, so a
+`pub` glob over them would re-export nothing and clippy says so; the four genuinely public items
+(`generate_random_key`, `hash_key`, `normalize_ip_or_cidr`, `ReassignOwnerPayload`) are therefore named
+explicitly, since the integration suites mint keys directly against the database and need the
+credential primitives.
+
+### `src/api/support.rs` — shared plumbing, decides nothing
+
+**Role & scope.** Helpers that **three or more** handler domains need: `generate_random_key`,
+`hash_key`, `normalize_ip_or_cidr`, `create_audit_log`, `format_key_reference`, the group-resolution
+family (`get_or_create_group`, `resolve_group_ref`, `resolve_group_by_identifier`,
+`resolve_group_ref_flexible`), `IP_EVENT_ACTIONS`, `ReassignOwnerPayload`.
+
+**Must not hold** anything that makes an authorization decision. That is the boundary against
+`guards.rs`, and it is testable rather than stylistic: nothing here inspects *who* is calling or
+returns a refusal that depends on the caller. A helper that starts deciding belongs in `guards.rs`.
+Nor anything a single domain uses — that belongs in the domain's own file.
+
+**Key exports.** as above.
 
 **Rationale.** A helper is here because pushing it into a domain module would make every other domain
-depend on that one. `ReassignOwnerPayload` is shared because §3 ownership is cross-domain by nature.
+depend on that one, and because leaving it in `mod.rs` made that file wiring plus a utility drawer at
+once. `format_key_reference` came from `guards.rs` in Session 42: it renders a string for a log line,
+decides nothing, and five of its seven call sites were already outside that module. Closes proposal
+**P2**. Mirrors `simply_hook_executor::api::support`.
 
-> **Known divergence.** `simply_hook_executor` keeps the equivalent helpers in a dedicated
-> `src/api/support.rs`, leaving its `api/mod.rs` as pure wiring. See Session 41, proposal **P2**.
+### `src/api/system.rs` — unauthenticated liveness and readiness probes
+
+**Role & scope.** `health_check` (`GET /health`) and `readiness_check` (`GET /ready`). The only two
+endpoints in the service that answer without a credential.
+
+**Must not hold** anything that returns data, names a resource, or reports an error in detail. Both
+handlers are reachable by anyone who can open a socket.
+
+**Key exports.** `health_check`, `readiness_check`.
+
+**Rationale.** Mounted in `lib.rs` on the **root** router, outside the `/api` nest and therefore
+outside `auth_middleware` — the callers are Docker's `HEALTHCHECK`, a Kubernetes probe and a load
+balancer, none of which can compute an HMAC over a body with a rolling timestamp. The convergence
+script asserts that placement, because moving them inside the nest would make them uncallable in a way
+that looks like a broken healthcheck rather than a misplaced route.
+
+Liveness and readiness are kept apart deliberately. `/health` touches nothing; `/ready` proves the
+database answers and the Master identity is pinned. An orchestrator *restarts* a container whose
+liveness probe fails, so a liveness check that consulted the database would turn a dependency outage
+into an unbounded restart loop. A failing `/ready` names which check failed and never why — the driver
+error goes to the log, where an operator can read it and an anonymous caller cannot.
 
 ### `src/api/guards.rs` — every authorization decision
 
@@ -287,7 +364,7 @@ resource* — shared, carrying per-key permission rows, governed by the R2 conju
 **Role & scope.** CRUD and owner reassignment for the specification's *creator-private entity* —
 visible only to its `owner_key_id` and Master, never exposed by the shared-resource visibility rule.
 
-**Must not hold** dispatch logic; that is top-level `src/webhooks.rs`.
+**Must not hold** dispatch logic; that is top-level `src/dispatch.rs`.
 
 **Key exports.** `create_webhook`, `list_webhooks`, `update_webhook`, `delete_webhook`,
 `reassign_webhook_owner`, `WebhookSummary`.

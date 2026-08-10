@@ -1,4 +1,17 @@
-//! Webhook background worker
+//! The outbound webhook dispatcher: the background worker that *sends* notifications.
+//!
+//! # Why this is `dispatch` and not `webhooks`
+//!
+//! It was `src/webhooks.rs` until the structural audit, which sat one directory away from
+//! `src/api/webhooks.rs` — and the two do entirely different jobs. That module is the CRUD surface
+//! for webhook **configuration**: a caller creating, listing, and deleting `webhook_config` rows.
+//! This one is the **runtime**: it consumes [`WebhookEvent`]s off a channel, resolves each target
+//! against the SSRF filter below, signs the body, and makes the outbound HTTP call. Nothing here
+//! serves a request, and nothing in `api/webhooks.rs` ever sends one.
+//!
+//! Two files with the same name whose only distinction was a path prefix is the shape that gets
+//! imported wrongly — and, worse, *reviewed* wrongly, because a diff header reading `webhooks.rs`
+//! does not say which of the two security models applies.
 
 use std::time::Duration;
 use std::str::FromStr;
