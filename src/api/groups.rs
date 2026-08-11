@@ -88,7 +88,7 @@ pub async fn create_ip_group(
         api_key_group_permission::Entity::insert(perm).exec(&state.db).await?;
     }
     
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "GROUP_CREATE", None, Some(payload.name.clone()), None).await?;
+    create_audit_log(&state.db, &key, client_ip.0, "GROUP_CREATE", None, Some(payload.name.clone()), None).await?;
 
     Ok(Json(serde_json::json!({ "id": id, "name": payload.name, "group_type": group_type })))
 }
@@ -144,7 +144,7 @@ pub async fn delete_ip_group(
         return Err(AppError::NotFound);
     }
     
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "GROUP_DELETE", None, None, Some(id.to_string())).await?;
+    create_audit_log(&state.db, &key, client_ip.0, "GROUP_DELETE", None, None, Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
@@ -181,8 +181,8 @@ pub async fn reassign_group_owner(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "GROUP_OWNER_REASSIGN",
         None,
         Some(group_name),

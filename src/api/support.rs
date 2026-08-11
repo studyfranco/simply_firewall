@@ -108,10 +108,30 @@ pub(crate) fn format_key_reference(name: &str, id: Uuid) -> String {
 /// is `ON DELETE SET NULL`, per `SCHEMA.MD`, but the name/prefix survive as a point-in-time
 /// snapshot rather than a live join). `client_ip` is the resolved caller address from
 /// [`crate::middleware::ClientIp`].
+///
+/// # Attribution is required, not defaulted
+///
+/// `key` and `client_ip` are taken **by value rather than as `Option`**, and that is the control
+/// rather than an ergonomic preference. `m20260811_000010` made the three attribution columns
+/// `NOT NULL`; the obvious way to satisfy that would have been to keep the `Option`s and substitute
+/// `"anonymous"` / `"unknown"` when they are `None`. That would be strictly worse. A fallback string
+/// makes an unattributed write *succeed*, so the first caller that has no key — a future background
+/// job, a system event, a handler mounted outside `auth_middleware` — silently produces rows that
+/// satisfy the constraint and attribute nothing. The column would be `NOT NULL` and the audit trail
+/// would still have holes in it.
+///
+/// Taking them by value makes that call impossible to write instead. Every audited route already
+/// runs behind [`crate::middleware::auth_middleware`], which resolves both before a handler sees the
+/// request, so all twenty call sites satisfy this today with no fallback needed — the `Option`s were
+/// never `None` in practice, only in the type.
+///
+/// The fallback exists exactly once, in the migration's backfill, where it is genuinely needed for
+/// rows written before the constraint. A future system-event writer should get its own function with
+/// its own explicit actor, not a `None` threaded through this one.
 pub(crate) async fn create_audit_log(
     db: &sea_orm::DatabaseConnection,
-    key: Option<&api_key::Model>,
-    client_ip: Option<std::net::IpAddr>,
+    key: &api_key::Model,
+    client_ip: std::net::IpAddr,
     action: &str,
     target_address: Option<String>,
     group_names: Option<String>,
@@ -119,10 +139,10 @@ pub(crate) async fn create_audit_log(
 ) -> Result<(), AppError> {
     let log = audit_log::ActiveModel {
         id: Set(Uuid::new_v4()),
-        api_key_id: Set(key.map(|k| k.id)),
-        api_key_name: Set(key.map(|k| k.name.clone())),
-        api_key_prefix: Set(key.map(|k| k.prefix.clone())),
-        client_ip: Set(client_ip.map(|ip| ip.to_string())),
+        api_key_id: Set(Some(key.id)),
+        api_key_name: Set(key.name.clone()),
+        api_key_prefix: Set(key.prefix.clone()),
+        client_ip: Set(client_ip.to_string()),
         action: Set(action.to_owned()),
         target_address: Set(target_address),
         group_names: Set(group_names),

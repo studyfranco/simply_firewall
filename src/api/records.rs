@@ -295,8 +295,8 @@ pub(crate) async fn handle_ip_upsert(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip),
+        &key,
+        client_ip,
         action,
         Some(normalized_address.clone()),
         Some(resolved_group_name),
@@ -663,8 +663,8 @@ pub async fn delete_ip_record(
         ip_record::Entity::delete_by_id(id).exec(&state.db).await?;
         create_audit_log(
             &state.db,
-            Some(&key),
-            Some(client_ip.0),
+            &key,
+            client_ip.0,
             "IP_HARD_DELETE",
             Some(address.clone()),
             None,
@@ -700,8 +700,8 @@ pub async fn delete_ip_record(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "IP_SOFT_DELETE",
         Some(address.clone()),
         None,
@@ -761,8 +761,8 @@ pub async fn restore_ip_record(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "IP_RESTORE",
         Some(address.clone()),
         None,
@@ -829,8 +829,8 @@ pub async fn purge_ip_records(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "IP_PURGE",
         None,
         None,
@@ -941,8 +941,8 @@ pub async fn delete_ip(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "IP_DELETE",
         Some(target_address),
         Some(group.name.clone()),

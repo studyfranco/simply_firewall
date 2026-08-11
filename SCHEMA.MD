@@ -252,14 +252,45 @@ Security audit trail tracking mutating operations across the application.
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique audit log entry ID |
 | `api_key_id` | `UUID` | Nullable, FK -> `api_keys.id` (SET NULL) | Performing API key ID (Null if triggered by system auto-gen) |
-| `api_key_name` | `String` | Nullable | Performing key's name, denormalized at write time so it survives that key later being deleted (unlike `api_key_id`, never nulled out by the FK's `SET NULL`) |
-| `api_key_prefix` | `String` | Nullable | Performing key's prefix, denormalized for the same reason as `api_key_name` |
-| `client_ip` | `String` | Nullable | Caller's resolved client IP (rightmost `X-Forwarded-For` hop, `X-Real-IP`, or raw TCP peer address) |
+| `api_key_name` | `String` | **Not Null** | Performing key's name, denormalized at write time so it survives that key later being deleted (unlike `api_key_id`, never nulled out by the FK's `SET NULL`) |
+| `api_key_prefix` | `String` | **Not Null** | Performing key's prefix, denormalized for the same reason as `api_key_name` |
+| `client_ip` | `String` | **Not Null** | Caller's resolved client IP (rightmost `X-Forwarded-For` hop, `X-Real-IP`, or raw TCP peer address) |
 | `action` | `String` | Not Null, Indexed | Operation type, e.g. `IP_ADD`, `IP_UPDATE`, `IP_DELETE`, `KEY_CREATE`, `KEY_DELETE`, `KEY_UPDATE`, `KEY_ROTATE`, `KEY_SECRET_ROTATE`, `KEY_PERM_UPDATE`, `GROUP_CREATE`, `GROUP_DELETE`, `WEBHOOK_CREATE`, `WEBHOOK_DELETE` (non-exhaustive — any mutating action may log its own type) |
 | `target_address` | `String` | Nullable | Target IP or CIDR range affected |
 | `group_names` | `String` | Nullable | Comma-separated list of group names involved |
 | `details` | `Text` | Nullable | Additional context or raw payload overview |
 | `timestamp` | `DateTimeUtc` | Not Null, Indexed | Log creation timestamp |
+
+#### Attribution is `NOT NULL` — the guarantee, and why it is at this layer
+
+`api_key_id` is `ON DELETE SET NULL` on purpose: deleting a credential must never erase the record of
+what it did. That makes `api_key_name` and `api_key_prefix` the **only** attribution that survives the
+key — a point-in-time snapshot, not a live join. A row whose FK has been nulled by the cascade *and*
+whose name was never written would record an action with no actor at all.
+
+Since `m20260811_000010_audit_attribution_not_null`, all three columns are `NOT NULL`:
+
+| Guarantee | Enforced by |
+| :--- | :--- |
+| No application path can write an unattributed row | `create_audit_log` takes `&api_key::Model` and `IpAddr` **by value, not `Option`** |
+| No *other* writer can either — restore, operator, future migration | The `NOT NULL` constraint itself |
+| Historical rows are preserved, not discarded | The migration backfills `(unknown)` before applying the constraint |
+
+The writer's signature is the part worth understanding. The obvious way to satisfy `NOT NULL` would
+have been to keep the `Option`s and substitute `"anonymous"` / `"unknown"` when absent. That is
+strictly worse: a fallback makes an unattributed write *succeed*, so the first caller without a key
+silently produces rows that satisfy the constraint and attribute nothing — the column would be
+`NOT NULL` and the trail would still have holes. Taking the values by value makes that call impossible
+to write instead. A future system-event writer should get its own function with its own explicit
+actor, not a `None` threaded through this one.
+
+The `(unknown)` backfill is deliberately not a plausible value — it cannot be confused with a real key
+name, prefix or address, so a reader can distinguish "not recorded" from "recorded as this".
+
+> **SQLite note.** SQLite has no `ALTER TABLE … ALTER COLUMN`, so tightening nullability there is a
+> create-copy-drop-rename table rebuild. PostgreSQL and MySQL take `ALTER COLUMN … SET NOT NULL`
+> directly. `tests/schema_integrity_tests.rs` pins what the rebuild had to carry across: the
+> `SET NULL` cascade, both indexes, and a column-name-keyed copy that cannot transpose values.
 
 ---
 

@@ -255,7 +255,7 @@ pub async fn create_api_key(
 
     api_key::Entity::insert(model).exec(&state.db).await?;
     
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_CREATE", None, None, Some(payload.name.clone())).await?;
+    create_audit_log(&state.db, &key, client_ip.0, "KEY_CREATE", None, None, Some(payload.name.clone())).await?;
 
     Ok(Json(CreateApiKeyResponse {
         id,
@@ -904,8 +904,8 @@ pub async fn delete_api_key(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "KEY_DELETE",
         None,
         None,
@@ -1025,7 +1025,7 @@ pub async fn update_api_key(
     // resulting name is what a reader will actually recognize it by later.
     let target_ref = format_key_reference(&updated.name, id);
 
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_UPDATE", None, None, Some(format!("Updated key {target_ref}"))).await?;
+    create_audit_log(&state.db, &key, client_ip.0, "KEY_UPDATE", None, None, Some(format!("Updated key {target_ref}"))).await?;
 
     Ok(Json(full_api_key_summary(&state.db, updated).await?))
 }
@@ -1079,7 +1079,7 @@ pub async fn rotate_api_key(
     active.updated_at = Set(Utc::now().naive_utc());
     active.update(&state.db).await?;
 
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "KEY_ROTATE", None, None, Some(format!("Rotated secret for key {target_ref}"))).await?;
+    create_audit_log(&state.db, &key, client_ip.0, "KEY_ROTATE", None, None, Some(format!("Rotated secret for key {target_ref}"))).await?;
 
     Ok(Json(RotateKeyResponse { id, plaintext_key, signing_secret }))
 }
@@ -1140,8 +1140,8 @@ pub async fn rotate_signing_secret(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "KEY_SECRET_ROTATE",
         None,
         None,
@@ -1264,8 +1264,8 @@ pub async fn update_key_group_permissions(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "KEY_PERM_UPDATE",
         None,
         Some(resolved_group_name),
@@ -1353,8 +1353,8 @@ pub async fn revoke_key_group_permission(
     let target = ApiKey::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "KEY_PERM_REVOKE",
         None,
         Some(group.name),

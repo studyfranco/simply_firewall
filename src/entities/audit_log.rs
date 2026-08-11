@@ -17,12 +17,19 @@ pub struct Model {
     /// The acting key's name, denormalized at write time so the audit trail stays legible even
     /// after that key is later deleted (unlike `api_key_id`, this is never nulled out by a
     /// cascade — it's a point-in-time snapshot, not a live join).
-    pub api_key_name: Option<String>,
-    /// The acting key's prefix, denormalized for the same reason as `api_key_name`.
-    pub api_key_prefix: Option<String>,
+    ///
+    /// **`NOT NULL` since `m20260811_000010`.** Because `api_key_id` is `ON DELETE SET NULL`, this
+    /// and `api_key_prefix` are the *only* attribution that survives the key. A row with a nulled
+    /// FK and no name would record an action with no actor at all. Historical rows that predate the
+    /// constraint carry the literal `(unknown)`, which is deliberately not mistakable for a real
+    /// key name.
+    pub api_key_name: String,
+    /// The acting key's prefix, denormalized for the same reason as `api_key_name`. `NOT NULL`.
+    pub api_key_prefix: String,
     /// The caller's resolved client IP (rightmost `X-Forwarded-For` hop, `X-Real-IP`, or raw TCP
-    /// peer address — see `middleware::auth_middleware`), if available.
-    pub client_ip: Option<String>,
+    /// peer address — see `middleware::auth_middleware`). `NOT NULL`: every audited route runs
+    /// behind `auth_middleware`, which always resolves an address before a handler sees the request.
+    pub client_ip: String,
     /// Operation type, e.g. `IP_ADD`, `IP_DELETE`, `KEY_CREATE`, `KEY_DELETE`, `KEY_PERM_UPDATE`,
     /// `GROUP_CREATE`, `GROUP_DELETE`, `WEBHOOK_CREATE`, `WEBHOOK_DELETE` (non-exhaustive).
     pub action: String,

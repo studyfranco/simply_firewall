@@ -45,8 +45,8 @@ pub async fn reassign_webhook_owner(
 
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "WEBHOOK_OWNER_REASSIGN",
         None,
         None,
@@ -209,7 +209,7 @@ pub async fn create_webhook(
     };
     webhook_config::Entity::insert(model).exec(&state.db).await?;
 
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "WEBHOOK_CREATE", None, None, Some(payload.target_url.clone())).await?;
+    create_audit_log(&state.db, &key, client_ip.0, "WEBHOOK_CREATE", None, None, Some(payload.target_url.clone())).await?;
 
     Ok(Json(serde_json::json!({
         "id": id,
@@ -497,8 +497,8 @@ pub async fn update_webhook(
     };
     create_audit_log(
         &state.db,
-        Some(&key),
-        Some(client_ip.0),
+        &key,
+        client_ip.0,
         "WEBHOOK_UPDATE",
         None,
         None,
@@ -574,7 +574,7 @@ pub async fn delete_webhook(
         return Err(AppError::NotFound);
     }
 
-    create_audit_log(&state.db, Some(&key), Some(client_ip.0), "WEBHOOK_DELETE", None, None, Some(id.to_string())).await?;
+    create_audit_log(&state.db, &key, client_ip.0, "WEBHOOK_DELETE", None, None, Some(id.to_string())).await?;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

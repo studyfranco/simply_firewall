@@ -198,9 +198,9 @@ async fn seed_audit_log(db: &DatabaseConnection, key: Uuid, name: &str, action: 
     audit_log::Entity::insert(audit_log::ActiveModel {
         id: Set(id),
         api_key_id: Set(Some(key)),
-        api_key_name: Set(Some(name.to_owned())),
-        api_key_prefix: Set(Some("abcd1234".to_owned())),
-        client_ip: Set(Some("203.0.113.7".to_owned())),
+        api_key_name: Set(name.to_owned()),
+        api_key_prefix: Set("abcd1234".to_owned()),
+        client_ip: Set("203.0.113.7".to_owned()),
         action: Set(action.to_owned()),
         target_address: Set(Some("198.51.100.4".to_owned())),
         group_names: Set(None),
@@ -294,12 +294,12 @@ async fn deleting_an_api_key_preserves_its_audit_trail_and_nulls_the_reference()
 
     assert_eq!(row.api_key_id, None, "the dangling reference is nulled, not left pointing nowhere");
     assert_eq!(
-        row.api_key_name.as_deref(),
-        Some("worker_bot"),
+        row.api_key_name,
+        "worker_bot",
         "the denormalized name survives — this is what keeps the trail readable after the join \
          target is gone"
     );
-    assert_eq!(row.api_key_prefix.as_deref(), Some("abcd1234"));
+    assert_eq!(row.api_key_prefix, "abcd1234");
     assert_eq!(row.action, "IP_ADD");
 }
 
@@ -857,4 +857,207 @@ async fn with_foreign_keys_off_the_same_delete_leaves_dangling_rows() {
         2,
         "both join tables are left dangling; with the pragma on this list is empty: {orphans:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────
+// Audit attribution: NOT NULL, and what the rebuild had to preserve
+// ─────────────────────────────────────────────────────────────
+//
+// `m20260811_000010` makes `api_key_name`, `api_key_prefix` and `client_ip` NOT NULL. On SQLite that
+// is not an `ALTER COLUMN` — the engine has none — but a full table rebuild: create, copy, drop,
+// rename. A rebuild is the most dangerous shape of migration there is, because everything it forgets
+// to recreate simply stops existing, and nothing fails. The tests below pin each thing it had to
+// carry across.
+
+/// The constraint is enforced by the **engine**, against a writer that bypasses the entity layer.
+///
+/// The Rust type says `String`, so no application path can produce a NULL — but the type is not what
+/// is deployed, and a restore, an operator, or a future migration writes SQL directly. This asserts
+/// the column, not the struct.
+#[tokio::test]
+async fn audit_attribution_columns_reject_null_from_raw_sql() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+    let key = seed_key(&db, "operator", None).await;
+
+    for column in ["api_key_name", "api_key_prefix", "client_ip"] {
+        // Every other column is supplied; only the one under test is NULL, so a refusal can only be
+        // that column's constraint rather than an incidental error.
+        let sql = format!(
+            "INSERT INTO audit_logs \
+             (id, api_key_id, api_key_name, api_key_prefix, client_ip, action, timestamp) \
+             VALUES (x'{}', x'{}', {}, {}, {}, 'IP_ADD', '2026-01-01 00:00:00')",
+            Uuid::new_v4().simple(),
+            key.simple(),
+            if column == "api_key_name" { "NULL" } else { "'n'" },
+            if column == "api_key_prefix" { "NULL" } else { "'p'" },
+            if column == "client_ip" { "NULL" } else { "'203.0.113.1'" },
+        );
+        let outcome = db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, sql)).await;
+        assert!(
+            outcome.is_err(),
+            "a NULL {column} must be refused — an audit row with no actor records an action nobody \
+             performed"
+        );
+    }
+
+    // The control: the same statement with every column supplied must succeed. Without it, a
+    // malformed INSERT would make all three assertions above pass for the wrong reason forever.
+    let ok = db
+        .execute_raw(Statement::from_string(
+            DatabaseBackend::Sqlite,
+            format!(
+                "INSERT INTO audit_logs \
+                 (id, api_key_id, api_key_name, api_key_prefix, client_ip, action, timestamp) \
+                 VALUES (x'{}', x'{}', 'n', 'p', '203.0.113.1', 'IP_ADD', '2026-01-01 00:00:00')",
+                Uuid::new_v4().simple(),
+                key.simple()
+            ),
+        ))
+        .await;
+    assert!(ok.is_ok(), "a fully attributed row must still insert: {ok:?}");
+}
+
+/// The rebuild preserved `ON DELETE SET NULL` on `api_key_id`.
+///
+/// The single highest-risk thing about this migration. That cascade is what lets a key be deleted
+/// without erasing what it did; a rebuild that dropped the foreign key, or recreated it as `CASCADE`,
+/// would turn deleting a credential into deleting its own audit trail — and the only symptom would be
+/// rows quietly disappearing.
+#[tokio::test]
+async fn the_audit_rebuild_preserved_the_set_null_cascade() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    let key = seed_key(&db, "worker_bot", None).await;
+    let entry = seed_audit_log(&db, key, "worker_bot", "IP_ADD").await;
+
+    api_key::Entity::delete_by_id(key).exec(&db).await.expect("the key deletes");
+
+    let row = audit_log::Entity::find_by_id(entry)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the audit row must survive the key that wrote it");
+    assert_eq!(row.api_key_id, None, "the dangling reference is nulled");
+    assert_eq!(
+        row.api_key_name, "worker_bot",
+        "and the denormalized attribution survives — which is now NOT NULL, so this is the only \
+         record of who acted"
+    );
+    assert_eq!(row.api_key_prefix, "abcd1234");
+}
+
+/// The rebuild preserved both indexes.
+///
+/// They are dropped with the old table and must be recreated by hand. Losing one turns every audit
+/// listing into a table scan — a regression no functional test would ever notice.
+#[tokio::test]
+async fn the_audit_rebuild_preserved_both_indexes() {
+    use sea_orm_migration::SchemaManager;
+
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+    let manager = SchemaManager::new(&db);
+
+    for index in ["idx-audit_logs-action", "idx-audit_logs-timestamp"] {
+        assert!(
+            manager.has_index("audit_logs", index).await.unwrap(),
+            "{index} did not survive the table rebuild"
+        );
+    }
+}
+
+/// Historical rows survive the constraint, and say so honestly.
+///
+/// Migrations 1–9 are applied, a row with NULL attribution is written the way the old schema allowed,
+/// and only then is migration 10 applied. This is the upgrade path a real deployment takes, and it is
+/// the one path the rest of the suite cannot exercise — every other test starts from a fully migrated
+/// database where such a row is already impossible.
+#[tokio::test]
+async fn rows_written_before_the_constraint_are_backfilled_not_dropped() {
+    use sea_orm_migration::MigratorTrait;
+
+    let tmp = TempDb::new();
+    let db = simply_ip_vault::db::connect(&tmp.url()).await.expect("pool opens");
+
+    // Everything up to and including m20260808_000009, but not m20260811_000010.
+    simply_ip_vault::migration::Migrator::up(&db, Some(9)).await.expect("nine migrations apply");
+
+    let key = seed_key(&db, "legacy", None).await;
+    let legacy = Uuid::new_v4();
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        format!(
+            "INSERT INTO audit_logs (id, api_key_id, action, timestamp) \
+             VALUES (x'{}', x'{}', 'IP_ADD', '2020-01-01 00:00:00')",
+            legacy.simple(),
+            key.simple()
+        ),
+    ))
+    .await
+    .expect("the old schema permitted unattributed rows");
+
+    // Now the constraint lands.
+    simply_ip_vault::migration::Migrator::up(&db, None).await.expect("the backfill migration applies");
+
+    let row = audit_log::Entity::find_by_id(legacy)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("a historical row must be backfilled, never discarded");
+
+    assert_eq!(row.api_key_name, "(unknown)");
+    assert_eq!(row.api_key_prefix, "(unknown)");
+    assert_eq!(row.client_ip, "(unknown)");
+    assert_eq!(row.action, "IP_ADD", "the rest of the row is carried across untouched");
+    assert_eq!(row.api_key_id, Some(key), "including the foreign key");
+    assert!(
+        row.client_ip.parse::<std::net::IpAddr>().is_err(),
+        "the fallback must not be mistakable for a real address — a reader has to be able to tell \
+         'not recorded' from 'recorded as this'"
+    );
+}
+
+/// The copy is by column name, not by position.
+///
+/// A rebuild that copies positionally looks correct until a column order changes, at which point
+/// names land in the address column and every type still checks out. Asserted with values that make
+/// a transposition visible.
+#[tokio::test]
+async fn the_audit_rebuild_did_not_transpose_columns() {
+    use sea_orm_migration::MigratorTrait;
+
+    let tmp = TempDb::new();
+    let db = simply_ip_vault::db::connect(&tmp.url()).await.expect("pool opens");
+    simply_ip_vault::migration::Migrator::up(&db, Some(9)).await.expect("nine migrations apply");
+
+    let key = seed_key(&db, "before", None).await;
+    let id = Uuid::new_v4();
+    db.execute_raw(Statement::from_string(
+        DatabaseBackend::Sqlite,
+        format!(
+            "INSERT INTO audit_logs \
+             (id, api_key_id, api_key_name, api_key_prefix, client_ip, action, target_address, \
+              group_names, details, timestamp) \
+             VALUES (x'{}', x'{}', 'NAME', 'PREFIX', '198.51.100.7', 'ACTION', 'TARGET', \
+              'GROUPS', 'DETAILS', '2021-02-03 04:05:06')",
+            id.simple(),
+            key.simple()
+        ),
+    ))
+    .await
+    .expect("the row inserts");
+
+    simply_ip_vault::migration::Migrator::up(&db, None).await.expect("the rebuild applies");
+
+    let row = audit_log::Entity::find_by_id(id).one(&db).await.unwrap().expect("row survives");
+    assert_eq!(row.api_key_name, "NAME");
+    assert_eq!(row.api_key_prefix, "PREFIX");
+    assert_eq!(row.client_ip, "198.51.100.7");
+    assert_eq!(row.action, "ACTION");
+    assert_eq!(row.target_address.as_deref(), Some("TARGET"));
+    assert_eq!(row.group_names.as_deref(), Some("GROUPS"));
+    assert_eq!(row.details.as_deref(), Some("DETAILS"));
+    assert_eq!(row.api_key_id, Some(key));
 }

@@ -6628,3 +6628,127 @@ precisely what the service already demands of itself.
 
 **One unforced structural divergence:** the peer mixes `require_` and `guard_` prefixes on its
 authorization guards where the vault uses `guard_` uniformly. Cosmetic, blocks nothing.
+
+---
+
+## Session 46 — `NOT NULL` audit attribution, source-hygiene test, peer snapshot refresh
+
+### 1. Task 1 — `NOT NULL` on the three attribution columns
+
+**Migration `m20260811_000010_audit_attribution_not_null`.** `api_key_name`, `api_key_prefix` and
+`client_ip` are now `NOT NULL`, matching the peer, which has had them so since its initial schema.
+
+The reason this matters is the interaction with the FK. `audit_logs.api_key_id` is `ON DELETE SET
+NULL` deliberately — deleting a credential must never erase what it did — which makes the denormalised
+name and prefix the *only* attribution that survives the key. A row whose FK has been nulled by the
+cascade **and** whose name was never written records an action with no actor at all.
+
+**The signature change is the part worth reviewing.** The brief asked for fallback values
+(`"anonymous"` / `"unknown"`) inside `create_audit_log`. I did not do that, and the reason is not
+stylistic:
+
+| Approach | Effect |
+| :--- | :--- |
+| Keep `Option`, substitute a fallback | An unattributed write **succeeds**. The first caller without a key silently produces rows that satisfy `NOT NULL` and attribute nothing — column constrained, trail still holed |
+| Take `&api_key::Model` and `IpAddr` **by value** | The call cannot be written. The compiler enforces what the constraint only detects |
+
+A survey of all **20 call sites** found **zero** passing `None` for either argument — every audited
+route runs behind `auth_middleware`, which resolves both before a handler sees the request. The
+`Option`s were never `None` in practice, only in the type, so removing them cost nothing and closed
+the future hole. This matches the peer's signature exactly.
+
+The fallback does exist, exactly once, where it is genuinely needed: the migration's backfill for rows
+written before the constraint. `(unknown)` is deliberately not a plausible value — it cannot be
+confused with a real key name, prefix or address, so a reader can tell "not recorded" from "recorded
+as this". A unit test asserts it does not parse as an IP address.
+
+**SQLite needs a table rebuild.** There is no `ALTER TABLE … ALTER COLUMN`, so the migration does
+create-copy-drop-rename; PostgreSQL and MySQL take `ALTER COLUMN … SET NOT NULL` directly. A rebuild
+is the most dangerous shape of migration there is — everything it forgets to recreate simply stops
+existing, and nothing fails. Three decisions guard that:
+
+- the replacement table is built with SeaORM's **schema builder**, not hand-written DDL, so column
+  types are byte-for-byte what the original migration produced;
+- the copy names **every column explicitly on both sides**, so a future reorder cannot transpose
+  values into the wrong columns with every type still checking out;
+- both indexes are recreated, and a unit test asserts the two table definitions differ *only* in the
+  three columns' nullability.
+
+**Four new tests in `tests/schema_integrity_tests.rs`** pin what the rebuild had to preserve:
+
+| Test | Property |
+| :--- | :--- |
+| `audit_attribution_columns_reject_null_from_raw_sql` | The constraint holds against a writer that bypasses the entity layer, with a control proving the same INSERT succeeds when fully attributed |
+| `the_audit_rebuild_preserved_the_set_null_cascade` | Deleting a key still nulls the FK and keeps the row — the highest-risk thing about a rebuild |
+| `the_audit_rebuild_preserved_both_indexes` | Neither index was lost. Losing one is a silent table scan no functional test notices |
+| `rows_written_before_the_constraint_are_backfilled_not_dropped` | Applies migrations 1–9, writes a NULL row the old schema allowed, then applies 10. The upgrade path a real deployment takes, and the one path no other test can exercise |
+| `the_audit_rebuild_did_not_transpose_columns` | Ten distinct values in, ten in the right columns out |
+
+### 2. Task 2 — `tests/source_hygiene.rs`
+
+Ported from the peer. Five tests: the raw-SQL marker scan, a DML-shape scan, an allowlist-freshness
+check, a meta-test proving the scanner sees violations, and `no_handler_is_ever_exempted`.
+
+**Two design departures from a naive port, both from things that went wrong while writing it.**
+
+*The DML scan matches statement **shape**, not keywords.* The first version tested for
+`SELECT `/`INSERT `/`UPDATE `/`DELETE ` case-insensitively and flagged **eight false positives**, every
+one ordinary English: `"Cannot delete yourself"`, `"you have no delete access to any group"`,
+`"can_write or can_delete require can_read"`. A gate that cries wolf eight times gets deleted rather
+than fixed. It now matches pairs — `DELETE … FROM`, `INSERT … INTO`, `UPDATE … SET`, `SELECT … FROM` —
+because a statement has a grammar English does not accidentally reproduce. The five real messages are
+in the meta-test as regression cases.
+
+Second version had an off-by-one the meta-test caught: the follower was searched *past* the keyword,
+so `DELETE ` had already consumed the space that ` FROM ` needed and `DELETE FROM` was unmatchable.
+
+*The allowlist is `src/db.rs` and `src/migration/` (a directory), plus a test asserting no
+`src/api/` path is ever exempted.* Per-file entries would need editing on every new migration; the
+property that actually matters is **not reachable from a request**, and `no_handler_is_ever_exempted`
+encodes that so it survives a future edit to `ALLOWED` by someone who did not read the comment. The
+peer had exactly that defect briefly — a `SELECT 1` exemption in an *unauthenticated* readiness probe.
+
+**Verified by planting.** A `DELETE FROM api_keys` string constant added to `src/api/records.rs` is
+caught: `src/api/records.rs:965  string literal contains 'DELETE FROM'`.
+
+The duplication with `verify_convergence.sh::check_no_raw_sql` is deliberate and is documented in the
+file header: the shell gate has to be run, and two successive versions of it were silently broken
+(gawk `ENDFILE` under `mawk`; a "pragma" exemption too wide) with each reporting CLEAN against a
+planted violation. Neither had a meta-test. This one does.
+
+### 3. Task 3 — peer snapshot refresh
+
+`rsync -a --delete` from `../simply_hook_executor/`, excluding `.git/`, `target/`, `Cargo.lock`.
+
+**The snapshot had genuinely drifted**, which matters because `verify_convergence.sh` diffs against it
+— a stale reference means the gate has been certifying agreement with code that no longer exists.
+Nineteen files differed, including `src/api/guards.rs`, `keys.rs`, `health.rs`, `support.rs`,
+`config.rs`, `error.rs`, plus `SCHEMA.MD`, `README.md` and `scripts/test_e2e.sh`. Convergence still
+passes against the refreshed copy — **62 matching, 0 divergences, 0 unexplained** — so no tracked
+primitive had moved, but that was not knowable beforehand.
+
+**`--delete` does not remove excluded paths.** rsync protects them on the receiver, so a pre-existing
+**3.1 GB** `target/` and a stale `Cargo.lock` survived the sync. Both removed explicitly; the snapshot
+went from 3.1 GB to **4.2 MB**. `example/*` is gitignored and nothing under it is tracked, so this was
+wasted disk rather than a repository problem — but it is exactly the sort of thing a `--delete` flag
+is assumed to have handled.
+
+### 4. Verification
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **260 passed**, 0 failed (248 before; +5 source hygiene, +5 schema integrity, +2 migration unit) |
+| `./scripts/test_e2e.sh` | **516 passed**, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 — 62 matching, 0 divergences, 0 unexplained |
+| `git diff RBAC_MODEL.md` | empty |
+
+### 5. Parity position after this session
+
+`audit_logs` attribution now matches the peer on all three columns and on the writer's signature. The
+remaining audit-schema difference is naming only — our `target_address` + `group_names` against the
+peer's single `target_resource` — which is domain vocabulary, not a constraint gap.
+
+The one open ecosystem item is unchanged and is on the peer: `simply_hook_executor` still accepts any
+non-empty `INITIAL_MASTER_KEY`.

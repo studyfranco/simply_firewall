@@ -294,6 +294,11 @@ family (`get_or_create_group`, `resolve_group_ref`, `resolve_group_by_identifier
 returns a refusal that depends on the caller. A helper that starts deciding belongs in `guards.rs`.
 Nor anything a single domain uses — that belongs in the domain's own file.
 
+**`create_audit_log` takes its actor by value, not as `Option`.** Since `m20260811_000010` the three
+attribution columns are `NOT NULL`, and the signature is what makes that unbreakable from application
+code: there is no `None` to thread through, so an unattributed write cannot be written rather than
+being silently defaulted to `"anonymous"`. See `SCHEMA.MD` for why a fallback would have been worse.
+
 **Key exports.** as above.
 
 **Rationale.** A helper is here because pushing it into a domain module would make every other domain
@@ -440,7 +445,7 @@ presence or absence here is a schema statement, not a convenience.
 | `ip_record.rs` | `ip_records` | 10 | The addresses themselves, plus the soft-delete triple `is_deleted` / `deleted_at` / `deleted_by` |
 | `ip_record_group_membership.rs` | `ip_record_group_memberships` | 2 | Composite-PK join of record ↔ group. Both columns cascade |
 | `webhook_config.rs` | `webhook_configs` | 14 | Dispatch targets: `target_url`, `secret_token`, `auth_mode`, `hmac_template`, `events`, `owner_key_id` |
-| `audit_log.rs` | `audit_logs` | 10 | The trail. `api_key_id` is `ON DELETE SET NULL`; `api_key_name`/`api_key_prefix` are denormalised so it stays legible after the key is gone |
+| `audit_log.rs` | `audit_logs` | 10 | The trail. `api_key_id` is `ON DELETE SET NULL`; `api_key_name`, `api_key_prefix` and `client_ip` are **`NOT NULL`** and denormalised, so it stays legible after the key is gone |
 | `mod.rs` | — | — | Module declarations only |
 | `prelude.rs` | — | — | `pub use …::Entity as X` for each table |
 
@@ -471,6 +476,7 @@ per-engine storage classes cannot be expressed portably through SeaQuery.
 | 7 | `m20260807_000007_add_api_key_master_marker` | **Superseded, and documents its own defect.** An application-maintained marker that did *not* satisfy §5 |
 | 8 | `m20260807_000008_add_lineage_and_ownership` | `api_keys.parent_key_id` (§4 subtree) and `owner_key_id` on groups and webhooks (§3) |
 | 9 | `m20260808_000009_derive_master_marker` | **The actual §5 enforcement.** Engine-derived marker under a unique index |
+| 10 | `m20260811_000010_audit_attribution_not_null` | `NOT NULL` on `audit_logs.api_key_name`, `.api_key_prefix`, `.client_ip`, with a `(unknown)` backfill for historical rows |
 
 Three carry reasoning worth reading before touching them:
 
@@ -483,3 +489,33 @@ Three carry reasoning worth reading before touching them:
 - **#8** adds no DDL foreign keys. SQLite has no `ALTER TABLE … ADD CONSTRAINT`, so the constraint
   would exist on two backends and silently not on the one CI runs. The application-level equivalents
   are covered by `tests/schema_integrity_tests.rs` instead.
+- **#10 is a table rebuild on SQLite**, which has no `ALTER TABLE … ALTER COLUMN`: create, copy, drop,
+  rename. That is the most dangerous shape of migration there is, because anything it forgets to
+  recreate simply stops existing and nothing fails. It builds the replacement with SeaORM's schema
+  builder rather than hand-written DDL so column types match the original exactly, copies **by column
+  name** so a future reorder cannot transpose values, and recreates both indexes. Four tests in
+  `tests/schema_integrity_tests.rs` pin the result — the `SET NULL` cascade, both indexes, the
+  backfill of pre-constraint rows, and the absence of transposition.
+
+---
+
+## `tests/` — what each suite is responsible for
+
+`src/` is the subject of this map, but the suites are where its guarantees are pinned, and knowing
+which file owns which property saves adding a test to the wrong one.
+
+| File | Owns |
+| :--- | :--- |
+| `rbac_model_compliance.rs` | One test per `RBAC_MODEL.md` rule and section (`r1_`–`r7_`, `s3_`–`s7_`). Five are marked `ADVERSARIAL(§N)` and bypass the application layer with raw SQL. `scripts/verify_convergence.sh` fails if a rule loses its test |
+| `security_tests.rs` | Named attacks, each asserting the attack fails. HMAC forgery, replay, proxy spoofing, master promotion, the unauthenticated probes |
+| `schema_integrity_tests.rs` | What the **engine** does — foreign-key cascades, orphan refusal, and everything `m20260811_000010`'s table rebuild had to carry across. File-backed, opened through `db::connect`, because `PRAGMA foreign_keys` is per-connection |
+| `rbac_integration_tests.rs` | The features working, end to end through the router |
+| `source_hygiene.rs` | Properties of the source tree: no raw SQL and no hand-written DML in `src/`, outside two startup-only exemptions. Carries a meta-test proving the scanner can see a violation |
+| `frontend_syntax_test.rs` | `static/app.js` parses. Nothing else compiles or executes it |
+
+**`source_hygiene.rs` deliberately duplicates `verify_convergence.sh::check_no_raw_sql`**, and the two
+are not interchangeable. The shell gate has to be *run*; the Rust test runs on every `cargo test`, in
+CI and in an IDE. More to the point, two successive versions of the shell gate were silently broken —
+one used a gawk extension that is an always-false variable under `mawk`, the other exempted anything
+near the word "pragma" — and each reported CLEAN against a deliberately planted violation. Both
+failures were invisible because neither had a meta-test. This file has one.
