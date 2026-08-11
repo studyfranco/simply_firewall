@@ -6752,3 +6752,99 @@ peer's single `target_resource` — which is domain vocabulary, not a constraint
 
 The one open ecosystem item is unchanged and is on the peer: `simply_hook_executor` still accepts any
 non-empty `INITIAL_MASTER_KEY`.
+
+---
+
+## Session 47 — Peer pull, and the final two-project parity audit
+
+Read-only analytical pass comparing this repository against its peer in `example/`. Deliverables:
+`SECURITY_COMPARISON_REPORT.md` (replacing its 2026-08-10 edition) and
+`STRUCTURAL_CONVERGENCE_REPORT.md` (replacing its 2026-08-10 edition). No file under `src/`, `tests/`
+or `scripts/` was touched in either project.
+
+### 1. Task 0 — peer pull
+
+```
+cd example/simply_hook_executor && git pull
+→ Already up to date.
+```
+
+| Probe | Result |
+| :--- | :--- |
+| Projects under `example/` | **One** — `simply_hook_executor`. There is no `example/simply_ip_vault`; the current project *is* the vault |
+| HEAD before / after | `4865a82` → `4865a82` |
+| Working tree | clean, 0 modified files |
+| Remote | `https://oshino.tomidejetsu.ovh/fallrik/simply_hook_executor.git` |
+
+Two things about the clone are worth recording, because both contradict earlier notes:
+
+- **`example/simply_hook_executor` is a real git clone**, not the flat snapshot the 2026-08-07 report
+  described. It has `.git` and an origin, so `git pull` is meaningful there.
+- **The `.git` survived last session's `rsync -a --delete`** for the same reason `target/` did: rsync
+  *protects* excluded paths on the receiver rather than deleting them. Last session I removed `target/`
+  and `Cargo.lock` by hand and did not check whether `.git` had also been preserved — it had, which is
+  fortunate, because deleting it would have severed the clone from its remote and made this pull
+  impossible. Worth knowing before the next sync: **rsync into that directory cannot remove `.git`,
+  and must not.**
+
+The peer's head is `refactor: enforce 64-hex master key, adopt ConflictWithDetails, unify guard
+prefixes and harden readiness probe` — which names every open item from the previous two reports. Each
+was verified against source rather than accepted from the commit message.
+
+### 2. Findings
+
+**The one open security item is closed.** The peer now validates `INITIAL_MASTER_KEY` as exactly 64
+hex characters and aborts startup otherwise (`src/config.rs:720, :782, :798`). Its version is
+marginally better than ours: it reports the *position* of the offending character.
+
+**The one open structural item is closed.** `require_*` guard functions: 0 remaining on either side;
+the peer now uses `guard_*` exclusively (11 functions).
+
+**Two divergences converged toward us without being asked.** The peer moved its readiness probe from a
+literal `SELECT 1` to SeaORM's typed builder — removing the raw-SQL allowlist entry that sat in an
+unauthenticated handler — and added the Master-pin assertion. The previous report recorded both as
+deliberate divergences where we were stricter; the peer's own audit reached the same conclusion.
+
+**Error taxonomy improved to 10/11 shared.** The peer adopted `ConflictWithDetails`. The remaining
+singleton, `TooManyRequests`, is required by its concurrency budget and has no analogue here.
+
+**Audit attribution is now identical on both sides** — `api_key_name`, `api_key_prefix` and `client_ip`
+`NOT NULL`, `api_key_id` nullable under `ON DELETE SET NULL`. We closed our half last session in
+`m20260811_000010`; the peer has had it since its initial schema.
+
+### 3. Method
+
+Every prior finding was re-tested against source rather than carried forward. The 8 findings ever
+raised (4 divergences, 3 specification defects, 1 credential-validation gap) are all closed.
+
+| Check | How |
+| :--- | :--- |
+| §5 uniqueness | `GENERATED ALWAYS AS` present in both migration trees; our `s5_` suite replays the original raw-SQL attack and it is refused |
+| R2 conjunction | `can_manage_keys` × 17 in the peer's `api/guards.rs` |
+| Dormant column | `owner_key_id` absent from the peer's `entities/api_key.rs` |
+| Payload strictness | 0 `is_master` occurrences on either side's payload types; 5 and 7 `deny_unknown_fields` sites |
+| Spec defects | `RBAC_MODEL.md` terminology table names the real columns, and the file is still byte-identical (`md5 cb0b76ab…`) |
+| Naming parity | 25 tracked security symbols checked for presence in both trees — **0 missing on either side** |
+
+Structural data (module trees, line counts, error variants, audit fields, test inventories) was
+tabulated from both trees rather than described.
+
+### 4. Gate status
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo test` | **260 passed**, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 — 62 matching, 0 divergences, 0 unexplained |
+| `git diff RBAC_MODEL.md` | empty |
+| `git status --porcelain src/ tests/` | empty — read-only compliance |
+
+### 5. Outcome
+
+**Security: 8/8 findings closed, 21/22 controls identical.** The single exception is the
+authentication posture, a permanent recorded asymmetry.
+
+**Structure: 0 unjustified divergences.** Both items flagged in the 2026-08-10 edition closed this
+cycle, from both directions — the peer unified its guard prefixes and adopted `ConflictWithDetails`,
+we made our audit attribution `NOT NULL`.
+
+There is no outstanding work in the ecosystem on either side.
