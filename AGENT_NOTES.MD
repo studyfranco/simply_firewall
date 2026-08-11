@@ -6848,3 +6848,88 @@ cycle, from both directions — the peer unified its guard prefixes and adopted 
 we made our audit attribution `NOT NULL`.
 
 There is no outstanding work in the ecosystem on either side.
+
+---
+
+## Session 48 — Clean-room audit: two findings, one per project
+
+Read-only pass under a **zero-knowledge constraint**: no prior audit report was read or referenced.
+Findings were derived from `RBAC_MODEL.md` and current `.rs` source only. Both reports overwritten.
+
+### 1. Task 0 — peer pull
+
+```
+cd example/simply_hook_executor && git pull
+→ Already up to date.        (4865a82, tree clean)
+```
+
+### 2. Method
+
+Rules were enumerated from the specification **first**, then each traced to an enforcement site in
+both codebases — rather than starting from the code and asking whether it looked reasonable. That
+ordering is what surfaced F-1: §7 names four specific column families that must be indexed, and
+checking each one mechanically is what exposed the missing one.
+
+| Step | What was done |
+| :--- | :--- |
+| §7 index audit | Enumerated every index in both migration trees, then checked each of `parent_key_id`, `owner_key_id`, key-hash, and both permission-table join columns |
+| §5 marker writability | Searched `src/` **and** `tests/` on both sides for a settable `master_marker` — the spec explicitly extends the ban to fixtures and test helpers |
+| §5 payload ban | Located every `pub is_master` and resolved which struct and which derive it belongs to, rather than counting occurrences |
+| R1–R7, §3, §4, §6 | Traced each to a named guard on both sides |
+| §4 oracle discipline | Confirmed out-of-scope and nonexistent return the same status on both sides |
+
+**A near-miss worth recording.** My first §7 sweep grepped for `.name("idx…")` and reported the peer
+as missing indexes on `parent_key_id`, `owner_key_id` and `key_hash`. That was **wrong**: the peer
+builds those through a `create_index(manager, name, table, column)` helper, which my pattern could not
+see, and `key_hash` is covered by `unique_key()` on both sides. Re-running against `"idx[_-]…"` string
+literals found all of them. Had I stopped at the first grep I would have reported three fabricated
+findings. The lesson generalises: when a check reports a *surprising cluster* of failures in one
+place, suspect the check before the code.
+
+### 3. Findings
+
+**F-1 — `api_key_hook_permissions.hook_id` is unindexed (peer, §7).**
+The peer indexes that table only as the composite `(api_key_id, hook_id)`, which cannot serve a
+predicate on its non-leading column. `src/api/keys.rs:577` filters on `HookId.is_in(managed)` **alone**
+— the §4 shared-resource visibility path — so `list_api_keys` full-scans a table that grows as
+*keys × hooks* for any non-Master caller managing at least one hook. The current project runs the
+structurally identical query at `src/api/keys.rs:570` and does index the column (`idx-akgp-group_id`,
+added in `m20260807_000008`). Availability concern, not authorization; one index closes it.
+
+**F-2 — cross-resource deletion of shared resource data (current project, specification gap).**
+`ip_records.target_address` is globally unique and `is_deleted` lives on the **record**, not the
+membership — so one record is shared by every group referencing it and a soft delete is global.
+`caller_may_delete_record` requires delete rights on **any one** of those groups. A record in groups A
+and B can therefore be removed from both by a caller holding `can_delete` on A alone.
+
+This is **not a violation**: §3 governs lifecycle of managed resources and creator-private entities,
+not resource data; R2 governs `can_manage`, not operational verbs; §6 governs key deletion. The
+specification is simply silent. It is worth closing because §4 already states the principle by analogy
+— *"a single shared resource must never become a keyhole into another parent's whole configuration"* —
+and F-2 is the mutation-side counterpart. No analogue on the peer: `hook_parameter.hook_id` is a
+single FK, so its resource data cannot span an authorization boundary.
+
+### 4. What was verified clean
+
+- **§5, all seven demands, both sides.** Engine-derived marker; **zero** settable-marker occurrences
+  anywhere in `src/` or `tests/`; storage mode pinned by test; 5 adversarial tests each; `is_master`
+  present only on `MeResponse` and `ApiKeySummary`, both `Serialize`; Master immutable but for its own
+  `bound_ips`.
+- **R1–R7, §3, §4, §6** — every rule traced to a named guard on both sides.
+- **Parity:** 25/25 security symbols identically named; 17/19 controls identical; 10/11 error variants
+  with identical status mappings; 8/10 audit fields identical.
+
+### 5. Gate status
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo test` | 260 passed, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 — 62 matching, 0 divergences |
+| `git diff RBAC_MODEL.md` | empty |
+| `git status --porcelain src/ tests/` (both projects) | empty — read-only compliance |
+
+### 6. Outcome
+
+No authorization bypass, privilege-escalation path, or cryptographic weakness in either project. Two
+minor findings, one per side, neither blocking deployment. F-1 is one line of DDL in the peer; F-2 is a
+question for the specification's authors rather than a defect to patch here.

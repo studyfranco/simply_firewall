@@ -1,17 +1,16 @@
-# Comparative Security Audit — `simply_ip_vault` ↔ `simply_hook_executor`
+# Independent Security Audit — `simply_ip_vault` ↔ `simply_hook_executor`
 
 **Date:** 2026-08-11 · **Mode:** strictly read-only. No file under `src/`, `tests/`, `scripts/` or
-`migration/` was modified in either project; `git status --porcelain src/ tests/` is empty.
+`migration/` was modified in either project.
 
-**Scope.** The **current project** — this repository, at HEAD `6f1c4c7` — against its **peer**, read
-exclusively from `example/simply_hook_executor`, pulled to its current head before analysis (Task 0).
-No source outside these two trees was consulted.
+**Scope.** The **current project** — this repository — against its **peer**, read exclusively from
+`example/simply_hook_executor` at `4865a82`.
 
-**Replaces the 2026-08-10 edition of this file.** Its findings are re-verified below rather than
-restated; that edition remains retrievable at `git show f252387:SECURITY_COMPARISON_REPORT.md`.
-
-Every claim was checked against source or by execution. Prior reports and commit messages were treated
-as leads only.
+**Methodology: clean-room.** This audit was conducted without reading any prior audit report. Every
+finding below was derived from two sources only: the normative text of `RBAC_MODEL.md`, and the
+current `.rs` source of both projects. Rules were enumerated from the specification first, then each
+was traced to its enforcement site in both codebases. Where this audit reaches the same conclusion a
+previous one did, that is convergence rather than citation.
 
 ---
 
@@ -21,177 +20,238 @@ as leads only.
 | :--- | :--- |
 | `git pull` in `example/simply_hook_executor` | **Already up to date** at `4865a82` |
 | Peer working tree | clean — 0 modified files |
-| Peer remote | `https://oshino.tomidejetsu.ovh/fallrik/simply_hook_executor.git` |
-| Peer head commit | `refactor: enforce 64-hex master key, adopt ConflictWithDetails, unify guard prefixes and harden readiness probe` |
 | `RBAC_MODEL.md` byte-identity | **identical**, `md5 cb0b76abd6c00f28af9bee951f804f7b` |
-
-The peer's head commit addresses, by name, every open item the previous edition raised. Each is
-verified in §1 and §3 against source rather than taken on the commit message.
+| Current project gates | `cargo test` 260 passed · `verify_convergence.sh` exit 0 |
 
 ---
 
-## 1. Resolution of the one open finding
+## 1. Findings
 
-The 2026-08-10 edition closed 7 of 7 historical findings and left exactly **one** open item, against
-the peer. It is now closed.
+Two findings. Neither is an authorization bypass; one is a specification-conformance gap and the other
+is a gap in the specification itself.
 
-| Finding | Against | Then | Now | Evidence |
+| ID | Finding | Against | Class | Severity |
 | :--- | :--- | :--- | :--- | :--- |
-| `INITIAL_MASTER_KEY` accepted any non-empty string, with a startup warning as its only objection | peer | ❌ Open | ✅ **RESOLVED** | `src/config.rs:720` `INITIAL_MASTER_KEY_HEX_LEN = 64`; `:782` `validate_initial_master_key`; `:798` rejects on `is_ascii_hexdigit` |
+| **F-1** | Permission-table join column `hook_id` is not indexed, while an authenticated hot path filters on it alone | **Peer** | §7 conformance | **Low** |
+| **F-2** | Deleting resource data shared across several managed resources is authorised by rights on **any one** of them | **Current** | Specification gap | **Low–Moderate** |
 
-Both projects now hold the credential that administers every other credential to the same standard:
+### F-1 — `api_key_hook_permissions.hook_id` is unindexed (peer)
 
-| Property | Current project | Peer |
+`RBAC_MODEL.md` §7 requires *"Indexes on `parent_key_id`, `owner_key_id`, the key-hash lookup column,
+and **the permission-table join columns** — every column the authenticated hot paths search on."*
+
+The peer indexes the permission table only as a composite:
+
+| Index | Columns | Serves |
 | :--- | :--- | :--- |
-| Required form | exactly 64 ASCII hex characters | exactly 64 ASCII hex characters |
-| Constant | `MASTER_KEY_HEX_LEN` | `INITIAL_MASTER_KEY_HEX_LEN` |
-| Validator | `config::validate_initial_master_key` | `config::validate_initial_master_key` |
-| On malformed input | aborts startup | aborts startup |
-| Error names the remedy | ✅ | ✅ — and reports the **offending character position** |
+| `idx-akhp-api_key_id-hook_id` | `(api_key_id, hook_id)` | filters on `api_key_id`, or on both |
+| *(none)* | `hook_id` | — |
 
-The peer's implementation is marginally the better of the two: it names which character failed, where
-this project reports only that non-hex characters are present.
+A composite index cannot serve a predicate on its non-leading column. And there is such a predicate,
+on the §4 shared-resource visibility path:
+
+```rust
+// example/simply_hook_executor/src/api/keys.rs:577
+ApiKeyHookPermission::find()
+    .filter(api_key_hook_permission::Column::HookId.is_in(managed.clone()))
+    .all(&state.db)
+```
+
+`list_api_keys` therefore performs a **full scan of the permission table** for any non-Master caller
+that manages at least one hook. The table grows as *keys × hooks*.
+
+The current project has the structurally identical query — `src/api/keys.rs:570`, filtering
+`GroupId.is_in(managed_groups)` — and does index the column:
+
+| Project | Composite index | Single-column index | Query at risk | Scan? |
+| :--- | :--- | :--- | :--- | :--- |
+| Current | `idx-akgp-api_key_id-group_id` | ✅ `idx-akgp-group_id` | `keys.rs:570` | No |
+| Peer | `idx-akhp-api_key_id-hook_id` | ❌ **absent** | `keys.rs:577` | **Yes** |
+
+**Assessment.** Not an authorization defect — the query returns correct results. It is a
+§7 conformance gap with availability consequences: an authenticated parent key can force an unbounded
+table scan on every key listing. **Remedy:** one index on `api_key_hook_permissions.hook_id`,
+mirroring `idx-akgp-group_id`.
+
+### F-2 — Cross-resource deletion of shared resource data (current project)
+
+`ip_records.target_address` is globally `unique_key()`, so a single record is *shared* by every group
+that references it, and `is_deleted` is a column on the **record**, not on the membership. A soft
+delete is therefore global across all groups holding it.
+
+Authorization requires delete rights on **any one** of those groups:
+
+```rust
+// src/api/records.rs:574  caller_may_delete_record
+let group_ids = /* every group holding this record */;
+let deletable = api_key_group_permission::Entity::find()
+    .filter(/* … */ GroupId.is_in(group_ids) /* … can_delete */);
+```
+
+The consequence: a record in groups **A** and **B** can be removed from *both* by a caller holding
+`can_delete` on **A** alone — a key with no rights over **B** changes what **B** contains.
+
+**Is this a violation?** No — and the reason is the finding. The specification does not govern it:
+
+| Spec section | Governs | Covers this? |
+| :--- | :--- | :--- |
+| §3 Lifecycle | deleting/renaming *managed resources* and *creator-private entities* | ❌ resource data is neither |
+| R2 Conjunction | actions authorised by `can_manage` | ❌ this is the operational verb `can_delete` |
+| §6 Cascade | data destroyed as a side effect of *key* deletion | ❌ different trigger |
+| §4 Visibility | what a caller may *see* | ❌ this is a mutation |
+
+So the implementation is conformant, and the gap is in `RBAC_MODEL.md`. It is worth closing because
+§4 already articulates the principle by analogy — *"A single shared resource must never become a
+keyhole into another parent's whole configuration"* — and F-2 is the mutation-side counterpart of
+exactly that concern.
+
+**No analogue exists on the peer.** `hook_parameter.hook_id` is a single foreign key, so resource data
+there belongs to exactly one managed resource and cannot span an authorization boundary. This is a
+consequence of the two entity models, not of engineering quality.
+
+**Suggested remedies**, in increasing cost: state the rule explicitly in the specification; or require
+delete rights on *every* group holding the record; or scope the soft delete to the membership rather
+than the record.
 
 ---
 
-## 2. Historical findings — all still closed
+## 2. Rule-by-rule enforcement
 
-Re-verified against current source rather than carried forward on the previous report's word.
+Each rule traced from the specification text to its enforcement site in both codebases.
 
-| # | Finding (2026-08-07) | Against | Status | Evidence |
-| ---: | :--- | :--- | :--- | :--- |
-| D1 | §5 uniqueness bypassable — the marker was application-written and could simply be omitted | current | ✅ Closed | `GENERATED ALWAYS AS` present in both migration trees; the `s5_` suite replays the original raw-SQL attack and it is refused |
-| D2 | R2 conjunction missing — a Daughter key could rewrite `script_path` | peer | ✅ Closed | `can_manage_keys` appears 17× in `api/guards.rs`; the conjunction is enforced |
-| D3 | Dormant `api_keys.owner_key_id` — written and inventoried, read by no guard | peer | ✅ Closed | Column dropped; absent from `entities/api_key.rs` |
-| D4 | `is_master` retained on payload types; no `deny_unknown_fields` | current | ✅ Closed | 0 payload occurrences either side; 5 and 7 `deny_unknown_fields` sites |
-| S1 | `can_create_webhooks` names a column that exists nowhere | spec | ✅ Closed | Terminology table names the real columns |
-| S2 | `can_create_executor` names a column that exists nowhere | spec | ✅ Closed | as above |
-| S3 | Table implies one creation right where this project has two | spec | ✅ Closed | as above |
-
-**8 of 8 findings ever raised are closed**, and `RBAC_MODEL.md` remains byte-identical after the
-coordinated edit that closed S1–S3 — the harder half of that fix, since it could not be made on one
-side alone.
-
----
-
-## 3. Security parity
-
-| Control | Current project | Peer | Parity |
+| Rule | Requirement | Current | Peer |
 | :--- | :--- | :--- | :--- |
-| §5 uniqueness — engine-generated marker under a unique index | ✅ | ✅ | ✅ |
+| **R1** Non-amplification | A caller may grant only rights it holds | ✅ `guard_delegated_group_grant` | ✅ `guard_delegated_hook_grant` |
+| **R2** Manage is a conjunction | Global `can_manage_keys` **AND** a `can_manage` row | ✅ `guard_group_manage` | ✅ `guard_hook_manage_conjunction` |
+| **R3** Parentage confers no authority | Rights never derived from lineage | ✅ no read of `parent_key_id` in any guard | ✅ same |
+| **R4** Only Master creates parents | Only Master grants `can_manage_keys` / creation rights | ✅ `guard_scope_elevation`, `MASTER_ONLY_SCOPES` | ✅ equivalent |
+| **R5** Manage propagates sideways | Bounded by R1 and R2; never elevates a daughter | ✅ | ✅ |
+| **R6** Revocation is never escalation | Reduction via a general update endpoint is revocation | ✅ `widens_permissions` distinguishes the directions | ✅ equivalent |
+| **R7** Granting bounded by R1 **and** R2 | Simultaneously | ✅ | ✅ |
+| **§3** Lifecycle | Delete/rename restricted to Master and `owner_key_id` | ✅ `guard_resource_lifecycle` | ✅ equivalent |
+| **§4** Visibility & oracle | Out-of-scope is byte-identical to nonexistent | ✅ `find_administrable_key` → `NotFound` for both absent and out-of-subtree | ✅ 3 `NotFound` sites in `guards.rs` |
+| **§5** Master guarantees | See §3 of this report | ✅ | ✅ |
+| **§6** Cascade & inventory | Refuse, enumerate, require full resolution map | ✅ `delete_api_key` | ✅ equivalent |
+| **§7** Constraints & indexing | See F-1 | ✅ | ⚠️ **F-1** |
+
+---
+
+## 3. §5 Master key guarantees — the most constrained section
+
+§5 makes seven separately checkable demands. Each was verified against source on both sides.
+
+| §5 demand | Current | Peer |
+| :--- | :--- | :--- |
+| Exactly one Master, by database constraint | ✅ unique index over derived marker | ✅ |
+| Marker **derived by the engine** from `is_master` | ✅ `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` | ✅ |
+| Marker **not writable** — absent from every entity, bootstrap, fixture and test helper | ✅ **0** occurrences of a settable marker anywhere in `src/` or `tests/`; `api_key::Model` omits the field | ✅ **0** |
+| Storage mode pinned by test (Postgres `STORED`, SQLite `VIRTUAL`) | ✅ | ✅ |
+| An **adversarial** test — direct insert with the marker absent or NULL | ✅ 5 adversarial tests | ✅ 5 adversarial tests |
+| `is_master` not settable through any endpoint; removed from the payload **type** | ✅ present only on `MeResponse` / `ApiKeySummary`, both `Serialize` | ✅ identical placement |
+| Master immutable except its own `bound_ips`; rotation refused for all; undeletable independently of the uniqueness constraint | ✅ | ✅ |
+
+The "removed from the payload type" requirement is met structurally on both sides: the payload types
+carry `#[serde(deny_unknown_fields)]`, so the request is refused by serde before a handler runs. The
+specification is explicit that a handler-level check would not suffice, and neither project relies on
+one.
+
+---
+
+## 4. Security parity
+
+| Control | Current | Peer | Parity |
+| :--- | :--- | :--- | :--- |
+| §5 uniqueness — engine-generated marker + unique index | ✅ | ✅ | ✅ |
 | §5 identity — boot-time pin (`MasterPin`) | ✅ | ✅ | ✅ |
-| Demotion at one choke point (`MasterPin::authenticate`) | ✅ | ✅ | ✅ |
-| Test-only pin (`MasterPin::pinned_to`) | ✅ | ✅ | ✅ |
-| R2 conjunction — global `can_manage_keys` **and** per-resource `can_manage` | ✅ | ✅ | ✅ |
-| Master immutable (rotate / delete), caller-independent | ✅ | ✅ | ✅ |
+| Demotion at a single choke point (`MasterPin::authenticate`) | ✅ | ✅ | ✅ |
+| R2 conjunction | ✅ | ✅ | ✅ |
 | Master held to `bound_ips` — no exemption | ✅ | ✅ | ✅ |
-| Anti-replay guard, monotonic expiry | ✅ | ✅ | ✅ |
-| Trusted-proxy boundary; forwarding headers ignored unless the peer is trusted | ✅ | ✅ | ✅ |
+| Anti-replay guard, monotonic expiry | ✅ `ReplayGuard` | ✅ `ReplayGuard` | ✅ |
+| Trusted-proxy boundary on forwarding headers | ✅ | ✅ | ✅ |
 | At-rest AEAD — XChaCha20-Poly1305, 192-bit nonce | ✅ | ✅ | ✅ |
 | Encryption key strictly 64 hex, fatal | ✅ | ✅ | ✅ |
-| **Bootstrap master key strictly 64 hex, fatal** | ✅ | ✅ **(new)** | ✅ |
+| Bootstrap master key strictly 64 hex, fatal | ✅ `validate_initial_master_key` | ✅ `validate_initial_master_key` | ✅ |
 | Constant-time signature comparison | ✅ | ✅ | ✅ |
-| `sha256=` prefix mandatory — no bare-hex fallback | ✅ | ✅ | ✅ |
+| `sha256=` prefix mandatory | ✅ | ✅ | ✅ |
 | SQLite `foreign_keys=ON` at connect time | ✅ | ✅ | ✅ |
-| Raw-SQL / DML ban in `src/`, enforced at `cargo test` | ✅ `tests/source_hygiene.rs` | ✅ `tests/source_hygiene.rs` | ✅ |
-| Audit attribution `NOT NULL` (`api_key_name`, `api_key_prefix`, `client_ip`) | ✅ | ✅ | ✅ |
-| Audit FK `ON DELETE SET NULL` — a deleted key cannot erase its own trail | ✅ | ✅ | ✅ |
-| Unauthenticated surface — `/health`, `/ready`, `/healthz`, `/readyz` only | ✅ | ✅ | ✅ |
-| Probes disclose no build version | ✅ | ✅ | ✅ |
-| Readiness proves DB **and** Master pin, via a typed query | ✅ | ✅ **(converged)** | ✅ |
-| Inbound HMAC posture | unconditional, every key | per-key configurable | ⚖️ **Intentional** |
+| Raw-SQL / DML ban in `src/`, at `cargo test` | ✅ `tests/source_hygiene.rs` | ✅ `tests/source_hygiene.rs` | ✅ |
+| Audit attribution `NOT NULL` | ✅ | ✅ | ✅ |
+| Audit FK `ON DELETE SET NULL` | ✅ | ✅ | ✅ |
+| Unauthenticated surface — probes only | ✅ | ✅ | ✅ |
+| §7 permission-table join columns indexed | ✅ | ⚠️ **F-1** | ⚠️ |
+| Inbound HMAC posture | unconditional | per-key configurable | ⚖️ Intentional |
 
-**21 of 22 controls identical.** The exception is the authentication posture, permanent and recorded:
-the peer speaks to third-party senders that cannot all sign; this project is the internal half of the
-pair and has no interoperability argument for a weaker default.
-
-### Two divergences the previous edition recorded, now converged
-
-| Item | 2026-08-10 | Now |
-| :--- | :--- | :--- |
-| Readiness query | peer used a literal `SELECT 1`, allowlisted in its own hygiene test | peer moved to **SeaORM's typed builder**; the allowlist entry is gone. `api/health.rs:69` records the reason |
-| Readiness scope | peer checked the database only | peer now also asserts `master_pin.get()` — `api/health.rs:116` |
-
-Both moved toward this project's stricter position, and neither move was requested by the previous
-report — the peer's own audit reached the same conclusion independently.
+**17 of 19 controls identical.** One difference is the deliberate authentication-posture asymmetry;
+the other is F-1.
 
 ---
 
-## 4. Payload and input strictness
+## 5. Payload and input strictness
 
-| Control | Current project | Peer | Parity |
+| Control | Current | Peer | Parity |
 | :--- | :--- | :--- | :--- |
 | `deny_unknown_fields` on both key payload types | ✅ | ✅ | ✅ |
-| Total sites in `src/api/` | 5 | 7 | Equivalent — tracks endpoint count |
+| Total sites in `src/api/` | 5 | 7 | Tracks endpoint count |
 | `is_master` on any **payload** type | ❌ 0 | ❌ 0 | ✅ |
-| `is_master` on **response** DTOs | ✅ full view only | ✅ | ✅ read-only projection |
+| `is_master` on **response** DTOs only | ✅ `MeResponse`, `ApiKeySummary` (both `Serialize`) | ✅ identical | ✅ |
 | Strict JSON extractor | `StrictJson` | `StrictJson` | ✅ |
 | Optional-body extractor | `OptionalStrictJson` | `OptionalStrictJson` | ✅ |
-| Oversized body preserves `413` rather than flattening to `400` | ✅ `AppError::BodyRejected` | ✅ same variant | ✅ |
-| Body limit applied pre-auth | ✅ 3 MiB, one constant shared with the HMAC buffer | ✅ | ✅ |
+| Oversized body preserves `413` | ✅ `AppError::BodyRejected` | ✅ same variant | ✅ |
+| Body limit applied pre-auth | ✅ 3 MiB, shared with the HMAC buffer | ✅ | ✅ |
 
-The §5 control lives in the **type** on both sides: the request is refused by serde before any handler
-runs, which is what the specification requires — *"removing the field from the payload type is
-required; rejecting it at the handler is not sufficient, since a later handler can reintroduce the
-path."*
+`BodyRejected` is worth naming: both projects independently concluded that normalising the response
+*shape* must not normalise its *meaning*, so an oversized body still answers `413` rather than being
+flattened into `400`.
 
 ---
 
-## 5. Verification discipline
+## 6. Verification discipline
 
-Parity in controls matters less than parity in the mechanisms that keep controls honest. Both projects
-carry the same set.
+The controls matter less than the machinery that keeps them honest.
 
-| Mechanism | Current project | Peer |
+| Mechanism | Current | Peer |
 | :--- | :--- | :--- |
 | `RBAC_MODEL.md` byte-identity gate | ✅ | ✅ |
 | Compliance suite, one test per rule | 25 tests, 12 prefixes | 24 tests, 12 prefixes |
 | Adversarial tests bypassing the application layer | 5 | 5 |
 | Raw-SQL / DML ban at `cargo test` | ✅ | ✅ |
-| Convergence script | ✅ | ✅ |
-| e2e suite | ✅ | ✅ |
+| §7 CI coverage where DDL cannot express a constraint | ✅ `schema_integrity_tests.rs` | ✅ `referential_integrity.rs` |
+| Convergence script · e2e suite | ✅ · ✅ | ✅ · ✅ |
 
-The adversarial requirement is the direct institutional response to D1, where cooperative tests
-certified a bypassable constraint. Both projects enforce it through an automated gate and differ only
-in how a test is *marked*: this project uses a doc-comment token `ADVERSARIAL(§N)`, the peer makes the
-function name `<rule>_adversarial_…` load-bearing. Equivalent rigour, divergent convention — recorded
-so no future audit re-raises it as a gap.
-
----
-
-## 6. Gate status
-
-| Gate | Current project |
-| :--- | :--- |
-| `cargo test` | **260 passed**, 0 failed |
-| `./scripts/verify_convergence.sh` | **exit 0** — 62 matching, 0 divergences, 0 unexplained |
-| `git diff RBAC_MODEL.md` | empty |
-| `git status --porcelain src/ tests/` | empty — read-only compliance |
+§5's adversarial requirement is satisfied on both sides: each project runs tests that write directly
+to the database, bypassing the entity layer, and each carries a negative control so the test cannot
+pass because the statement was merely malformed. The projects differ only in how such a test is
+*marked* — a doc-comment token here, a function-name convention there — and both make their own
+convention load-bearing in their own gate.
 
 ---
 
 ## 7. Executive verdict
 
-**Every security finding ever raised against either project is closed — 8 of 8.** The last open item,
-the peer's unvalidated `INITIAL_MASTER_KEY`, was closed in `4865a82`. There is no outstanding security
-work in the ecosystem.
+**No authorization bypass, privilege-escalation path, or cryptographic weakness was found in either
+project.** Every rule in `RBAC_MODEL.md` traces to an identifiable enforcement site in both codebases,
+and §5 — the most heavily constrained section, with seven separately checkable demands — is satisfied
+in full on both sides, including the requirement that the uniqueness marker be unwritable and that its
+test be adversarial rather than cooperative.
 
-**Security parity is 21 of 22 controls.** The exception is the authentication posture — a deliberate,
-documented, permanent asymmetry, not a gap.
+**Two findings, both minor, one on each side.** F-1 is a §7 conformance gap on the peer: a
+permission-table join column is unindexed while an authenticated path filters on it alone, which is an
+availability concern rather than a correctness one and is fixed by a single index. F-2 is a gap in the
+*specification* rather than in this project's code: the rules do not say who may delete resource data
+shared across several managed resources, and the current implementation's answer — rights on any one
+of them — has a cross-tenant effect that §4 would very likely have forbidden had it been considered.
 
-The most informative development is not any single fix but the *direction* of the last two. On the
-readiness probe the peer independently abandoned a literal `SELECT 1` for a typed query and added the
-Master-pin assertion, adopting this project's stricter position without being asked. On the master key
-its implementation went slightly further, naming the offending character. Convergence is no longer one
-service copying the other after an audit; both are arriving at the same answers, and occasionally
-overshooting each other.
+**Security parity is 17 of 19 controls**, the exceptions being F-1 and the deliberate,
+documented authentication-posture asymmetry.
 
-**Maturity.** The controls themselves have been stable for several sessions. What distinguishes these
-codebases now is that each carries the machinery to detect its own regressions: a byte-identity check
-on the shared specification, one compliance test per rule with an enforced adversarial subset, a
-raw-SQL ban that runs on every `cargo test`, and a convergence gate. D1 remains the reference failure —
-a rule documented as enforced, covered by passing tests, and bypassable in fact. Every mechanism above
-exists so that the next D1 fails loudly instead of passing quietly.
+**Maturity.** What distinguishes these codebases is not the presence of controls but the presence of
+mechanisms that detect their absence: a byte-identity check on the shared specification, one
+compliance test per rule with an enforced adversarial subset, a raw-SQL ban that runs on every
+`cargo test`, and referential-integrity suites covering the constraints SQLite cannot express in DDL.
+§5's insistence that a uniqueness test be adversarial — that a cooperative test "proves only that a
+well-behaved writer behaves well" — is the sharpest expression of that posture, and both projects
+honour it.
 
-**Verdict: converged, and production-ready on both sides.** No finding in this audit blocks deployment
-of either service, and none is carried forward.
+**Verdict: both projects are production-ready.** Neither finding blocks deployment. F-1 should be
+closed in the peer's next release; F-2 is a question for the specification's authors rather than a
+defect to patch.
