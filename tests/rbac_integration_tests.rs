@@ -6293,3 +6293,217 @@ async fn batch_enforces_address_validation_and_rejects_duplicates() {
          resolved by payload order"
     );
 }
+
+
+// ═════════════════════════════════════════════════════════════
+// Batch performance and concurrent readability
+// ═════════════════════════════════════════════════════════════
+
+/// A file-backed app built through the production connection path.
+///
+/// The rest of this suite uses `sqlite::memory:` via `Database::connect`, which applies none of the
+/// pool's pragmas — an in-memory database cannot use WAL at all. A test about lock behaviour has to
+/// use the pool `main.rs` actually builds, or it measures something that is never deployed.
+async fn perf_fixture() -> (axum::Router, DatabaseConnection, String, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("vault_perf_{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}", dir.join("v.db").display());
+
+    let db = simply_ip_vault::db::connect(&url).await.expect("file-backed pool opens");
+    simply_ip_vault::db::run_migrations(&db).await.expect("migrations apply");
+
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state.clone());
+    let (_id, plaintext) = insert_key(&db, "Perf Tester", true, true, true, true).await;
+    state.master_pin.pin_at_boot(&db).await.expect("master pins");
+
+    (app, db, plaintext, dir)
+}
+
+/// The pool's durability settings are what make a large write cheap, so they are asserted here too.
+///
+/// `src/db.rs` already unit-tests all four pragmas; this re-checks the two that govern write cost
+/// against the very connection the benchmark below runs on. A benchmark whose fixture silently lost
+/// WAL would report a number nobody could interpret.
+#[tokio::test]
+async fn the_benchmark_pool_really_has_wal_and_synchronous_normal() {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let (_app, db, _key, dir) = perf_fixture().await;
+    let backend = db.get_database_backend();
+
+    let read = |sql: &'static str, col: &'static str| {
+        let db = db.clone();
+        async move {
+            db.query_one_raw(Statement::from_string(backend, sql.to_owned()))
+                .await
+                .unwrap()
+                .unwrap()
+                .try_get::<String>("", col)
+                .unwrap_or_else(|_| {
+                    "non-string".to_owned()
+                })
+        }
+    };
+
+    assert_eq!(read("PRAGMA journal_mode;", "journal_mode").await, "wal");
+
+    let sync: i32 = db
+        .query_one_raw(Statement::from_string(backend, "PRAGMA synchronous;".to_owned()))
+        .await
+        .unwrap()
+        .unwrap()
+        .try_get("", "synchronous")
+        .unwrap();
+    assert_eq!(sync, 1, "synchronous must be NORMAL (1), the standard companion to WAL");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 2 000-record `upsert` followed by a 2 000-record `full_replace`, timed, with readiness probes
+/// running against the same pool throughout.
+///
+/// # What this does and does not assert
+///
+/// The **timing bound is generous on purpose and is not a performance contract.** These tests build
+/// in debug, on whatever machine happens to run them, alongside every other test in the suite; a
+/// tight threshold would fail for reasons that have nothing to do with the code under test, and a
+/// benchmark that cries wolf gets deleted rather than investigated. The bound here is wide enough to
+/// be a *regression* signal — an accidental O(n²) or a per-record transaction would blow through it
+/// by an order of magnitude — and nothing narrower should be read into it.
+///
+/// The **concurrency assertion is the real content**, and it is worth being precise about what it
+/// shows. `SQLITE_MAX_CONNECTIONS` is 1, so a probe issued *during* the batch does not demonstrate
+/// WAL reader/writer separation — it would queue on the pool regardless. What it does demonstrate is
+/// the property an operator actually cares about: the batch holds the connection for a bounded time
+/// and the service answers normally on either side of it, rather than the transaction wedging the
+/// pool for the life of the request.
+#[tokio::test]
+async fn a_large_batch_completes_promptly_and_leaves_the_service_responsive() {
+    use std::time::Instant;
+
+    const RECORDS: usize = 2_000;
+    /// Wide enough to be a regression signal, not a performance contract — see the doc comment.
+    const BUDGET: std::time::Duration = std::time::Duration::from_secs(20);
+
+    let (app, db, key, dir) = perf_fixture().await;
+
+    // 198.51.100.0/22 gives 1 024 hosts per /24; four /24s cover 2 000 without touching private or
+    // loopback space, which `guard_bannable_address` would refuse.
+    let addresses: Vec<String> = (0..RECORDS)
+        .map(|i| format!("198.51.{}.{}", 100 + (i / 250), 1 + (i % 250)))
+        .collect();
+    assert_eq!(
+        addresses.iter().collect::<std::collections::HashSet<_>>().len(),
+        RECORDS,
+        "the generated addresses must be distinct, or the batch would be refused as duplicated"
+    );
+
+    let batch = |mode: &'static str, records: Vec<String>, tick: i64| {
+        let (app, key) = (app.clone(), key.clone());
+        async move {
+            let body = json!({
+                "group_name": "perf-group",
+                "mode": mode,
+                "records": records
+                    .iter()
+                    .map(|a| json!({ "target_address": a, "cause": "bulk sync" }))
+                    .collect::<Vec<_>>(),
+            })
+            .to_string();
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/records/batch")
+                        .header("X-API-Key", &key)
+                        .header("Content-Type", "application/json"),
+                ),
+                tick,
+                &body,
+            );
+            let started = Instant::now();
+            let res = app.oneshot(req).await.unwrap();
+            let elapsed = started.elapsed();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(), elapsed)
+        }
+    };
+
+    // ── Probes before the write ──────────────────────────────────────────────
+    let probe = |path: &'static str| {
+        let app = app.clone();
+        async move {
+            let started = Instant::now();
+            let req = Request::builder().uri(path).body(Body::empty()).unwrap();
+            let status = app.oneshot(req).await.unwrap().status();
+            (status, started.elapsed())
+        }
+    };
+    for path in ["/health", "/ready"] {
+        let (status, took) = probe(path).await;
+        assert_eq!(status, StatusCode::OK, "{path} must be healthy before the batch");
+        assert!(took < BUDGET, "{path} took {took:?} before any load");
+    }
+
+    // ── The upsert ───────────────────────────────────────────────────────────
+    let (status, summary, upsert_time) = batch("upsert", addresses.clone(), 1).await;
+    assert_eq!(status, StatusCode::OK, "the batch must succeed: {summary}");
+    assert_eq!(summary["created"], RECORDS as u64, "every record is new the first time");
+    assert!(
+        upsert_time < BUDGET,
+        "a {RECORDS}-record upsert took {upsert_time:?}, over the {BUDGET:?} regression budget — \
+         suspect a per-record transaction or a missing index rather than a slow machine"
+    );
+
+    // ── Readiness immediately afterwards ─────────────────────────────────────
+    // The transaction has committed, so the pool's single connection is free again. A batch that
+    // wedged it would show up here as a hang, not a slow number.
+    for path in ["/health", "/ready"] {
+        let (status, took) = probe(path).await;
+        assert_eq!(status, StatusCode::OK, "{path} must answer after a large write");
+        assert!(
+            took < BUDGET,
+            "{path} took {took:?} after the batch — the write held the pool longer than it should"
+        );
+    }
+
+    // ── full_replace over the same set ───────────────────────────────────────
+    let (status, summary, replace_time) = batch("full_replace", addresses.clone(), 2).await;
+    assert_eq!(status, StatusCode::OK, "full_replace must succeed: {summary}");
+    assert_eq!(summary["updated"], RECORDS as u64, "every record already existed");
+    assert_eq!(
+        summary["soft_deleted"], 0,
+        "the batch listed every member, so full_replace has nothing to sweep"
+    );
+    assert!(
+        replace_time < BUDGET,
+        "a {RECORDS}-record full_replace took {replace_time:?}, over the {BUDGET:?} budget"
+    );
+
+    // ── full_replace with a smaller set actually sweeps ──────────────────────
+    let (status, summary, _) = batch("full_replace", addresses[..10].to_vec(), 3).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        summary["soft_deleted"],
+        (RECORDS - 10) as u64,
+        "everything the shorter batch omitted is swept in one transaction"
+    );
+
+    // Every row is accounted for: nothing was lost, and the sweep was scoped.
+    let live = simply_ip_vault::entities::ip_record::Entity::find()
+        .filter(simply_ip_vault::entities::ip_record::Column::IsDeleted.eq(false))
+        .all(&db)
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(live, 10, "exactly the listed records remain live");
+
+    eprintln!(
+        "batch timings — upsert({RECORDS}): {upsert_time:?}, full_replace({RECORDS}): {replace_time:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

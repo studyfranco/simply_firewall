@@ -330,7 +330,7 @@ pub(crate) async fn handle_ip_upsert(
         group_id: Some(target_group_id),
         cause: payload.cause,
     };
-    let _ = state.webhook_tx.send(event).await;
+    state.enqueue_webhook(event);
 
     Ok(axum::http::StatusCode::OK)
 }
@@ -1003,7 +1003,7 @@ pub async fn delete_ip(
         group_id: Some(group.id),
         cause: Some("Deleted via API".to_owned()),
     };
-    let _ = state.webhook_tx.send(event).await;
+    state.enqueue_webhook(event);
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }

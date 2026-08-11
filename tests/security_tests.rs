@@ -3184,15 +3184,34 @@ async fn a_correctly_signed_query_string_authenticates() {
 /// **Memory bound.** The router-wide limit and the middleware's signature buffer are the same
 /// number, so no body size is accepted by one layer and refused by the other.
 ///
-/// Asserted on the constants rather than by pushing 3 MiB through the stack: the property that
+/// Asserted on the resolver rather than by pushing a payload through the stack: the property that
 /// matters is that the two cannot drift, and a size-based test would pass just as well with two
 /// independently-chosen values that happen to agree today.
+///
+/// This used to assert the literal `3 * 1024 * 1024`, which made it a test of *the number* rather
+/// than of the invariant its own doc comment describes — so raising the default to 10 MiB for the
+/// batch endpoint broke it while the invariant it was meant to protect was never in danger. It now
+/// checks what it always claimed to.
 #[test]
 fn the_body_limit_and_the_signature_buffer_are_one_constant() {
+    // Both layers call this one function: `create_app`'s `DefaultBodyLimit::max(...)` and
+    // `auth_middleware`'s `to_bytes(body, ...)`. There is no second value to disagree with.
+    let resolved = simply_ip_vault::config::max_body_bytes();
+
+    assert_eq!(
+        resolved,
+        simply_ip_vault::MAX_REQUEST_BODY_BYTES,
+        "with MAX_BODY_SIZE_MIB unset, the resolver must return the compiled-in default"
+    );
     assert_eq!(
         simply_ip_vault::MAX_REQUEST_BODY_BYTES,
-        3 * 1024 * 1024,
-        "the converged limit is 3 MiB"
+        simply_ip_vault::config::DEFAULT_MAX_BODY_MIB * 1024 * 1024,
+        "the constant is the named default in bytes, not a second hand-written literal"
+    );
+    assert!(
+        resolved >= 1024 * 1024,
+        "the floor keeps a misconfiguration from rejecting ordinary payloads and presenting as a \
+         broken API rather than as a bad setting"
     );
 }
 

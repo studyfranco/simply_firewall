@@ -104,13 +104,32 @@ automatically if present):
 | `INITIAL_MASTER_KEY` | *(unset)* | Deterministic bootstrap master key, for test/CI only. **Must be exactly 64 hex characters**; anything else aborts startup. Unset is the correct production setting — the service generates a random 256-bit key and prints it once. |
 | `INITIAL_MASTER_SIGNING_SECRET` | *(unset)* | The bootstrap key's HMAC signing secret. Test/CI only, same as above. |
 | `ALLOW_PRIVATE_WEBHOOKS` | `false` | Set to `true` to allow webhook targets on private/loopback/link-local addresses (useful for local testing; leave `false` in production to keep SSRF protection active). |
+| `MAX_BODY_SIZE_MIB` | `10` | Largest request body accepted, in MiB. Raised from 3 for `POST /api/records/batch` — ten thousand records exceed 3 MiB comfortably. Applied to the router **and** to the middleware's signature buffer through one resolver, so the two cannot disagree. Over the limit answers `413`. Floor of 1 MiB. |
+| `WEBHOOK_WORKERS` | `1` | Parallel webhook dispatch workers. Clamped to at least 1 — `0` would leave nothing draining the queue while the service looked healthy. |
+| `WEBHOOK_DISPATCH_INTERVAL_MS` | `500` | Pause each worker takes **after** finishing an event. `0` disables throttling. Paces events per worker, so the aggregate ceiling is `WEBHOOK_WORKERS / interval` events per second. |
+| `WEBHOOK_QUEUE_CAPACITY` | `1024` | Depth of the in-memory webhook queue. When full, events are **dropped with a warning** rather than stalling the request that produced them — see below. |
 | `IP_RETENTION_DAYS` | `92` | How long a soft-deleted IP record is kept before the purge worker removes it. |
 | `IP_RETENTION_SWEEP_SECONDS` | `3600` | Interval between purge sweeps. |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter, e.g. `debug`, `simply_ip_vault=debug`. |
 
 Three of these abort startup rather than falling back when malformed — `VAULT_ENCRYPTION_KEY`,
 `TRUSTED_PROXIES`, and `INITIAL_MASTER_KEY`. Each configures a security boundary, and the only
-alternative to refusing is silently applying a boundary different from the one you wrote down.
+alternative to refusing is silently applying a boundary different from the one you wrote down. The
+operational tuning variables above fail *soft* by contrast: a malformed number logs a warning and uses
+the default, because throttling a notification queue wrongly is a performance choice, not a boundary.
+
+### Webhook delivery is best-effort
+
+The dispatch queue is bounded and **drops events when it is full**, logging each at `warn` with the
+address and the configured capacity. That is deliberate. A firewall API that stops answering because a
+*notification* queue backed up has its priorities inverted — the ban is the product, the webhook is a
+courtesy — so the request never waits on the queue.
+
+Throttling makes a full queue much likelier than it used to be: at the default pace one worker drains
+two events per second, so a bulk operation can outrun it. If you see the warning, raise
+`WEBHOOK_QUEUE_CAPACITY` or `WEBHOOK_WORKERS`, or lower `WEBHOOK_DISPATCH_INTERVAL_MS`. A consumer that
+cannot tolerate loss should poll `GET /api/ips?since=…&include_deleted=true` instead — the webhook
+stream has always been best-effort, and now says so.
 
 ### Docker
 

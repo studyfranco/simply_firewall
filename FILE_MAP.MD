@@ -164,7 +164,19 @@ in `main.rs` — the branch that refuses a weak credential is worth being able t
 **Key exports.** `TrustedProxies`, `ProxyMatcher`, `InvalidTrustedProxies`, `resolve_client_ip`,
 `normalize_ip`, `is_trusted`, `resolve_bind_addr`, `parse_bind_addr`, `parse_trusted_proxies`,
 `validate_initial_master_key`, `InvalidInitialMasterKey`, `INITIAL_MASTER_KEY_ENV`,
-`MASTER_KEY_HEX_LEN`.
+`MASTER_KEY_HEX_LEN`, `max_body_bytes`, `webhook_workers`, `webhook_dispatch_interval`,
+`webhook_queue_capacity`, `DEFAULT_MAX_BODY_MIB`.
+
+**Operational tuning lives here too, and fails soft.** `max_body_bytes`, `webhook_workers`,
+`webhook_dispatch_interval` and `webhook_queue_capacity` each read their variable **once** into a
+`OnceLock` — a limit that can change under a running process is one nobody can reason about after the
+fact — and a malformed value logs a warning and uses the default rather than aborting. That is the
+opposite of `TRUSTED_PROXIES` and `VAULT_ENCRYPTION_KEY` on purpose: those are boundaries, these are
+performance choices, and refusing to boot over a tuning typo trades a real outage for a small one.
+
+`max_body_bytes` is called by **both** `create_app`'s `DefaultBodyLimit` and `auth_middleware`'s
+signature buffer. One function, two callers — which is what makes it impossible for the two layers to
+drift into a band of sizes one accepts and the other refuses.
 
 **Rationale.** The chain walk is meant to be character-for-character identical to the peer's, and
 `verify_convergence.sh` diffs it: a difference means one service trusts an address the other would

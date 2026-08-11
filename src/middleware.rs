@@ -19,15 +19,24 @@ use crate::state::AppState;
 /// Largest request body the auth middleware will buffer in order to verify its signature, in bytes.
 ///
 /// The signature covers the raw body, so the body must be fully read *before* the request reaches a
-/// handler. That makes this an unavoidable pre-authentication memory allocation, and therefore a cap
-/// is required: without one, an unauthenticated caller could force unbounded buffering.
+/// handler. That makes the allocation unavoidable, and therefore a cap required.
 ///
-/// Deliberately **derived from** [`crate::MAX_REQUEST_BODY_BYTES`] rather than chosen independently.
-/// Two separately-picked numbers leave a band of sizes that one layer accepts and the other refuses,
-/// which is exactly the parser-differential shape that turns into a bug: a body between the limits
-/// would be fully buffered and HMAC'd here only to be rejected by the extractor afterwards — paying
-/// the memory cost of a payload the service had already decided not to accept.
-const MAX_SIGNED_BODY_BYTES: usize = crate::MAX_REQUEST_BODY_BYTES;
+/// Resolved through [`crate::config::max_body_bytes`], the **same function** the router's
+/// `DefaultBodyLimit` calls — not a separately-chosen constant. Two independently-picked numbers
+/// leave a band of sizes that one layer accepts and the other refuses, which is exactly the
+/// parser-differential shape that turns into a bug: a body between the limits would be fully
+/// buffered and HMAC'd here only to be rejected by the extractor afterwards, paying the memory cost
+/// of a payload the service had already decided not to accept. One function, two callers, no band.
+///
+/// **How exposed this allocation is.** Buffering happens *after* the key lookup (step 3 of the
+/// ordering below), so reaching it requires a caller whose key hash is in the database — not an
+/// anonymous one. That is what makes a 10 MiB default defensible where it would not be if the body
+/// were read first. It is still a per-in-flight-request cost multiplied by concurrency, so an
+/// operator issuing many low-trust keys should lower `MAX_BODY_SIZE_MIB` rather than assume the
+/// default is free.
+fn max_signed_body_bytes() -> usize {
+    crate::config::max_body_bytes()
+}
 
 /// The resolved client IP for the current request (rightmost `X-Forwarded-For` hop, `X-Real-IP`,
 /// or raw TCP peer address — see [`auth_middleware`]). Inserted into request extensions so
@@ -219,7 +228,7 @@ pub async fn auth_middleware(
     let (parts, body) = req.into_parts();
     // The full request target, query string included — see `crypto::verify_signature`.
     let target = signed_target(&parts);
-    let body_bytes = axum::body::to_bytes(body, MAX_SIGNED_BODY_BYTES)
+    let body_bytes = axum::body::to_bytes(body, max_signed_body_bytes())
         .await
         .map_err(|e| {
             tracing::warn!("Rejected request: unreadable or oversized body: {}", e);

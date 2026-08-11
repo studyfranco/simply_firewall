@@ -156,6 +156,45 @@ impl AppState {
         self
     }
 
+    /// Queues a webhook event without ever blocking the request that produced it.
+    ///
+    /// # Why `try_send` and not `send().await`
+    ///
+    /// The handlers used to `await` the send. That was harmless while the worker drained the channel
+    /// as fast as events arrived — and stopped being harmless the moment dispatch became throttled.
+    /// At the default pace one worker handles two events per second, so a bulk operation fills the
+    /// queue in well under a second and every subsequent `send().await` parks the HTTP handler until
+    /// a slot frees. A firewall API that stops answering because a *notification* queue is full has
+    /// its priorities backwards: the ban is the product, the webhook is a courtesy.
+    ///
+    /// So a full queue drops the event and logs it at `warn`. That is a real loss and is stated
+    /// plainly rather than hidden — the log names the address and the depth, so an operator sees
+    /// exactly what to raise. It is also not a new class of loss: the previous code discarded the
+    /// send result entirely (`let _ = …`), so a closed channel already dropped events silently.
+    ///
+    /// Raise `WEBHOOK_QUEUE_CAPACITY`, add workers, or lower `WEBHOOK_DISPATCH_INTERVAL_MS` if this
+    /// appears in a log. Consumers that cannot tolerate loss should poll
+    /// `GET /api/ips?since=…&include_deleted=true` instead; the webhook stream is best-effort by
+    /// construction and always has been.
+    pub fn enqueue_webhook(&self, event: WebhookEvent) {
+        if let Err(e) = self.webhook_tx.try_send(event) {
+            match e {
+                mpsc::error::TrySendError::Full(dropped) => tracing::warn!(
+                    address = %dropped.address,
+                    action = %dropped.action,
+                    capacity = crate::config::webhook_queue_capacity(),
+                    "Webhook queue is full; dropping this notification rather than stalling the \
+                     request that produced it. Raise WEBHOOK_QUEUE_CAPACITY or WEBHOOK_WORKERS, or \
+                     lower WEBHOOK_DISPATCH_INTERVAL_MS."
+                ),
+                mpsc::error::TrySendError::Closed(dropped) => tracing::warn!(
+                    address = %dropped.address,
+                    "Webhook channel is closed; the dispatcher is not running"
+                ),
+            }
+        }
+    }
+
     /// Builds state with an explicit trusted-proxy list and the zero-config plaintext cipher.
     ///
     /// The common test constructor; prefer [`AppState::with_parts`] when the cipher matters.

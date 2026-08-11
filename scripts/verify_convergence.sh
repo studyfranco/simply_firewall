@@ -723,12 +723,15 @@ echo
 
 # ─────────────────────────────────────────────────────────────
 echo "${BOLD}Pillar 3 — Pipeline ordering & memory bounds${RESET}"
-assert_present "3 MiB router-wide body limit" \
-    "src/lib.rs" "MAX_REQUEST_BODY_BYTES: usize = 3 \* 1024 \* 1024"
+assert_present "the router-wide body limit is a named default, not a literal" \
+    "src/lib.rs" "MAX_REQUEST_BODY_BYTES: usize = config::DEFAULT_MAX_BODY_MIB"
 assert_present "the limit is applied to the router" \
-    "src/lib.rs" "DefaultBodyLimit::max\(MAX_REQUEST_BODY_BYTES\)"
-assert_present "the signature buffer derives from that one constant" \
-    "src/middleware.rs" "MAX_SIGNED_BODY_BYTES: usize = crate::MAX_REQUEST_BODY_BYTES"
+    "src/lib.rs" "DefaultBodyLimit::max\(config::max_body_bytes\(\)\)"
+# The property is that both layers resolve through the *same function*, so they cannot drift into a
+# band of sizes one accepts and the other refuses. Asserted on the call, not on a shared constant,
+# because the limit became runtime-configurable (`MAX_BODY_SIZE_MIB`) in Session 52.
+assert_present "the signature buffer resolves through the same function as the router limit" \
+    "src/middleware.rs" "crate::config::max_body_bytes\(\)"
 # Ordering is asserted structurally: the signature check must appear before the bound_ips check in
 # the middleware source. Reversing them reintroduces the 401/403 oracle, and would otherwise be
 # caught only by a test someone might delete.

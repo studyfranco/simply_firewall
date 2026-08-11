@@ -12,7 +12,12 @@ use tokio::sync::mpsc;
 use tower_http::services::ServeDir;
 use tower_http::trace::TraceLayer;
 
-/// Hard ceiling on the size of any request body this service will buffer, in bytes (3 MiB).
+/// Compile-time default ceiling on any request body, in bytes.
+///
+/// **Superseded at runtime by [`config::max_body_bytes`]**, which reads `MAX_BODY_SIZE_MIB` and
+/// falls back to this. Kept as a named constant because the reasoning below is about the *limit*,
+/// not about where its value comes from, and because both layers still resolve through one function
+/// so they cannot disagree.
 ///
 /// **The single source of truth for both body limits.** It is applied as an explicit
 /// [`DefaultBodyLimit`] over the whole router *and* referenced by
@@ -31,7 +36,7 @@ use tower_http::trace::TraceLayer;
 ///   silently widen the exposure.
 ///
 /// A body over the limit is rejected with `413 Payload Too Large` before it is read to completion.
-pub const MAX_REQUEST_BODY_BYTES: usize = 3 * 1024 * 1024;
+pub const MAX_REQUEST_BODY_BYTES: usize = config::DEFAULT_MAX_BODY_MIB * 1024 * 1024;
 
 pub mod api;
 pub mod config;
@@ -126,7 +131,12 @@ pub fn create_app(state: AppState) -> Router {
         // it would leave the SPA path — which never reaches the auth middleware — unbounded, and a
         // limit that can be sidestepped by aiming at a different route is not a limit. No route
         // overrides it: `DefaultBodyLimit` is set exactly once, here.
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
+        // `DefaultBodyLimit::max`, not `RequestBodyLimitLayer`. The latter rejects at the tower
+        // layer with a bare `413` and no body, which would break the `{"error": …}` contract every
+        // other failure on these routes honours — and `AppError::BodyRejected` exists precisely to
+        // carry the extractor's status through *with* that shape. The limit is read once at router
+        // construction, so it is fixed for the life of the process like every other security bound.
+        .layer(DefaultBodyLimit::max(config::max_body_bytes()))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -144,7 +154,7 @@ pub fn setup_state(
     (AppState, mpsc::Sender<WebhookEvent>, tokio::task::JoinHandle<()>),
     state::StartupConfigError,
 > {
-    let (tx, rx) = mpsc::channel::<WebhookEvent>(100);
+    let (tx, rx) = mpsc::channel::<WebhookEvent>(config::webhook_queue_capacity());
     let db_worker = db.clone();
     let worker_handle = tokio::spawn(async move {
         dispatch::run_webhook_worker(db_worker, rx).await;

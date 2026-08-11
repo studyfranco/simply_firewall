@@ -88,6 +88,117 @@ pub fn parse_bind_addr(host: Option<&str>, port: Option<&str>) -> SocketAddr {
 /// deployment **must** set this variable. See [`resolve_client_ip`].
 pub const TRUSTED_PROXIES_ENV: &str = "TRUSTED_PROXIES";
 
+// ─────────────────────────────────────────────────────────────
+// Operational tuning
+// ─────────────────────────────────────────────────────────────
+//
+// Every value below is read **once** into a `OnceLock` and cached. Re-reading the environment per
+// request would make the effective configuration a moving target — the same class of value this
+// module's header rules out for the security settings, for the same reason: a limit that can change
+// under a running process is one nobody can reason about after the fact.
+//
+// All three fail *soft*. A malformed number logs a warning and uses the default, because none of them
+// is a security boundary: throttling a notification queue too fast or too slow is a performance
+// choice, and refusing to boot over it would trade a real outage for a tuning mistake. Contrast
+// `TRUSTED_PROXIES` and `VAULT_ENCRYPTION_KEY`, which abort startup — those *are* boundaries.
+
+/// Reads a numeric environment variable, falling back to `default` with a warning if unusable.
+fn numeric_env<T>(name: &str, default: T) -> T
+where
+    T: std::str::FromStr + std::fmt::Display + Copy,
+{
+    match std::env::var(name) {
+        Err(_) => default,
+        Ok(raw) => match raw.trim().parse::<T>() {
+            Ok(value) => value,
+            Err(_) => {
+                tracing::warn!(
+                    "{name}={raw:?} is not a valid number; using the default of {default}"
+                );
+                default
+            }
+        },
+    }
+}
+
+/// Parallel webhook dispatch workers. Env `WEBHOOK_WORKERS`, default 1.
+pub const WEBHOOK_WORKERS_ENV: &str = "WEBHOOK_WORKERS";
+
+/// Delay each worker waits between events, in milliseconds. Env `WEBHOOK_DISPATCH_INTERVAL_MS`.
+pub const WEBHOOK_INTERVAL_ENV: &str = "WEBHOOK_DISPATCH_INTERVAL_MS";
+
+/// Depth of the in-memory webhook queue. Env `WEBHOOK_QUEUE_CAPACITY`.
+pub const WEBHOOK_QUEUE_ENV: &str = "WEBHOOK_QUEUE_CAPACITY";
+
+/// Number of worker tasks consuming the webhook channel. **Clamped to at least 1.**
+///
+/// Zero would mean nothing drains the queue: every send would fill the buffer and then fail, and the
+/// service would look healthy while delivering nothing. A configuration that silently disables a
+/// subsystem should not be reachable by typing `0`.
+pub fn webhook_workers() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| numeric_env::<usize>(WEBHOOK_WORKERS_ENV, 1).max(1))
+}
+
+/// Pause a worker takes after finishing one event, in milliseconds. `0` disables throttling.
+///
+/// This paces **events per worker**, not individual HTTP calls: one event may fan out to several
+/// webhook configs, and those still dispatch concurrently. The aggregate ceiling is therefore
+/// `webhook_workers() / interval` events per second — with the defaults, two per second.
+///
+/// The default is deliberately non-zero. A bulk operation can enqueue thousands of events in a
+/// second, and an unthrottled worker turns that into a synchronised burst against every configured
+/// receiver at once — which reads, from the receiver's side, as a denial-of-service originating from
+/// us. Pacing costs latency on a notification that is already asynchronous.
+pub fn webhook_dispatch_interval() -> std::time::Duration {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_millis(*VALUE.get_or_init(|| numeric_env::<u64>(WEBHOOK_INTERVAL_ENV, 500)))
+}
+
+/// Capacity of the webhook channel. **Clamped to at least 1** — `mpsc::channel(0)` panics.
+///
+/// Raised from the historical 100 because throttling makes a full queue far likelier: at the default
+/// pace a single worker drains two events per second, so a bulk operation fills 100 slots almost
+/// immediately. See `state::AppState::enqueue_webhook` for what happens when it does fill — briefly,
+/// the event is dropped with a warning rather than blocking the request that produced it.
+pub fn webhook_queue_capacity() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| numeric_env::<usize>(WEBHOOK_QUEUE_ENV, 1_024).max(1))
+}
+
+/// Maximum request body size in mebibytes. Env `MAX_BODY_SIZE_MIB`, default 10.
+pub const MAX_BODY_SIZE_ENV: &str = "MAX_BODY_SIZE_MIB";
+
+/// Default body limit in MiB, used when [`MAX_BODY_SIZE_ENV`] is unset or unparseable.
+///
+/// Raised from 3 to 10 for `POST /api/records/batch`: ten thousand records with causes and timestamps
+/// exceeds 3 MiB comfortably, and a batch endpoint whose documented maximum cannot be submitted is
+/// not a batch endpoint.
+pub const DEFAULT_MAX_BODY_MIB: usize = 10;
+
+/// The request body ceiling in bytes, resolved once.
+///
+/// **Read by two layers that must agree exactly**: the router's `DefaultBodyLimit`, and
+/// `middleware::auth_middleware`, which buffers the body to verify its HMAC. If the middleware's
+/// buffer were the larger of the two, a body between the limits would be fully read and hashed only
+/// to be rejected by the extractor afterwards — paying the memory cost of a payload the service had
+/// already decided not to accept. One function, called by both, is what makes that impossible rather
+/// than merely unlikely.
+///
+/// **On raising it.** The middleware buffers *after* the key lookup, so reaching this allocation
+/// requires a caller holding a key whose hash is in the database — not an anonymous one. It is still
+/// a per-in-flight-request cost multiplied by concurrency, so an operator running many low-trust keys
+/// should lower it rather than assume the default is free.
+///
+/// Clamped to at least 1 MiB: a smaller ceiling rejects ordinary key-creation payloads and would
+/// present as the API being broken rather than as a misconfiguration.
+pub fn max_body_bytes() -> usize {
+    static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        numeric_env::<usize>(MAX_BODY_SIZE_ENV, DEFAULT_MAX_BODY_MIB).max(1) * 1024 * 1024
+    })
+}
+
 /// Environment variable overriding the generated bootstrap master key.
 pub const INITIAL_MASTER_KEY_ENV: &str = "INITIAL_MASTER_KEY";
 

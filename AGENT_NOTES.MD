@@ -7199,3 +7199,105 @@ Six integration tests, covering each property the brief named plus the two bypas
 | `./scripts/test_e2e.sh` | **516 passed**, 0 failed |
 | `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences, 0 unexplained |
 | `git diff RBAC_MODEL.md` | empty |
+
+---
+
+## Session 52 — Webhook throttling, configurable body limit, batch benchmark
+
+Three operational hardening tasks after the batch endpoint landed. Two of them turned up a problem the
+brief did not name.
+
+### 1. Webhook worker pool and throttling
+
+`WEBHOOK_WORKERS` (default 1), `WEBHOOK_DISPATCH_INTERVAL_MS` (default 500), and a third the brief did
+not ask for: `WEBHOOK_QUEUE_CAPACITY` (default 1024, raised from a hardcoded 100).
+
+`mpsc::Receiver` is not clonable — an mpsc channel has one consumer by definition — so the workers
+share it behind a `tokio::sync::Mutex` and take turns calling `recv`. **The guard is dropped before
+any dispatch**, scoped explicitly, so workers serialise on picking up an event and run its HTTP calls
+concurrently. Holding it across the dispatch would have made `WEBHOOK_WORKERS` decorative.
+
+The pause is **after** the work, not before it, so a service receiving one event an hour never waits
+for it. Throttling exists to flatten bursts, not to add latency to a quiet system.
+
+**The problem the brief did not name.** Handlers called `state.webhook_tx.send(event).await`. That was
+harmless while the worker drained as fast as events arrived — and stopped being harmless the moment
+dispatch became throttled. At the default pace one worker handles two events per second, so a bulk
+operation fills the queue in under a second and every subsequent `send().await` **parks the HTTP
+handler** until a slot frees. Introducing throttling without touching this would have converted a
+notification backlog into API unavailability.
+
+So `AppState::enqueue_webhook` now uses `try_send` and drops on a full queue with a `warn` naming the
+address and the capacity. That is a real loss, stated plainly rather than hidden — and not a new class
+of it: the previous code discarded the send result entirely (`let _ = …`), so a closed channel already
+dropped events silently. A firewall API that stops answering because a *notification* queue backed up
+has its priorities inverted; the ban is the product, the webhook is a courtesy. Consumers that cannot
+tolerate loss should poll `GET /api/ips?since=…&include_deleted=true`.
+
+### 2. Configurable body limit
+
+`MAX_BODY_SIZE_MIB`, default **10** (raised from a hardcoded 3 MiB — ten thousand batch records exceed
+3 MiB comfortably, and a batch endpoint whose documented maximum cannot be submitted is not one).
+
+**Kept `DefaultBodyLimit::max`, did not switch to `RequestBodyLimitLayer`.** The brief suggested the
+latter; it rejects at the tower layer with a bare `413` and no body, which would break the
+`{"error": …}` contract every other failure on these routes honours — and `AppError::BodyRejected`
+exists precisely to carry the extractor's status through *with* that shape. Using it would have worked
+against the brief's own requirement to preserve `BodyRejected`.
+
+Both layers resolve through `config::max_body_bytes()`. One function, two callers, so they cannot
+drift into a band of sizes one accepts and the other refuses.
+
+**On raising a pre-auth buffer.** Checked the ordering rather than assuming: the middleware buffers at
+step 4, *after* the key lookup at step 3. Reaching a 10 MiB allocation therefore requires a caller
+whose key hash is in the database, not an anonymous one. That is what makes the larger default
+defensible. It is still a per-in-flight-request cost multiplied by concurrency, and the docs say so.
+
+> **Divergence from the peer.** `simply_hook_executor` keeps 3 MiB and has no batch endpoint. Recorded
+> rather than converged.
+
+### 3. Benchmark, and what it can honestly assert
+
+Measured on a **debug** build: a 2 000-record `upsert` takes **1.09 s**, `full_replace` **0.79 s**.
+
+**The brief asked to assert `< 150ms`. That is roughly 7× faster than reality here and the assertion
+would fail on every run.** The test uses a 20 s budget instead — wide enough that an accidental O(n²)
+or a per-record transaction blows through it by an order of magnitude, and wide enough not to flake on
+a loaded machine. The doc comment says explicitly that it is a regression signal and not a performance
+contract, because a benchmark that cries wolf gets deleted rather than investigated. Release builds
+will be substantially faster; the number above is not the one to quote.
+
+**A correction to the premise.** The task asked to show that batch transactions do not block
+concurrent read probes, attributing that to WAL. `SQLITE_MAX_CONNECTIONS` is **1** (measured, not
+assumed — SQLite permits a single writer and DDL migrations break at any pool size ≥ 2), so a probe
+issued *during* a batch queues on the **pool**, not on SQLite, and WAL's reader/writer separation is
+not what saves it. What the test therefore asserts is the property an operator actually has: the batch
+holds the connection for a bounded time and the service answers normally on either side of it. Claiming
+WAL concurrency here would have been a comfortable statement that is not true of this deployment.
+
+The suite's usual `sqlite::memory:` fixture cannot use WAL at all, so the benchmark builds its own
+file-backed pool through `db::connect` and re-asserts `journal_mode=wal` and `synchronous=1` against
+the connection it actually measures.
+
+### 4. A test that asserted the number instead of the invariant
+
+`the_body_limit_and_the_signature_buffer_are_one_constant` failed when the default moved to 10 MiB. Its
+own doc comment said the property was "that the two cannot drift" — and it asserted the literal
+`3 * 1024 * 1024`. So the invariant it existed to protect was never in danger; the test was simply
+pinned to a number. Rewritten to check what it always claimed to: that both layers resolve through the
+same function, that the constant is the named default in bytes, and that the floor holds.
+
+### 5. Gates
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **275 passed**, 0 failed (273 before) |
+| `./scripts/test_e2e.sh` | **516 passed**, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences |
+| `git diff RBAC_MODEL.md` | empty |
+
+Three convergence assertions referenced the old body-limit shape and were **updated to follow the
+code, not loosened** — the pattern now asserts both layers call `config::max_body_bytes()`, which is
+the invariant, where before it asserted a literal that happened to encode it.

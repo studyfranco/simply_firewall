@@ -206,7 +206,47 @@ pub fn resolve_hmac_template(
 }
 
 /// Runs the background webhook worker, processing events and dispatching HTTP requests
-pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<WebhookEvent>) {
+pub async fn run_webhook_worker(db: DatabaseConnection, rx: Receiver<WebhookEvent>) {
+    let workers = crate::config::webhook_workers();
+    let interval = crate::config::webhook_dispatch_interval();
+
+    // One receiver, many consumers. `mpsc::Receiver` is not clonable — deliberately, since an mpsc
+    // channel has exactly one consumer by definition — so the workers share it behind a mutex and
+    // take turns calling `recv`. The lock is held only across the `recv` itself and released before
+    // any dispatch, so the workers serialise on *picking up* an event and run its HTTP calls
+    // concurrently. That is the intended shape: the queue is the contended resource, the network is
+    // not.
+    let shared = std::sync::Arc::new(tokio::sync::Mutex::new(rx));
+    let mut pool = JoinSet::new();
+
+    info!(
+        workers,
+        interval_ms = interval.as_millis() as u64,
+        capacity = crate::config::webhook_queue_capacity(),
+        "Starting webhook dispatch pool"
+    );
+
+    for id in 0..workers {
+        let db = db.clone();
+        let shared = shared.clone();
+        pool.spawn(async move { dispatch_worker(id, db, shared, interval).await });
+    }
+
+    while pool.join_next().await.is_some() {}
+    info!("Webhook dispatch pool shut down.");
+}
+
+/// One worker: take an event, dispatch it, pause, repeat.
+///
+/// The pause is **after** the work rather than before it, so a service that receives one event an
+/// hour never waits for it. Throttling exists to flatten bursts, not to add latency to a quiet
+/// system, and `interval == 0` skips the sleep entirely.
+async fn dispatch_worker(
+    id: usize,
+    db: DatabaseConnection,
+    rx: std::sync::Arc<tokio::sync::Mutex<Receiver<WebhookEvent>>>,
+    interval: Duration,
+) {
     let client = match Client::builder()
         .timeout(WEBHOOK_TIMEOUT)
         .user_agent("SimplyFirewall/2.0")
@@ -229,9 +269,20 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
     let mut join_set = JoinSet::new();
     let allow_private_webhooks = std::env::var("ALLOW_PRIVATE_WEBHOOKS").unwrap_or_else(|_| "false".to_owned()) == "true";
 
-    info!("Webhook worker started.");
+    info!(worker = id, "Webhook worker started.");
 
-    while let Some(event) = rx.recv().await {
+    loop {
+        // Scoped so the guard drops before any dispatch below — holding it across the HTTP calls
+        // would serialise the whole pool behind one slow receiver and make `WEBHOOK_WORKERS`
+        // decorative.
+        let event = {
+            let mut guard = rx.lock().await;
+            match guard.recv().await {
+                Some(event) => event,
+                None => break,
+            }
+        };
+
         info!(address = %event.address, action = %event.action, "Processing event for webhooks");
 
         let gid = match event.group_id {
@@ -423,11 +474,17 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
         }
         
         while let Some(Ok(_)) = join_set.try_join_next() {}
+
+        // Paces this worker's *events*. One event may still fan out to several configs
+        // concurrently, so the aggregate ceiling is `WEBHOOK_WORKERS / interval` events per second.
+        if !interval.is_zero() {
+            tokio::time::sleep(interval).await;
+        }
     }
 
-    info!("Webhook channel closed, draining pending tasks...");
+    info!(worker = id, "Webhook channel closed, draining pending tasks...");
     while join_set.join_next().await.is_some() {}
-    info!("Webhook worker shut down.");
+    info!(worker = id, "Webhook worker shut down.");
 }
 
 #[cfg(test)]
