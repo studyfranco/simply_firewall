@@ -396,7 +396,7 @@
                                 <label for="webhook-auth-mode">Auth Mode <span>*</span></label>
                                 <select id="webhook-auth-mode" class="input-field select-field">
                                     <option value="CANONICAL_V1" selected>CANONICAL_V1 (Simply IP Vault / hook executor)</option>
-                                    <option value="BODY_ONLY">BODY_ONLY (generic receivers)</option>
+                                    <option value="HMAC_ONLY">HMAC_ONLY (signature only, no key)</option>
                                     <option value="API_KEY_ONLY">API_KEY_ONLY (key header, no signature)</option>
                                     <option value="NONE">NONE (no auth headers)</option>
                                 </select>
@@ -422,6 +422,31 @@
                                     Credential for the <em>receiving</em> system. Stored as given, never shown again.
                                     Rename the header if the receiver expects something other than
                                     <code>X-API-Key</code>.
+                                </small>
+                            </div>
+                        </div>
+
+                        <!-- Signature transport — applies to whichever mode signs. Kept adjacent to
+                             the template because all three answer the same question: what exactly
+                             does the receiver see, and under what name. -->
+                        <div class="compact-grid">
+                            <div class="form-group" id="webhook-sig-header-group">
+                                <label for="webhook-sig-header">Signature Header</label>
+                                <input type="text" id="webhook-sig-header" class="input-field font-mono"
+                                       placeholder="X-Signature-256" autocomplete="off" spellcheck="false">
+                                <small class="field-hint">
+                                    Where the signature is sent. Blank uses <code>X-Signature-256</code>,
+                                    which is what another Simply IP Vault instance and the hook executor
+                                    expect. GitHub-style receivers want <code>X-Hub-Signature-256</code>.
+                                </small>
+                            </div>
+                            <div class="form-group" id="webhook-sig-prefix-group">
+                                <label for="webhook-sig-prefix">Signature Prefix</label>
+                                <input type="text" id="webhook-sig-prefix" class="input-field font-mono"
+                                       value="sha256=" placeholder="sha256=" autocomplete="off" spellcheck="false">
+                                <small class="field-hint">
+                                    Prepended to the hex digest. Clear it to send a bare digest for
+                                    receivers that reject a prefix. The algorithm is always SHA-256.
                                 </small>
                             </div>
                         </div>

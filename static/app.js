@@ -393,18 +393,23 @@ class FirewallClient {
     // user-supplied happens here or at the assignment site.
     static AUTH_MODE_HINTS = {
         CANONICAL_V1:
-            'Signs the template below and sends <code>X-Timestamp</code> (plus <code>X-API-Key</code> ' +
-            'when set), so the dispatch can authenticate directly against another Simply IP Vault ' +
-            'instance or a hook executor.',
-        BODY_ONLY:
-            'Signs the payload alone as <code>sha256=&lt;hex&gt;</code> — what GitHub-style consumers ' +
-            'expect. No timestamp is sent.',
+            '<strong>Sends:</strong> signature + <code>X-Timestamp</code>, and <code>X-API-Key</code> ' +
+            'when one is set. Signs the canonical template below, so a dispatch authenticates ' +
+            'directly against another Simply IP Vault instance or a hook executor. ' +
+            '<em>Use this between our own services.</em>',
+        HMAC_ONLY:
+            '<strong>Sends:</strong> the signature and nothing else — no key header, no timestamp. ' +
+            'Signs the payload alone, the way GitHub-style receivers expect. ' +
+            '<em>Use this for third-party endpoints that verify a signature.</em>',
         API_KEY_ONLY:
-            'Sends <code>X-API-Key</code> and nothing else. No signature is computed, so the key is ' +
-            'the entire credential.',
+            '<strong>Sends:</strong> <code>X-API-Key</code> only. Nothing is signed, so the key is ' +
+            'the entire credential and anyone who captures it can replay the request. ' +
+            '<em>Use this only over TLS, for receivers that accept nothing else.</em>',
         NONE:
-            'Sends no authentication headers at all. Only appropriate for a receiver that is already ' +
-            'protected some other way.'
+            '<strong>Sends:</strong> no authentication headers at all. ' +
+            '<em>Use this only when the receiver is already protected some other way</em> — a ' +
+            'private listener reachable from this host alone, or a credential you have set as a ' +
+            'custom header below.'
     };
 
     constructor() {
@@ -1391,7 +1396,7 @@ class FirewallClient {
 
         const badgeClasses = {
             CANONICAL_V1: 'badge-canonical',
-            BODY_ONLY: 'badge-body-only',
+            HMAC_ONLY: 'badge-hmac-only',
             API_KEY_ONLY: 'badge-api-key',
             NONE: 'badge-no-auth'
         };
@@ -1399,7 +1404,7 @@ class FirewallClient {
         tbody.innerHTML = this.state.webhooks.map(w => {
             // Older rows (and any response from a pre-auth-mode server) carry no field at all;
             // treat that as the legacy default rather than rendering "undefined".
-            const mode = w.auth_mode || w.signature_mode || 'BODY_ONLY';
+            const mode = w.auth_mode || w.signature_mode || 'HMAC_ONLY';
             const badgeClass = badgeClasses[mode] || 'badge-body-only';
             // A non-default template changes what is actually signed, so it belongs next to the
             // mode rather than buried — this is the field most likely to explain a rejected
@@ -1493,21 +1498,19 @@ class FirewallClient {
         return Math.max(5, Math.min(100, Math.floor(available / rowHeight)));
     }
 
-    // Recomputes the table's height budget from the viewport and re-paginates to match.
+    // Re-paginates the IP table to whatever height the layout has settled on.
     ///
-    // The budget is "everything below the table's top edge, less room for the pagination bar" —
-    // derived from a live `getBoundingClientRect()` rather than a hardcoded offset, so it stays
-    // correct as the filter bar wraps to more lines on a narrow window or the top bar retracts.
+    // The height is set by CSS flex, not here. This only reads it back: "Auto" rows means "as many
+    // as fit", which cannot be known until the browser has laid the flex chain out.
     syncIpTableViewport() {
         const scroller = document.querySelector('#tab-firewall .table-scroll');
         if (!scroller) return;
 
-        const top = scroller.getBoundingClientRect().top;
-        // Reserve for the pagination row plus the card's bottom padding.
-        const reserved = 120;
-        const budget = Math.max(220, window.innerHeight - top - reserved);
-        scroller.style.setProperty('--table-max-h', `${Math.round(budget)}px`);
-
+        // The height itself is CSS's job now — the table is a flex child that fills whatever the
+        // window leaves it (see `#tab-firewall .table-scroll`). What still has to happen in JS is
+        // re-pagination: `resolveIpPageSize` measures the scroller's *rendered* height, so it must
+        // run after a resize has settled. Measuring reality beats the old computed budget, which
+        // carried a hardcoded 120px reservation that any change to the pager silently invalidated.
         const size = this.resolveIpPageSize();
         if (size !== this.ipCache.pageSize) {
             this.ipCache.setPageSize(size);
@@ -1968,7 +1971,7 @@ class FirewallClient {
      */
     syncWebhookAuthFields() {
         const mode = document.getElementById('webhook-auth-mode').value;
-        const needsSecret = mode === 'CANONICAL_V1' || mode === 'BODY_ONLY';
+        const needsSecret = mode === 'CANONICAL_V1' || mode === 'HMAC_ONLY';
         const needsApiKey = mode === 'CANONICAL_V1' || mode === 'API_KEY_ONLY';
         const needsTemplate = mode === 'CANONICAL_V1';
 
@@ -1982,6 +1985,10 @@ class FirewallClient {
         // API_KEY_ONLY where it is the entire credential — matching the server's own validation.
         toggle('webhook-api-key-group', 'webhook-api-key', needsApiKey, mode === 'API_KEY_ONLY');
         toggle('webhook-hmac-template-group', 'webhook-hmac-template', needsTemplate, true);
+        // Header and prefix apply to whichever mode signs, so they follow `needsSecret` rather than
+        // the template. Neither is required: blank means this service's default.
+        toggle('webhook-sig-header-group', 'webhook-sig-header', needsSecret, false);
+        toggle('webhook-sig-prefix-group', 'webhook-sig-prefix', needsSecret, false);
 
         // One line describing the *selected* mode, replacing the permanent paragraph that
         // described all four at once. Same information, shown when it is relevant.
@@ -2096,7 +2103,7 @@ class FirewallClient {
 
         // Only the fields this mode uses are sent. Anything the user typed under a previously
         // selected mode and then hid stays out of the request rather than being persisted invisibly.
-        if (authMode === 'CANONICAL_V1' || authMode === 'BODY_ONLY') {
+        if (authMode === 'CANONICAL_V1' || authMode === 'HMAC_ONLY') {
             payload.secret_token = document.getElementById('webhook-secret').value;
         }
         if (authMode === 'CANONICAL_V1' || authMode === 'API_KEY_ONLY') {
@@ -2115,6 +2122,18 @@ class FirewallClient {
         }
         if (authMode === 'CANONICAL_V1') {
             payload.hmac_template = document.getElementById('webhook-hmac-template').value;
+        }
+        if (authMode === 'CANONICAL_V1' || authMode === 'HMAC_ONLY') {
+            // Sent only when non-default, so an untouched form leaves the columns NULL and the
+            // server keeps resolving them to its own standard rather than pinning today's answer.
+            const sigHeader = document.getElementById('webhook-sig-header').value.trim();
+            if (sigHeader) payload.signature_header = sigHeader;
+
+            // The prefix is sent whenever the field differs from the default *including when it is
+            // empty*: a bare hex digest is a real choice some receivers require, and treating "" as
+            // "unset" would make it unreachable from the dashboard.
+            const sigPrefix = document.getElementById('webhook-sig-prefix').value;
+            if (sigPrefix !== 'sha256=') payload.signature_prefix = sigPrefix;
         }
 
         payload.headers_json = Object.keys(headers).length > 0 ? JSON.stringify(headers) : null;

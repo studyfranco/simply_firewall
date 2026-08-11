@@ -2479,12 +2479,17 @@ async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row
     );
     assert_eq!(row.target_address, "198.51.100.10", "the record's data is untouched");
 
-    // Half two: it is gone from every read the caller has. Each listing gets its own timestamp —
-    // the three paths differ, but the loop also runs after earlier calls in this test and a repeat
-    // would otherwise collide with one of them.
-    for (offset, path) in
-        ["/api/ips", "/api/ips?format=iplist", "/api/ips?include_deleted=true"].iter().enumerate()
-    {
+    // Half two: it is gone from every *ordinary* read. Each listing gets its own timestamp — the
+    // paths differ, but the loop also runs after earlier calls in this test and a repeat would
+    // otherwise collide with one of them.
+    //
+    // `?include_deleted=true` is deliberately **not** in this list. It used to be, back when the flag
+    // was master-only; it is now open to any caller and scoped by group instead, so a key reading a
+    // group it may read *should* see that group's tombstones — that is what a delta-sync consumer
+    // replicates. What must not change is that the tombstone stays out of the default listing and out
+    // of the address export, which is what this loop still pins. The group scoping itself is covered
+    // by `include_deleted_is_scoped_to_readable_groups_for_a_non_master`.
+    for (offset, path) in ["/api/ips", "/api/ips?format=iplist"].iter().enumerate() {
         let req = signed_later(
             inject_connect_info(Request::builder().uri(*path).header("X-API-Key", &deleter)),
             &secret,
@@ -2498,9 +2503,34 @@ async fn non_master_delete_is_soft_and_hides_the_record_without_dropping_the_row
         let text = String::from_utf8(body.to_vec()).unwrap();
         assert!(
             !text.contains("198.51.100.10"),
-            "{path} must not expose a soft-deleted record to a non-master (got {text})"
+            "{path} must not expose a soft-deleted record without an explicit opt-in (got {text})"
         );
     }
+
+    // And the opt-in does surface it — for this caller, in this group. Asserted here rather than
+    // merely removed from the loop above, so the change of policy is pinned rather than implied.
+    let req = signed_later(
+        inject_connect_info(
+            Request::builder().uri("/api/ips?include_deleted=true").header("X-API-Key", &deleter),
+        ),
+        &secret,
+        3,
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let text = String::from_utf8(
+        axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec(),
+    )
+    .unwrap();
+    assert!(
+        text.contains("198.51.100.10"),
+        "include_deleted must surface a tombstone in a group the caller can read: {text}"
+    );
+    assert!(
+        !text.contains("deleted_by"),
+        "but never the id of the key that deleted it — that is master-only: {text}"
+    );
 
     // A non-master cannot escalate to a hard delete by asking for one.
     let req = signed(
@@ -3934,4 +3964,190 @@ async fn a_legitimate_master_is_refused_when_this_process_pinned_another_identit
         StatusCode::OK,
         "the key is demoted, not revoked — it keeps every scope it legitimately holds"
     );
+}
+
+
+// ─────────────────────────────────────────────────────────────
+// include_deleted: scoped, not master-gated
+// ─────────────────────────────────────────────────────────────
+//
+// `?include_deleted=true` used to be refused to every non-master. That gate bought nothing — the
+// group-scoping filter already confines a non-master to the groups it holds `can_read` on — while
+// making the trash view unusable by the delta-sync consumers that need it: a replica which cannot
+// see deletions diverges from its source silently and never recovers.
+//
+// The flag is now open to everyone and the *rows* are what remain scoped. These tests pin that the
+// scoping is real, that widening the flag did not widen anything else, and that the §4 oracle is
+// still closed.
+
+/// A scoped key sees soft-deleted records **in its own readable group**, and nothing from elsewhere.
+///
+/// The two halves are asserted in one test on purpose. Either alone is satisfiable by a mistake: a
+/// service that ignored `include_deleted` entirely would pass the second, and one that ignored group
+/// scoping would pass the first.
+#[tokio::test]
+async fn include_deleted_is_scoped_to_readable_groups_for_a_non_master() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let master = insert_master_key(&db, "Master").await;
+    let (reader_id, reader) = insert_key(&db, "Reader", false, false, false, false, None).await;
+
+    let mine = insert_group(&db, "mine").await;
+    let theirs = insert_group(&db, "theirs").await;
+    let my_record = insert_ip_record(&db, "198.51.100.61", mine).await;
+    let their_record = insert_ip_record(&db, "198.51.100.62", theirs).await;
+
+    // Read *and* delete on my group; nothing at all on the other one.
+    grant(&db, reader_id, mine, true, false, true).await;
+
+    let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let call = |api_key: String, method: &'static str, path: String| {
+        let (app, tick) = (app.clone(), tick.clone());
+        async move {
+            let secret = test_signing_secret(&api_key);
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder().method(method).uri(&path).header("X-API-Key", &api_key),
+                ),
+                &secret,
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                "",
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    // The master soft-deletes the record in the other group, so there is something to leak.
+    let (status, _) = call(master.clone(), "DELETE", format!("/api/ips/{their_record}")).await;
+    assert_eq!(status, StatusCode::OK);
+    // The reader soft-deletes its own.
+    let (status, _) = call(reader.clone(), "DELETE", format!("/api/ips/{my_record}")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (status, body) = call(reader.clone(), "GET", "/api/ips?include_deleted=true".to_owned()).await;
+    assert_eq!(status, StatusCode::OK, "a can_read key may ask for the trash");
+    assert!(
+        body.contains("198.51.100.61"),
+        "a scoped key must see soft-deleted records in a group it can read: {body}"
+    );
+    assert!(
+        !body.contains("198.51.100.62"),
+        "a soft-deleted record in an unreadable group must stay invisible — widening the flag must \
+         not widen the scope: {body}"
+    );
+
+    // And the default listing still hides its own deleted row, so the flag is what did the work.
+    let (_, body) = call(reader, "GET", "/api/ips".to_owned()).await;
+    assert!(!body.contains("198.51.100.61"), "the default listing still hides the trash: {body}");
+}
+
+/// `deleted_by` is Master-only, and widening `include_deleted` did not smuggle it out.
+///
+/// The column holds a raw key id. `RBAC_MODEL.md` §4 limits what one key may learn about another to
+/// id, name and rights *on a shared resource*; nothing entitles a group reader to the identity of an
+/// unrelated key. This is the field most likely to leak as a side effect of the change above, so it
+/// gets its own test rather than an assertion tacked onto one.
+#[tokio::test]
+async fn deleted_by_is_visible_to_master_and_withheld_from_everyone_else() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let master = insert_master_key(&db, "Master").await;
+    let (reader_id, reader) = insert_key(&db, "Reader", false, false, false, false, None).await;
+    let group = insert_group(&db, "shared").await;
+    let record = insert_ip_record(&db, "198.51.100.63", group).await;
+    grant(&db, reader_id, group, true, false, true).await;
+
+    let tick = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let call = |api_key: String, method: &'static str, path: String| {
+        let (app, tick) = (app.clone(), tick.clone());
+        async move {
+            let secret = test_signing_secret(&api_key);
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder().method(method).uri(&path).header("X-API-Key", &api_key),
+                ),
+                &secret,
+                tick.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                "",
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    let (status, _) = call(reader.clone(), "DELETE", format!("/api/ips/{record}")).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, seen_by_reader) = call(reader, "GET", "/api/ips?include_deleted=true".to_owned()).await;
+    assert!(seen_by_reader.contains("198.51.100.63"), "the record is in scope: {seen_by_reader}");
+    assert!(
+        !seen_by_reader.contains("deleted_by"),
+        "a non-master must not learn which key performed the deletion: {seen_by_reader}"
+    );
+    // The control: the field is genuinely populated, so its absence above is suppression rather
+    // than there being nothing to suppress.
+    let (_, seen_by_master) =
+        call(master, "GET", "/api/ips?include_deleted=true".to_owned()).await;
+    assert!(
+        seen_by_master.contains("deleted_by"),
+        "master must still see the attribution: {seen_by_master}"
+    );
+}
+
+/// Naming an unreadable group is not an error — §4 oracle discipline.
+///
+/// Refusing here would tell an unauthorised caller that the group exists, which is exactly the
+/// distinction §4 forbids: an out-of-scope name must be indistinguishable from one that names
+/// nothing at all.
+#[tokio::test]
+async fn requesting_an_unreadable_group_is_indistinguishable_from_requesting_a_nonexistent_one() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (reader_id, reader) = insert_key(&db, "Reader", false, false, false, false, None).await;
+    let mine = insert_group(&db, "mine").await;
+    let secret_group = insert_group(&db, "secret").await;
+    insert_ip_record(&db, "198.51.100.64", secret_group).await;
+    grant(&db, reader_id, mine, true, false, false).await;
+
+    let call = |path: String, offset: i64| {
+        let (app, reader) = (app.clone(), reader.clone());
+        async move {
+            let secret = test_signing_secret(&reader);
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder().uri(&path).header("X-API-Key", &reader),
+                ),
+                &secret,
+                offset,
+                "",
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    let (existing_status, existing_body) =
+        call("/api/ips?include_deleted=true&groups=secret".to_owned(), 1).await;
+    let (absent_status, absent_body) =
+        call("/api/ips?include_deleted=true&groups=no-such-group-anywhere".to_owned(), 2).await;
+
+    assert_eq!(
+        (existing_status, existing_body.as_str()),
+        (absent_status, absent_body.as_str()),
+        "a group the caller cannot read must answer byte-identically to one that does not exist"
+    );
+    assert!(!existing_body.contains("198.51.100.64"), "and it leaks no rows: {existing_body}");
 }

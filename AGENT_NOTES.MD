@@ -6933,3 +6933,130 @@ single FK, so its resource data cannot span an authorization boundary.
 No authorization bypass, privilege-escalation path, or cryptographic weakness in either project. Two
 minor findings, one per side, neither blocking deployment. F-1 is one line of DDL in the peer; F-2 is a
 question for the specification's authors rather than a defect to patch here.
+
+---
+
+## Session 49 — Postgres boot fix, `include_deleted` for read keys, `HMAC_ONLY`, full-height table
+
+Feature session preparing for the companion `simply_ip_exporter` and `simply_ip_sync`. Four code
+tasks; two migrations (`m20260811_000011`, `m20260811_000012`).
+
+### 1. The PostgreSQL boot failure, and its actual cause
+
+`master.rs` asserted the §5 uniqueness index through `SchemaManager::has_index`. That helper selects
+a per-backend catalog query **behind cargo feature gates**:
+
+```rust
+#[cfg(feature = "sqlx-postgres")] DbBackend::Postgres => …,
+other => return Err(DbErr::BackendNotSupported { ctx: "has_index" }),
+```
+
+and `Cargo.toml` enables all three backends on `sea-orm` but **only `sqlx-sqlite` on
+`sea-orm-migration`**. The PostgreSQL arm was therefore compiled out, control reached the fallback,
+and the service refused to start against a database whose index was present and correct. Not a schema
+problem at all — a feature-flag mismatch between two crates, surfacing only on a backend no local
+suite starts.
+
+Fixed with `db::has_index`, a per-backend catalog query with **bound** parameters:
+
+| Backend | Catalog | Placeholders |
+| :--- | :--- | :--- |
+| SQLite | `sqlite_master` | `?` |
+| PostgreSQL | `pg_indexes` | `$1`, `$2` |
+| MySQL | `information_schema.statistics`, scoped by `DATABASE()` | `?` |
+
+Enabling the missing features would also have worked; this was preferred because the check is a
+*runtime* assertion about a live schema rather than a migration concern, and because it makes the
+behaviour independent of another crate's flags — which is what let the failure hide.
+
+**Placed in `src/db.rs`, not `master.rs`.** Catalog inspection has no entity API, so it is
+necessarily raw SQL, and `db.rs` is the module `tests/source_hygiene.rs` allowlists: startup-only and
+unreachable from any request. Widening the allowlist to a module the middleware can reach would have
+been the wrong trade.
+
+**The selection is a separate testable function.** No suite here starts a PostgreSQL server, so no
+connection-based test could have caught the original defect or can guard its return.
+`index_catalog_query` is pure, and `every_backend_has_a_catalog_query_in_its_own_dialect` asserts each
+dialect's catalog, its placeholder style, and MySQL's `DATABASE()` scoping. The part that broke is now
+the part that is checkable without a database.
+
+An unknown `DatabaseBackend` variant (the enum is `#[non_exhaustive]`) returns an error rather than
+`true`: reporting a §5 constraint as present without having looked is the exact failure the check
+exists to prevent.
+
+### 2. `include_deleted` opened to `can_read` keys
+
+Previously `key.is_master && flag`. The gate bought nothing — the group-scoping filter already
+confines a non-master to groups it holds `can_read` on — while making the trash view unusable by the
+delta-sync consumers that need it. **A replica that cannot see deletions diverges from its source
+silently and never recovers.**
+
+Now the flag is open and the *rows* stay scoped. Three tests pin it: a scoped key sees its own
+group's tombstones and nothing from an unreadable group; `deleted_by` is withheld from non-masters;
+and an unreadable group name answers byte-identically to a nonexistent one.
+
+**One departure from the brief, and it is deliberate.** The brief asked to "allow `include_deleted` if
+the caller … holds `can_read` on **all** groups requested", which implies refusing otherwise. That
+would install an **oracle**: `groups=secret` would answer `403` while `groups=no-such-group` answered
+`200`, letting any authenticated caller enumerate group names. `RBAC_MODEL.md` §4 forbids exactly that
+distinction. Implemented as restrict-not-reject instead — which the brief's own fallback clause for
+the no-`groups` case already prefers, so the two readings agree where it matters.
+
+`deleted_by` is now Master-only. It stores a raw key id, and §4 limits what one key may learn about
+another to id, name and rights *on a shared resource*. Widening the flag must not smuggle that out as
+a side effect.
+
+`IpRecordResponse` already carried `is_deleted` and `deleted_at`. **The brief asked for
+`Option<DateTime<Utc>>`; they remain `NaiveDateTime`** — every timestamp on the type is naive UTC, and
+changing one field would make a single object mix two serialisations. If RFC 3339 with `Z` is wanted
+for the exporter, it should be one deliberate change across all four timestamp fields.
+
+### 3. `BODY_ONLY` → `HMAC_ONLY`
+
+The old name described the HMAC's *input* and left the security-relevant half to be inferred: that the
+mode sends a signature **and nothing else**. `sends_api_key()` already excluded it, but nothing said
+so, and nothing tested it with an `api_key` actually populated — the existing test created a webhook
+without one, so it could not distinguish "withheld" from "nothing to send". It does now.
+
+- `BODY_ONLY` is still **parsed** (`AuthMode::BODY_ONLY_LEGACY`) and never emitted, so a client's
+  stored automation migrates itself on the next round-trip.
+- `m20260811_000012` rewrites stored rows, in both directions — `down` restores the old spelling.
+- New `signature_header` / `signature_prefix` columns, nullable, resolved at read time rather than
+  backfilled. `Some("")` on the prefix is **meaningful** (a bare digest, which some receivers
+  require), which is why only NULL falls back.
+- **The algorithm stays SHA-256 and is deliberately not configurable.** Making it selectable would
+  mean accepting SHA-1 — the algorithm the receivers wanting a custom header most often ask for — and
+  this service would then be generating signatures it knows to be forgeable, on request.
+
+### 4. Frontend
+
+The IP Records table now fills the window via a flex chain (`#dashboard-container` →
+`#tab-firewall` → `.list-section` → `.table-scroll`) rather than a `calc(100vh - …)`. The space above
+the table is not constant: the filter bar wraps as the window narrows and the sticky top bar retracts,
+so any hardcoded subtrahend is wrong for all but one window size. `min-height: 0` on each link is the
+part that is easy to omit and breaks everything — a flex item's default `min-height: auto` refuses to
+shrink below its content, so the page scrolls while the scroller never does.
+
+The JS no longer computes `--table-max-h` (it carried a hardcoded 120px reservation that any change to
+the pager silently invalidated); it now only re-paginates, reading the scroller's *rendered* height.
+
+The four auth-mode hints were rewritten to a parallel `**Sends:** … *Use this when …*` shape, and the
+hint box given a `min-height` so the form no longer jumps a row when the select changes.
+
+### 5. Gates
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **267 passed**, 0 failed (260 before) |
+| `./scripts/test_e2e.sh` | **516 passed**, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences, 0 unexplained |
+| `git diff RBAC_MODEL.md` | empty |
+
+**The convergence gate caught this change, correctly.** Moving off `SchemaManager::has_index` altered
+the call's shape, and the assertion keyed on the old one reported ABSENT. The pattern was **updated to
+follow the code, not loosened** — an assertion that stops matching what it guards is the vacuous-pass
+failure that file exists to prevent, and it has now been earned twice. A second assertion was added
+alongside it (`fn index_catalog_query` in `src/db.rs`) so the *backend-agnostic* property is tracked
+too, not just the call site.

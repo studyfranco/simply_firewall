@@ -1437,7 +1437,7 @@ check "204" "clean up the rotation test key"
 
 # ── 22. Webhook auth modes ──────────────────────────────────────────────────
 
-log_section "22. Webhook Auth Modes (CANONICAL_V1 / BODY_ONLY / API_KEY_ONLY / NONE)"
+log_section "22. Webhook Auth Modes (CANONICAL_V1 / HMAC_ONLY / API_KEY_ONLY / NONE)"
 
 api_call POST "/api/groups" "$MASTER_KEY" '{"name":"SigMode-Group"}'
 check "200" "create a group for auth-mode webhooks"
@@ -1488,7 +1488,10 @@ DEFAULT_MODE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 api_call POST "/api/webhooks" "$MASTER_KEY" \
     "{\"name\":\"alias-mode\",\"target_url\":\"https://example.com/h\",\"secret_token\":\"s\",\"payload_template\":\"{}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"signature_mode\":\"BODY_ONLY\"}"
 check "200" "the deprecated signature_mode alias is still accepted"
-check_true '.auth_mode == "BODY_ONLY"' "the alias selects the same mode under the new name"
+# The request sent the deprecated `signature_mode: BODY_ONLY`; the service accepts it and reports the
+# current name back. Both halves matter — refusing the old spelling would break stored automation,
+# and echoing it back would leave two names for one mode in circulation indefinitely.
+check_true '.auth_mode == "HMAC_ONLY"' "the legacy alias is accepted and normalised to HMAC_ONLY"
 ALIAS_MODE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
 api_call GET "/api/webhooks" "$MASTER_KEY"
@@ -1554,7 +1557,7 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
             echo -e "$(ts)   ${RED}✗ FAIL${RESET} canonical signature mismatch (got '$HOOK_SIG', expected '$EXPECTED_SIG')" >&2
         fi
 
-        # `sha256=`-prefixed, exactly like BODY_ONLY and exactly like what the API itself now
+        # `sha256=`-prefixed, exactly like HMAC_ONLY and exactly like what the API itself now
         # requires inbound. This is the property that lets a dispatch authenticate directly against
         # another instance's /api/* route: a bare digest would be refused with 401 there.
         case "$HOOK_SIG" in
@@ -1579,8 +1582,8 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
     # timestamp — the regression guard for third-party consumers.
     : > "$RECEIVER_LOG"
     api_call POST "/api/webhooks" "$MASTER_KEY" \
-        "{\"name\":\"legacy-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/legacy\",\"secret_token\":\"$CANON_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"BODY_ONLY\",\"events\":\"IP_ADD\"}"
-    check "200" "create a BODY_ONLY webhook on the same receiver"
+        "{\"name\":\"legacy-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/legacy\",\"secret_token\":\"$CANON_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$SIGMODE_GROUP_ID\",\"auth_mode\":\"HMAC_ONLY\",\"events\":\"IP_ADD\"}"
+    check "200" "create an HMAC_ONLY webhook on the same receiver"
     LEGACY_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
     api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.223\",\"group_name\":\"SigMode-Group\"}"
@@ -1600,28 +1603,28 @@ if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
 
         if [ -z "$LEGACY_TS" ]; then
             PASS_COUNT=$((PASS_COUNT + 1))
-            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} BODY_ONLY sends no X-Timestamp header" >&2
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} HMAC_ONLY sends no X-Timestamp header" >&2
         else
             FAIL_COUNT=$((FAIL_COUNT + 1))
-            echo -e "$(ts)   ${RED}✗ FAIL${RESET} BODY_ONLY unexpectedly sent X-Timestamp: $LEGACY_TS" >&2
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} HMAC_ONLY unexpectedly sent X-Timestamp: $LEGACY_TS" >&2
         fi
 
         if [ "$LEGACY_SIG" == "$LEGACY_EXPECTED" ]; then
             PASS_COUNT=$((PASS_COUNT + 1))
-            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} BODY_ONLY signature is sha256=HMAC(body) — unchanged legacy format" >&2
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} HMAC_ONLY signature is sha256=HMAC(body) — unchanged legacy format" >&2
         else
             FAIL_COUNT=$((FAIL_COUNT + 1))
-            echo -e "$(ts)   ${RED}✗ FAIL${RESET} BODY_ONLY signature mismatch (got '$LEGACY_SIG', expected '$LEGACY_EXPECTED')" >&2
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} HMAC_ONLY signature mismatch (got '$LEGACY_SIG', expected '$LEGACY_EXPECTED')" >&2
         fi
     else
         FAIL_COUNT=$((FAIL_COUNT + 1))
-        echo -e "$(ts)   ${RED}✗ FAIL${RESET} BODY_ONLY webhook was never delivered" >&2
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} HMAC_ONLY webhook was never delivered" >&2
     fi
 
     api_call DELETE "/api/webhooks/$LEGACY_WEBHOOK_ID" "$MASTER_KEY"
     check "204" "delete the legacy webhook"
 else
-    warn "Local webhook receiver unavailable — skipping live CANONICAL_V1/BODY_ONLY dispatch verification."
+    warn "Local webhook receiver unavailable — skipping live CANONICAL_V1/HMAC_ONLY dispatch verification."
 fi
 
 # ── 23. Dynamic HMAC templates & key-based dispatch ─────────────────────────

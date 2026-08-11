@@ -178,6 +178,8 @@ async fn seed_webhook(db: &DatabaseConnection, name: &str, group: Uuid, owner: O
         auth_mode: Set("none".to_owned()),
         api_key: Set(None),
         hmac_template: Set(None),
+        signature_header: Set(None),
+        signature_prefix: Set(None),
         headers_json: Set(None),
         payload_template: Set("{}".to_owned()),
         group_id: Set(group),
@@ -954,18 +956,26 @@ async fn the_audit_rebuild_preserved_the_set_null_cascade() {
 /// listing into a table scan — a regression no functional test would ever notice.
 #[tokio::test]
 async fn the_audit_rebuild_preserved_both_indexes() {
-    use sea_orm_migration::SchemaManager;
-
     let tmp = TempDb::new();
     let db = fresh_db(&tmp).await;
-    let manager = SchemaManager::new(&db);
 
+    // Through `db::has_index`, the production helper, rather than `SchemaManager::has_index` — so
+    // this test exercises the code path that actually runs at boot on every backend.
     for index in ["idx-audit_logs-action", "idx-audit_logs-timestamp"] {
         assert!(
-            manager.has_index("audit_logs", index).await.unwrap(),
+            simply_ip_vault::db::has_index(&db, "audit_logs", index).await.unwrap(),
             "{index} did not survive the table rebuild"
         );
     }
+
+    // And it must be able to say "no" — an index checker that always answers true would make the
+    // assertions above, and the §5 boot check, meaningless.
+    assert!(
+        !simply_ip_vault::db::has_index(&db, "audit_logs", "idx-audit_logs-nonexistent")
+            .await
+            .unwrap(),
+        "has_index must report an absent index as absent"
+    );
 }
 
 /// Historical rows survive the constraint, and say so honestly.
@@ -1060,4 +1070,31 @@ async fn the_audit_rebuild_did_not_transpose_columns() {
     assert_eq!(row.group_names.as_deref(), Some("GROUPS"));
     assert_eq!(row.details.as_deref(), Some("DETAILS"));
     assert_eq!(row.api_key_id, Some(key));
+}
+
+/// Every column a delta-sync consumer filters on is indexed.
+///
+/// The exporter and sync worker poll "what changed since T" on a schedule against the largest table
+/// in the schema. Without an index that is a full scan per poll, and it degrades as the table grows
+/// rather than failing outright — the kind of regression that shows up as a slow dashboard months
+/// later and is never traced back to a missing line in a migration.
+///
+/// Asserted through `db::has_index`, the same helper the §5 boot check uses, so this also exercises
+/// that path on every run.
+#[tokio::test]
+async fn the_delta_sync_columns_are_indexed() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    for index in [
+        "idx-ip_records-updated_at",
+        "idx_ip_records_deleted_at",
+        "idx_ip_records_is_deleted",
+        "idx-ip_records-last_seen_at",
+    ] {
+        assert!(
+            simply_ip_vault::db::has_index(&db, "ip_records", index).await.unwrap(),
+            "{index} is missing — a delta query on that column scans the whole table"
+        );
+    }
 }

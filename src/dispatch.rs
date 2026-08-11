@@ -287,6 +287,21 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
             
             let mode = AuthMode::from_stored(&config.auth_mode);
 
+            // NULL means "this service's standard", resolved here rather than backfilled into every
+            // row — see `m20260811_000012`. An empty `signature_prefix` is a *meaningful* value (a
+            // receiver wanting a bare hex digest), which is why only NULL falls back.
+            let signature_header = config
+                .signature_header
+                .as_deref()
+                .map(str::trim)
+                .filter(|h| !h.is_empty())
+                .unwrap_or(webhook_config::DEFAULT_SIGNATURE_HEADER)
+                .to_owned();
+            let signature_prefix = config
+                .signature_prefix
+                .clone()
+                .unwrap_or_else(|| webhook_config::DEFAULT_SIGNATURE_PREFIX.to_owned());
+
             // Sent by the two modes that identify the caller by key. Inserted before the signature
             // so it is covered by nothing and can never be confused for one; a blank column means
             // "no such header" rather than an empty one, which some receivers treat as a real
@@ -306,9 +321,12 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
             }
 
             let signature = match mode {
-                // Legacy/generic: HMAC over the body alone, prefixed `sha256=` the way
-                // GitHub-style receivers expect. Unchanged from before auth modes existed.
-                AuthMode::BodyOnly => {
+                // Signature and nothing else: HMAC over the body alone. `sends_api_key()` excludes
+                // this mode, so the key header above was skipped even if `api_key` is populated —
+                // that is the defining property of HMAC_ONLY, not an oversight. A receiver that
+                // chose signature-only authentication must not be handed a reusable bearer secret
+                // it never asked for.
+                AuthMode::HmacOnly => {
                     let mut mac = match Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes()) {
                         Ok(m) => m,
                         Err(e) => {
@@ -317,15 +335,11 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
                         }
                     };
                     mac.update(payload.as_bytes());
-                    Some(format!(
-                        "{}{}",
-                        crate::crypto::SIGNATURE_PREFIX,
-                        hex::encode(mac.finalize().into_bytes())
-                    ))
+                    Some(format!("{}{}", signature_prefix, hex::encode(mac.finalize().into_bytes())))
                 }
                 // CANONICAL_V1: sign the resolved hmac_template and send the timestamp alongside,
                 // so the receiver can run its own anti-replay check. Prefixed `sha256=`, exactly
-                // like BODY_ONLY above and exactly like what the inbound API middleware now
+                // like HMAC_ONLY above and exactly like what the inbound API middleware now
                 // requires — that is the whole point of this mode: with the default template the
                 // header is byte-identical to one `crypto::compute_signature` would produce, so a
                 // dispatch authenticates directly against another instance's /api/* route (and
@@ -357,21 +371,34 @@ pub async fn run_webhook_worker(db: DatabaseConnection, mut rx: Receiver<Webhook
                     if let Ok(hv) = HeaderValue::from_str(&timestamp) {
                         headers.insert("X-Timestamp", hv);
                     }
-                    Some(format!(
-                        "{}{}",
-                        crate::crypto::SIGNATURE_PREFIX,
-                        hex::encode(mac.finalize().into_bytes())
-                    ))
+                    Some(format!("{}{}", signature_prefix, hex::encode(mac.finalize().into_bytes())))
                 }
                 // No signature to compute: the key header above (API_KEY_ONLY) or nothing at all
                 // (NONE) is the whole credential.
                 AuthMode::ApiKeyOnly | AuthMode::None => None,
             };
 
-            if let Some(sig_val) = signature
-                && let Ok(hv) = HeaderValue::from_str(&sig_val)
-            {
-                headers.insert("X-Signature-256", hv);
+            if let Some(sig_val) = signature {
+                // The header name is caller-configurable, so it is parsed rather than assumed: an
+                // unusable name must skip the dispatch, not panic the worker or send the signature
+                // under a name the receiver will not read.
+                match (
+                    HeaderName::from_bytes(signature_header.as_bytes()),
+                    HeaderValue::from_str(&sig_val),
+                ) {
+                    (Ok(name), Ok(hv)) => {
+                        headers.insert(name, hv);
+                    }
+                    _ => {
+                        error!(
+                            webhook = %config.name,
+                            header = %signature_header,
+                            "Webhook signature header is not a valid HTTP header name; skipping \
+                             dispatch rather than sending an unsigned payload"
+                        );
+                        continue;
+                    }
+                }
             }
 
             let target_url = config.target_url.clone();
@@ -524,8 +551,8 @@ mod tests {
 
     #[test]
     fn from_stored_never_downgrades_an_unreadable_mode_to_none() {
-        assert_eq!(AuthMode::from_stored("wat"), AuthMode::BodyOnly);
-        assert_eq!(AuthMode::from_stored(""), AuthMode::BodyOnly);
+        assert_eq!(AuthMode::from_stored("wat"), AuthMode::HmacOnly);
+        assert_eq!(AuthMode::from_stored(""), AuthMode::HmacOnly);
         assert_eq!(AuthMode::from_stored("canonical_v1"), AuthMode::CanonicalV1);
         assert_eq!(AuthMode::from_stored(" NONE "), AuthMode::None);
     }

@@ -126,6 +126,106 @@ pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
     Ok(SqlxSqliteConnector::from_sqlx_sqlite_pool(pool))
 }
 
+/// Whether `index` exists on `table`, on any supported backend.
+///
+/// # Why this is not `SchemaManager::has_index`
+///
+/// It was, and **the service could not start on PostgreSQL**. `sea-orm-migration`'s `has_index`
+/// selects a per-backend catalog query behind cargo feature gates:
+///
+/// ```text
+/// #[cfg(feature = "sqlx-postgres")] DbBackend::Postgres => …,
+/// other => return Err(DbErr::BackendNotSupported { ctx: "has_index" }),
+/// ```
+///
+/// and this crate depends on `sea-orm-migration` with **only** `sqlx-sqlite` enabled, while `sea-orm`
+/// itself enables all three. So the PostgreSQL arm is compiled out, control reaches the fallback, and
+/// the boot-time §5 index check fails with `BackendNotSupported` against a database whose index is
+/// present and correct.
+///
+/// Enabling the extra features on `sea-orm-migration` would also have worked. This is preferred for
+/// two reasons: the check is a *runtime* assertion about a live schema rather than a migration
+/// concern, so it belongs beside connection setup rather than in the migration harness; and it makes
+/// the behaviour independent of a feature-flag combination in another crate, which is what made the
+/// failure surface only on a backend no local suite starts.
+///
+/// # Why the queries live here
+///
+/// Catalog inspection has no representation in SeaORM's entity API — there is no `Entity` for
+/// `pg_indexes` — so it is necessarily raw SQL. `src/db.rs` is the module `tests/source_hygiene.rs`
+/// allowlists for exactly this: startup-only, unreachable from any request, and already the home of
+/// "how the database is opened and interrogated". Putting it in `master.rs` would have required
+/// widening that allowlist to a module the middleware can reach.
+///
+/// **Both parameters are bound, never interpolated.** They are compile-time constants today, and
+/// binding them costs nothing while removing the question entirely.
+///
+/// Returns `Ok(false)` when the index is absent — an absent index is an answer, not an error. Only a
+/// failure to *ask* is an error.
+pub async fn has_index(db: &DatabaseConnection, table: &str, index: &str) -> Result<bool, DbErr> {
+    let backend = db.get_database_backend();
+    let sql = index_catalog_query(backend)?;
+
+    let row = db
+        .query_one_raw(Statement::from_sql_and_values(
+            backend,
+            sql,
+            [index.into(), table.into()],
+        ))
+        .await?
+        .ok_or_else(|| {
+            DbErr::Custom(format!(
+                "catalog query for index '{index}' on '{table}' returned no row"
+            ))
+        })?;
+
+    // `COUNT(*)` is `i64` on PostgreSQL and SQLite and narrower on some MySQL drivers, so the
+    // smaller type is tried second rather than assumed.
+    let hits: i64 = match row.try_get::<i64>("", "hits") {
+        Ok(n) => n,
+        Err(_) => i64::from(row.try_get::<i32>("", "hits")?),
+    };
+    Ok(hits > 0)
+}
+
+/// The catalog query for one backend, taking the index name first and the table name second.
+///
+/// Split out from [`has_index`] purely so it can be unit-tested. That matters more than it usually
+/// would: the defect this replaced was **PostgreSQL-only**, and no suite in this repository starts a
+/// PostgreSQL server — so a test that needs a live connection could not have caught it and cannot
+/// guard against its return. Selecting the statement is the part that was broken, and it is testable
+/// without a database.
+///
+/// Placeholder syntax is per-backend — PostgreSQL numbers them, the other two do not — which is one
+/// more reason each dialect gets its own statement rather than a shared string with substitutions.
+fn index_catalog_query(backend: DatabaseBackend) -> Result<&'static str, DbErr> {
+    Ok(match backend {
+        DatabaseBackend::Sqlite => {
+            "SELECT COUNT(*) AS hits FROM sqlite_master \
+             WHERE type = 'index' AND name = ? AND tbl_name = ?"
+        }
+        DatabaseBackend::Postgres => {
+            "SELECT COUNT(*) AS hits FROM pg_indexes WHERE indexname = $1 AND tablename = $2"
+        }
+        DatabaseBackend::MySql => {
+            // Scoped to the connected schema: `information_schema.statistics` spans every database on
+            // the server, so an identically named index elsewhere would otherwise be a false hit.
+            "SELECT COUNT(*) AS hits FROM information_schema.statistics \
+             WHERE index_name = ? AND table_name = ? AND table_schema = DATABASE()"
+        }
+        // `DatabaseBackend` is `#[non_exhaustive]`, so a future SeaORM release can add a variant this
+        // build has never heard of. Refusing is the only safe answer: the caller uses this to assert
+        // a §5 constraint, and inventing `true` for a backend whose catalog we cannot read would
+        // report the constraint as present without having looked — an unverified guarantee reported
+        // as verified, which is the exact failure this check exists to prevent.
+        other => {
+            return Err(DbErr::Custom(format!(
+                "no catalog query is known for backend {other:?}; refusing to assume an index exists"
+            )));
+        }
+    })
+}
+
 /// Runs every pending migration.
 ///
 /// A thin wrapper, and worth having anyway: it puts migration execution beside connection setup so
@@ -294,6 +394,67 @@ mod tests {
 
         // Re-running is a no-op rather than an error: this is what a restart does.
         run_migrations(&db).await.expect("migrations are idempotent across restarts");
+    }
+
+    /// Every supported backend has a catalog query, and each speaks its own dialect.
+    ///
+    /// This is the regression test for a **PostgreSQL-only boot failure**: the previous
+    /// implementation used `SchemaManager::has_index`, whose PostgreSQL arm is behind a cargo feature
+    /// this crate does not enable for `sea-orm-migration`, so it answered `BackendNotSupported` and
+    /// the service refused to start against a perfectly good database.
+    ///
+    /// No suite here starts a PostgreSQL server, so no connection-based test could have caught that
+    /// or can guard its return. Selecting the statement is the part that broke, and it is checkable
+    /// without a database — which is the whole reason it is a separate function.
+    #[test]
+    fn every_backend_has_a_catalog_query_in_its_own_dialect() {
+        let sqlite = index_catalog_query(DatabaseBackend::Sqlite).expect("sqlite is supported");
+        let postgres = index_catalog_query(DatabaseBackend::Postgres).expect("postgres is supported");
+        let mysql = index_catalog_query(DatabaseBackend::MySql).expect("mysql is supported");
+
+        // Each reads the catalog its own engine actually exposes.
+        assert!(sqlite.contains("sqlite_master"), "{sqlite}");
+        assert!(postgres.contains("pg_indexes"), "{postgres}");
+        assert!(mysql.contains("information_schema.statistics"), "{mysql}");
+
+        // PostgreSQL numbers its placeholders; the other two do not. Getting this wrong is a runtime
+        // syntax error on one backend only.
+        assert!(postgres.contains("$1") && postgres.contains("$2"), "{postgres}");
+        assert!(!sqlite.contains("$1") && sqlite.matches('?').count() == 2, "{sqlite}");
+        assert!(!mysql.contains("$1") && mysql.matches('?').count() == 2, "{mysql}");
+
+        // MySQL's catalog spans every database on the server, so the query must scope itself.
+        assert!(mysql.contains("DATABASE()"), "an unscoped MySQL lookup matches other schemas: {mysql}");
+
+        // All three project the same column name, which `has_index` reads back positionally by name.
+        for q in [sqlite, postgres, mysql] {
+            assert!(q.contains("AS hits"), "{q}");
+        }
+    }
+
+    /// The index check answers truthfully in both directions against a live schema.
+    ///
+    /// A checker that always returned `true` would satisfy the boot-time §5 assertion without ever
+    /// looking, which is the failure mode that assertion exists to prevent.
+    #[tokio::test]
+    async fn has_index_reports_presence_and_absence() {
+        let tmp = TempDb::new();
+        let db = connect(&tmp.url()).await.expect("pool opens");
+        run_migrations(&db).await.expect("migrations run");
+
+        assert!(
+            has_index(&db, "api_keys", "idx-api_keys-master_marker").await.unwrap(),
+            "the §5 uniqueness index must be reported as present"
+        );
+        assert!(
+            !has_index(&db, "api_keys", "idx-api_keys-does-not-exist").await.unwrap(),
+            "an absent index must be reported as absent, not as an error and not as present"
+        );
+        // Right index name, wrong table: the table predicate has to be doing work too.
+        assert!(
+            !has_index(&db, "audit_logs", "idx-api_keys-master_marker").await.unwrap(),
+            "the table name must be part of the match"
+        );
     }
 
     /// Foreign keys are genuinely enforced, not merely reported as on.

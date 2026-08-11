@@ -20,7 +20,7 @@ pub struct Model {
     /// dispatched request. Empty for the unsigned modes (`API_KEY_ONLY`, `NONE`), which have no
     /// HMAC to key.
     pub secret_token: String,
-    /// How outbound dispatches authenticate — one of `"CANONICAL_V1"`, `"BODY_ONLY"`,
+    /// How outbound dispatches authenticate — one of `"CANONICAL_V1"`, `"HMAC_ONLY"`,
     /// `"API_KEY_ONLY"`, `"NONE"`. See [`AuthMode`], which is the parsed form; this column stores
     /// its string representation.
     ///
@@ -31,7 +31,7 @@ pub struct Model {
     pub auth_mode: String,
     /// Value sent as the `X-API-Key` header, for receivers that identify the caller by key on top
     /// of (or instead of) a signature. Used by `CANONICAL_V1` and `API_KEY_ONLY`; ignored by
-    /// `BODY_ONLY` and `NONE`.
+    /// `HMAC_ONLY` and `NONE`.
     ///
     /// A plaintext credential for a *remote* system, not one of this instance's own keys — there is
     /// nothing to hash it against here, so it is stored and sent verbatim, and never returned by
@@ -43,6 +43,19 @@ pub struct Model {
     /// See [`resolve_hmac_template`](crate::dispatch::resolve_hmac_template) for the substitution
     /// and escape rules.
     pub hmac_template: Option<String>,
+    /// Header the signature is sent in. `None` means [`DEFAULT_SIGNATURE_HEADER`].
+    ///
+    /// Configurable because receivers disagree: a peer instance of this service and
+    /// `simply_hook_executor` both expect `X-Signature-256`, while GitHub-style consumers expect
+    /// `X-Hub-Signature-256`. Stored NULL rather than backfilled so an untouched row keeps meaning
+    /// "whatever this service considers standard" instead of pinning today's answer forever.
+    pub signature_header: Option<String>,
+    /// Prefix on the hex digest. `None` means [`DEFAULT_SIGNATURE_PREFIX`]; `Some("")` means none.
+    ///
+    /// The empty string is a meaningful value here, not an unset one — some receivers expect a bare
+    /// hex digest and reject `sha256=`. That distinction is why this is `Option<String>` and not a
+    /// `String` defaulted at the DDL layer.
+    pub signature_prefix: Option<String>,
     /// Custom JSON key-value object of HTTP headers to inject into requests.
     pub headers_json: Option<String>,
     /// Template string with dynamic variables (e.g.
@@ -79,6 +92,19 @@ pub struct Model {
 /// actually signed are the same `METHOD\nPATH\nTIMESTAMP\nBODY` the inbound API verifies.
 pub const DEFAULT_HMAC_TEMPLATE: &str = r"{method}\n{path}\n{timestamp}\n{body}";
 
+/// Header the signature is sent in when `signature_header` is NULL.
+///
+/// The same header the inbound middleware verifies, which is what lets one instance dispatch
+/// directly into another's authenticated API without either side configuring anything.
+pub const DEFAULT_SIGNATURE_HEADER: &str = "X-Signature-256";
+
+/// Prefix on the hex digest when `signature_prefix` is NULL.
+///
+/// Deliberately the same constant the inbound verifier requires — see `crypto::SIGNATURE_PREFIX`,
+/// which is mandatory rather than stripped-if-present. Naming the algorithm in the header value is
+/// what makes a future migration to a different digest detectable by a receiver instead of silent.
+pub const DEFAULT_SIGNATURE_PREFIX: &str = "sha256=";
+
 /// How an outbound webhook dispatch authenticates itself to its receiver.
 ///
 /// Kept as a real type rather than stringly-typed comparisons scattered through the dispatcher, so
@@ -93,11 +119,17 @@ pub enum AuthMode {
     /// authenticated API (and what `simply_hook_executor` expects). A custom template covers
     /// receivers that sit behind a path-rewriting reverse proxy, or that canonicalize differently.
     CanonicalV1,
-    /// HMAC-SHA256 over the raw request body only, sent as `X-Signature-256: sha256=<hex>`.
+    /// HMAC-SHA256 over the raw request body only, and **no key header of any kind**.
     ///
-    /// The original behaviour, kept for generic third-party receivers (GitHub-style webhook
-    /// consumers) that expect exactly this and would reject anything else.
-    BodyOnly,
+    /// The mode for generic third-party receivers (GitHub-style webhook consumers) that authenticate
+    /// the signature and nothing else. Named `HMAC_ONLY` since the schema change in
+    /// `m20260811_000012`; it was `BODY_ONLY`, which described the *input* to the HMAC and left
+    /// readers to infer the more important half — that this mode sends a signature **and nothing
+    /// else**. Rows and payloads carrying the old spelling are still accepted, see [`Self::parse`].
+    ///
+    /// The header name and prefix are configurable per webhook (`signature_header`,
+    /// `signature_prefix`) for receivers that expect `X-Hub-Signature-256` or an unprefixed digest.
+    HmacOnly,
     /// Sends `X-API-Key` and no signature at all — for APIs whose only credential is a bearer-style
     /// key. Requires `api_key` to be set.
     ApiKeyOnly,
@@ -112,8 +144,15 @@ pub enum AuthMode {
 impl AuthMode {
     /// The string written to `webhook_configs.auth_mode` for canonical signing.
     pub const CANONICAL_V1: &'static str = "CANONICAL_V1";
-    /// The string written to `webhook_configs.auth_mode` for body-only signing.
-    pub const BODY_ONLY: &'static str = "BODY_ONLY";
+    /// The string written to `webhook_configs.auth_mode` for signature-only dispatch.
+    pub const HMAC_ONLY: &'static str = "HMAC_ONLY";
+    /// The pre-`m20260811_000012` spelling of [`Self::HMAC_ONLY`], still accepted on input.
+    ///
+    /// Kept as a parse-only alias rather than deleted: a caller's stored automation may still send
+    /// it, and refusing a value this service itself wrote would break integrations to no purpose.
+    /// It is never *emitted* — [`Self::as_str`] returns the new spelling — so a round-trip through
+    /// the API migrates a client's configuration for it.
+    pub const BODY_ONLY_LEGACY: &'static str = "BODY_ONLY";
     /// The string written to `webhook_configs.auth_mode` for key-only authentication.
     pub const API_KEY_ONLY: &'static str = "API_KEY_ONLY";
     /// The string written to `webhook_configs.auth_mode` for unauthenticated dispatches.
@@ -122,7 +161,7 @@ impl AuthMode {
     /// Every accepted value, for API validation and error messages.
     pub const ALL: [&'static str; 4] = [
         Self::CANONICAL_V1,
-        Self::BODY_ONLY,
+        Self::HMAC_ONLY,
         Self::API_KEY_ONLY,
         Self::NONE,
     ];
@@ -131,28 +170,28 @@ impl AuthMode {
     pub fn parse(value: &str) -> Option<Self> {
         match value.trim().to_ascii_uppercase().as_str() {
             Self::CANONICAL_V1 => Some(Self::CanonicalV1),
-            Self::BODY_ONLY => Some(Self::BodyOnly),
+            Self::HMAC_ONLY | Self::BODY_ONLY_LEGACY => Some(Self::HmacOnly),
             Self::API_KEY_ONLY => Some(Self::ApiKeyOnly),
             Self::NONE => Some(Self::None),
             _ => None,
         }
     }
 
-    /// Parses a value already persisted in the database, falling back to [`Self::BodyOnly`].
+    /// Parses a value already persisted in the database, falling back to [`Self::HmacOnly`].
     ///
     /// Fails *safe* rather than erroring: a row with an unrecognized mode (hand-edited SQL, or a
-    /// downgrade after a future mode is added) still dispatches under the conservative legacy
-    /// scheme instead of silently dropping the event or panicking inside the worker. Note the
-    /// fallback is `BODY_ONLY`, not the column default `CANONICAL_V1` — an unreadable mode must
-    /// resolve to *more* signing, never less, and never to [`Self::None`].
+    /// downgrade after a future mode is added) still dispatches under a signing scheme instead of
+    /// silently dropping the event or panicking inside the worker. The fallback is `HMAC_ONLY`, not
+    /// the column default `CANONICAL_V1` — an unreadable mode must resolve to *more* signing, never
+    /// less, and never to [`Self::None`].
     pub fn from_stored(value: &str) -> Self {
         Self::parse(value).unwrap_or_else(|| {
             tracing::warn!(
                 "Unrecognized webhook auth_mode {:?} in database; falling back to {}",
                 value,
-                Self::BODY_ONLY
+                Self::HMAC_ONLY
             );
-            Self::BodyOnly
+            Self::HmacOnly
         })
     }
 
@@ -160,7 +199,7 @@ impl AuthMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CanonicalV1 => Self::CANONICAL_V1,
-            Self::BodyOnly => Self::BODY_ONLY,
+            Self::HmacOnly => Self::HMAC_ONLY,
             Self::ApiKeyOnly => Self::API_KEY_ONLY,
             Self::None => Self::NONE,
         }
@@ -168,12 +207,18 @@ impl AuthMode {
 
     /// Whether this mode computes an HMAC, and therefore requires a non-empty `secret_token`.
     pub fn requires_secret(self) -> bool {
-        matches!(self, Self::CanonicalV1 | Self::BodyOnly)
+        matches!(self, Self::CanonicalV1 | Self::HmacOnly)
     }
 
     /// Whether this mode sends `X-API-Key`. Only `API_KEY_ONLY` *requires* a value; `CANONICAL_V1`
     /// sends one when configured and omits the header otherwise, since a plain HMAC receiver has no
     /// use for it.
+    ///
+    /// **[`Self::HmacOnly`] never sends one**, even when `api_key` is populated on the row — that is
+    /// the defining property of the mode and the reason it was renamed. A receiver choosing
+    /// signature-only authentication has said it does not want a bearer credential, and shipping one
+    /// anyway would put a reusable secret on the wire for a peer that never asked for it and may not
+    /// protect it.
     pub fn sends_api_key(self) -> bool {
         matches!(self, Self::CanonicalV1 | Self::ApiKeyOnly)
     }

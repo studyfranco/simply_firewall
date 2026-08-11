@@ -32,7 +32,6 @@
 use std::sync::OnceLock;
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
-use sea_orm_migration::SchemaManager;
 use uuid::Uuid;
 
 use crate::entities::api_key;
@@ -165,8 +164,11 @@ impl MasterPin {
         // told to recreate an index while two masters sat in the table unmentioned. Counting first
         // surfaces the more urgent fact; the index error is then reported on the next start, once the
         // ambiguity the service cannot resolve for itself has been resolved.
-        let manager = SchemaManager::new(db);
-        if !manager.has_index(API_KEYS_TABLE, MASTER_MARKER_INDEX).await? {
+        // `crate::db::has_index` rather than `SchemaManager::has_index`. The latter selects its
+        // catalog query behind cargo feature gates that this crate does not enable for PostgreSQL, so
+        // it answered `BackendNotSupported` there and **the service could not start on Postgres at
+        // all** — against a database whose index was present and correct. See `db::has_index`.
+        if !crate::db::has_index(db, API_KEYS_TABLE, MASTER_MARKER_INDEX).await? {
             return Err(MasterPinError::MissingUniquenessIndex);
         }
 

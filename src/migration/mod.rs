@@ -11,6 +11,8 @@ mod m20260807_000007_add_api_key_master_marker;
 mod m20260807_000008_add_lineage_and_ownership;
 mod m20260808_000009_derive_master_marker;
 mod m20260811_000010_audit_attribution_not_null;
+mod m20260811_000011_index_ip_record_delta_columns;
+mod m20260811_000012_webhook_hmac_only_mode;
 
 /// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
@@ -29,6 +31,8 @@ impl MigratorTrait for Migrator {
             Box::new(m20260807_000008_add_lineage_and_ownership::Migration),
             Box::new(m20260808_000009_derive_master_marker::Migration),
             Box::new(m20260811_000010_audit_attribution_not_null::Migration),
+            Box::new(m20260811_000011_index_ip_record_delta_columns::Migration),
+            Box::new(m20260811_000012_webhook_hmac_only_mode::Migration),
         ]
     }
 }

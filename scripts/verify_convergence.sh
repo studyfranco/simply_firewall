@@ -407,8 +407,17 @@ assert_present "the demotion is applied at one choke point, in the middleware" \
     "src/middleware.rs" "state.master_pin.authenticate\(&state.db, &mut key_record\)"
 assert_present "a key claiming master is demoted unless it is the pinned one" \
     "src/master.rs" "key\.is_master = false"
+# The call now threads the connection explicitly, because it moved off `SchemaManager::has_index` to
+# `crate::db::has_index`. That helper's PostgreSQL arm was compiled out by a cargo feature this crate
+# does not enable on `sea-orm-migration`, so the boot check answered `BackendNotSupported` and the
+# service could not start on Postgres at all. The pattern is updated rather than loosened: an
+# assertion that stops matching the code it guards is the vacuous-pass failure this file exists to
+# prevent, and it caught this change correctly.
 assert_present "the §5 uniqueness index is re-checked at runtime, not just in the migration" \
-    "src/master.rs" "has_index\(API_KEYS_TABLE, MASTER_MARKER_INDEX\)"
+    "src/master.rs" "has_index\(db, API_KEYS_TABLE, MASTER_MARKER_INDEX\)"
+# And the check must be backend-agnostic, since the version it replaced was not.
+assert_present "the runtime index check works on every supported backend" \
+    "src/db.rs" "fn index_catalog_query"
 
 # The demotion must stay in exactly one place. A second copy is not a redundancy — it is a second
 # thing to keep correct, and the one that gets it wrong is invisible because the other still works.

@@ -616,6 +616,50 @@ body {
     overflow-y: auto;
 }
 
+/* ─── Full-height IP Records view ───────────────────────── */
+
+/*
+ * The IP Records table fills the window instead of stopping at 60vh with dead space beneath it.
+ * Done as a flex chain rather than `height: calc(100vh - 320px)`: the space above the table is not a
+ * constant. The filter bar wraps to two or three lines as the window narrows, the sticky top bar
+ * retracts on scroll, and a banner may or may not be present — every one of those changes the
+ * offset, and a hardcoded subtrahend is wrong for all but one window size.
+ *
+ * `min-height: 0` on each link is the part that is easy to omit and breaks the whole thing. A flex
+ * item's default `min-height: auto` refuses to shrink below its content, so without it the table
+ * pushes the chain taller than the viewport and the *page* scrolls while the scroller never does —
+ * which is precisely the layout this replaces.
+ */
+#dashboard-container.container {
+    display: flex;
+    flex-direction: column;
+    min-height: 100vh;
+}
+
+/* Only the active panel participates; `.tab-panel` is `display: none` otherwise and a flex
+   declaration there would override that and show every tab at once. */
+#tab-firewall.tab-panel.active {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+#tab-firewall .list-section {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+#tab-firewall .table-scroll {
+    flex: 1 1 auto;
+    /* The 60vh cap above is a *floor* for the JS-free case, not a ceiling for this one. Releasing it
+       is what lets the table grow past 60vh on a tall window; `flex` supplies the height instead. */
+    max-height: none;
+    min-height: 12rem;
+}
+
 /* The header cells carry the background, not <thead>: a transparent sticky row lets body rows
    show through as they scroll beneath it. */
 .table-scroll .data-table th {
@@ -847,7 +891,7 @@ body {
     border: 1px solid rgba(96, 165, 250, 0.35);
 }
 
-.badge-body-only {
+.badge-hmac-only {
     background-color: rgba(189, 195, 199, 0.1);
     color: var(--text-muted);
     border: 1px solid var(--border);
@@ -1093,10 +1137,10 @@ body {
     font-size: 0.82rem;
 }
 
-/* Height is driven by `--table-max-h`, recomputed from the viewport on resize and whenever the top
-   bar retracts. The 60vh fallback is what applies before the first measurement (and if JS is
-   disabled), so the table is never unbounded. */
-.table-scroll {
+/* Every other scrollable table keeps the measured budget. The IP Records one is flex-sized above
+   and deliberately excluded: two mechanisms competing for the same height is how a table ends up
+   correct only until the next resize. */
+.table-scroll:not(#tab-firewall .table-scroll) {
     max-height: var(--table-max-h, 60vh);
 }
 
@@ -1580,15 +1624,36 @@ body {
     align-items: center;
 }
 
+/* The hint swaps with the selected mode, so it is sized to the longest of the four rather than to
+   whichever happens to be showing — otherwise the whole form jumps a row every time the select
+   changes. `min-height` here is three lines at this line-height. */
 .auth-mode-hint {
     margin: 0;
-    align-self: center;
-    padding: 0.5rem 0.7rem;
+    align-self: stretch;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    min-height: 4.6rem;
+    padding: 0.6rem 0.8rem;
     background-color: var(--bg-input);
     border: 1px solid var(--border);
     border-left: 3px solid var(--highlight);
     border-radius: var(--radius);
-    line-height: 1.45;
+    line-height: 1.5;
+}
+
+/* "Sends:" leads every hint; making it the one emphasised token keeps the four descriptions
+   scannable as a set rather than as four paragraphs that happen to sit in the same box. */
+.auth-mode-hint strong {
+    color: var(--text-main);
+    font-weight: 600;
+}
+
+.auth-mode-hint em {
+    display: block;
+    margin-top: 0.3rem;
+    color: var(--text-muted);
+    font-style: normal;
 }
 
 @media (max-width: 700px) {

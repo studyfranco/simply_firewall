@@ -98,6 +98,16 @@ pub struct CreateWebhookPayload {
     /// Canonical string template for `CANONICAL_V1`, with `{method}`/`{path}`/`{timestamp}`/`{body}`
     /// placeholders. Omitted or empty means the default `{method}\n{path}\n{timestamp}\n{body}`.
     pub hmac_template: Option<String>,
+    /// Header the signature is sent in. Omitted or empty means `X-Signature-256`.
+    ///
+    /// For receivers that expect a different name — `X-Hub-Signature-256` is the common one. Applies
+    /// to both signing modes.
+    pub signature_header: Option<String>,
+    /// Prefix on the hex digest. Omitted means `sha256=`; an explicit `""` sends a bare digest.
+    ///
+    /// The empty string is meaningful rather than absent here, which is why it is not normalised
+    /// away: some receivers reject a prefixed value outright.
+    pub signature_prefix: Option<String>,
 }
 
 
@@ -197,6 +207,16 @@ pub async fn create_webhook(
         auth_mode: Set(auth_mode.as_str().to_owned()),
         api_key: Set(api_key),
         hmac_template: Set(hmac_template),
+        // Trimmed to `None` when blank so "unset" has exactly one representation in the column, and
+        // the dispatcher's fallback is reached rather than an empty header name being attempted.
+        // `signature_prefix` is *not* given that treatment: `Some("")` is a real choice there.
+        signature_header: Set(payload
+            .signature_header
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_owned)),
+        signature_prefix: Set(payload.signature_prefix.clone()),
         headers_json: Set(payload.headers_json.clone()),
         payload_template: Set(payload.payload_template.clone()),
         group_id: Set(payload.group_id),
@@ -243,7 +263,7 @@ pub struct WebhookSummary {
     /// Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook fires for; `None`
     /// means all events.
     pub events: Option<String>,
-    /// How dispatches authenticate: `"CANONICAL_V1"`, `"BODY_ONLY"`, `"API_KEY_ONLY"` or `"NONE"`.
+    /// How dispatches authenticate: `"CANONICAL_V1"`, `"HMAC_ONLY"`, `"API_KEY_ONLY"` or `"NONE"`.
     /// Safe to expose — it describes the *scheme*, not the `secret_token` or `api_key` behind it.
     pub auth_mode: String,
     /// The canonical string template used in `CANONICAL_V1` mode, resolved to the effective value
@@ -253,6 +273,11 @@ pub struct WebhookSummary {
     /// Whether an `X-API-Key` is configured, without disclosing it. The dashboard needs to render
     /// the field as populated; nothing needs its value back.
     pub has_api_key: bool,
+    /// The header the signature is actually sent in, resolved to the effective value rather than
+    /// echoed as stored — so the dashboard shows what a receiver will see, not a NULL.
+    pub signature_header: String,
+    /// The prefix actually applied to the digest, resolved the same way. May legitimately be empty.
+    pub signature_prefix: String,
     /// Creation timestamp
     pub created_at: chrono::NaiveDateTime,
 }
@@ -277,6 +302,12 @@ impl From<webhook_config::Model> for WebhookSummary {
                 .hmac_template
                 .unwrap_or_else(|| webhook_config::DEFAULT_HMAC_TEMPLATE.to_owned()),
             has_api_key: w.api_key.is_some_and(|k| !k.is_empty()),
+            signature_header: w
+                .signature_header
+                .unwrap_or_else(|| webhook_config::DEFAULT_SIGNATURE_HEADER.to_owned()),
+            signature_prefix: w
+                .signature_prefix
+                .unwrap_or_else(|| webhook_config::DEFAULT_SIGNATURE_PREFIX.to_owned()),
             created_at: w.created_at,
         }
     }

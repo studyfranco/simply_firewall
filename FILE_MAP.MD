@@ -61,8 +61,16 @@ place in `src/` outside `migration/` permitted to issue raw SQL, and then only `
 **Must not hold** any DML. `scripts/verify_convergence.sh::check_no_raw_sql` flags a
 `SELECT`/`INSERT`/`UPDATE`/`DELETE` keyword appearing anywhere in this file's raw-statement windows.
 
-**Key exports.** `connect`, `apply_sqlite_pragmas`, `run_migrations`, `SQLITE_BUSY_TIMEOUT_MS`,
-`SQLITE_MAX_CONNECTIONS`.
+**Key exports.** `connect`, `apply_sqlite_pragmas`, `run_migrations`, `has_index`,
+`SQLITE_BUSY_TIMEOUT_MS`, `SQLITE_MAX_CONNECTIONS`.
+
+**`has_index` replaced `SchemaManager::has_index`, and the reason matters.** That helper picks its
+catalog query behind cargo feature gates, and this crate enables only `sqlx-sqlite` on
+`sea-orm-migration` — so its PostgreSQL arm was compiled out and the §5 boot check answered
+`BackendNotSupported` against a database whose index was present. **The service could not start on
+PostgreSQL at all.** Catalog inspection has no entity API, so it is necessarily raw SQL, which is why
+it lives here rather than in `master.rs`: this module is the one `tests/source_hygiene.rs` allowlists,
+and it is startup-only rather than request-reachable.
 
 **Rationale.** `SQLITE_MAX_CONNECTIONS = 1` is not a tuning knob. SQLite permits one writer, and a DDL
 sequence spread across connections does not survive — `m20260808_000009` drops `master_marker` and
@@ -477,6 +485,8 @@ per-engine storage classes cannot be expressed portably through SeaQuery.
 | 8 | `m20260807_000008_add_lineage_and_ownership` | `api_keys.parent_key_id` (§4 subtree) and `owner_key_id` on groups and webhooks (§3) |
 | 9 | `m20260808_000009_derive_master_marker` | **The actual §5 enforcement.** Engine-derived marker under a unique index |
 | 10 | `m20260811_000010_audit_attribution_not_null` | `NOT NULL` on `audit_logs.api_key_name`, `.api_key_prefix`, `.client_ip`, with a `(unknown)` backfill for historical rows |
+| 11 | `m20260811_000011_index_ip_record_delta_columns` | Index on `ip_records.updated_at` — the column a polling delta-sync consumer filters on |
+| 12 | `m20260811_000012_webhook_hmac_only_mode` | Renames the `BODY_ONLY` auth mode to `HMAC_ONLY` and adds `signature_header` / `signature_prefix` |
 
 Three carry reasoning worth reading before touching them:
 

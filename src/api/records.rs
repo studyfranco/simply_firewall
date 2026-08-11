@@ -348,11 +348,17 @@ pub struct QueryFilters {
     pub format: Option<String>,
     /// Synonym for `format` — `format=iplist` and `mode=iplist` are both accepted.
     pub mode: Option<String>,
-    /// Master-only: also return soft-deleted records (the "trash" view).
+    /// Also return soft-deleted records (the "trash" view).
     ///
-    /// Ignored for non-master callers rather than rejected — a scoped key asking for the trash is
-    /// asking for something it has no concept of, and answering `403` would tell it the flag
-    /// exists. It simply gets the normal, live-only listing.
+    /// **Available to any caller, scoped exactly as live records are.** A non-master sees soft-deleted
+    /// records only inside groups it holds `can_read` on, because the same `accessible_groups` filter
+    /// that bounds the live listing bounds this one — there is no separate code path for deleted rows
+    /// to escape through. Master sees everything.
+    ///
+    /// Requesting a group the caller cannot read is **not an error**. It contributes nothing to the
+    /// result, exactly as a group that does not exist would. That is `RBAC_MODEL.md` §4 oracle
+    /// discipline: answering `403` here would tell an unauthorised caller that the group exists,
+    /// which is precisely the distinction §4 forbids a caller from drawing.
     pub include_deleted: Option<bool>,
 }
 
@@ -378,13 +384,22 @@ pub struct IpRecordResponse {
     pub updated_at: chrono::NaiveDateTime,
     /// Last seen at
     pub last_seen_at: chrono::NaiveDateTime,
-    /// Whether the record is soft-deleted. Always `false` in a normal listing; only ever `true`
-    /// in a master's `include_deleted=true` view.
+    /// Whether the record is soft-deleted. Always `false` in a normal listing; `true` only appears
+    /// under `include_deleted=true`.
+    ///
+    /// Emitted unconditionally rather than skipped when false: a delta-sync consumer needs to
+    /// distinguish "this record is live" from "this field was omitted", and a tombstone that
+    /// serialises identically to a live row is useless for replication.
     pub is_deleted: bool,
-    /// When it was soft-deleted, if it was.
+    /// When it was soft-deleted, if it was. Naive UTC, like every other timestamp on this type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_at: Option<chrono::NaiveDateTime>,
-    /// Which API key soft-deleted it, if it was.
+    /// Which API key soft-deleted it — **Master only**.
+    ///
+    /// The column stores a raw key id. `RBAC_MODEL.md` §4 limits what one key may learn about another
+    /// to id, name and rights *on a shared resource*, and nothing entitles a group reader to the
+    /// identity of an unrelated key. Widening `include_deleted` to non-masters must not smuggle that
+    /// out as a side effect, so it is `None` for every non-master caller.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deleted_by: Option<String>,
 }
@@ -401,10 +416,20 @@ pub async fn list_ips(
     let mut query = ip_record_group_membership::Entity::find()
         .find_also_related(ip_record::Entity);
 
-    // Soft-deleted records are invisible unless a master explicitly asks for the trash. Applied
-    // here, before every other filter, so no later branch can accidentally reintroduce them —
-    // including the `iplist` export format, which shares this query.
-    let include_deleted = key.is_master && filters.include_deleted.unwrap_or(false);
+    // Soft-deleted records are excluded unless the caller asks for them. Applied here, before every
+    // other filter, so no later branch can accidentally reintroduce them — including the `iplist`
+    // export format, which shares this query.
+    //
+    // The flag is **not** master-gated. It used to be, and the restriction bought nothing: the
+    // group-scoping filter below already confines a non-master to the groups it holds `can_read` on,
+    // and a soft-deleted row in a group you may read is not more sensitive than a live one in the
+    // same group. Gating the flag instead of the rows made the trash view unavailable to the
+    // delta-sync consumers that need it — an exporter cannot replicate deletions it cannot see.
+    //
+    // What is *not* done here is equally deliberate: no caller is refused for naming a group it
+    // cannot read. Such a group simply contributes nothing, exactly as a nonexistent one would.
+    // Refusing would turn this endpoint into an existence oracle over group names, which §4 forbids.
+    let include_deleted = filters.include_deleted.unwrap_or(false);
     if !include_deleted {
         query = query.filter(ip_record::Column::IsDeleted.eq(false));
     }
@@ -557,7 +582,9 @@ pub async fn list_ips(
             last_seen_at: record.last_seen_at,
             is_deleted: record.is_deleted,
             deleted_at: record.deleted_at,
-            deleted_by: record.deleted_by,
+            // Master only — see the field's doc comment. A group reader may see *that* a record was
+            // deleted, never *which key* did it.
+            deleted_by: if key.is_master { record.deleted_by } else { None },
         });
     }
 

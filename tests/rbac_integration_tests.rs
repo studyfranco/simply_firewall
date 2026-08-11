@@ -3749,6 +3749,8 @@ struct CapturedHook {
     signature: Option<String>,
     timestamp: Option<String>,
     api_key: Option<String>,
+    /// A signature arriving under a caller-configured header name rather than the default.
+    custom_signature: Option<String>,
 }
 
 /// Spawns a loopback mock receiver on an ephemeral port, returning its base URL and the shared slot
@@ -3775,6 +3777,7 @@ async fn spawn_capturing_receiver() -> (String, std::sync::Arc<std::sync::Mutex<
                 c.signature = header("X-Signature-256");
                 c.timestamp = header("X-Timestamp");
                 c.api_key = header("X-API-Key");
+                c.custom_signature = header("X-Hub-Signature-256");
                 c.body = Some(body);
                 StatusCode::OK
             }
@@ -3913,10 +3916,11 @@ async fn test_canonical_v1_webhook_sends_timestamp_and_canonical_signature() {
     ).is_some());
 }
 
-/// `BODY_ONLY` must keep the legacy behaviour exactly: body-only HMAC, `sha256=` prefix, and **no**
+/// `HMAC_ONLY` must keep the legacy `BODY_ONLY` behaviour exactly: body-only HMAC, `sha256=` prefix,
+/// and **no**
 /// `X-Timestamp` or `X-API-Key` header. Guards third-party receivers against a silent change.
 #[tokio::test]
-async fn test_body_only_signs_the_payload_alone_and_sends_no_timestamp() {
+async fn test_hmac_only_signs_the_payload_alone_and_sends_neither_timestamp_nor_key() {
     use hmac::{Hmac, KeyInit, Mac};
     use sha2::Sha256;
 
@@ -3945,7 +3949,10 @@ async fn test_body_only_signs_the_payload_alone_and_sends_no_timestamp() {
     assert_eq!(res.status(), StatusCode::OK);
     let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
     let created: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert_eq!(created["auth_mode"], "BODY_ONLY", "the deprecated alias still selects the mode");
+    // The request used the deprecated `signature_mode: "BODY_ONLY"` spelling and the service
+    // normalises it to the current name — which is how a client's stored configuration migrates
+    // itself on the next round-trip rather than needing a coordinated edit.
+    assert_eq!(created["auth_mode"], "HMAC_ONLY", "the legacy alias still selects the mode");
 
     let req = signed(inject_connect_info(Request::builder()
         .method("POST")
@@ -3960,8 +3967,11 @@ async fn test_body_only_signs_the_payload_alone_and_sends_no_timestamp() {
 
     let delivered_body = hit.body.expect("body");
     let signature = hit.signature.expect("missing X-Signature-256");
-    assert!(hit.timestamp.is_none(), "BODY_ONLY must not send X-Timestamp");
-    assert!(hit.api_key.is_none(), "BODY_ONLY must not send X-API-Key");
+    assert!(hit.timestamp.is_none(), "HMAC_ONLY must not send X-Timestamp");
+    assert!(
+        hit.api_key.is_none(),
+        "HMAC_ONLY must send no key header at all — that is the property the mode is named for"
+    );
 
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
     mac.update(delivered_body.as_bytes());
@@ -4007,7 +4017,7 @@ async fn test_auth_mode_is_validated_and_exposed_in_listings() {
             .header("Content-Type", "application/json")), payload.to_string())
     };
 
-    // A typo must be a 400, not a silent downgrade to BODY_ONLY: a caller who believes they enabled
+    // A typo must be a 400, not a silent downgrade to HMAC_ONLY: a caller who believes they enabled
     // canonical signing would otherwise ship a receiver that rejects every dispatch.
     let res = app.clone().oneshot(make(json!("CANONICAL_V2"), "typo")).await.unwrap();
     assert_eq!(res.status(), StatusCode::BAD_REQUEST);
@@ -4037,7 +4047,10 @@ async fn test_auth_mode_is_validated_and_exposed_in_listings() {
             .find(|w| w["name"] == name).unwrap().clone()
     };
     assert_eq!(row("lowercase")["auth_mode"], "CANONICAL_V1", "casing is normalized on the way in");
-    assert_eq!(row("explicit-legacy")["auth_mode"], "BODY_ONLY");
+    // Accepted on input, reported under the current name. Both halves matter: refusing the legacy
+    // spelling would break stored automation, and echoing it back would leave two names in
+    // circulation forever.
+    assert_eq!(row("explicit-legacy")["auth_mode"], "HMAC_ONLY");
     assert_eq!(row("defaulted")["auth_mode"], "CANONICAL_V1", "omitted mode defaults to CANONICAL_V1");
 
     // An unset hmac_template reports the effective default, not null — the dashboard renders this
@@ -4159,6 +4172,8 @@ async fn test_auth_mode_migration_preserves_existing_rows_and_reverses_cleanly()
     migration::Migrator::down(&db, Some(steps)).await.unwrap();
     let row = db.query_one_raw(Statement::from_string(backend,
         "SELECT signature_mode FROM webhook_configs WHERE id = 'w'".to_owned())).await.unwrap().unwrap();
+    // Unwound past `m20260811_000012`, so the column holds the pre-rename spelling again — the
+    // `down` path rewrites the data, not just the schema.
     assert_eq!(row.try_get::<String>("", "signature_mode").unwrap(), "BODY_ONLY");
 
     // Re-apply it: the backfill — not the column default — decides what the existing row gets.
@@ -4167,8 +4182,10 @@ async fn test_auth_mode_migration_preserves_existing_rows_and_reverses_cleanly()
         "SELECT auth_mode, api_key, hmac_template FROM webhook_configs WHERE id = 'w'".to_owned()))
         .await.unwrap().unwrap();
     assert_eq!(
-        row.try_get::<String>("", "auth_mode").unwrap(), "BODY_ONLY",
-        "an existing webhook must keep its mode, not inherit the new CANONICAL_V1 default"
+        row.try_get::<String>("", "auth_mode").unwrap(), "HMAC_ONLY",
+        "an existing webhook must keep its *mode* — re-applying the chain renames BODY_ONLY to \
+         HMAC_ONLY without letting it inherit the CANONICAL_V1 column default, which would silently \
+         change what the receiver is sent"
     );
     assert_eq!(row.try_get::<Option<String>>("", "api_key").unwrap(), None);
     assert_eq!(
@@ -5154,6 +5171,8 @@ async fn s4_oracle_discipline_an_invisible_key_is_indistinguishable_from_a_missi
         auth_mode: Set("BODY_ONLY".to_owned()),
         api_key: Set(None),
         hmac_template: Set(None),
+        signature_header: Set(None),
+        signature_prefix: Set(None),
         headers_json: Set(None),
         payload_template: Set("{}".to_owned()),
         group_id: Set(group_id),
@@ -5731,5 +5750,92 @@ async fn s6_an_empty_inventory_deletes_directly_and_a_doomed_reassignment_target
     assert!(
         simply_ip_vault::entities::prelude::ApiKey::find_by_id(parent_id)
             .one(&db).await.unwrap().is_some()
+    );
+}
+
+
+/// `HMAC_ONLY` withholds `X-API-Key` **even when the row has one**, and honours a custom signature
+/// header and prefix.
+///
+/// The first half is the property the mode is named for and the reason it was renamed from
+/// `BODY_ONLY`. The existing dispatch test creates a webhook with no `api_key` at all, so it cannot
+/// distinguish "withheld" from "there was nothing to send" — this one populates the column and
+/// asserts the header still never appears. A receiver that chose signature-only authentication must
+/// not be handed a reusable bearer credential it never asked for.
+///
+/// The second half covers the configurable transport added alongside the rename: GitHub-style
+/// receivers expect `X-Hub-Signature-256`, and some expect a bare digest with no `sha256=` prefix.
+#[tokio::test]
+async fn hmac_only_withholds_a_configured_api_key_and_honours_a_custom_signature_header() {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
+
+    let (base_url, captured) = spawn_capturing_receiver().await;
+    let (app, _db, plaintext, group_id) = setup_webhook_fixture("hmac-only-group").await;
+
+    let secret = "hmac-only-secret";
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")), json!({
+            "name": "Hmac Only Hook",
+            "target_url": format!("{base_url}/hook"),
+            "secret_token": secret,
+            "payload_template": "{\"ip\":\"$target_address\"}",
+            "group_id": group_id.to_string(),
+            "auth_mode": "HMAC_ONLY",
+            // Deliberately populated. The mode must ignore it rather than "not have one to send".
+            "api_key": "a-credential-the-receiver-never-asked-for",
+            "signature_header": "X-Hub-Signature-256",
+            // Empty string, not omitted: a bare digest is a real choice, and treating "" as unset
+            // would make it unreachable through the API.
+            "signature_prefix": "",
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(created["auth_mode"], "HMAC_ONLY");
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/ban")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")),
+        json!({ "target_address": "7.7.7.7", "group_name": "hmac-only-group" }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let hit = await_dispatch(&captured).await.expect("webhook was not delivered within timeout");
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "false") };
+
+    assert!(
+        hit.api_key.is_none(),
+        "HMAC_ONLY must withhold X-API-Key even when the row carries one — the receiver chose \
+         signature-only authentication and must not be handed a reusable secret"
+    );
+    assert!(hit.timestamp.is_none(), "HMAC_ONLY sends no timestamp");
+    assert!(
+        hit.signature.is_none(),
+        "with a custom header configured, nothing may still arrive under the default name"
+    );
+
+    let signature = hit.custom_signature.expect("missing X-Hub-Signature-256");
+    assert!(
+        !signature.starts_with("sha256="),
+        "an explicitly empty signature_prefix must produce a bare digest, got {signature:?}"
+    );
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(hit.body.expect("body").as_bytes());
+    assert_eq!(
+        signature,
+        hex::encode(mac.finalize().into_bytes()),
+        "the digest is still HMAC-SHA256 over the body alone — only its transport is configurable"
     );
 }

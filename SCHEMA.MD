@@ -208,9 +208,11 @@ Defines HTTP endpoints to notify when IP events occur within a specific group.
 | `name` | `String` | Not Null | Human-readable name for the webhook |
 | `target_url` | `String` | Not Null | HTTP/HTTPS target endpoint URL |
 | `secret_token` | `String` | Not Null | Shared secret used to generate the HMAC SHA-256 signature (`X-Signature-256`). Empty string in the modes that compute no signature. Never returned by `GET /api/webhooks` |
-| `auth_mode` | `Text` | Not Null, Default: `'CANONICAL_V1'` | How dispatches authenticate — one of `'CANONICAL_V1'`, `'BODY_ONLY'`, `'API_KEY_ONLY'`, `'NONE'` (see the table below). Unrecognized stored values fall back to `'BODY_ONLY'`, never to `'NONE'` |
+| `auth_mode` | `Text` | Not Null, Default: `'CANONICAL_V1'` | How dispatches authenticate — one of `'CANONICAL_V1'`, `'HMAC_ONLY'`, `'API_KEY_ONLY'`, `'NONE'` (see the table below). Unrecognized stored values fall back to `'HMAC_ONLY'`, never to `'NONE'` |
 | `api_key` | `Text` | Nullable | Value sent as the `X-API-Key` header by `'CANONICAL_V1'` and `'API_KEY_ONLY'`. A plaintext credential for the *receiving* system, so it is stored verbatim (there is nothing here to verify it against) and never returned by `GET /api/webhooks` — the listing reports only `has_api_key` |
 | `hmac_template` | `Text` | Nullable, Default: `'{method}\n{path}\n{timestamp}\n{body}'` | The string signed in `'CANONICAL_V1'` mode. `NULL` means the default. Only meaningful for `'CANONICAL_V1'` |
+| `signature_header` | `String` | Nullable | Header the signature is sent in. NULL means `X-Signature-256`. For receivers expecting a different name (`X-Hub-Signature-256`). Added by `m20260811_000012` |
+| `signature_prefix` | `String` | Nullable | Prefix on the hex digest. NULL means `sha256=`; an explicit `""` sends a bare digest. The empty string is a *meaningful* value here, not an unset one. Added by `m20260811_000012` |
 | `headers_json` | `Text` | Nullable | Custom JSON key-value object of HTTP headers to inject into requests |
 | `payload_template` | `Text` | Not Null | Template string with dynamic variables (e.g. `{"ip":"$target_address","group":"$group_name"}`) |
 | `group_id` | `UUID` | FK -> `ip_groups.id` (CASCADE) | Monitored IP Group |
@@ -223,9 +225,19 @@ Defines HTTP endpoints to notify when IP events occur within a specific group.
 | `auth_mode` | Signed message | Headers dispatched | Requires |
 | :--- | :--- | :--- | :--- |
 | `CANONICAL_V1` *(default)* | the resolved `hmac_template` | `X-Signature-256: sha256=<hex>`, `X-Timestamp`, and `X-API-Key` when `api_key` is set | `secret_token` |
-| `BODY_ONLY` | `RAW_BODY` | `X-Signature-256: sha256=<hex>` | `secret_token` |
+| `HMAC_ONLY` | `RAW_BODY` | the signature **and nothing else** — no `X-API-Key` even when `api_key` is set, no `X-Timestamp` | `secret_token` |
 | `API_KEY_ONLY` | *(none)* | `X-API-Key` | `api_key` |
 | `NONE` | *(none)* | *(none)* | — |
+
+Both signing modes send the digest under `signature_header` (NULL ⇒ `X-Signature-256`) with
+`signature_prefix` prepended (NULL ⇒ `sha256=`, explicit `""` ⇒ bare digest). **The algorithm is
+always SHA-256 and is deliberately not configurable** — making it selectable would mean accepting
+SHA-1 for the receivers most likely to ask, and this service would then be generating signatures it
+knows to be forgeable.
+
+`HMAC_ONLY` was named `BODY_ONLY` before `m20260811_000012`. The old spelling described the HMAC's
+*input* and left the security-relevant half — that the mode sends no bearer credential — to be
+inferred. It is still accepted on input for compatibility and is never emitted.
 
 *`hmac_template` substitution rules:*
 
@@ -313,6 +325,10 @@ To ensure optimal query performance under high load, the following indexes are m
 3. `ip_groups.name`: Unique index for quick group resolution.
 4. `ip_records.target_address`: Indexed for fast IP checking / duplicates.
 5. `ip_records.last_seen_at`: Indexed for temporal filtering (`max_age` / `since` queries).
+5b. `ip_records.updated_at`, `.deleted_at`, `.is_deleted`: Indexed for **delta replication** — the
+    companion exporter and sync worker poll "what changed since T" on a schedule, and an unindexed
+    range scan over the largest table degrades as it grows rather than failing outright. Tombstones
+    are indexed too: a replica that cannot see deletions diverges silently.
 6. `ip_records.is_deleted`: Indexed — every normal read filters on it, so without this the soft-delete filter turns each listing into a full scan as the trash accumulates.
 7. `ip_records.deleted_at`: Indexed for the retention purge sweep.
 6. `api_key_group_permissions (api_key_id, group_id)`: Unique joint index for instant permission verification.
