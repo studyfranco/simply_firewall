@@ -128,8 +128,15 @@ pub(crate) fn format_key_reference(name: &str, id: Uuid) -> String {
 /// The fallback exists exactly once, in the migration's backfill, where it is genuinely needed for
 /// rows written before the constraint. A future system-event writer should get its own function with
 /// its own explicit actor, not a `None` threaded through this one.
-pub(crate) async fn create_audit_log(
-    db: &sea_orm::DatabaseConnection,
+///
+/// # Generic over the connection
+///
+/// Takes any [`ConnectionTrait`](sea_orm::ConnectionTrait), so it can be called with a
+/// `DatabaseTransaction` as readily as with the pool. That matters for the batch endpoint: an audit
+/// row written outside the transaction it describes would survive a rollback and claim an operation
+/// that never happened, which is worse than no row at all — a trail that lies is not a trail.
+pub(crate) async fn create_audit_log<C: sea_orm::ConnectionTrait>(
+    db: &C,
     key: &api_key::Model,
     client_ip: std::net::IpAddr,
     action: &str,

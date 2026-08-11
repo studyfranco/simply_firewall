@@ -7117,3 +7117,85 @@ whose job is to *observe* should not mutate a tree someone is mid-edit on.
 | :--- | :--- |
 | `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences, 0 unexplained |
 | `cargo test` | **267 passed**, 0 failed |
+
+---
+
+## Session 51 — `POST /api/records/batch`, and a schema task that was already done
+
+### 1. Task 1 needed no migration
+
+The brief specified a target `ip_records` schema and asked for `m20260811_000013`. Checked field by
+field against the live schema first: **every column, nullability, default, unique constraint and index
+already matches.**
+
+| Target | Present since |
+| :--- | :--- |
+| `target_address` NOT NULL, UNIQUE, indexed | `m20230101_000001` (`unique_key()`) |
+| `cause` Text nullable · `is_locked` bool default false | `m20230101_000001` |
+| `created_at`, `updated_at`, `last_seen_at` NOT NULL | `m20230101_000001`; `last_seen_at` indexed there |
+| `is_deleted` NOT NULL default false, indexed · `deleted_at` nullable, indexed · `deleted_by` Text, no FK | `m20260801_000005` |
+| `updated_at` indexed | `m20260811_000011` (last session) |
+
+**No migration was created.** An empty one is immutable history that does nothing, and every future
+reader would have to open it to discover that. Recorded here instead.
+
+### 2. The batch endpoint
+
+`POST /api/records/batch` — transactional bulk sync for the companion exporter and sync worker.
+`upsert` (default) or `full_replace`.
+
+**The authorization decision is the important part.** `full_replace` soft-deletes every unlisted
+record, so it requires `can_delete` **and** `can_write`; `upsert` needs only `can_write`. Without that
+split, a key holding write access could empty a group by sending an empty batch — deletion reached
+through a write verb. `RBAC_MODEL.md` keeps operational verbs distinct precisely so holding one never
+confers another, and a bulk endpoint is where that boundary erodes quietly. Tested in both directions:
+refused on `can_write` alone, accepted once `can_delete` is granted, same payload.
+
+**`guard_bannable_address` was extracted from `handle_ip_upsert`.** It was inline, which meant this
+second write path would have accepted `127.0.0.1` and `10.0.0.0/8` into a banlist that
+`POST /api/ban` refuses. A validation rule enforced at one of two entrances is not a rule; it is a
+speed bump on the door people happen to use. Both paths now call the same function.
+
+**Other deliberate choices:**
+
+- **`created_at` is never overwritten** on an existing row, even when the payload supplies one. It
+  records when this service first saw the address; letting a sync rewrite it would turn the column
+  into "when the exporter last ran" and lose the only record of first appearance.
+- **Locked records are skipped in both modes** — not updated, not linked, and exempt from the
+  `full_replace` sweep. An administrative hold a remote sync could clear would not be a hold.
+- **`is_locked` is never settable from the payload.** A client could otherwise mint a record immune to
+  its own later syncs.
+- **Duplicates are refused**, not last-one-wins. `1.2.3.4` and `1.2.3.4/32` canonicalise to one
+  address; silently picking one would make the result depend on payload order.
+- **`MAX_BATCH_RECORDS = 10_000`.** The 3 MiB body limit bounds this only indirectly, so the ceiling
+  would otherwise depend on how verbose each record happened to be. It also bounds the transaction —
+  on SQLite a single writer holds the global write lock for its whole duration.
+- **Validation happens before `BEGIN`.** A batch that will be rejected should not first take the lock.
+- **`create_audit_log` is now generic over `ConnectionTrait`** so the aggregated audit row is written
+  *inside* the transaction. A row that survives a rollback describes something that never happened.
+- **One audit row, not one per record.** A 10 000-record sync would otherwise bury every other event
+  and turn the trail into the batch's own transcript.
+
+### 3. Tests
+
+Six integration tests, covering each property the brief named plus the two bypass risks:
+
+| Test | Pins |
+| :--- | :--- |
+| `batch_preserves_created_at_while_advancing_last_seen_at` | `created_at` survives a re-sync supplying an *earlier* value; `last_seen_at`/`updated_at` advance; an omitted `cause` does not clear one |
+| `batch_skips_locked_records_without_modifying_them` | counted in `locked_skipped`, and not even `updated_at` moves |
+| `full_replace_soft_deletes_omitted_records_and_records_who_did_it` | listed row kept, omitted row swept and attributed, **locked row exempt** |
+| `deleted_by_survives_the_deletion_of_the_key_it_names` | raw text, no FK — attribution outlives the key |
+| `full_replace_requires_delete_rights_while_upsert_needs_only_write` | the verb boundary, both directions |
+| `batch_enforces_address_validation_and_rejects_duplicates` | loopback/private refused as in `POST /api/ban`; duplicate canonical forms refused |
+
+### 4. Gates
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **273 passed**, 0 failed (267 before) |
+| `./scripts/test_e2e.sh` | **516 passed**, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences, 0 unexplained |
+| `git diff RBAC_MODEL.md` | empty |

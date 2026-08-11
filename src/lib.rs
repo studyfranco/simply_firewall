@@ -64,6 +64,10 @@ pub fn create_app(state: AppState) -> Router {
         .route("/ips/{id}", delete(api::delete_ip_record))
         .route("/ips/{id}/restore", post(api::restore_ip_record))
         .route("/system/purge-ips", post(api::purge_ip_records))
+        // Bulk synchronisation for the companion exporter/sync worker. Distinct from the singular
+        // `/ips` routes above: it is transactional, and its `full_replace` mode expresses "and
+        // everything else in this group is gone", which no per-record call can.
+        .route("/records/batch", post(api::batch_records))
         .route("/ban", post(api::handle_ban))
         .route("/white", post(api::handle_white))
         // Admin endpoints

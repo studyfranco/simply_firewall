@@ -8,7 +8,7 @@ use chrono::Utc;
 use ipnetwork::IpNetwork;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, sea_query::OnConflict, SqlErr,
+    QueryOrder, QuerySelect, TransactionTrait, sea_query::OnConflict, SqlErr,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -53,6 +53,43 @@ pub async fn handle_ban(
 ) -> Result<impl IntoResponse, AppError> {
     handle_ip_upsert(state, key, client_ip.0, payload, false).await
 }
+/// Refuses an address that must never be banned, whatever the caller asked for.
+///
+/// Loopback, unspecified, RFC 1918 / link-local IPv4, and link-local / unique-local IPv6. Banning any
+/// of them is either meaningless or actively harmful: a rule covering `127.0.0.1` or `10.0.0.0/8`
+/// propagates through the webhook dispatchers to every downstream firewall and can cut a fleet off
+/// from itself.
+///
+/// **Extracted so the batch endpoint cannot bypass it.** It was inline in [`handle_ip_upsert`], which
+/// meant a second write path — exactly what `POST /api/records/batch` is — would have silently
+/// accepted what the single-record path refuses. A validation rule enforced at one of two entrances
+/// is not a validation rule; it is a speed bump on the door people happen to use.
+///
+/// Whitelists are exempt by construction: this is only called for banlist targets, since whitelisting
+/// a private range is the ordinary reason to have a whitelist at all.
+pub(crate) fn guard_bannable_address(network: &IpNetwork) -> Result<(), AppError> {
+    let ip = network.network();
+    if ip.is_loopback() || ip.is_unspecified() {
+        return Err(AppError::InvalidInput("Cannot ban loopback or unspecified addresses".to_owned()));
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            if v4.is_private() || v4.is_link_local() {
+                return Err(AppError::InvalidInput("Cannot ban private or link-local IPv4 addresses".to_owned()));
+            }
+        }
+        std::net::IpAddr::V6(v6) => {
+            let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
+            let is_unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00;
+            if is_link_local || is_unique_local {
+                return Err(AppError::InvalidInput("Cannot ban link-local or unique-local IPv6 addresses".to_owned()));
+            }
+        }
+    }
+    Ok(())
+}
+
+
 
 
 /// Handles POST /api/v1/white to add an IP to a whitelist group
@@ -82,24 +119,7 @@ pub(crate) async fn handle_ip_upsert(
     let normalized_address = normalize_ip_or_cidr(&payload.target_address);
 
     if !is_whitelist {
-        let ip = network.network();
-        if ip.is_loopback() || ip.is_unspecified() {
-             return Err(AppError::InvalidInput("Cannot ban loopback or unspecified addresses".to_owned()));
-        }
-        match ip {
-            std::net::IpAddr::V4(v4) => {
-                if v4.is_private() || v4.is_link_local() {
-                     return Err(AppError::InvalidInput("Cannot ban private or link-local IPv4 addresses".to_owned()));
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                let is_link_local = (v6.segments()[0] & 0xffc0) == 0xfe80;
-                let is_unique_local = (v6.segments()[0] & 0xfe00) == 0xfc00;
-                if is_link_local || is_unique_local {
-                     return Err(AppError::InvalidInput("Cannot ban link-local or unique-local IPv6 addresses".to_owned()));
-                }
-            }
-        }
+        guard_bannable_address(&network)?;
     }
 
     let target_group_id: Uuid;
@@ -986,4 +1006,404 @@ pub async fn delete_ip(
     let _ = state.webhook_tx.send(event).await;
 
     Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+
+// ═════════════════════════════════════════════════════════════
+// POST /api/records/batch — bulk synchronisation
+// ═════════════════════════════════════════════════════════════
+
+/// Largest batch accepted in one request.
+///
+/// The 3 MiB body limit already bounds this indirectly, but indirectly is the problem: the ceiling
+/// would then depend on how verbose each record happened to be, so the same client could succeed with
+/// 40 000 terse entries and fail with 8 000 wordy ones. An explicit count gives a stable contract and
+/// a message that says what to do about it.
+///
+/// It also bounds the transaction. Every record below is a `SELECT` plus an `INSERT`/`UPDATE` inside
+/// one `BEGIN`, and on SQLite — a single-writer engine — that transaction holds the write lock for its
+/// whole duration. An unbounded batch is a self-inflicted outage for every other caller.
+pub const MAX_BATCH_RECORDS: usize = 10_000;
+
+/// How a batch reconciles against what is already in the group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BatchMode {
+    /// Add and update the listed records, leaving everything else in the group alone.
+    #[default]
+    Upsert,
+    /// Additionally soft-delete every active, unlocked record in the group that the batch omits.
+    ///
+    /// The destructive mode, and the reason this endpoint requires `can_delete` rather than
+    /// `can_write` when it is selected — see [`batch_records`].
+    FullReplace,
+}
+
+/// One record in a batch.
+///
+/// Every timestamp is optional and falls back to "now". A synchronising client that has real
+/// timestamps from its own store should send them, so the vault's view matches the source of truth
+/// rather than recording when the sync happened to run.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRecordInput {
+    /// The address or CIDR. Canonicalised before use, so `1.2.3.4/32` and `1.2.3.4` are one record.
+    pub target_address: String,
+    /// Reason or metadata. Omitted leaves an existing value untouched; it does not clear it.
+    pub cause: Option<String>,
+    /// Soft-delete state to apply. `Some(false)` on a deleted record restores it.
+    pub is_deleted: Option<bool>,
+    /// Creation timestamp, used only when the record is new. **Never overwrites an existing one.**
+    pub created_at: Option<chrono::NaiveDateTime>,
+    /// Last-update timestamp. Defaults to now.
+    pub updated_at: Option<chrono::NaiveDateTime>,
+    /// Last-activity timestamp. Defaults to now.
+    pub last_seen_at: Option<chrono::NaiveDateTime>,
+    /// Soft-delete timestamp. Only meaningful alongside `is_deleted: true`.
+    pub deleted_at: Option<chrono::NaiveDateTime>,
+}
+
+/// Payload for `POST /api/records/batch`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BatchRecordsPayload {
+    /// Target group by name. Created if absent and the caller may create groups.
+    pub group_name: String,
+    /// Reconciliation mode. Defaults to `upsert`.
+    #[serde(default)]
+    pub mode: BatchMode,
+    /// The records. Duplicates (after canonicalisation) are refused.
+    pub records: Vec<BatchRecordInput>,
+}
+
+/// What a batch did, counted by outcome.
+#[derive(Debug, Default, Serialize)]
+pub struct BatchRecordsResponse {
+    /// Rows inserted.
+    pub created: u64,
+    /// Existing rows updated.
+    pub updated: u64,
+    /// Rows that were soft-deleted and are now live again.
+    pub restored: u64,
+    /// Rows left untouched because `is_locked` was set.
+    pub locked_skipped: u64,
+    /// Rows soft-deleted because `full_replace` omitted them.
+    pub soft_deleted: u64,
+    /// Memberships created linking a record to the target group.
+    pub linked: u64,
+}
+
+/// Handles `POST /api/records/batch` — synchronise many records into one group atomically.
+///
+/// Built for the companion exporter and sync worker, which reconcile an external source of truth
+/// against this service on a schedule. Doing that through `POST /api/ban` one address at a time costs
+/// a round trip and a transaction each; more importantly it has no way to express "and everything
+/// else in this group is gone", which is what `full_replace` is for.
+///
+/// # Authorization
+///
+/// | Mode | Requires |
+/// | :--- | :--- |
+/// | `upsert` | `can_write` on the group |
+/// | `full_replace` | `can_write` **and** `can_delete` |
+///
+/// The second row is the one that matters. `full_replace` soft-deletes every unlisted record, so a
+/// key holding only `can_write` could otherwise empty a group by sending an empty batch — deletion
+/// through a write verb. `RBAC_MODEL.md` keeps operational verbs distinct precisely so that holding
+/// one does not confer another, and a bulk endpoint is exactly where that boundary erodes quietly.
+///
+/// Master bypasses the per-group check, as everywhere else.
+///
+/// # Atomicity
+///
+/// Everything runs in one transaction: the per-record work, the `full_replace` sweep, and the audit
+/// row. A partially applied sync is worse than a failed one — the client cannot tell which half
+/// landed, and a retry would double-apply the part that did. The audit row is written *inside* the
+/// transaction for the same reason: an entry that survives a rollback describes something that never
+/// happened.
+///
+/// # What it will not do
+///
+/// - **Touch a locked record.** `is_locked` rows are counted in `locked_skipped` and left exactly as
+///   they are, in both modes. They are also excluded from the `full_replace` sweep.
+/// - **Hard-delete anything.** `full_replace` soft-deletes; the rows remain, attributed to the caller
+///   via `deleted_by`, and `RBAC_MODEL.md` §6's "data is never destroyed implicitly" holds.
+/// - **Bypass address validation.** Banlist targets go through [`guard_bannable_address`], the same
+///   guard `handle_ip_upsert` uses, so a batch cannot insert `127.0.0.1` into a banlist that the
+///   single-record path refuses.
+pub async fn batch_records(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    crate::extract::StrictJson(payload): crate::extract::StrictJson<BatchRecordsPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    if payload.records.len() > MAX_BATCH_RECORDS {
+        return Err(AppError::InvalidInput(format!(
+            "Batch too large: {} records, limit is {MAX_BATCH_RECORDS}. Split it and retry.",
+            payload.records.len()
+        )));
+    }
+
+    // Canonicalise and validate everything *before* opening the transaction. A batch that is going to
+    // be rejected should not first acquire the write lock, and on SQLite that lock is global.
+    let mut normalized: Vec<(String, &BatchRecordInput)> = Vec::with_capacity(payload.records.len());
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for record in &payload.records {
+        let network: IpNetwork = record.target_address.parse().map_err(|_| {
+            AppError::InvalidInput(format!(
+                "Invalid IP or CIDR format: {:?}",
+                record.target_address
+            ))
+        })?;
+        let address = normalize_ip_or_cidr(&record.target_address);
+        // Refused rather than last-one-wins. Two entries for one address after canonicalisation
+        // (`1.2.3.4` and `1.2.3.4/32`) mean the client's own view is inconsistent, and silently
+        // picking one would make the result depend on payload order.
+        if !seen.insert(address.clone()) {
+            return Err(AppError::InvalidInput(format!(
+                "Duplicate target_address in batch after canonicalisation: {address}"
+            )));
+        }
+        normalized.push((address, record));
+        // Validation against the group type happens below, once the group is resolved — the network
+        // is parsed here only to reject malformed input before any lock is taken.
+        let _ = network;
+    }
+
+    // ── Group resolution and authorization ──────────────────────────────────
+    let existing = ip_group::Entity::find()
+        .filter(ip_group::Column::Name.eq(payload.group_name.clone()))
+        .one(&state.db)
+        .await?;
+
+    let group = match existing {
+        Some(g) => {
+            if !key.is_master {
+                let perm = api_key_group_permission::Entity::find()
+                    .filter(
+                        Condition::all()
+                            .add(api_key_group_permission::Column::ApiKeyId.eq(key.id))
+                            .add(api_key_group_permission::Column::GroupId.eq(g.id)),
+                    )
+                    .one(&state.db)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::Forbidden(
+                            "Permission denied: You have no access strictly mapped to this group"
+                                .to_owned(),
+                        )
+                    })?;
+
+                if !perm.can_write {
+                    return Err(AppError::Forbidden(
+                        "Permission denied: You do not have write access to this group".to_owned(),
+                    ));
+                }
+                // The whole reason this check exists — see the doc comment. `full_replace` deletes,
+                // and a write verb must not confer deletion.
+                if payload.mode == BatchMode::FullReplace && !perm.can_delete {
+                    return Err(AppError::Forbidden(
+                        "Permission denied: mode 'full_replace' soft-deletes the records it omits \
+                         and therefore requires delete access to this group, not only write access"
+                            .to_owned(),
+                    ));
+                }
+            }
+            g
+        }
+        None => {
+            if !key.is_master && !key.can_create_groups {
+                return Err(AppError::Forbidden(
+                    "Permission denied: Target group does not exist and you cannot create groups"
+                        .to_owned(),
+                ));
+            }
+            // A batch into a group that does not exist yet has nothing to replace, so the mode makes
+            // no difference to what happens — but the permission check above still applied.
+            get_or_create_group(&state.db, &payload.group_name, "banlist", resource_owner(&key))
+                .await?
+        }
+    };
+
+    // Banlist targets are held to the same address rules as `POST /api/ban`. Checked after the
+    // authorization above, so a caller with no access to the group learns nothing about its type.
+    if group.group_type != "whitelist" {
+        for (address, _) in &normalized {
+            let network: IpNetwork = address
+                .parse()
+                .map_err(|_| AppError::InvalidInput(format!("Invalid IP or CIDR format: {address}")))?;
+            guard_bannable_address(&network)?;
+        }
+    }
+
+    // ── The transaction ─────────────────────────────────────────────────────
+    let now = Utc::now().naive_utc();
+    let txn = state.db.begin().await?;
+    let mut summary = BatchRecordsResponse::default();
+
+    for (address, input) in &normalized {
+        let existing = ip_record::Entity::find()
+            .filter(ip_record::Column::TargetAddress.eq(address.clone()))
+            .one(&txn)
+            .await?;
+
+        let record_id = match existing {
+            Some(record) if record.is_locked => {
+                // Left exactly as it is — not updated, not linked, not counted as anything else.
+                summary.locked_skipped += 1;
+                continue;
+            }
+            Some(record) => {
+                let was_deleted = record.is_deleted;
+                let id = record.id;
+                let mut active: ip_record::ActiveModel = record.into();
+
+                // `created_at` is deliberately never written here: it records when this service
+                // first saw the address, and a re-sync is not a creation.
+                active.last_seen_at = Set(input.last_seen_at.unwrap_or(now));
+                active.updated_at = Set(input.updated_at.unwrap_or(now));
+                if let Some(cause) = &input.cause {
+                    active.cause = Set(Some(cause.clone()));
+                }
+
+                match input.is_deleted {
+                    Some(true) => {
+                        active.is_deleted = Set(true);
+                        active.deleted_at = Set(Some(input.deleted_at.unwrap_or(now)));
+                        active.deleted_by = Set(Some(key.id.to_string()));
+                    }
+                    // Explicitly live, or the batch says nothing and the record was deleted — either
+                    // way a sync that lists an address is asserting it exists, so it comes back.
+                    _ if was_deleted => {
+                        active.is_deleted = Set(false);
+                        active.deleted_at = Set(None);
+                        active.deleted_by = Set(None);
+                        summary.restored += 1;
+                    }
+                    _ => {}
+                }
+
+                active.update(&txn).await?;
+                summary.updated += 1;
+                id
+            }
+            None => {
+                let id = Uuid::new_v4();
+                let deleted = input.is_deleted.unwrap_or(false);
+                ip_record::ActiveModel {
+                    id: Set(id),
+                    target_address: Set(address.clone()),
+                    cause: Set(input.cause.clone()),
+                    // Never set from the payload. A client cannot mint a locked record and thereby
+                    // make it immune to its own later syncs.
+                    is_locked: Set(false),
+                    created_at: Set(input.created_at.unwrap_or(now)),
+                    updated_at: Set(input.updated_at.unwrap_or(now)),
+                    last_seen_at: Set(input.last_seen_at.unwrap_or(now)),
+                    is_deleted: Set(deleted),
+                    deleted_at: Set(if deleted { Some(input.deleted_at.unwrap_or(now)) } else { None }),
+                    deleted_by: Set(if deleted { Some(key.id.to_string()) } else { None }),
+                }
+                .insert(&txn)
+                .await?;
+                summary.created += 1;
+                id
+            }
+        };
+
+        let linked = ip_record_group_membership::Entity::insert(
+            ip_record_group_membership::ActiveModel {
+                ip_record_id: Set(record_id),
+                group_id: Set(group.id),
+            },
+        )
+        .on_conflict(
+            OnConflict::columns([
+                ip_record_group_membership::Column::IpRecordId,
+                ip_record_group_membership::Column::GroupId,
+            ])
+            .do_nothing()
+            .to_owned(),
+        )
+        .exec_without_returning(&txn)
+        .await?;
+        summary.linked += linked;
+    }
+
+    // ── full_replace: soft-delete what the batch omitted ────────────────────
+    if payload.mode == BatchMode::FullReplace {
+        let member_ids: Vec<Uuid> = ip_record_group_membership::Entity::find()
+            .filter(ip_record_group_membership::Column::GroupId.eq(group.id))
+            .all(&txn)
+            .await?
+            .into_iter()
+            .map(|m| m.ip_record_id)
+            .collect();
+
+        if !member_ids.is_empty() {
+            let candidates = ip_record::Entity::find()
+                .filter(
+                    Condition::all()
+                        .add(ip_record::Column::Id.is_in(member_ids))
+                        .add(ip_record::Column::IsDeleted.eq(false))
+                        // Locked rows are exempt from the sweep as well as from the updates above:
+                        // an administrative lock that a remote sync could clear would not be a lock.
+                        .add(ip_record::Column::IsLocked.eq(false)),
+                )
+                .all(&txn)
+                .await?;
+
+            for record in candidates {
+                if seen.contains(&record.target_address) {
+                    continue;
+                }
+                let mut active: ip_record::ActiveModel = record.into();
+                active.is_deleted = Set(true);
+                active.deleted_at = Set(Some(now));
+                active.deleted_by = Set(Some(key.id.to_string()));
+                active.updated_at = Set(now);
+                active.update(&txn).await?;
+                summary.soft_deleted += 1;
+            }
+        }
+    }
+
+    // One aggregated row, not one per record: a 10 000-record sync would otherwise bury every other
+    // event in the trail and turn the audit log into the batch's own transcript.
+    create_audit_log(
+        &txn,
+        &key,
+        client_ip.0,
+        "batch_records_updated",
+        None,
+        Some(group.name.clone()),
+        Some(format!(
+            "mode={} submitted={} created={} updated={} restored={} locked_skipped={} \
+             soft_deleted={}",
+            match payload.mode {
+                BatchMode::Upsert => "upsert",
+                BatchMode::FullReplace => "full_replace",
+            },
+            normalized.len(),
+            summary.created,
+            summary.updated,
+            summary.restored,
+            summary.locked_skipped,
+            summary.soft_deleted,
+        )),
+    )
+    .await?;
+
+    txn.commit().await?;
+
+    tracing::info!(
+        group = %group.name,
+        created = summary.created,
+        updated = summary.updated,
+        soft_deleted = summary.soft_deleted,
+        locked_skipped = summary.locked_skipped,
+        "Batch record synchronisation committed"
+    );
+
+    Ok(Json(summary))
 }

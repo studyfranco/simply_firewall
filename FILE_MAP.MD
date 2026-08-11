@@ -398,11 +398,20 @@ so the same move is not proposed a third time.
 
 ### `src/api/records.rs` — IP record endpoints
 
-**Role & scope.** Ban/whitelist upsert, listing with filters and pagination, soft delete, restore, and
-purge. The specification's *resource data*.
+**Role & scope.** Ban/whitelist upsert, listing with filters and pagination, soft delete, restore,
+purge, and the transactional bulk sync at `POST /api/records/batch`. The specification's
+*resource data*.
 
 **Key exports.** `handle_ban`, `handle_white`, `list_ips`, `delete_ip`, `delete_ip_record`,
-`restore_ip_record`, `purge_ip_records`, `QueryFilters`, `IpRecordResponse`.
+`restore_ip_record`, `purge_ip_records`, `batch_records`, `guard_bannable_address`, `QueryFilters`,
+`IpRecordResponse`, `BatchRecordsPayload`, `BatchMode`, `MAX_BATCH_RECORDS`.
+
+**Two things about `batch_records` worth knowing before editing it.** `full_replace` requires
+`can_delete` on the group and not merely `can_write` — it soft-deletes every record the batch omits,
+so a write-only key could otherwise empty a group by sending an empty batch, reaching deletion through
+a write verb. And `guard_bannable_address` was extracted from `handle_ip_upsert` specifically so this
+endpoint shares it: a second write path that skipped the loopback/private-range check would be a
+bypass, not a feature.
 
 **Rationale.** Records inherit authorization from their group's permission row rather than carrying
 one of their own, so every handler here resolves a group first and then defers to `guards.rs`.

@@ -5839,3 +5839,457 @@ async fn hmac_only_withholds_a_configured_api_key_and_honours_a_custom_signature
         "the digest is still HMAC-SHA256 over the body alone — only its transport is configurable"
     );
 }
+
+
+// ═════════════════════════════════════════════════════════════
+// POST /api/records/batch
+// ═════════════════════════════════════════════════════════════
+
+/// Builds an app plus a master key, for the batch tests below.
+async fn batch_fixture() -> (axum::Router, DatabaseConnection, String) {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+    let (_id, plaintext) = insert_key(&db, "Batch Tester", true, true, true, true).await;
+    (app, db, plaintext)
+}
+
+/// Reads one record straight from the database, bypassing every read endpoint.
+///
+/// The assertions below are about columns — `created_at` preserved, `deleted_by` populated — and a
+/// listing endpoint applies its own projection and scoping. Going to the row is the only way to see
+/// what was actually written.
+async fn raw_record_by_address(
+    db: &DatabaseConnection,
+    address: &str,
+) -> Option<simply_ip_vault::entities::ip_record::Model> {
+    simply_ip_vault::entities::ip_record::Entity::find()
+        .filter(simply_ip_vault::entities::ip_record::Column::TargetAddress.eq(address.to_owned()))
+        .one(db)
+        .await
+        .unwrap()
+}
+
+/// Re-registering an address advances `last_seen_at` and `updated_at` but never `created_at`.
+///
+/// `created_at` records when this service first saw the address. A sync that reports it again is not
+/// a creation, and letting a client overwrite that field would make the column mean "when the
+/// exporter last ran" — losing the only record of first appearance, which is what an operator asks
+/// for when investigating how long something has been blocked.
+#[tokio::test]
+async fn batch_preserves_created_at_while_advancing_last_seen_at() {
+    let (app, db, key) = batch_fixture().await;
+
+    let post = |body: String, tick: i64| {
+        let (app, key) = (app.clone(), key.clone());
+        async move {
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/records/batch")
+                        .header("X-API-Key", &key)
+                        .header("Content-Type", "application/json"),
+                ),
+                tick,
+                &body,
+            );
+            app.oneshot(req).await.unwrap()
+        }
+    };
+
+    // First sync: an explicit, old creation timestamp.
+    let res = post(
+        json!({
+            "group_name": "batch-group",
+            "records": [{
+                "target_address": "203.0.113.10",
+                "cause": "initial",
+                "created_at": "2020-01-01T00:00:00",
+                "last_seen_at": "2020-01-01T00:00:00",
+            }],
+        })
+        .to_string(),
+        1,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(summary["created"], 1);
+    assert_eq!(summary["linked"], 1);
+
+    let first = raw_record_by_address(&db, "203.0.113.10").await.expect("record exists");
+    assert_eq!(first.created_at.to_string(), "2020-01-01 00:00:00");
+
+    // Second sync: same address, newer activity.
+    let res = post(
+        json!({
+            "group_name": "batch-group",
+            "records": [{
+                "target_address": "203.0.113.10",
+                "created_at": "1999-01-01T00:00:00",
+                "last_seen_at": "2026-06-01T12:00:00",
+            }],
+        })
+        .to_string(),
+        2,
+    )
+    .await;
+    assert_eq!(res.status(), StatusCode::OK);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(summary["created"], 0, "the address already existed");
+    assert_eq!(summary["updated"], 1);
+
+    let second = raw_record_by_address(&db, "203.0.113.10").await.expect("record still exists");
+    assert_eq!(
+        second.created_at, first.created_at,
+        "created_at must survive a re-sync — even one that supplies an earlier value"
+    );
+    assert_eq!(second.last_seen_at.to_string(), "2026-06-01 12:00:00");
+    assert!(second.updated_at > first.updated_at, "updated_at advances");
+    assert_eq!(second.cause.as_deref(), Some("initial"), "an omitted cause does not clear it");
+}
+
+/// A locked record is skipped, counted, and left byte-for-byte as it was.
+///
+/// `is_locked` is an administrative hold. A bulk sync from an external source is exactly the traffic
+/// it exists to withstand — otherwise the lock protects a record only from callers who were not going
+/// to touch it anyway.
+#[tokio::test]
+async fn batch_skips_locked_records_without_modifying_them() {
+    let (app, db, key) = batch_fixture().await;
+    let group_id = insert_group_row(&db, "locked-group").await;
+
+    // A locked record, placed in the group directly.
+    let record_id = Uuid::new_v4();
+    let original = chrono::NaiveDateTime::parse_from_str("2021-03-04 05:06:07", "%Y-%m-%d %H:%M:%S").unwrap();
+    simply_ip_vault::entities::ip_record::ActiveModel {
+        id: Set(record_id),
+        target_address: Set("203.0.113.20".to_owned()),
+        cause: Set(Some("hands off".to_owned())),
+        is_locked: Set(true),
+        created_at: Set(original),
+        updated_at: Set(original),
+        last_seen_at: Set(original),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+        ip_record_id: Set(record_id),
+        group_id: Set(group_id),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let body = json!({
+        "group_name": "locked-group",
+        "records": [{
+            "target_address": "203.0.113.20",
+            "cause": "overwritten by the sync",
+            "is_deleted": true,
+        }],
+    })
+    .to_string();
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/records/batch")
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
+        ),
+        body,
+    );
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(summary["locked_skipped"], 1);
+    assert_eq!(summary["updated"], 0);
+    assert_eq!(summary["created"], 0);
+
+    let row = raw_record_by_address(&db, "203.0.113.20").await.expect("still there");
+    assert!(row.is_locked, "the lock survives");
+    assert!(!row.is_deleted, "a locked record is not soft-deleted by a batch that asks for it");
+    assert_eq!(row.cause.as_deref(), Some("hands off"), "its cause is untouched");
+    assert_eq!(row.updated_at, original, "not even updated_at moves");
+}
+
+/// `full_replace` soft-deletes the active records the batch omits, attributing each to the caller.
+///
+/// Also asserts the two exemptions, because a sweep that took everything would be a very different
+/// feature: an already-deleted record is not re-deleted, and a **locked** one is never swept at all.
+#[tokio::test]
+async fn full_replace_soft_deletes_omitted_records_and_records_who_did_it() {
+    let (app, db, key) = batch_fixture().await;
+    let group_id = insert_group_row(&db, "replace-group").await;
+    let key_id = simply_ip_vault::entities::api_key::Entity::find()
+        .filter(simply_ip_vault::entities::api_key::Column::IsMaster.eq(true))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    let seed = |address: &'static str, locked: bool| {
+        let db = db.clone();
+        async move {
+            let id = Uuid::new_v4();
+            let now = chrono::Utc::now().naive_utc();
+            simply_ip_vault::entities::ip_record::ActiveModel {
+                id: Set(id),
+                target_address: Set(address.to_owned()),
+                cause: Set(None),
+                is_locked: Set(locked),
+                created_at: Set(now),
+                updated_at: Set(now),
+                last_seen_at: Set(now),
+                is_deleted: Set(false),
+                deleted_at: Set(None),
+                deleted_by: Set(None),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+                ip_record_id: Set(id),
+                group_id: Set(group_id),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+    };
+    seed("203.0.113.31", false).await; // kept — the batch lists it
+    seed("203.0.113.32", false).await; // omitted — must be swept
+    seed("203.0.113.33", true).await;  // omitted but locked — must survive
+
+    let body = json!({
+        "group_name": "replace-group",
+        "mode": "full_replace",
+        "records": [{ "target_address": "203.0.113.31" }],
+    })
+    .to_string();
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/records/batch")
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
+        ),
+        body,
+    );
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let summary: serde_json::Value =
+        serde_json::from_slice(&axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap())
+            .unwrap();
+    assert_eq!(summary["soft_deleted"], 1, "exactly the omitted unlocked record");
+
+    let kept = raw_record_by_address(&db, "203.0.113.31").await.unwrap();
+    assert!(!kept.is_deleted, "a listed record stays live");
+
+    let swept = raw_record_by_address(&db, "203.0.113.32").await.unwrap();
+    assert!(swept.is_deleted, "an omitted record is soft-deleted");
+    assert!(swept.deleted_at.is_some(), "and stamped");
+    assert_eq!(
+        swept.deleted_by.as_deref(),
+        Some(key_id.to_string().as_str()),
+        "deleted_by attributes the acting key by raw id — no FK, so the attribution survives the \
+         key being deleted later"
+    );
+
+    let locked = raw_record_by_address(&db, "203.0.113.33").await.unwrap();
+    assert!(
+        !locked.is_deleted,
+        "a locked record is exempt from the sweep — an administrative hold a remote sync could \
+         clear would not be a hold"
+    );
+}
+
+/// `deleted_by` holds a raw key id with no foreign key, so attribution outlives the key.
+///
+/// The column is `Text`, not a `UUID` FK, and deliberately: a cascade or `SET NULL` on key deletion
+/// would erase the record of who removed an address. This asserts both halves — the value is the
+/// key's id, and deleting that key leaves it in place.
+#[tokio::test]
+async fn deleted_by_survives_the_deletion_of_the_key_it_names() {
+    let (app, db, key) = batch_fixture().await;
+    let key_id = simply_ip_vault::entities::api_key::Entity::find()
+        .filter(simply_ip_vault::entities::api_key::Column::IsMaster.eq(true))
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap()
+        .id;
+
+    let body = json!({
+        "group_name": "attrib-group",
+        "records": [{ "target_address": "203.0.113.40", "is_deleted": true }],
+    })
+    .to_string();
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/records/batch")
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
+        ),
+        body,
+    );
+    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let row = raw_record_by_address(&db, "203.0.113.40").await.unwrap();
+    assert!(row.is_deleted);
+    assert_eq!(row.deleted_by.as_deref(), Some(key_id.to_string().as_str()));
+
+    // Remove the key directly — the API refuses to delete a master, and this is about the column.
+    simply_ip_vault::entities::api_key::Entity::delete_by_id(key_id).exec(&db).await.unwrap();
+
+    let after = raw_record_by_address(&db, "203.0.113.40").await.unwrap();
+    assert_eq!(
+        after.deleted_by.as_deref(),
+        Some(key_id.to_string().as_str()),
+        "no FK means no cascade: the attribution survives the key, which is the whole point of \
+         storing it as text"
+    );
+}
+
+/// **`full_replace` requires `can_delete`, not merely `can_write`.**
+///
+/// The security property of this endpoint. `full_replace` soft-deletes every unlisted record, so a
+/// key holding only `can_write` could otherwise empty a group by sending an empty batch — deletion
+/// reached through a write verb. `RBAC_MODEL.md` keeps operational verbs distinct precisely so that
+/// holding one never confers another, and a bulk endpoint is where that boundary erodes quietly.
+///
+/// Asserted in both directions: refused without `can_delete`, and permitted with it.
+#[tokio::test]
+async fn full_replace_requires_delete_rights_while_upsert_needs_only_write() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let group_id = insert_group_row(&db, "verbs-group").await;
+    let (writer_id, writer) = insert_key(&db, "Writer", false, false, false, false).await;
+    grant_perm(&db, writer_id, group_id, true, true, false, false).await; // read+write, no delete
+
+    let call = |mode: &'static str, tick: i64, api_key: String| {
+        let app = app.clone();
+        async move {
+            let body = json!({
+                "group_name": "verbs-group",
+                "mode": mode,
+                "records": [{ "target_address": "203.0.113.50" }],
+            })
+            .to_string();
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/records/batch")
+                        .header("X-API-Key", &api_key)
+                        .header("Content-Type", "application/json"),
+                ),
+                tick,
+                &body,
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    assert_eq!(
+        call("upsert", 1, writer.clone()).await,
+        StatusCode::OK,
+        "can_write is enough to upsert"
+    );
+    assert_eq!(
+        call("full_replace", 2, writer.clone()).await,
+        StatusCode::FORBIDDEN,
+        "can_write alone must not reach a mode that deletes"
+    );
+
+    // Grant delete and the same request goes through — so the refusal was the verb, not something
+    // incidental about the payload.
+    grant_perm(&db, writer_id, insert_group_row(&db, "unused").await, true, true, true, false).await;
+    simply_ip_vault::entities::api_key_group_permission::Entity::update_many()
+        .col_expr(simply_ip_vault::entities::api_key_group_permission::Column::CanDelete, sea_orm::sea_query::Expr::value(true))
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::ApiKeyId.eq(writer_id))
+        .filter(simply_ip_vault::entities::api_key_group_permission::Column::GroupId.eq(group_id))
+        .exec(&db)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        call("full_replace", 3, writer).await,
+        StatusCode::OK,
+        "with can_delete the same request succeeds"
+    );
+}
+
+/// A batch cannot insert what `POST /api/ban` refuses, and duplicates are rejected.
+///
+/// Both are bypass checks. A second write path that skips the validation the first enforces is not a
+/// feature, it is a hole — and duplicate addresses after canonicalisation would make the result
+/// depend on payload order.
+#[tokio::test]
+async fn batch_enforces_address_validation_and_rejects_duplicates() {
+    let (app, _db, key) = batch_fixture().await;
+
+    let call = |records: serde_json::Value, tick: i64| {
+        let (app, key) = (app.clone(), key.clone());
+        async move {
+            let body =
+                json!({ "group_name": "validation-group", "records": records }).to_string();
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/records/batch")
+                        .header("X-API-Key", &key)
+                        .header("Content-Type", "application/json"),
+                ),
+                tick,
+                &body,
+            );
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    assert_eq!(
+        call(json!([{ "target_address": "not-an-ip" }]), 1).await,
+        StatusCode::BAD_REQUEST,
+        "malformed addresses are refused"
+    );
+    assert_eq!(
+        call(json!([{ "target_address": "127.0.0.1" }]), 2).await,
+        StatusCode::BAD_REQUEST,
+        "a batch must not ban loopback — the same guard POST /api/ban applies"
+    );
+    assert_eq!(
+        call(json!([{ "target_address": "10.0.0.1" }]), 3).await,
+        StatusCode::BAD_REQUEST,
+        "nor private space"
+    );
+    assert_eq!(
+        call(
+            json!([{ "target_address": "203.0.113.60" }, { "target_address": "203.0.113.60/32" }]),
+            4
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "two spellings of one address canonicalise to a duplicate and are refused rather than \
+         resolved by payload order"
+    );
+}
