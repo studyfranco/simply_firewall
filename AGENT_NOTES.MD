@@ -7060,3 +7060,60 @@ follow the code, not loosened** — an assertion that stops matching what it gua
 failure that file exists to prevent, and it has now been earned twice. A second assertion was added
 alongside it (`fn index_catalog_query` in `src/db.rs`) so the *backend-agnostic* property is tracked
 too, not just the call site.
+
+---
+
+## Session 50 — Automated peer sync in the convergence gate
+
+Small change, and it paid for itself on the first run.
+
+### What was added
+
+**`AGENT.MD` → `## 🔄 Peer Repository Synchronization`.** Agents must `git -C example/<peer> pull`
+before reading anything under `example/` or writing a convergence/parity/security report, and must log
+the outcome in `AGENT_NOTES.MD`. Two prohibitions recorded alongside it: do not `rsync` over a peer
+clone (`--delete` *protects* excluded paths, so `--exclude=.git` leaves the git directory intact while
+overwriting the worktree), and do not commit inside `example/` (it is gitignored here, so the work is
+invisible and lost on the next sync).
+
+**`scripts/verify_convergence.sh` → `sync_peer_repositories()`**, run before any comparison. Iterates
+`example/*/.git` rather than hardcoding one peer.
+
+### It caught a real staleness immediately
+
+The first run pulled the peer from `4865a82` to `8858d25` — **five commits**, including
+`docs: finalize independent security and structural convergence reports`. Session 47's log records
+"Already up to date at 4865a82", which was true when written and was stale within a day. That is
+exactly the failure this closes: a convergence check against a stale clone passes every assertion and
+certifies agreement with code that no longer exists.
+
+Convergence still passes against the newer peer — 63 matching, 0 divergences — but that was not
+knowable beforehand, which is the point.
+
+### Failure handling, and the one that matters
+
+Every path degrades to a warning; the gate never fails on sync. Verified by exercising each:
+
+| Condition | Behaviour | Exit |
+| :--- | :--- | :--- |
+| Normal | pulls, reports the new short HEAD | 0 |
+| `SKIP_PEER_SYNC=1` | skips, says so | 0 |
+| Unreachable remote | `⚠️ Warning: Could not pull peer repository, continuing with local version...` plus the HEAD it stayed at | 0 |
+| Dirty peer worktree | refuses to pull, compares as-is | 0 |
+| No `.git` under `example/` | notes it is a flat snapshot | 0 |
+
+**`GIT_TERMINAL_PROMPT=0` is the load-bearing line.** These remotes are HTTPS on a self-hosted forge,
+and without it a missing or expired credential makes git block on an interactive prompt. In CI that is
+not a failure but a **hang** — the failure mode that costs the most to diagnose, because the log ends
+mid-run with no error. `timeout 60` bounds the network side for the same reason.
+
+The dirty-worktree refusal is the other deliberate one: merging on top of local modifications either
+fails noisily or succeeds and silently mixes edits into the reference being compared against. A gate
+whose job is to *observe* should not mutate a tree someone is mid-edit on.
+
+### Gates
+
+| Gate | Result |
+| :--- | :--- |
+| `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences, 0 unexplained |
+| `cargo test` | **267 passed**, 0 failed |

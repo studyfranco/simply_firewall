@@ -14,6 +14,44 @@ To keep this context clean and modular, responsibilities are split across three 
 
 ---
 
+## 🔄 Peer Repository Synchronization
+
+`example/` holds working clones of the sibling services this project is kept convergent with —
+currently `example/simply_hook_executor`. They are **real git clones with their own remotes**, not
+flat snapshots.
+
+### Mandatory: pull before you analyse
+
+**Before reading any source under `example/`, and before producing a convergence, parity, or security
+report, run:**
+
+```bash
+git -C example/<peer_repo> pull
+```
+
+Do this even when the directory looks current. An audit that compares against a stale clone certifies
+agreement with code that no longer exists, and it does so *silently* — every check passes, the report
+reads clean, and the conclusion is worthless. This has already happened once: a snapshot that had
+drifted by nineteen files, including six under `src/api/`, was audited as though it were current.
+
+Log the outcome of the pull ("Already up to date", or the commit range) in `AGENT_NOTES.MD` alongside
+the report. A reader needs to know *which* peer commit a conclusion was drawn from; "the peer" is not
+a reference anyone can check later.
+
+`./scripts/verify_convergence.sh` performs this pull automatically, so running the gate satisfies the
+requirement for its own comparisons. It does **not** satisfy it for reports you write by reading files
+directly — do it yourself in that case.
+
+### Two things not to do
+
+- **Do not `rsync` over a peer clone.** `rsync --delete` *protects* excluded paths rather than
+  removing them, so `--exclude=.git` leaves the clone's git directory intact but its worktree
+  overwritten — and any local commits unreachable. Use `git pull`.
+- **Do not commit inside `example/`.** These are read-only references. `example/*` is gitignored here,
+  so changes made there are invisible to this repository's history and will be lost on the next sync.
+
+---
+
 ## 🎯 Project Overview
 
 `simply_ip_vault` is an enterprise-grade, central Firewall and ACL management API written in Rust. It acts as the single source of truth for IP banning/whitelisting and dispatches signed, templated webhook events to downstream systems or other `simply_ip_vault` instances. It features an integrated Vanilla JS dashboard governed by a granular multi-tenant Role-Based Access Control (RBAC) system.

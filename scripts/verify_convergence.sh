@@ -42,6 +42,66 @@ MATCH_COUNT=0
 DRIFT_COUNT=0
 EXPECTED_COUNT=0
 
+# ─────────────────────────────────────────────────────────────
+# Peer sync — compare against the peer's current HEAD, not a stale one
+# ─────────────────────────────────────────────────────────────
+#
+# The clones under `example/` have their own remotes and fall behind. A convergence check run against
+# a stale clone certifies agreement with code that no longer exists, and does so *silently*: every
+# assertion passes and the summary reads clean. That has happened — a snapshot nineteen files behind,
+# six of them under `src/api/`, was audited as current.
+#
+# **Never fatal.** This gate must stay usable offline, on a laptop with no route to the forge, and in
+# CI without credentials. Every failure below degrades to a warning and the check proceeds against
+# whatever is on disk, which is still worth running.
+#
+# Set `SKIP_PEER_SYNC=1` to bypass entirely — for an air-gapped run, or to pin a comparison to a known
+# peer commit while investigating a drift report.
+sync_peer_repositories() {
+    if [ "${SKIP_PEER_SYNC:-0}" == "1" ]; then
+        echo "  ${YELLOW}⚠${RESET}  peer sync skipped (SKIP_PEER_SYNC=1) — comparing against the local checkout"
+        return
+    fi
+
+    local git_dir peer name
+    local found=0
+    for git_dir in "$PROJECT_ROOT"/example/*/.git; do
+        # Unmatched globs expand to the literal pattern, so the guard is on existence, not on the
+        # loop running. A flat snapshot with no `.git` is a legitimate setup and simply has nothing
+        # to pull.
+        [ -e "$git_dir" ] || continue
+        found=1
+        peer="$(dirname "$git_dir")"
+        name="$(basename "$peer")"
+
+        # Refuse to pull over local modifications. A dirty peer worktree means somebody is mid-edit
+        # or a previous sync copied files in; merging on top of that either fails noisily or succeeds
+        # and silently mixes the two. Neither belongs in a check that is supposed to observe.
+        if [ -n "$(git -C "$peer" status --porcelain 2>/dev/null)" ]; then
+            echo "  ${YELLOW}⚠${RESET}  $name has local changes — not pulling, comparing against the working tree as-is"
+            continue
+        fi
+
+        # `GIT_TERMINAL_PROMPT=0` is the load-bearing part. These remotes are HTTPS, and without it a
+        # missing or expired credential makes git block on an interactive prompt — which in CI is not
+        # an error but a hang, the failure mode that costs the most to diagnose. `timeout` bounds the
+        # network side for the same reason.
+        if GIT_TERMINAL_PROMPT=0 timeout 60 git -C "$peer" pull --quiet --ff-only 2>/dev/null; then
+            echo "  ${GREEN}✓${RESET} $name synced — now at $(git -C "$peer" rev-parse --short HEAD)"
+        else
+            echo "  ${YELLOW}⚠️  Warning: Could not pull peer repository, continuing with local version...${RESET}"
+            echo "     $name stays at $(git -C "$peer" rev-parse --short HEAD 2>/dev/null || echo 'unknown')" \
+                 "— offline, no credentials, or the branch has diverged."
+        fi
+    done
+
+    [ "$found" == "1" ] || echo "  ${BLUE}·${RESET}  no git clone under example/ — comparing against the files on disk"
+}
+
+echo "${BOLD}Peer synchronization${RESET}"
+sync_peer_repositories
+echo
+
 if [ ! -d "$PEER_ROOT" ]; then
     echo "${YELLOW}SKIP${RESET} peer service not found at $PEER_ROOT" >&2
     echo "Mount simply_hook_executor there (read-only is fine) to enable drift detection." >&2
