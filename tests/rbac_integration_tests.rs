@@ -6507,3 +6507,165 @@ async fn a_large_batch_completes_promptly_and_leaves_the_service_responsive() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+// ═════════════════════════════════════════════════════════════
+// Differential sync: tombstones must survive the `since` filter
+// ═════════════════════════════════════════════════════════════
+
+/// A record soft-deleted after `since` is returned as a tombstone, even though its `last_seen_at`
+/// predates the cutoff.
+///
+/// # The bug this pins
+///
+/// Soft delete writes `is_deleted`, `deleted_at`, `deleted_by` and `updated_at` — but deliberately
+/// **not** `last_seen_at`, which records when the address was last *observed*, not when the row was
+/// last touched. Conflating the two would corrupt the field's meaning.
+///
+/// The `since` filter, however, tested `last_seen_at` alone. So an address last seen at T0 and
+/// deleted at T1 was invisible to every `?since=` query with a cutoff after T0: the deletion had
+/// happened, the tombstone existed in the database, and no differential consumer could ever learn of
+/// it. Exporters and sync workers kept the entry in memory forever, and the divergence was permanent
+/// rather than self-correcting — a later poll could not surface it either, because `last_seen_at`
+/// only ever moves forward on re-registration, which by definition never happens to a deleted record.
+///
+/// # Why the four assertions
+///
+/// A fix that simply widened the filter would satisfy the first assertion and break the rest. The
+/// tombstone must appear **only** under `include_deleted`, must disappear once the client has caught
+/// up past the deletion, and must not drag in deletions older than the cutoff — otherwise every poll
+/// re-delivers the whole trash and the "differential" part is lost.
+#[tokio::test]
+async fn test_differential_sync_includes_recently_deleted_ips() {
+    let (app, db, key, dir) = perf_fixture().await;
+
+    let group_id = insert_group_row(&db, "sync-group").await;
+
+    // T0 — an hour ago. Seeded directly so the timestamp is exact; the deletion below still goes
+    // through the real endpoint, so the code path that writes the tombstone is the deployed one.
+    let t0 = chrono::Utc::now().naive_utc() - chrono::Duration::hours(1);
+    let record_id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_record::ActiveModel {
+        id: Set(record_id),
+        target_address: Set("198.51.100.77".to_owned()),
+        cause: Set(Some("seeded at T0".to_owned())),
+        is_locked: Set(false),
+        created_at: Set(t0),
+        updated_at: Set(t0),
+        last_seen_at: Set(t0),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+        ip_record_id: Set(record_id),
+        group_id: Set(group_id),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let get = |path: String, tick: i64| {
+        let (app, key) = (app.clone(), key.clone());
+        async move {
+            let req = signed_later(
+                inject_connect_info(Request::builder().uri(&path).header("X-API-Key", &key)),
+                tick,
+                "",
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    // T1 — delete through the API, so `deleted_at` is written by production code.
+    let req = signed_later(
+        inject_connect_info(
+            Request::builder().method("DELETE").uri(format!("/api/ips/{record_id}")).header("X-API-Key", &key),
+        ),
+        1,
+        "",
+    );
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let row = simply_ip_vault::entities::ip_record::Entity::find_by_id(record_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .expect("the row survives a soft delete");
+    assert!(row.is_deleted, "the delete was soft");
+    let t1 = row.deleted_at.expect("deleted_at is stamped");
+    assert_eq!(row.last_seen_at, t0, "last_seen_at must NOT move on delete — that is the premise");
+
+    let t1_epoch = t1.and_utc().timestamp();
+
+    // 1. since = T1 → the tombstone must be delivered.
+    let (status, body) = get(format!("/api/ips?since={t1_epoch}&include_deleted=true"), 2).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("198.51.100.77"),
+        "a record deleted at or after `since` must reach a differential consumer even though its \
+         last_seen_at predates the cutoff — otherwise the deletion is never replicated: {body}"
+    );
+    let items: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        items[0]["is_deleted"], true,
+        "and it must arrive flagged as a tombstone, not as a live record"
+    );
+
+    // 2. Without the flag it stays hidden — the fix must not leak trash into ordinary listings.
+    let (_, body) = get(format!("/api/ips?since={t1_epoch}"), 3).await;
+    assert!(
+        !body.contains("198.51.100.77"),
+        "include_deleted is still what opts a caller into tombstones: {body}"
+    );
+
+    // 3. since = T2 > T1 → already replicated, must not be re-sent.
+    let t2_epoch = t1_epoch + 60;
+    let (_, body) = get(format!("/api/ips?since={t2_epoch}&include_deleted=true"), 4).await;
+    assert!(
+        !body.contains("198.51.100.77"),
+        "a client that has caught up past the deletion must not receive it again, or every poll \
+         re-delivers the entire trash: {body}"
+    );
+
+    // 4. A live record whose last_seen_at predates the cutoff stays excluded, so the new clause
+    //    widened the filter for tombstones only and not for everything.
+    let quiet_id = Uuid::new_v4();
+    simply_ip_vault::entities::ip_record::ActiveModel {
+        id: Set(quiet_id),
+        target_address: Set("198.51.100.88".to_owned()),
+        cause: Set(None),
+        is_locked: Set(false),
+        created_at: Set(t0),
+        updated_at: Set(t0),
+        last_seen_at: Set(t0),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+    simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+        ip_record_id: Set(quiet_id),
+        group_id: Set(group_id),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let (_, body) = get(format!("/api/ips?since={t1_epoch}&include_deleted=true"), 5).await;
+    assert!(
+        !body.contains("198.51.100.88"),
+        "a live record last seen before the cutoff is still out of scope — the deletion clause must \
+         not become a second way to match everything: {body}"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

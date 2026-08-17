@@ -7301,3 +7301,93 @@ same function, that the constant is the named default in bytes, and that the flo
 Three convergence assertions referenced the old body-limit shape and were **updated to follow the
 code, not loosened** — the pattern now asserts both layers call `config::max_body_bytes()`, which is
 the invariant, where before it asserted a literal that happened to encode it.
+
+---
+
+## Session 53 — Differential sync silently dropped every deletion
+
+A real bug, reproduced before it was fixed.
+
+### The defect
+
+`GET /api/ips?since=<t>` filtered on `last_seen_at >= t` alone. Soft delete writes `is_deleted`,
+`deleted_at`, `deleted_by` and `updated_at` — but **deliberately not `last_seen_at`**, which records
+when the address was last *observed*; a deletion is not a re-sighting, and moving it would corrupt the
+field's meaning.
+
+So an address last seen at T0 and deleted at T1 failed the filter for every cutoff after T0. The
+tombstone existed in the database and no differential consumer could reach it.
+
+**The part that makes it serious is that the divergence was permanent.** `last_seen_at` only moves
+forward on re-registration, which by definition never happens to a deleted record — so no later poll
+could correct it either. An exporter or sync worker kept the stale entry in memory indefinitely, and
+the only recovery was a full resync nobody knew to trigger. A soft-deleted ban stayed enforced
+downstream forever.
+
+### Order of work
+
+The regression test was written **first** and observed to fail, with the empty response quoted in the
+assertion message:
+
+```
+a record deleted at or after `since` must reach a differential consumer even though its
+last_seen_at predates the cutoff — otherwise the deletion is never replicated: []
+```
+
+A test that has never been seen red is not evidence the fix did anything.
+
+### The fix
+
+`src/api/records.rs`, the `since` branch: a record is in scope when **either** timestamp crosses the
+cutoff.
+
+```rust
+let mut window = Condition::any().add(ip_record::Column::LastSeenAt.gte(threshold));
+if include_deleted {
+    window = window.add(
+        Condition::all()
+            .add(ip_record::Column::IsDeleted.eq(true))
+            .add(ip_record::Column::DeletedAt.gte(threshold)),
+    );
+}
+query = query.filter(window);
+```
+
+Two choices worth stating:
+
+- **The deletion arm is gated on `include_deleted`.** Applying it unconditionally would leak
+  tombstones into ordinary listings for anyone who happened to pass `since` — the flag is what opts a
+  caller into trash, and a differential query must not become a second door to it.
+- **`IsDeleted.eq(true)` is redundant and kept anyway.** `deleted_at >= threshold` already excludes
+  live rows, since NULL compares as unknown rather than true. Naming the flag says what the arm is
+  *for*, and lets the engine use `idx_ip_records_is_deleted`.
+
+`last_seen_at` was **not** changed to `updated_at`. That would have widened the base arm for every
+caller — a record whose `cause` was edited would start appearing in activity-based polls — and the
+bug is about deletions, not about redefining what "last seen" means.
+
+### The test asserts four things, not one
+
+A fix that merely widened the filter would pass the first and fail the rest:
+
+| # | Assertion |
+| --: | :--- |
+| 1 | A record deleted at or after `since` is returned, flagged `is_deleted: true` |
+| 2 | Without `include_deleted` it stays hidden — no trash leaking into ordinary reads |
+| 3 | With `since` **after** the deletion it is not re-sent — otherwise every poll re-delivers the whole trash and "differential" means nothing |
+| 4 | A **live** record last seen before the cutoff is still excluded — the new arm must not become a second way to match everything |
+
+The test also asserts the premise itself (`last_seen_at` is unchanged by the delete), so if a future
+edit makes soft delete touch that column, this test explains why it mattered rather than silently
+becoming vacuous.
+
+### Gates
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **276 passed**, 0 failed (275 before) |
+| `./scripts/test_e2e.sh` | **516 passed**, 0 failed |
+| `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences |
+| `git diff RBAC_MODEL.md` | empty |

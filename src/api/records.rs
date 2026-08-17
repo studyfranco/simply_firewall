@@ -357,7 +357,16 @@ pub struct QueryFilters {
     pub status: Option<String>,
     /// Maximum age in seconds, based on `last_seen_at`
     pub max_age: Option<i64>,
-    /// Only return records last seen at or after this Unix timestamp (seconds)
+    /// Differential-sync cutoff, as a Unix timestamp in seconds.
+    ///
+    /// A record is in scope when **either** its `last_seen_at` is at or after the cutoff, **or** —
+    /// with `include_deleted=true` — it was soft-deleted at or after it. Both arms are needed: soft
+    /// delete does not move `last_seen_at`, so a record last seen before the cutoff and deleted
+    /// after it would otherwise be invisible, and its deletion unreplicable *forever* (see the
+    /// filter's own comment in `list_ips`).
+    ///
+    /// Poll with the timestamp of the previous response to receive additions, re-registrations and
+    /// tombstones since then, and nothing already delivered.
     pub since: Option<i64>,
     /// Pagination limit
     pub limit: Option<u64>,
@@ -549,11 +558,39 @@ pub async fn list_ips(
         query = query.filter(ip_record::Column::LastSeenAt.gte(threshold));
     }
 
+    // The differential-sync cutoff. Two columns can put a record on the near side of it, and using
+    // only the first was a bug that made deletions unreplicable.
+    //
+    // `last_seen_at` records when the address was last *observed*; soft delete deliberately does not
+    // touch it, because a deleted record is not a re-sighting and conflating the two would corrupt
+    // the field's meaning. But that left the tombstone unreachable: an address last seen at T0 and
+    // deleted at T1 failed `last_seen_at >= since` for every cutoff after T0, so no differential
+    // consumer could ever learn the deletion had happened. Worse, the divergence was *permanent* —
+    // `last_seen_at` only moves forward on re-registration, which by definition never happens to a
+    // deleted record, so no later poll could correct it either. Exporters kept stale entries
+    // indefinitely.
+    //
+    // So a record is in scope when **either** timestamp crosses the cutoff. The deletion arm is
+    // gated on `include_deleted` rather than applied unconditionally: without the flag a tombstone
+    // must stay invisible exactly as it does in an unfiltered listing, and matching on `deleted_at`
+    // there would leak the trash into ordinary reads for anyone who passed `since`.
     if let Some(since) = filters.since {
         let threshold = chrono::DateTime::from_timestamp(since, 0)
             .ok_or_else(|| AppError::InvalidInput("Invalid `since` timestamp".to_owned()))?
             .naive_utc();
-        query = query.filter(ip_record::Column::LastSeenAt.gte(threshold));
+
+        let mut window = Condition::any().add(ip_record::Column::LastSeenAt.gte(threshold));
+        if include_deleted {
+            window = window.add(
+                Condition::all()
+                    // `deleted_at >= threshold` alone would already exclude live rows, since NULL
+                    // compares as unknown rather than true. The flag is named anyway: it says what
+                    // this arm is *for*, and it lets the engine use `idx_ip_records_is_deleted`.
+                    .add(ip_record::Column::IsDeleted.eq(true))
+                    .add(ip_record::Column::DeletedAt.gte(threshold)),
+            );
+        }
+        query = query.filter(window);
     }
 
     let limit = filters.limit.unwrap_or(50);
