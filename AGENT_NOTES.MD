@@ -7391,3 +7391,114 @@ becoming vacuous.
 | `./scripts/test_e2e.sh` | **516 passed**, 0 failed |
 | `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences |
 | `git diff RBAC_MODEL.md` | empty |
+
+---
+
+## Session 54 — Edge-case robustness tests, and one premise that did not hold
+
+Six test tasks. Five confirmed existing behaviour; one asserted behaviour that does not exist and is
+recorded rather than silently implemented.
+
+### 1. Canonicalisation — one premise verified, one contradicted
+
+Probed the helper empirically before writing anything:
+
+| Input | Canonical form |
+| :--- | :--- |
+| `2001:0db8:0000:0000:0000:0000:0000:0001/128` | `2001:db8::1` ✅ |
+| `2001:DB8::1` | `2001:db8::1` ✅ |
+| `10.0.0.5/32` | `10.0.0.5` ✅ |
+| **`192.168.1.50/24`** | **`192.168.1.50/24`** ❌ — *not* `192.168.1.0/24` |
+
+**IPv6 canonicalisation works exactly as the brief assumed.** Every spelling of one host — expanded,
+compressed, mixed case, with or without `/128` — collapses to a single canonical string, and the
+UNIQUE index refuses a second row for it.
+
+**CIDR host-bit masking does not happen, and the brief asked me to assert that it does.**
+`normalize_ip_or_cidr` strips only a redundant `/32` or `/128`; a genuine subnet keeps whatever host
+bits it was written with. So `192.168.1.50/24` and `192.168.1.0/24` are **two separate records with
+separate lifecycles** — banning one does not ban the other, and deleting one leaves the other
+enforced.
+
+I did not change this, and the reason is not that the current behaviour is obviously right — there is
+a real argument that two spellings of one network should be one record, exactly as two spellings of
+one host are. It is that `target_address` is the UNIQUE key **and the value stored on every existing
+row**. Masking on write would orphan every row already persisted in non-masked form: unreachable by
+the old spelling and by the new. That needs a data migration, which is a different piece of work from
+a test-hardening pass, and doing it silently inside one would be worse than not doing it.
+
+So `a_cidr_keeps_its_host_bits_and_is_not_masked_to_the_network_base` pins current semantics with a
+doc comment saying plainly that it documents rather than endorses them, and that a deliberate change
+should make it fail loudly. **Open question for the owner** — see the summary.
+
+### 2. Intra-batch duplicates
+
+The brief suggested "last-wins or deduplication". The endpoint refuses with `400`, which was a
+deliberate choice when it was written: last-wins makes the result depend on **payload order**, so the
+same record set syncs differently depending on how the client serialised it. A client sending two
+`cause` values for one address has an inconsistent view of its own state, and silently picking one
+hides that.
+
+The test asserts what the brief actually cares about — **no `5xx`** — plus that the message names the
+offending address, that a rejected batch writes *nothing* (the check runs before `BEGIN`), and a
+control showing the same shape without the duplicate succeeds.
+
+### 3. Stale `since` — my first version of this test was wrong
+
+Asserted that a record last seen 200 days ago is returned by `?since=<100 days ago>`. It is not, and
+should not be: `since` is a differential filter, and a record untouched for 200 days has not changed
+within the window. The test caught my own error.
+
+Rewritten to pin the three things that are actually true: records changed inside the window are
+returned, a record untouched for longer is still excluded (so an old cutoff does not quietly degrade
+into "return everything"), and a tombstone purged by retention is unrecoverable by any cutoff — the
+honest limit of differential sync, and a property of the *data* rather than of the query.
+
+### 4. Webhook saturation
+
+Built the state with a **capacity-1 channel whose receiver is dropped immediately** — strictly harsher
+than saturation — and enqueued 2 000 events. Production capacity comes from a `OnceLock` and cannot be
+varied per test, and 1 024 genuine events would mean 1 024 signed round trips to demonstrate a property
+that is about the channel rather than about volume.
+
+The whole test is wrapped in `tokio::time::timeout`, because the failure mode is a **hang** rather than
+a wrong answer, and no assertion catches a future that never returns. It then asserts the API still
+answers, that a *write* path still succeeds, and that the ban actually landed — dropping the courtesy
+is correct, failing the product is not.
+
+### 5. Concurrent batch writes
+
+Eight tasks × 60 records with **overlapping** ranges (stride 30), so half of every batch contends with
+another. Disjoint sets would exercise only insertion; the overlap is where a lost update or a double
+insert on a UNIQUE column would surface. The final count is asserted as the exact union.
+
+**What this does not show is WAL reader/writer concurrency.** `SQLITE_MAX_CONNECTIONS` is 1, so these
+transactions queue on the pool and never race inside SQLite. What it shows is that the queueing is
+correct and bounded — every task completes, none returns `SQLITE_BUSY`, and `busy_timeout=5000` is
+what keeps a queued writer waiting rather than erroring. The doc comment says so rather than letting
+the test name imply more than it proves.
+
+**A false positive of my own making, worth recording.** The first version scanned response bodies for
+the substring `"locked"` and flagged every *successful* batch — the success payload carries a
+`locked_skipped` counter. Narrowed to the specific engine messages (`database is locked`,
+`sqlite_busy`). Same class of error as the DML-keyword scanner in Session 51: a substring that
+collides with legitimate content. A check that fires on healthy output gets deleted, not fixed.
+
+### 6. E2E
+
+Section 30, fifteen checks. Worth repeating over HTTP rather than trusting the Rust suites alone
+because canonicalisation there happens on a string that has travelled through JSON, a URL query and
+SeaORM's parameter binding — a mismatch anywhere on that path leaves the unit assertions true and the
+deployed behaviour wrong. The IPv6 half asserts the round trip: submit the expanded form, read back
+the compressed one, re-submit a mixed-case spelling, and get `created == 0, updated == 1`.
+
+### 7. Gates
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **282 passed**, 0 failed (276 before; +2 canonicalisation, +2 batch/retention, +2 saturation/concurrency) |
+| `./scripts/test_e2e.sh` | **531 passed**, 0 failed (516 before; +15 in §30) |
+| `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences |
+| `git diff RBAC_MODEL.md` | empty |

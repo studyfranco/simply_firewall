@@ -6669,3 +6669,249 @@ async fn test_differential_sync_includes_recently_deleted_ips() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+
+/// A batch carrying the same address twice is **refused with `400`**, never a raw database error.
+///
+/// # Why refusal rather than last-wins
+///
+/// `target_address` is UNIQUE, so a batch containing `1.2.3.4` twice — or `1.2.3.4` and
+/// `1.2.3.4/32`, which canonicalise to one string — has no single correct outcome. Three were
+/// available:
+///
+/// | Option | Why not |
+/// | :--- | :--- |
+/// | Let it reach the database | A `500` from a constraint violation, with the whole transaction lost and nothing said about which entry caused it |
+/// | Last-wins | The result depends on **payload order**, so the same set of records syncs differently depending on how the client happened to serialise it |
+/// | Refuse with `400` | Deterministic, names the offending address, and the client's own view is what needs fixing |
+///
+/// The client sending duplicates has an inconsistent picture of its own state — two `cause` values
+/// for one address is not something the vault can reconcile on its behalf. Silently picking one would
+/// hide that.
+///
+/// The assertion that matters most is the *negative* one: no `5xx`. A constraint violation escaping
+/// to the caller would be the vault reporting its own schema as the client's problem.
+#[tokio::test]
+async fn test_batch_payload_internal_duplicates() {
+    let (app, db, key) = batch_fixture().await;
+
+    let post = |records: serde_json::Value, tick: i64| {
+        let (app, key) = (app.clone(), key.clone());
+        async move {
+            let body = json!({ "group_name": "dupe-group", "records": records }).to_string();
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/records/batch")
+                        .header("X-API-Key", &key)
+                        .header("Content-Type", "application/json"),
+                ),
+                tick,
+                &body,
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (status, String::from_utf8(bytes.to_vec()).unwrap())
+        }
+    };
+
+    // Identical spelling, conflicting causes — the shape the brief describes.
+    let (status, body) = post(
+        json!([
+            { "target_address": "203.0.113.90", "cause": "first" },
+            { "target_address": "203.0.113.90", "cause": "second, contradicting the first" },
+        ]),
+        1,
+    )
+    .await;
+
+    assert!(
+        !status.is_server_error(),
+        "an intra-batch duplicate must never surface as a database error — the vault's UNIQUE \
+         constraint is not the caller's problem to interpret (got {status}: {body})"
+    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "it is a malformed request: {body}");
+    assert!(
+        body.contains("203.0.113.90"),
+        "the refusal must name the offending address so the client can fix its own view: {body}"
+    );
+    assert!(body.contains("uplicate"), "and say what was wrong with it: {body}");
+
+    // Different spellings of one address collide the same way, because the check runs *after*
+    // canonicalisation — otherwise the constraint would catch it instead, as a 500.
+    let (status, body) = post(
+        json!([
+            { "target_address": "203.0.113.91", "cause": "plain" },
+            { "target_address": "203.0.113.91/32", "cause": "same host, /32 spelling" },
+        ]),
+        2,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "two spellings of one host are a duplicate too: {body}"
+    );
+
+    // Nothing was written. The refusal happens before the transaction opens, so a rejected batch
+    // leaves the database exactly as it found it — no partial application to reconcile.
+    let stored = simply_ip_vault::entities::ip_record::Entity::find().all(&db).await.unwrap();
+    assert!(
+        stored.is_empty(),
+        "a refused batch must write nothing at all, got {} row(s)",
+        stored.len()
+    );
+
+    // The control: the same batch without the duplicate succeeds, so the refusal was the duplicate
+    // and not something incidental about the payload.
+    let (status, body) = post(
+        json!([
+            { "target_address": "203.0.113.90", "cause": "first" },
+            { "target_address": "203.0.113.92", "cause": "distinct" },
+        ]),
+        3,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "distinct addresses are accepted: {body}");
+}
+
+/// A `since` far older than the retention window succeeds and returns whatever still exists.
+///
+/// # What is actually being checked
+///
+/// `since` is a *filter*, not a cursor into a log, so there is no such thing as a value that is "too
+/// old" for it — a timestamp before every row simply matches every row. The failure mode worth
+/// excluding is the opposite of an error: that a client resuming after a long outage silently gets an
+/// empty page, or a `400`, and concludes the vault is empty.
+///
+/// The retention boundary is where the honest limitation lies, and it is a limitation of the *data*
+/// rather than of the query. `run_retention_worker` purges soft-deleted records after
+/// `IP_RETENTION_DAYS` (92 by default), so a tombstone older than that is gone from the database
+/// entirely. A consumer that has been offline longer than the retention window cannot learn about
+/// those deletions from any `since` value, because the rows no longer exist to be returned — it needs
+/// a full resync, and no header or status code can substitute for that.
+///
+/// This test pins three things: the query succeeds and returns the records that *did* change inside
+/// the window, a record untouched for longer than the cutoff is still excluded (so an old `since` does
+/// not quietly degrade into "return everything"), and a tombstone purged by retention is
+/// unrecoverable by any cutoff.
+#[tokio::test]
+async fn test_sync_since_older_than_retention_period() {
+    let (app, db, key, dir) = perf_fixture().await;
+    let group_id = insert_group_row(&db, "retention-sync").await;
+
+    let long_ago = chrono::Utc::now().naive_utc() - chrono::Duration::days(200);
+    let within_window = chrono::Utc::now().naive_utc() - chrono::Duration::days(50);
+    let recent = chrono::Utc::now().naive_utc() - chrono::Duration::days(1);
+
+    let seed = |address: &'static str, last_seen: chrono::NaiveDateTime, deleted: Option<chrono::NaiveDateTime>| {
+        let db = db.clone();
+        async move {
+            let id = Uuid::new_v4();
+            simply_ip_vault::entities::ip_record::ActiveModel {
+                id: Set(id),
+                target_address: Set(address.to_owned()),
+                cause: Set(None),
+                is_locked: Set(false),
+                created_at: Set(last_seen),
+                updated_at: Set(last_seen),
+                last_seen_at: Set(last_seen),
+                is_deleted: Set(deleted.is_some()),
+                deleted_at: Set(deleted),
+                deleted_by: Set(None),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            simply_ip_vault::entities::ip_record_group_membership::ActiveModel {
+                ip_record_id: Set(id),
+                group_id: Set(group_id),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+    };
+
+    // Live, last seen 50 days ago — inside the 100-day window, so it must be returned.
+    seed("198.51.100.201", within_window, None).await;
+    // A recent tombstone, well inside the 92-day retention window.
+    seed("198.51.100.202", recent, Some(recent)).await;
+    // Live, but untouched for 200 days — *outside* the window and correctly excluded. Seeded so the
+    // test distinguishes "the query works" from "the query returns everything", which an
+    // over-broad filter would also satisfy.
+    seed("198.51.100.203", long_ago, None).await;
+
+    // 100 days back: older than the retention boundary, and a perfectly ordinary filter value.
+    let since = (chrono::Utc::now() - chrono::Duration::days(100)).timestamp();
+    let req = signed_later(
+        inject_connect_info(
+            Request::builder()
+                .uri(format!("/api/ips?since={since}&include_deleted=true&limit=100"))
+                .header("X-API-Key", &key),
+        ),
+        1,
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "a `since` predating the retention window is a valid filter, not an error"
+    );
+    let body = String::from_utf8(
+        axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec(),
+    )
+    .unwrap();
+
+    assert!(
+        body.contains("198.51.100.201"),
+        "a live record changed inside the window is returned, so a client resuming after a long \
+         outage gets data rather than an empty page: {body}"
+    );
+    assert!(
+        body.contains("198.51.100.202"),
+        "and a tombstone inside the retention window is delivered as usual: {body}"
+    );
+    assert!(
+        !body.contains("198.51.100.203"),
+        "a record untouched for longer than the cutoff is still excluded — `since` remains a \
+         differential filter and does not degrade into 'return everything' just because the cutoff \
+         is old: {body}"
+    );
+
+    // The boundary is a property of the data, not of the query: a tombstone purged by retention is
+    // simply absent, and no `since` value can recover it. Asserted by deleting the row the way the
+    // retention worker would and re-running the identical request.
+    simply_ip_vault::entities::ip_record::Entity::delete_many()
+        .filter(simply_ip_vault::entities::ip_record::Column::TargetAddress.eq("198.51.100.202"))
+        .exec(&db)
+        .await
+        .unwrap();
+
+    let req = signed_later(
+        inject_connect_info(
+            Request::builder()
+                .uri(format!("/api/ips?since={since}&include_deleted=true&limit=100"))
+                .header("X-API-Key", &key),
+        ),
+        2,
+        "",
+    );
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "still a successful query");
+    let body = String::from_utf8(
+        axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap().to_vec(),
+    )
+    .unwrap();
+    assert!(
+        !body.contains("198.51.100.202"),
+        "a purged tombstone cannot be returned by any `since` — the consumer needs a full resync, \
+         which is the documented limit of differential sync: {body}"
+    );
+    assert!(body.contains("198.51.100.201"), "the in-window live record is unaffected: {body}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

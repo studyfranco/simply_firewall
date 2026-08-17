@@ -4170,3 +4170,258 @@ async fn requesting_an_unreadable_group_is_indistinguishable_from_requesting_a_n
     );
     assert!(!existing_body.contains("198.51.100.64"), "and it leaks no rows: {existing_body}");
 }
+
+
+// ─────────────────────────────────────────────────────────────
+// Backpressure and concurrency
+// ─────────────────────────────────────────────────────────────
+
+/// **A saturated webhook queue drops events; it never blocks the request that produced one.**
+///
+/// # The failure this exists to prevent
+///
+/// Handlers used to `webhook_tx.send(event).await`. That is harmless while the dispatcher drains as
+/// fast as events arrive — and stopped being harmless when dispatch became throttled. At the default
+/// pace one worker handles two events per second, so a bulk operation fills the queue in well under a
+/// second and every subsequent `send().await` parks the Axum handler until a slot frees. A firewall
+/// API that stops answering because a *notification* queue backed up has its priorities inverted:
+/// the ban is the product, the webhook is a courtesy.
+///
+/// # Why a tiny channel instead of 1 024 real events
+///
+/// The production capacity comes from `WEBHOOK_QUEUE_CAPACITY` through a `OnceLock`, so it is fixed
+/// for the process and cannot be varied per test. Generating 1 024 genuine events would also mean
+/// 1 024 signed HTTP round trips — minutes of runtime to demonstrate a property that is about the
+/// channel, not about volume.
+///
+/// So the state is built with a **deliberately tiny channel whose receiver is dropped immediately**.
+/// That is a strictly harsher condition than saturation: capacity 1 with no consumer at all. If
+/// `enqueue_webhook` can block, it blocks here.
+///
+/// The whole test is wrapped in a timeout, because the failure mode is a *hang* rather than a wrong
+/// answer — and an assertion cannot catch a future that never returns.
+#[tokio::test]
+async fn test_webhook_queue_overflow_non_blocking() {
+    let db = setup_test_db().await;
+
+    // Capacity 1, and the receiver is dropped on the next line: every send after the first faces a
+    // full-or-closed channel.
+    let (webhook_tx, webhook_rx) = tokio::sync::mpsc::channel(1);
+    drop(webhook_rx);
+
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state.clone());
+
+    let master = insert_master_key(&db, "Flood Master").await;
+    let secret = test_signing_secret(&master);
+    let group_id = insert_group(&db, "flood-group").await;
+
+    // Enqueue far past capacity directly. `enqueue_webhook` is the function under test; going
+    // through handlers would measure HTTP overhead instead of the queue's behaviour.
+    let flood = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        for i in 0..2_000 {
+            state.enqueue_webhook(simply_ip_vault::state::WebhookEvent {
+                action: "IP_ADD".to_owned(),
+                address: format!("198.51.100.{}", i % 250),
+                is_whitelist: false,
+                group_id: Some(group_id),
+                cause: None,
+            });
+        }
+    })
+    .await;
+    assert!(
+        flood.is_ok(),
+        "enqueueing 2 000 events into a capacity-1 channel with no consumer must not block — if \
+         this times out, `enqueue_webhook` is awaiting a slot and a bulk operation can stall the API"
+    );
+
+    // And the service still answers. The point is not that one request works in isolation but that
+    // the flood left nothing wedged: the same state, the same process, immediately afterwards.
+    let started = std::time::Instant::now();
+    let req = signed_later(
+        inject_connect_info(
+            Request::builder().uri("/api/ips").header("X-API-Key", &master),
+        ),
+        &secret,
+        1,
+        "",
+    );
+    let res = tokio::time::timeout(std::time::Duration::from_secs(5), app.clone().oneshot(req))
+        .await
+        .expect("the API must answer after a queue flood, not hang")
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "an authenticated read still succeeds");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "and promptly: {:?}",
+        started.elapsed()
+    );
+
+    // A write path, which is what actually enqueues, is equally unaffected.
+    let body = json!({ "target_address": "203.0.113.200", "group_name": "flood-group" }).to_string();
+    let req = signed_later(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/ban")
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        2,
+        &body,
+    );
+    let res = tokio::time::timeout(std::time::Duration::from_secs(5), app.oneshot(req))
+        .await
+        .expect("a write that enqueues a webhook must not block on the queue")
+        .unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "the ban is recorded even though its notification could not be queued — dropping the \
+         courtesy is correct, failing the product is not"
+    );
+
+    // The ban really landed, so the dropped notification cost nothing but the notification.
+    let stored = simply_ip_vault::entities::ip_record::Entity::find()
+        .filter(
+            simply_ip_vault::entities::ip_record::Column::TargetAddress.eq("203.0.113.200"),
+        )
+        .one(&db)
+        .await
+        .unwrap();
+    assert!(stored.is_some(), "the record was written despite the webhook being dropped");
+}
+
+/// Concurrent batch writes all succeed, with no `SQLITE_BUSY`, corruption, or lost rows.
+///
+/// # What this actually demonstrates
+///
+/// Not WAL reader/writer concurrency. `SQLITE_MAX_CONNECTIONS` is **1** — SQLite permits a single
+/// writer, and a DDL sequence spread across connections does not survive — so these transactions do
+/// not race inside SQLite at all: they queue on the pool and execute one at a time. That is the
+/// design, not a limitation being worked around.
+///
+/// What it demonstrates is that the queueing is *correct and bounded*: every task completes, none
+/// returns `SQLITE_BUSY` or a lock error, and the final row count is exactly the union of what the
+/// tasks wrote. A serialisation bug would show up here as a failed request or a missing row, and
+/// `busy_timeout=5000` is what keeps a queued writer waiting rather than erroring.
+///
+/// The tasks write **overlapping** address ranges deliberately. Disjoint sets would exercise only
+/// insertion; the overlap forces the same rows to be contended, which is where a lost update or a
+/// double insert on a UNIQUE column would surface.
+#[tokio::test]
+async fn test_concurrent_batch_writes_under_wal() {
+    use std::sync::Arc;
+
+    const TASKS: usize = 8;
+    const PER_TASK: usize = 60;
+    /// Each task starts 30 addresses into the previous one's range, so half of every batch collides.
+    const STRIDE: usize = 30;
+
+    // File-backed through `db::connect`: the in-memory fixture the rest of this suite uses has no
+    // WAL and no busy_timeout, so it would not exercise the pool this test is about.
+    let dir = std::env::temp_dir().join(format!("vault_conc_{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}", dir.join("v.db").display());
+    let db = simply_ip_vault::db::connect(&url).await.expect("file-backed pool opens");
+    simply_ip_vault::db::run_migrations(&db).await.expect("migrations apply");
+
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = Arc::new(create_app(state.clone()));
+    let master = insert_master_key(&db, "Concurrency Master").await;
+    state.master_pin.pin_at_boot(&db).await.expect("master pins");
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for task in 0..TASKS {
+        let app = app.clone();
+        let master = master.clone();
+        tasks.spawn(async move {
+            let records: Vec<serde_json::Value> = (0..PER_TASK)
+                .map(|i| {
+                    let n = task * STRIDE + i;
+                    json!({
+                        "target_address": format!("198.51.{}.{}", 100 + (n / 250), 1 + (n % 250)),
+                        "cause": format!("task {task}"),
+                    })
+                })
+                .collect();
+            let body = json!({ "group_name": "conc-group", "records": records }).to_string();
+            let req = signed_later(
+                inject_connect_info(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/records/batch")
+                        .header("X-API-Key", &master)
+                        .header("Content-Type", "application/json"),
+                ),
+                &test_signing_secret(&master),
+                // A distinct timestamp per task: identical signed requests inside one second are
+                // replays, which the anti-replay guard would reject for the right reason and make
+                // this test fail for the wrong one.
+                task as i64 + 1,
+                &body,
+            );
+            let res = (*app).clone().oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            (task, status, String::from_utf8(bytes.to_vec()).unwrap())
+        });
+    }
+
+    let mut completed = 0;
+    while let Some(joined) = tasks.join_next().await {
+        let (task, status, body) = joined.expect("no task may panic — a poisoned lock or an \
+                                                 unhandled DB error would surface here");
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "task {task} failed with {status}: {body}\n\
+             SQLITE_BUSY or a lock error here means a queued writer gave up instead of waiting; \
+             busy_timeout is what prevents that"
+        );
+        // Matched against the specific engine messages, not on the bare word "locked" — the success
+        // body carries a `locked_skipped` counter, and a substring check for "locked" flagged every
+        // healthy response. Naming the actual error strings is both narrower and clearer about what
+        // is being excluded.
+        let lowered = body.to_lowercase();
+        for signal in ["database is locked", "sqlite_busy", "database table is locked"] {
+            assert!(
+                !lowered.contains(signal),
+                "task {task} reported {signal:?}: {body}"
+            );
+        }
+        assert!(
+            !body.contains("\"error\""),
+            "task {task} returned an error payload: {body}"
+        );
+        completed += 1;
+    }
+    assert_eq!(completed, TASKS, "every concurrent batch completed");
+
+    // The union of eight overlapping ranges, counted exactly. A lost update would leave this short;
+    // a double insert would have violated the UNIQUE constraint and failed a task above.
+    let expected = (TASKS - 1) * STRIDE + PER_TASK;
+    let stored = simply_ip_vault::entities::ip_record::Entity::find().all(&db).await.unwrap();
+    assert_eq!(
+        stored.len(),
+        expected,
+        "expected the exact union of the overlapping ranges ({expected} rows), found {}",
+        stored.len()
+    );
+    assert!(
+        stored.iter().all(|r| !r.is_deleted && !r.target_address.is_empty()),
+        "every row is intact — no partially written or corrupted record"
+    );
+
+    // The service is still healthy afterwards, so nothing was left holding the pool.
+    let res = (*app).clone()
+        .oneshot(Request::builder().uri("/ready").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "readiness survives concurrent write pressure");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

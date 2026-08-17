@@ -539,7 +539,7 @@ which file owns which property saves adding a test to the wrong one.
 | :--- | :--- |
 | `rbac_model_compliance.rs` | One test per `RBAC_MODEL.md` rule and section (`r1_`–`r7_`, `s3_`–`s7_`). Five are marked `ADVERSARIAL(§N)` and bypass the application layer with raw SQL. `scripts/verify_convergence.sh` fails if a rule loses its test |
 | `security_tests.rs` | Named attacks, each asserting the attack fails. HMAC forgery, replay, proxy spoofing, master promotion, the unauthenticated probes |
-| `schema_integrity_tests.rs` | What the **engine** does — foreign-key cascades, orphan refusal, and everything `m20260811_000010`'s table rebuild had to carry across. File-backed, opened through `db::connect`, because `PRAGMA foreign_keys` is per-connection |
+| `schema_integrity_tests.rs` | What the **engine** does — foreign-key cascades, orphan refusal, address canonicalisation against the UNIQUE constraint, and everything `m20260811_000010`'s table rebuild had to carry across. File-backed, opened through `db::connect`, because `PRAGMA foreign_keys` is per-connection |
 | `rbac_integration_tests.rs` | The features working, end to end through the router |
 | `source_hygiene.rs` | Properties of the source tree: no raw SQL and no hand-written DML in `src/`, outside two startup-only exemptions. Carries a meta-test proving the scanner can see a violation |
 | `frontend_syntax_test.rs` | `static/app.js` parses. Nothing else compiles or executes it |

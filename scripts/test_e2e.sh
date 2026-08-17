@@ -3018,6 +3018,64 @@ check_local "$GOOD_READY" "1" "#29 a well-formed 64-hex INITIAL_MASTER_KEY still
 kill "$GOOD_PID" 2>/dev/null; wait "$GOOD_PID" 2>/dev/null
 
 
+log_section "30. Edge cases: intra-batch duplicates and IPv6 canonicalisation"
+
+# Light CLI cover for two properties the Rust suites pin in depth. Worth repeating here because these
+# run against the **real binary over HTTP**: canonicalisation happens on a string that has travelled
+# through JSON, a URL query and SeaORM's parameter binding, and a mismatch anywhere in that path
+# would leave the unit-level assertions true and the deployed behaviour wrong.
+
+api_call POST "/api/groups" "$MASTER_KEY" \
+    "{\"name\":\"edge-group\",\"group_type\":\"banlist\"}"
+check "200" "#30 create the edge-case group"
+EDGE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# ── Intra-batch duplicates ──────────────────────────────────────────────────
+# Two entries for one address, with conflicting causes. Must be a clean 400 naming the address —
+# never a 500 from the UNIQUE constraint, and never a silent last-wins that depends on payload order.
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"203.0.113.240\",\"cause\":\"first\"},{\"target_address\":\"203.0.113.240\",\"cause\":\"second\"}]}"
+check "400" "#30 an intra-batch duplicate is refused, not surfaced as a database error"
+check_true '.error | test("uplicate")' "#30 the refusal says what was wrong"
+check_true '.error | test("203.0.113.240")' "#30 and names the offending address"
+
+# Different spellings of one host collide the same way, because the check runs after canonicalisation.
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"203.0.113.241\"},{\"target_address\":\"203.0.113.241/32\"}]}"
+check "400" "#30 two spellings of one host are a duplicate after canonicalisation"
+
+# The control: the same shape without the duplicate succeeds, so the refusals above were the
+# duplicate and not something incidental about batch payloads.
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"203.0.113.242\"},{\"target_address\":\"203.0.113.243\"}]}"
+check "200" "#30 a batch of distinct addresses is accepted"
+check_true '.created == 2' "#30 both records were created"
+
+# ── IPv6 canonicalisation over the wire ─────────────────────────────────────
+# Fully expanded, with a redundant /128. Must be stored compressed and without the prefix.
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"2001:0db8:0000:0000:0000:0000:0000:00ff/128\",\"cause\":\"expanded form\"}]}"
+check "200" "#30 an expanded IPv6 address with /128 is accepted"
+check_true '.created == 1' "#30 and stored as a new record"
+
+api_call GET "/api/ips?groups=edge-group&limit=100" "$MASTER_KEY"
+check "200" "#30 list the edge-case group"
+check_true '[.[] | select(.target_address == "2001:db8::ff")] | length == 1' \
+    "#30 the expanded IPv6 form is stored in canonical compressed notation"
+
+# Re-submitting a *different* spelling of the same address must update that one record rather than
+# create a second — the property the UNIQUE index exists to guarantee.
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"edge-group\",\"records\":[{\"target_address\":\"2001:DB8::00FF\",\"cause\":\"mixed case, compressed\"}]}"
+check "200" "#30 a different spelling of the same IPv6 host is accepted"
+check_true '.created == 0 and .updated == 1' \
+    "#30 and matches the existing record instead of creating a duplicate"
+
+api_call GET "/api/ips?groups=edge-group&ip=2001:db8&limit=100" "$MASTER_KEY"
+check_true 'length == 1' "#30 exactly one row exists for the IPv6 host, whatever the spelling"
+check_true '.[0].cause == "mixed case, compressed"' "#30 and the re-submission updated it"
+
+
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2
 

@@ -1098,3 +1098,134 @@ async fn the_delta_sync_columns_are_indexed() {
         );
     }
 }
+
+// ─────────────────────────────────────────────────────────────
+// Address canonicalisation, and the uniqueness constraint behind it
+// ─────────────────────────────────────────────────────────────
+//
+// `ip_records.target_address` is UNIQUE, so canonicalisation is what decides whether two spellings
+// are one ban or two. That makes `normalize_ip_or_cidr` a *schema* concern as much as a formatting
+// one, which is why these live here rather than beside the handlers.
+
+/// Every spelling of one IPv6 host canonicalises to the same string, and the database enforces it.
+///
+/// IPv6 has more redundant spellings than any other address family — leading zeros, `::` compression,
+/// an explicit `/128` — and a service that stored them separately would let the same host be banned
+/// four times, unbanned once, and remain blocked. The canonical form is what makes the UNIQUE index
+/// meaningful rather than decorative.
+///
+/// Asserted twice over: first that the function agrees, then that a **second insert really collides**.
+/// The first alone would pass if the column had silently lost its constraint.
+#[tokio::test]
+async fn every_spelling_of_one_ipv6_host_is_one_record() {
+    use simply_ip_vault::api::normalize_ip_or_cidr;
+
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    let spellings = [
+        "2001:db8::1/128",
+        "2001:0db8:0000:0000:0000:0000:0000:0001/128",
+        "2001:0db8:0000:0000:0000:0000:0000:0001",
+        "2001:db8::1",
+        // Mixed case is the same address; IPv6 literals are case-insensitive.
+        "2001:DB8::1",
+    ];
+
+    let canonical = normalize_ip_or_cidr(spellings[0]);
+    assert_eq!(canonical, "2001:db8::1", "the canonical form drops /128 and compresses");
+    for spelling in spellings {
+        assert_eq!(
+            normalize_ip_or_cidr(spelling),
+            canonical,
+            "{spelling} must canonicalise to {canonical}"
+        );
+    }
+
+    // Now the half that matters: the engine refuses the duplicate, so even a writer that skipped the
+    // helper cannot produce two rows for one host.
+    let group = seed_group(&db, "v6", None).await;
+    seed_record_in_group(&db, &canonical, group).await;
+
+    let collision = ip_record::Entity::insert(ip_record::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        target_address: Set(canonical.clone()),
+        cause: Set(None),
+        is_locked: Set(false),
+        created_at: Set(Utc::now().naive_utc()),
+        updated_at: Set(Utc::now().naive_utc()),
+        last_seen_at: Set(Utc::now().naive_utc()),
+        is_deleted: Set(false),
+        deleted_at: Set(None),
+        deleted_by: Set(None),
+    })
+    .exec(&db)
+    .await;
+    assert!(
+        collision.is_err(),
+        "target_address is UNIQUE — a second row for the same canonical host must be refused"
+    );
+}
+
+/// **A CIDR keeps the host bits it was written with. It is NOT masked to the network base.**
+///
+/// This pins current behaviour, and it is *not* what a reader might assume. `192.168.1.50/24` stays
+/// `192.168.1.50/24`; it does not become `192.168.1.0/24`, and the two are therefore **separate rows
+/// with separate lifecycles**. Banning one does not ban the other, and deleting one leaves the other
+/// enforced.
+///
+/// `normalize_ip_or_cidr` only strips a redundant `/32` or `/128` — the prefix lengths that describe a
+/// single host and add nothing — and leaves every genuine subnet exactly as given, because
+/// `IpNetwork::ip()` returns the address as parsed rather than masked.
+///
+/// # Whether that is right is an open question, deliberately left open here
+///
+/// There is a real argument that two spellings of one network should be one record, exactly as two
+/// spellings of one host are. Changing it is not a formatting tweak: `target_address` is the UNIQUE
+/// key and the value stored on every existing row, so masking on write would orphan every row already
+/// persisted in non-masked form — reachable by neither the old spelling nor the new. That needs a data
+/// migration, not a one-line edit, and it is out of scope for a test-hardening pass.
+///
+/// So this test documents the semantics rather than endorsing them. If the behaviour is changed, this
+/// test should fail loudly and be rewritten — which is the point of pinning it.
+#[tokio::test]
+async fn a_cidr_keeps_its_host_bits_and_is_not_masked_to_the_network_base() {
+    use simply_ip_vault::api::normalize_ip_or_cidr;
+
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    assert_eq!(
+        normalize_ip_or_cidr("192.168.1.50/24"),
+        "192.168.1.50/24",
+        "host bits inside a genuine subnet survive canonicalisation"
+    );
+    assert_ne!(
+        normalize_ip_or_cidr("192.168.1.50/24"),
+        normalize_ip_or_cidr("192.168.1.0/24"),
+        "the two spellings are therefore distinct records — see this test's doc comment"
+    );
+
+    // Only the single-host prefixes are stripped, which is the whole of what the helper normalises.
+    assert_eq!(normalize_ip_or_cidr("10.0.0.5/32"), "10.0.0.5");
+    assert_eq!(normalize_ip_or_cidr("2001:db8::1/128"), "2001:db8::1");
+    assert_eq!(normalize_ip_or_cidr("10.0.0.0/8"), "10.0.0.0/8", "a real subnet is untouched");
+
+    // And the database agrees: both spellings coexist, because they are different strings.
+    let group = seed_group(&db, "cidr", None).await;
+    seed_record_in_group(&db, &normalize_ip_or_cidr("192.168.1.50/24"), group).await;
+    seed_record_in_group(&db, &normalize_ip_or_cidr("192.168.1.0/24"), group).await;
+
+    let stored = ip_record::Entity::find().all(&db).await.unwrap().len();
+    assert_eq!(
+        stored, 2,
+        "two spellings of one network are two rows today — the constraint cannot merge what \
+         canonicalisation did not"
+    );
+
+    // Unparseable input is returned verbatim rather than rejected: the helper normalises, it does not
+    // validate. Callers that must reject malformed input parse it themselves — see
+    // `guard_bannable_address` and the batch endpoint, which both do.
+    assert_eq!(normalize_ip_or_cidr("not-an-address"), "not-an-address");
+    assert_eq!(normalize_ip_or_cidr(""), "");
+}
