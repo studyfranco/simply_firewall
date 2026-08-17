@@ -59,28 +59,52 @@ pub fn hash_key(key: &str) -> String {
 // Address normalization
 // ─────────────────────────────────────────────────────────────
 
-/// Canonicalizes an IP address or CIDR string so the same address always has exactly one
-/// string representation, regardless of how the caller wrote it. An IPv4 `/32` or IPv6 `/128` —
-/// a "network" of exactly one host — is stripped down to the plain host address: without this,
-/// `188.190.74.128/32` and `188.190.74.128` would be stored/matched as two different
-/// `ip_records.target_address` values despite meaning the same thing. Genuine subnets (`/24`,
-/// `/64`, ...) keep their CIDR notation exactly as given — `IpNetwork::ip()` returns the address
-/// as parsed, not masked to the network base, so a non-aligned host-within-a-subnet like
-/// `188.190.74.130/24` round-trips unchanged rather than becoming `188.190.74.0/24`.
+/// Canonicalizes an IP address or CIDR string so the same target always has exactly one string
+/// representation, regardless of how the caller wrote it.
 ///
-/// Infallible by design: input that doesn't parse as a valid IP/CIDR at all is returned
-/// unchanged. This function's job is normalization, not validation — callers that need to reject
-/// malformed input (e.g. `handle_ip_upsert`) already parse and validate it themselves; callers
-/// that use this for a best-effort match (e.g. `list_ips`'s substring filter, `delete_ip`'s
-/// lookup) need a plain fragment like `"74.128"` to keep working exactly as before.
+/// `ip_records.target_address` is UNIQUE, so this function is what decides whether two spellings are
+/// one rule or two. That makes it a schema concern as much as a formatting one.
+///
+/// Two normalisations, and they pull in opposite directions on purpose:
+///
+/// | Input | Output | Why |
+/// | :--- | :--- | :--- |
+/// | `1.2.3.4/32`, `2001:db8::1/128` | `1.2.3.4`, `2001:db8::1` | A prefix covering exactly one host says nothing the address does not. Dropping it stops `X/32` and `X` being two rows for one host |
+/// | `192.168.1.50/24` | `192.168.1.0/24` | **Host bits are masked off.** `…50/24` and `…100/24` name the *same network*, and a network rule is about the network |
+/// | `2001:db8::fe/64` | `2001:db8::/64` | Same rule, v6 |
+/// | `192.168.1.130/25` | `192.168.1.128/25` | Masking is by prefix length, not by octet boundary |
+///
+/// # Why host bits are masked
+///
+/// A subnet ban is a statement about a range. Two clients writing `10.0.0.5/8` and `10.9.9.9/8` mean
+/// the identical rule, and storing them separately produced two rows with independent lifecycles:
+/// banning through one and unbanning through the other left the range still blocked, with nothing in
+/// the API to show why. Masking makes the UNIQUE constraint do the deduplication instead of leaving
+/// it to whoever typed the address.
+///
+/// This **changed** in Session 55. Host bits were previously preserved, and the reasoning recorded at
+/// the time — that `IpNetwork::ip()` returns the address as parsed, so a rule stayed exactly as
+/// written — described the mechanism rather than defending the outcome. Existing rows written in
+/// non-masked form are not rewritten by this change; migrating them is an administrative step.
+///
+/// # Infallible by design
+///
+/// Input that does not parse as an address or CIDR is returned unchanged. This function normalises,
+/// it does not validate — callers that must reject malformed input parse it themselves (see
+/// [`super::records::guard_bannable_address`] and the batch endpoint, which both do), and callers
+/// using it for a best-effort match need a bare fragment like `"74.128"` to pass through untouched.
 pub fn normalize_ip_or_cidr(input: &str) -> String {
     match input.parse::<IpNetwork>() {
         Ok(net) => {
-            let is_single_host = (net.is_ipv4() && net.prefix() == 32) || (net.is_ipv6() && net.prefix() == 128);
+            let is_single_host =
+                (net.is_ipv4() && net.prefix() == 32) || (net.is_ipv6() && net.prefix() == 128);
             if is_single_host {
+                // `network()` would return the same value here, but `ip()` says what is meant: a
+                // single host, with the redundant prefix dropped.
                 net.ip().to_string()
             } else {
-                net.to_string()
+                // `network()` applies the prefix mask, including for non-byte-aligned lengths.
+                format!("{}/{}", net.network(), net.prefix())
             }
         }
         Err(_) => input.to_owned(),

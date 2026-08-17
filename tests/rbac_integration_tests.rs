@@ -1553,10 +1553,13 @@ async fn test_cidr_and_ipv6_boundary_validation() {
     assert_eq!(res.status(), StatusCode::OK);
 }
 
-/// `normalize_ip_or_cidr` must strip a single-host CIDR suffix (`/32` for IPv4, `/128` for IPv6)
-/// down to the plain address, leave genuine subnets — including their original, possibly
-/// non-network-aligned host bits — untouched, and pass unparseable input through unchanged rather
-/// than erroring: it's a normalization helper, not a validator.
+/// `normalize_ip_or_cidr` strips a single-host CIDR suffix (`/32`, `/128`) down to the plain
+/// address, **masks host bits off a genuine subnet**, and passes unparseable input through unchanged
+/// rather than erroring: it is a normalization helper, not a validator.
+///
+/// The masking half changed in Session 55. This test previously asserted that
+/// `188.190.74.130/24` survived verbatim; it now canonicalises to `188.190.74.0/24`, so that two
+/// clients naming the same network with different host bits address one record rather than two.
 #[tokio::test]
 async fn test_normalize_ip_or_cidr_strips_single_host_prefixes_only() {
     use simply_ip_vault::api::normalize_ip_or_cidr;
@@ -1566,11 +1569,14 @@ async fn test_normalize_ip_or_cidr_strips_single_host_prefixes_only() {
     assert_eq!(normalize_ip_or_cidr("::1/128"), "::1");
     assert_eq!(normalize_ip_or_cidr("2001:db8::1"), "2001:db8::1");
 
-    // Genuine subnets keep their CIDR notation, including non-network-aligned host bits (not
-    // masked down to the network address).
-    assert_eq!(normalize_ip_or_cidr("10.0.0.0/24"), "10.0.0.0/24");
-    assert_eq!(normalize_ip_or_cidr("188.190.74.130/24"), "188.190.74.130/24");
+    // Genuine subnets keep their prefix and are masked down to the network address.
+    assert_eq!(normalize_ip_or_cidr("10.0.0.0/24"), "10.0.0.0/24", "already canonical");
+    assert_eq!(normalize_ip_or_cidr("188.190.74.130/24"), "188.190.74.0/24", "host bits masked");
     assert_eq!(normalize_ip_or_cidr("2001:db8::/64"), "2001:db8::/64");
+    assert_eq!(normalize_ip_or_cidr("2001:db8::fe/64"), "2001:db8::/64", "v6 host bits masked");
+    // Masking follows the prefix length, not the octet boundary.
+    assert_eq!(normalize_ip_or_cidr("192.168.1.130/25"), "192.168.1.128/25");
+    assert_eq!(normalize_ip_or_cidr("192.168.1.126/25"), "192.168.1.0/25");
 
     // Unparseable input (garbage, or a genuine partial substring fragment as used by the
     // /api/ips filter) passes through unchanged rather than being rejected.

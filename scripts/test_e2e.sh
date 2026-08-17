@@ -1313,7 +1313,7 @@ log "A genuine subnet (not a single-host CIDR) must keep its CIDR notation uncha
 api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.0/24","group_name":"canon-e2e-group","cause":"real subnet"}'
 check "200" "ban a /24 subnet"
 api_call GET "/api/ips?groups=canon-e2e-group" "$MASTER_KEY"
-check_jq ".[0].target_address" "203.0.113.0/24" "a /24 is stored with its CIDR notation intact, not stripped like /32"
+check_jq ".[0].target_address" "203.0.113.0/24" "a /24 keeps its CIDR notation (already the network address; host bits would be masked)"
 
 # ── 19. Latest-activity-first ordering & lightweight iplist format ──────────
 
@@ -3051,6 +3051,56 @@ api_call POST "/api/records/batch" "$MASTER_KEY" \
 check "200" "#30 a batch of distinct addresses is accepted"
 check_true '.created == 2' "#30 both records were created"
 
+# ── CIDR host-bit masking over the wire ─────────────────────────────────────
+# A subnet submitted with host bits set must be stored as the network address. Checked over HTTP
+# because canonicalisation runs on a string that has crossed JSON, a URL query and SeaORM's parameter
+# binding — a mismatch anywhere on that path leaves the Rust assertions true and the deployment wrong.
+#
+# Its own group and a range no other section touches. `target_address` is globally UNIQUE, so a
+# record created by an earlier section is the *same row* here — an earlier draft of this block reused
+# 203.0.113.0/24, which §16 already bans, and the `.created == 1` assertion failed because the batch
+# correctly reported `updated` instead. The isolation is what makes "created" mean what it says.
+api_call POST "/api/groups" "$MASTER_KEY" \
+    "{\"name\":\"cidr-group\",\"group_type\":\"banlist\"}"
+check "200" "#30 create the CIDR-canonicalisation group"
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"cidr-group\",\"records\":[{\"target_address\":\"93.184.216.50/24\",\"cause\":\"host bits set\"}]}"
+check "200" "#30 a CIDR with host bits set is accepted"
+check_true '.created == 1' "#30 and stored as a new record"
+
+api_call GET "/api/ips?groups=cidr-group&limit=100" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "93.184.216.0/24")] | length == 1' \
+    "#30 the CIDR is stored masked to its network address"
+check_true '[.[] | select(.target_address == "93.184.216.50/24")] | length == 0' \
+    "#30 and the as-typed form is not stored"
+
+# A different host inside the same /24 must update that one record, not create a second.
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"cidr-group\",\"records\":[{\"target_address\":\"93.184.216.200/24\",\"cause\":\"different host bits\"}]}"
+check "200" "#30 a different host inside the same network is accepted"
+check_true '.created == 0 and .updated == 1' \
+    "#30 and deduplicates onto the existing network record"
+
+api_call GET "/api/ips?groups=cidr-group&ip=93.184.216.0&limit=100" "$MASTER_KEY"
+check_true 'length == 1' "#30 exactly one row exists for the /24, whatever host bits were typed"
+check_true '.[0].cause == "different host bits"' "#30 and the second write updated it"
+
+# A single host keeps its exact address — masking applies to networks, not to /32.
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"cidr-group\",\"records\":[{\"target_address\":\"93.184.216.77/32\"}]}"
+check "200" "#30 a /32 single host is accepted"
+api_call GET "/api/ips?groups=cidr-group&ip=93.184.216.77&limit=100" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "93.184.216.77")] | length == 1' \
+    "#30 a /32 is stored as the bare host address, never masked"
+
+# IPv6 subnets follow the same rule.
+api_call POST "/api/records/batch" "$MASTER_KEY" \
+    "{\"group_name\":\"cidr-group\",\"records\":[{\"target_address\":\"2001:db8:beef::fe/64\"}]}"
+check "200" "#30 an IPv6 CIDR with host bits set is accepted"
+api_call GET "/api/ips?groups=cidr-group&ip=2001:db8:beef&limit=100" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "2001:db8:beef::/64")] | length == 1' \
+    "#30 the IPv6 CIDR is stored masked to its network address"
+
 # ── IPv6 canonicalisation over the wire ─────────────────────────────────────
 # Fully expanded, with a redundant /128. Must be stored compressed and without the prefix.
 api_call POST "/api/records/batch" "$MASTER_KEY" \
@@ -3071,7 +3121,10 @@ check "200" "#30 a different spelling of the same IPv6 host is accepted"
 check_true '.created == 0 and .updated == 1' \
     "#30 and matches the existing record instead of creating a duplicate"
 
-api_call GET "/api/ips?groups=edge-group&ip=2001:db8&limit=100" "$MASTER_KEY"
+# Filtered on the full canonical address, not the `2001:db8` prefix. The looser form worked only
+# while this was the sole documentation-prefix record in the group; it is a substring match, so any
+# later 2001:db8 address would join the result and this assertion would fail for an unrelated reason.
+api_call GET "/api/ips?groups=edge-group&ip=2001:db8::ff&limit=100" "$MASTER_KEY"
 check_true 'length == 1' "#30 exactly one row exists for the IPv6 host, whatever the spelling"
 check_true '.[0].cause == "mixed case, compressed"' "#30 and the re-submission updated it"
 

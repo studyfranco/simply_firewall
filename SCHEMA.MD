@@ -326,8 +326,13 @@ To ensure optimal query performance under high load, the following indexes are m
 4. `ip_records.target_address`: Indexed for fast IP checking / duplicates.
 5. `ip_records.last_seen_at`: Indexed for temporal filtering (`max_age` / `since` queries).
 5c. `ip_records.target_address`: `UNIQUE`, so one address is exactly one row shared by every group
-    that references it. `POST /api/records/batch` canonicalises before matching, and refuses a batch
-    containing two spellings of one address rather than letting payload order decide the winner.
+    that references it. Values are **canonicalised before they reach the column** by
+    `api::normalize_ip_or_cidr`: a single-host prefix is dropped (`1.2.3.4/32` → `1.2.3.4`) and a
+    subnet is **masked to its network address** (`192.168.1.50/24` → `192.168.1.0/24`,
+    `2001:db8::fe/64` → `2001:db8::/64`). Two spellings of one network are therefore one row, and the
+    UNIQUE constraint does the deduplication rather than leaving it to whoever typed the address.
+    `POST /api/records/batch` canonicalises before matching and refuses a batch containing two
+    spellings of one target rather than letting payload order decide the winner.
 
 5b. `ip_records.updated_at`, `.deleted_at`, `.is_deleted`: Indexed for **delta replication** — the
     companion exporter and sync worker poll "what changed since T" on a schedule, and an unindexed

@@ -1489,6 +1489,11 @@ non-aligned host-within-a-subnet like `188.190.74.130/24` round-trip unchanged i
 silently becoming `188.190.74.0/24`, which the task's "subnets retain their CIDR notation"
 requirement depends on.
 
+> **Superseded in Session 55.** This behaviour was deliberately reversed: host bits are now masked,
+> so `188.190.74.130/24` canonicalises to `188.190.74.0/24` via `IpNetwork::network()`. The reasoning
+> above described the *mechanism* accurately and is left in place as the record of why the original
+> choice was made; see Session 55 for why it no longer holds.
+
 Applied at all three places that actually needed it:
 - `handle_ip_upsert` (`/api/ban`, `/api/white`): computed once as `normalized_address` right
   after the existing parse/validation, then used for the DB lookup, the stored `target_address`,
@@ -7502,3 +7507,83 @@ the compressed one, re-submit a mixed-case spelling, and get `created == 0, upda
 | `./scripts/test_e2e.sh` | **531 passed**, 0 failed (516 before; +15 in §30) |
 | `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences |
 | `git diff RBAC_MODEL.md` | empty |
+
+---
+
+## Session 55 — CIDR host bits are now masked at ingestion
+
+Reverses the decision recorded in Session 15 and re-examined in Session 54. The owner made the call;
+the data migration for existing rows is handled separately by the administrator.
+
+### The change
+
+`api::normalize_ip_or_cidr` masks host bits off any genuine subnet:
+
+| Input | Before | Now |
+| :--- | :--- | :--- |
+| `192.168.1.50/24` | `192.168.1.50/24` | **`192.168.1.0/24`** |
+| `2001:db8::fe/64` | `2001:db8::fe/64` | **`2001:db8::/64`** |
+| `192.168.1.130/25` | `192.168.1.130/25` | **`192.168.1.128/25`** |
+| `1.2.3.4/32`, `1.2.3.4` | `1.2.3.4` | `1.2.3.4` *(unchanged)* |
+
+Implemented as `format!("{}/{}", net.network(), net.prefix())`. `IpNetwork::network()` masks by prefix
+length rather than octet boundary — verified against `/25` before relying on it, since an
+implementation that zeroed trailing octets would pass every `/24` test and fail `/25` silently.
+
+**One function, so every path inherits it.** `handle_ip_upsert`, `batch_records`, `list_ips`'s filter
+and `delete_ip` all already routed through `normalize_ip_or_cidr`; no call site changed. That is the
+payoff of the Session 42 consolidation — the alternative would have been four edits and a fifth path
+someone forgets.
+
+The rationale from Session 15 is left in place in this log with a pointer forward. It described the
+*mechanism* accurately (`IpNetwork::ip()` returns the address as parsed) and was never wrong about
+that; what changed is the judgement about the outcome.
+
+### Tests
+
+Three new, in `tests/schema_integrity_tests.rs`, replacing
+`a_cidr_keeps_its_host_bits_and_is_not_masked_to_the_network_base` — which **failed exactly as its own
+doc comment predicted it would when the behaviour changed.** That is what pinning behaviour is for.
+
+| Test | Pins |
+| :--- | :--- |
+| `test_cidr_host_bit_normalization` | The saved `target_address` is the network address; `/25` masks by prefix, not octet; `/32` and bare hosts untouched |
+| `test_cidr_deduplication_different_host_bits` | `…50/24`, `…100/24` and `…255/24` resolve to one row; a second insert collides at the engine; lookup by any spelling finds it |
+| `test_ipv6_cidr_host_bit_normalization` | v6 masking over 128 bits and compressed notation, including `/56` and `/60` — an implementation special-casing v4 octets would pass the first two and fail here |
+
+Two existing assertions were updated rather than deleted: the unit test in
+`rbac_integration_tests.rs` and an e2e comment, both of which stated host-bit retention as the
+expected behaviour.
+
+### Two e2e failures, both my own test bugs rather than product bugs
+
+**`.created == 1` failed** because my block reused `203.0.113.0/24`, which §16 already bans. Since
+`target_address` is globally UNIQUE, that is the *same row* — the batch correctly answered
+`created: 0, updated: 1`. Moved the block to its own group and a range no other section touches. The
+failure was the assertion assuming a fresh record in a shared database, and it is worth recording
+because masking makes such collisions *more* likely: two sections that previously wrote distinct
+subnets can now write the same one.
+
+**`length == 1` failed** on a filter of `ip=2001:db8` — a substring match that worked only while that
+was the sole documentation-prefix record in the group. My new `2001:db8:beef::/64` joined the result.
+Tightened to the full canonical address. The check was over-loose before I touched it; adding a
+second record only exposed it.
+
+### Gates
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | clean |
+| `cargo clippy --all-targets -- -D warnings` | clean |
+| `cargo test` | **284 passed**, 0 failed (282 before) |
+| `./scripts/test_e2e.sh` | **544 passed**, 0 failed (531 before; +13 in §30) |
+| `./scripts/verify_convergence.sh` | exit 0 — 63 matching, 0 divergences |
+| `git diff RBAC_MODEL.md` | empty |
+
+### For the administrator
+
+Existing rows are **not** rewritten. A row stored as `192.168.1.50/24` is now unreachable through the
+API: every lookup canonicalises to `192.168.1.0/24` and will not match it. Migrating means rewriting
+`target_address` to the masked form and merging any rows that collide once masked — including their
+group memberships — which is why it is a deliberate administrative step rather than a migration
+shipped here.

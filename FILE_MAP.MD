@@ -309,6 +309,11 @@ credential primitives.
 family (`get_or_create_group`, `resolve_group_ref`, `resolve_group_by_identifier`,
 `resolve_group_ref_flexible`), `IP_EVENT_ACTIONS`, `ReassignOwnerPayload`.
 
+**`normalize_ip_or_cidr` is a schema concern, not a formatting one.** `target_address` is UNIQUE, so
+this function decides whether two spellings are one rule or two: it drops a redundant `/32`/`/128` and
+**masks host bits off a genuine subnet** (`192.168.1.50/24` → `192.168.1.0/24`). Changed in Session 55;
+rows written before that keep their as-typed form until an administrator migrates them.
+
 **Must not hold** anything that makes an authorization decision. That is the boundary against
 `guards.rs`, and it is testable rather than stylistic: nothing here inspects *who* is calling or
 returns a refusal that depends on the caller. A helper that starts deciding belongs in `guards.rs`.
