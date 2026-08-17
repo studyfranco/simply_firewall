@@ -547,6 +547,7 @@ which file owns which property saves adding a test to the wrong one.
 | `schema_integrity_tests.rs` | What the **engine** does — foreign-key cascades, orphan refusal, address canonicalisation against the UNIQUE constraint, and everything `m20260811_000010`'s table rebuild had to carry across. File-backed, opened through `db::connect`, because `PRAGMA foreign_keys` is per-connection |
 | `rbac_integration_tests.rs` | The features working, end to end through the router |
 | `source_hygiene.rs` | Properties of the source tree: no raw SQL and no hand-written DML in `src/`, outside two startup-only exemptions. Carries a meta-test proving the scanner can see a violation |
+| `concurrency_and_contracts.rs` | Races and interface contracts. Replay-ledger atomicity under real thread contention, concurrent-delete idempotency, and a map of the response shape returned for every kind of malformed input — including the two extractors that fall outside the `{"error": …}` envelope. Name shared with the peer's suite of the same purpose |
 | `frontend_syntax_test.rs` | `static/app.js` parses. Nothing else compiles or executes it |
 
 **`source_hygiene.rs` deliberately duplicates `verify_convergence.sh::check_no_raw_sql`**, and the two

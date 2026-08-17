@@ -7587,3 +7587,106 @@ API: every lookup canonicalises to `192.168.1.0/24` and will not match it. Migra
 `target_address` to the masked form and merging any rows that collide once masked — including their
 group memberships — which is why it is a deliberate administrative step rather than a migration
 shipped here.
+
+---
+
+## Session 56 — Reference audit of `example/`, and a test that passed for the wrong reason
+
+### 1. What was audited
+
+`example/` holds one project, `simply_hook_executor`, pulled to `1113333` before reading (the pull
+brought a **new** `tests/concurrency_and_contracts.rs` that did not exist at the last audit).
+
+| Peer artefact | Lines | Verdict |
+| :--- | ---: | :--- |
+| `tests/concurrency_and_contracts.rs` | 360 | **Adopted** — three patterns, see below |
+| `tests/common/mod.rs` | 796 | **Recommended, not applied** — see §4 |
+| `scripts/test_e2e.sh` helpers | — | **Adopted** `pick_port`/`port_in_use`, `check_not_contains` |
+| `tests/source_hygiene.rs`, `referential_integrity.rs`, `health_probes.rs`, `rbac_model_compliance.rs` | — | Already mirrored here |
+| `benches/` | — | Does not exist on either side |
+| Signal handling | — | **No gap**: both already `trap cleanup EXIT INT TERM` |
+
+### 2. The finding that mattered: a test that could not fail
+
+The peer's `two_concurrent_identical_signed_requests_only_one_succeeds` looked like a clean import,
+and the property is real — our `ReplayGuard::check_and_record` holds one mutex across the lookup and
+the insert, and nothing verified it.
+
+Ported it, watched it pass, then **planted a check-then-insert window in the guard to confirm it would
+catch the regression it claimed to guard. It did not.** Three attempts:
+
+| Attempt | Result | Why |
+| :--- | :--- | :--- |
+| `#[tokio::test]`, plant with `yield_now()` | passed | Current-thread runtime: the two tasks never ran in parallel |
+| `flavor = "multi_thread"`, 50 ms sleep in the window | passed | `auth_middleware` takes a database connection *before* the replay guard, and `SQLITE_MAX_CONNECTIONS` is **1** — the requests serialise on the pool and never contend for the ledger |
+| Direct test on `ReplayGuard`, 16 threads on a barrier | **FAILED as intended** — "2 were accepted" | No HTTP layer, so no pool to serialise on |
+
+So the HTTP-level test cannot prove atomicity **in this deployment**, and its doc comment now says so
+instead of claiming otherwise. The property is asserted where it can actually fail, in
+`the_replay_ledger_admits_one_winner_under_real_thread_contention`.
+
+Two things worth carrying forward. First, the same failure mode this codebase keeps meeting: a test
+that passes for a reason unrelated to what it asserts. It would have shipped reading as a strong
+guarantee. Second — **the SQLite deployment gets part of its replay safety from the connection pool**,
+which is not where anyone would look for it, and a move to PostgreSQL with a real pool removes that
+accidental serialisation. The direct test is what would still be watching.
+
+My first two *plants* were also wrong — the first re-checked under the second lock, so it was not a
+TOCTOU at all. A plant that does not reproduce the defect proves nothing about the test.
+
+### 3. Adopted
+
+**`tests/concurrency_and_contracts.rs`** (new, name shared with the peer):
+
+| Test | Property |
+| :--- | :--- |
+| `two_concurrent_identical_signed_requests_only_one_succeeds` | End-to-end: one `200`, one `401`. Documents that it cannot prove atomicity, and why |
+| `the_replay_ledger_admits_one_winner_under_real_thread_contention` | 16 threads, one barrier, 25 rounds. **Verified against a planted TOCTOU** |
+| `the_replay_ledger_scopes_its_refusal_to_one_key_and_digest` | The companion: a guard refusing *everything* would satisfy "exactly one winner" while breaking the service |
+| `two_concurrent_deletes_of_the_same_record_are_idempotent` | Adapted, not copied — our contract differs. Both succeeding is *correct* here; what is excluded is a torn row (deleted without a timestamp, duplicated) |
+| `malformed_input_is_refused_on_every_extractor` | See §5 |
+
+**E2E harness:** `pick_port`/`port_in_use` replace a hard failure with automatic selection from
+3000–3100, honouring an explicit `PORT` and treating a conflict on *that* as fatal. Verified by
+holding 3000 with a listener: the suite moved to 3001 and all 544 checks passed. This is a direct fix
+for a collision that previously stopped the suite running at all while a peer instance held 3000.
+`check_not_contains` came with an empty-needle guard, which is the detail worth having — `""` is a
+substring of everything, so an empty needle would report PASS forever.
+
+### 4. Recommended, not applied
+
+The peer's `tests/common/mod.rs` (796 lines) gives its suites one shared harness. Ours duplicate
+`setup_test_db`, `insert_key`, `signed_at` and friends across six files. The peer's arrangement is
+cleaner in the abstract, and the duplication here is deliberate — `security_tests.rs` says so in its
+header: a refactor of one suite's fixtures can never silently weaken another's. Consolidating is
+mechanical churn across 289 passing tests for no behavioural gain, so it is recorded rather than done.
+
+### 5. A contract gap this surfaced
+
+Mapping the response for every kind of malformed input showed **two extractors outside the
+`{"error": …}` envelope** that `error.rs` and `FILE_MAP.MD` describe as universal:
+
+| Request | Status | Body |
+| :--- | :--- | :--- |
+| `DELETE /api/ips/not-a-uuid` | `400` | `Invalid URL: Cannot parse …` — **plain text** |
+| `GET /api/ips?limit=abc` | `400` | `Failed to deserialize query string …` — **plain text** |
+| `GET /api/ips?since=<out of range>` | `400` | `{"error": "..."}` — JSON |
+| malformed JSON body | `400` | `{"error": "..."}` — JSON |
+
+Axum emits `Path` and `Query` rejections itself, before any handler runs. A client doing
+`response.json().error` gets `null` for the first two and a message for the last two, at the same
+status — decided by whether the value failed to *parse* or failed to *validate*. Closing it means
+custom rejections at every `Path`/`Query` call site, which changes handler signatures rather than
+tests. Pinned with assertions that say "PINNED GAP … invert when closed", so a future fix has a test
+to flip rather than a surprise to discover.
+
+### 6. Metrics
+
+| Gate | Before | After |
+| :--- | ---: | ---: |
+| `cargo test` | 284 | **289** |
+| `./scripts/test_e2e.sh` | 544 | **544** (harness change, no new checks) |
+| `./scripts/verify_convergence.sh` | exit 0 | exit 0 — 63 matching, 0 divergences |
+| Test files | 7 | 8 |
+
+`cargo check` clean, `clippy -D warnings` clean, `git diff RBAC_MODEL.md` empty.

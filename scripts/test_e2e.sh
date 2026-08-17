@@ -47,8 +47,49 @@ BASE_URL="${BASE_URL:-http://127.0.0.1:3000}"
 # the plumbing was missing: overriding BASE_URL pointed curl at a new port while the server stayed on
 # 3000. Deriving it once here makes `BASE_URL=http://127.0.0.1:3300 ./scripts/test_e2e.sh` work, which
 # is what lets this suite run beside a `simply_hook_executor` already holding 3000.
-VAULT_PORT="$(printf '%s' "$BASE_URL" | sed -n 's|.*:\([0-9]\{1,5\}\)$|\1|p')"
-VAULT_PORT="${VAULT_PORT:-3000}"
+#
+# Adopted from `simply_hook_executor` in the Session 56 reference audit: the port is now *chosen*
+# rather than assumed. An explicitly requested one is honoured and a conflict on it is fatal —
+# silently moving would defeat the point of pinning it — while the default walks up from 3000 to the
+# first free port. That is a direct fix for a real collision: this suite could not run at all while a
+# `simply_hook_executor` instance held 3000, and the previous behaviour was to abort with advice to
+# stop it.
+REQUESTED_PORT=""
+if [ -n "${BASE_URL_EXPLICIT:-}" ] || [ -n "${PORT:-}" ]; then
+    REQUESTED_PORT="${PORT:-$(printf '%s' "$BASE_URL" | sed -n 's|.*:\([0-9]\{1,5\}\)$|\1|p')}"
+elif [ -n "${BASE_URL+x}" ] && [ "$BASE_URL" != "http://127.0.0.1:3000" ]; then
+    REQUESTED_PORT="$(printf '%s' "$BASE_URL" | sed -n 's|.*:\([0-9]\{1,5\}\)$|\1|p')"
+fi
+
+# True when something is listening. The subshell's exit status is the connect result, and the
+# descriptor it opens dies with it, so nothing leaks into the caller's shell.
+port_in_use() {
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null
+}
+
+pick_port() {
+    if [ -n "$REQUESTED_PORT" ]; then
+        if port_in_use "$REQUESTED_PORT"; then
+            err "PORT=$REQUESTED_PORT was requested but something is already listening on it."
+            exit 1
+        fi
+        VAULT_PORT="$REQUESTED_PORT"
+        return
+    fi
+
+    local candidate
+    for candidate in $(seq 3000 3100); do
+        if ! port_in_use "$candidate"; then
+            VAULT_PORT="$candidate"
+            [ "$candidate" -ne 3000 ] && log "Port 3000 is busy; using the next free port $VAULT_PORT"
+            BASE_URL="http://127.0.0.1:$VAULT_PORT"
+            return
+        fi
+    done
+    err "No free port between 3000 and 3100."
+    exit 1
+}
+VAULT_PORT=3000
 # Deterministic bootstrap secret: passed to the server as INITIAL_MASTER_KEY so this script never
 # needs to scrape the master key back out of the (buffered, redirected) server log.
 MASTER_KEY="e2eaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -269,6 +310,27 @@ check_jq() {
 # Compares two locally-computed values, for assertions that are not about an HTTP response at all —
 # a process exit status, a log line, the presence of a file. Usage:
 #   check_local ACTUAL EXPECTED "description"
+# Asserts the last response body does NOT contain a needle.
+#
+# The empty-needle guard is the part worth copying: `""` is a substring of every string, so an
+# assertion with an empty needle can never fail and would sit in the suite forever reporting PASS.
+# Adopted from `simply_hook_executor`.
+check_not_contains() {
+    local needle="$1" description="$2"
+    if [ -z "$needle" ]; then
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (empty needle — the assertion is vacuous)" >&2
+        return
+    fi
+    if [[ "$RESP_BODY" == *"$needle"* ]]; then
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} $description (the body contains it)" >&2
+    else
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} $description" >&2
+    fi
+}
+
 check_local() {
     local actual="$1" expected="$2" description="$3"
     if [ "$actual" == "$expected" ]; then
@@ -321,11 +383,8 @@ for bin in curl jq cargo openssl; do
     log "Found $bin: $(command -v "$bin")"
 done
 
-if command -v fuser >/dev/null 2>&1 && fuser "$VAULT_PORT/tcp" >/dev/null 2>&1; then
-    err "Port $VAULT_PORT is already in use (this suite boots the main instance there)."
-    err "Stop whatever is bound to it, or re-run with BASE_URL=http://127.0.0.1:<free port>."
-    exit 1
-fi
+pick_port
+log "Main instance will listen on port $VAULT_PORT ($BASE_URL)"
 
 # python3 is a *soft* dependency: only the live webhook-delivery verification (§13) needs a local
 # HTTP listener to observe whether a dispatch actually happened. Its absence — or the receiver
