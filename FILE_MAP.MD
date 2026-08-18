@@ -67,7 +67,7 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | `m20260807_000007_add_api_key_master_marker.rs` | 159 | Adds `master_marker` as an **application-maintained** column. **Superseded** — retained only so the history replays. |
 | `m20260807_000008_add_lineage_and_ownership.rs` | 262 | Adds `parent_key_id` and `owner_key_id`, plus the §7 hot-path indexes. |
 | `m20260808_000009_derive_master_marker.rs` | 260 | Replaces the hand-maintained marker with one the **engine derives** (`GENERATED ALWAYS AS`, `STORED` on Postgres / `VIRTUAL` elsewhere). This is what satisfies `RBAC_MODEL.md` §5. |
-| `m20260811_000010_audit_attribution_not_null.rs` | 287 | Makes `api_key_name`, `api_key_prefix`, `client_ip` `NOT NULL` — structurally forbidding an unattributed audit row. No peer service has an equivalent. |
+| `m20260811_000010_audit_attribution_not_null.rs` | 287 | Makes `api_key_name`, `api_key_prefix`, `client_ip` `NOT NULL` — structurally forbidding an unattributed audit row. No peer service has an equivalent. **Backfills the `UNRECORDED` sentinel before tightening nullability**, and carries the SQLite table-rebuild path (no `ALTER COLUMN` there). The `NOT NULL` strings coexist with `api_key_id`'s `ON DELETE SET NULL` because they are different columns — denormalized copies survive the cascade. **Reference implementation for the rebuild pattern**; see `AGENT.MD` § SeaORM Migration Standards. |
 | `m20260811_000011_index_ip_record_delta_columns.rs` | 72 | Indexes `ip_records.updated_at` so delta (`since`) queries do not table-scan. |
 | `m20260811_000012_webhook_hmac_only_mode.rs` | 105 | Renames the `BODY_ONLY` auth mode to `HMAC_ONLY` and makes the signature header configurable. |
 
@@ -105,6 +105,16 @@ failures were invisible because neither had a meta-test. This file has one.
 4. `src/middleware.rs` — how a request is authenticated before any guard runs.
 5. `src/master.rs` — why Master identity and Master cardinality are separate properties.
 6. The handler module for whatever you are changing.
+
+## Migration conventions
+
+Full standards live in `AGENT.MD` § *SeaORM Migration Standards*. The two that cause damage if missed:
+
+- **Never rename an applied migration.** `#[derive(DeriveMigrationName)]` derives identity from the
+  file name and SeaORM stores it in `seaql_migrations`. A rename makes an applied migration look
+  unapplied and it re-runs on next boot.
+- **The existing 12 files use a six-digit sequence** (`_000010_`), not `HHMMSS`. They are grandfathered.
+  New migrations use `mYYYYMMDD_HHMMSS_name.rs`.
 
 ## Invariants that are easy to break
 

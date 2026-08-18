@@ -7797,3 +7797,68 @@ The `Cargo.toml` `oxc` pin flagged in the previous entry was resolved by the mai
 and `25a5c4d`: the dependencies now float at `0.145` rather than being pinned at `=0.143.0`. The
 rationale comment above them still describes the older pinning decision and no longer matches the
 manifest.
+
+---
+
+## Session — SeaORM migration standards & audit attribution verification (2026-08-18)
+
+**Scope:** Documentation only. No `src/`, `tests/`, or migration file was modified; the audit
+attribution work the brief asked for was already implemented and correct, so the task resolved to
+verification plus writing the standard down.
+
+### Task 1 — migration standards, and one correction to the brief
+
+Added `AGENT.MD` § *SeaORM Migration Standards*: naming, registration/ordering, backend portability,
+and audit attribution.
+
+**The brief specified `mYYYYMMDD_HHMMSS_migration_name.rs` as the mandatory format. The 12 existing
+migrations do not match it** — they carry a six-digit *monotonic sequence* in the second slot
+(`m20260811_000010_…` is the tenth migration, not 00:00:10). The convention was documented as
+requested for **new** migrations, and the existing files explicitly grandfathered, because retrofitting
+it would be a production-breaking change rather than a cleanup:
+
+`#[derive(DeriveMigrationName)]` derives each migration's identity from its **file name**, and SeaORM
+records that exact string in `seaql_migrations` on the target database. Renaming an applied migration
+makes SeaORM treat it as never run, so it re-executes against a schema that already has the change on
+the next boot of a production instance. The stated constraint was "without introducing breaking changes
+or schema conflicts in production", and a bulk rename is precisely that. This is now written into
+`AGENT.MD` as a standing prohibition rather than left as tribal knowledge.
+
+### Task 2 — audit attribution integrity: verified, no change required
+
+Every element the brief asked for already exists in `m20260811_000010_audit_attribution_not_null.rs`:
+
+| Requirement | Status | Evidence |
+| :--- | :--- | :--- |
+| `NOT NULL` maintained on audit columns | Present | `api_key_name`, `api_key_prefix`, `client_ip` |
+| Backfill before constraint in `up()` | Present | `backfill(manager).await?` is the first statement, with a comment stating the ordering is load-bearing |
+| FK integrity toward `api_keys` | Present | `api_key_id` FK with `ON DELETE SET NULL`, preserved across the SQLite rebuild |
+| No `NOT NULL` / `SET NULL` conflict | **Not possible by construction** | See below |
+
+**On the conflict the brief asked to avoid:** there is none, and the design is deliberate. The nulled
+column (`api_key_id`) and the `NOT NULL` columns (the three attribution strings) are *different
+columns*. The strings are denormalized at write time, so the `ON DELETE SET NULL` cascade nulls the
+foreign key while attribution survives intact. That is what allows an API key to be **hard**-deleted
+without either destroying its audit history or violating a constraint — **so neither soft-deletion nor
+a sentinel key on `api_keys` is required**, contrary to the mechanism the brief suggested aligning
+with. Two tests already pin this: one asserts the backfill sentinel cannot be confused with a real
+value (`"system"` / `"127.0.0.1"` are rejected as candidates), another asserts the `SET NULL` cascade
+survives the table rebuild.
+
+Reinforced at the application layer by `api::support::create_audit_log`, which takes its actor by value
+rather than `Option` — an unattributed write is unrepresentable, not merely refused.
+
+### Task 3 — quality gates
+
+All five gates run clean, no warnings:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean, zero warnings |
+| `cargo test` | **289 passed**, 0 failed |
+| `./scripts/test_e2e.sh` | **544 checks passed**, 0 failed |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+Metrics are unchanged from the previous session, as expected for a documentation-only change — recorded
+here so a future reader can tell that the gates were actually run rather than assumed.

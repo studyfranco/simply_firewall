@@ -410,3 +410,87 @@ For every route registered under `/api`, tests MUST assert three distinct outcom
     All mutating actions MUST write audit logs, accessible via `GET /api/audit-logs` for Master keys and rendered in a dedicated UI panel.
 
 *End of directives. Write safe, panic-free (`no .unwrap()`), and elegant Rust code.*
+---
+
+## SeaORM Migration Standards
+
+### 1. Naming Convention
+
+New migrations use the full timestamped format:
+
+```
+mYYYYMMDD_HHMMSS_migration_name.rs
+```
+
+`YYYYMMDD` is the authoring date, `HHMMSS` the authoring time, and `migration_name` a `snake_case`
+description of the change (`add_api_key_signing_secret`, not `update_keys`). The timestamp exists to
+make ordering total and collision-free when two agents author migrations on the same day.
+
+**The 12 migrations currently in `src/migration/` predate this convention** and use a six-digit
+monotonic sequence in the second slot (`m20260811_000010_audit_attribution_not_null.rs` — `000010` is
+the tenth migration, not 00:00:10). They are correct as they stand and are explicitly grandfathered.
+
+#### Never rename an existing migration
+
+Every migration derives its identity from its **file name** via `#[derive(DeriveMigrationName)]`, and
+SeaORM records that exact string in the `seaql_migrations` table on the target database.
+
+Renaming an applied migration therefore does not tidy anything — it makes SeaORM believe a migration it
+has already run has never been run. On next boot it re-executes against a schema that already has the
+change, and the deployment fails, or worse, half-applies. **A production database records the old
+name forever.** Retrofitting the convention above onto the existing files is a breaking change, not a
+cleanup, and must not be done.
+
+Apply the convention to new migrations only.
+
+### 2. Registration and ordering
+
+- Register every migration in `src/migration/mod.rs`. An unregistered file is dead code that silently
+  never runs.
+- Order in the registry is the order of execution. Never reorder entries after a migration has shipped.
+- Never edit a migration that has been applied anywhere. Correct it with a new migration.
+
+### 3. Backend portability
+
+Migrations run against SQLite, Postgres, and MySQL. Two consequences bite in practice:
+
+- **SQLite has no `ALTER TABLE … ALTER COLUMN`.** Changing a column's nullability or type there means
+  rebuilding the table: create the new shape, copy rows, drop the old, rename. `m20260811_000010`
+  is the reference implementation of this pattern, including the foreign keys and indexes the rebuild
+  has to carry across.
+- **Generated-column storage mode differs by engine** (Postgres accepts `STORED`, SQLite requires
+  `VIRTUAL`). The pairing must be pinned by test, since the wrong one fails only against a live server
+  that a local suite never starts (`RBAC_MODEL.md` §5).
+
+Branch on `manager.get_database_backend()` rather than assuming SQLite.
+
+### 4. Audit Attribution (`NOT NULL`)
+
+`audit_logs.api_key_name`, `.api_key_prefix` and `.client_ip` are `NOT NULL`, enforced in SQL rather
+than by handler discipline. An audit row that cannot say who acted is not an audit row.
+
+The constraint coexists with — and depends on — the deletion strategy on `audit_logs.api_key_id`:
+
+| Column | Nullability | On key deletion | Why |
+| :--- | :--- | :--- | :--- |
+| `api_key_id` | `NULL`able | `ON DELETE SET NULL` | Deleting a credential must not delete the history of what it did |
+| `api_key_name` | `NOT NULL` | Retained | Denormalized at write time, so attribution survives the key |
+| `api_key_prefix` | `NOT NULL` | Retained | Same |
+| `client_ip` | `NOT NULL` | Retained | Same |
+
+**There is no conflict between the `NOT NULL` columns and the `ON DELETE SET NULL` cascade, because
+they are different columns.** The FK is nullable and gets nulled; the three attribution *strings* are
+denormalized copies that are never touched by the cascade. This is what lets a key be hard-deleted
+while its audit trail stays attributable — no soft-delete or sentinel key is required on `api_keys`.
+
+Two invariants follow, and both are pinned by test:
+
+- **Backfill precedes the constraint.** `up()` writes the `UNRECORDED` sentinel into every pre-existing
+  NULL *before* tightening nullability. Reversing that order fails on the `ALTER` (Postgres/MySQL) or
+  on the row copy (SQLite rebuild). Any future migration tightening a nullable column must do the same.
+- **The sentinel must not be mistakable for real data.** It is deliberately not `"system"` or
+  `"127.0.0.1"`; a backfilled unknown must be distinguishable from a genuine recorded actor.
+
+At the application layer this is reinforced by `api::support::create_audit_log`, which takes its actor
+**by value rather than `Option`** — an unattributed write is unrepresentable in the type system, not
+merely rejected at runtime.
