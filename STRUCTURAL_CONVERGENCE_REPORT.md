@@ -1,252 +1,178 @@
-# Structural & Formal Convergence Report — `simply_ip_vault` ↔ `simply_hook_executor`
+# Structural and Formal Convergence Report
 
-**Date:** 2026-08-11 · **Mode:** strictly read-only. No file under `src/`, `tests/` or `scripts/` was
-modified in either project.
+**Subject:** `simply_ip_vault` (current project) compared against the three peer services vendored in `example/`.
+**Method:** Clean-room structural analysis of current sources only.
+**Date:** 2026-08-18
 
-**Scope.** The **current project** — this repository — against its **peer**, read exclusively from
-`example/simply_hook_executor` at `4865a82` (`git pull`: already up to date).
-
-**Methodology: clean-room.** Written without reference to any prior structural analysis. Every figure
-below was measured from the two source trees during this pass.
-
-**Companion to** `SECURITY_COMPARISON_REPORT.md`, which covers the security posture. This report asks a
-narrower question: do these two codebases share a foundational structure, or do they merely implement
-the same rules by different means?
-
----
-
-## 1. Top-level module hierarchy
-
-| Current project | Lines | Peer | Lines | Role | Status |
-| :--- | ---: | :--- | ---: | :--- | :--- |
-| `main.rs` | 316 | `main.rs` | 347 | Startup order, bootstrap, graceful shutdown | ✅ |
-| `lib.rs` | 152 | `lib.rs` | 163 | Router assembly, body limit, module declarations | ✅ |
-| `config.rs` | 1 397 | `config.rs` | 1 642 | Env parsing, trusted proxies, client-IP resolution, master-key validation | ✅ |
-| `crypto.rs` | 839 | `crypto.rs` | 781 | At-rest AEAD, CANONICAL_V1, HMAC | ✅ |
-| `db.rs` | 376 | `db.rs` | 427 | Pool construction, SQLite pragmas, migrations | ✅ |
-| `master.rs` | 320 | `master.rs` | 291 | Boot-time Master identity pin | ✅ |
-| `middleware.rs` | 319 | `middleware.rs` | 543 | Authentication, anti-replay, `bound_ips` | ✅ |
-| `replay.rs` | 440 | `replay.rs` | 406 | Anti-replay guard | ✅ |
-| `retention.rs` | 134 | `retention.rs` | 150 | Background purge worker | ✅ |
-| `state.rs` | 169 | `state.rs` | 80 | `AppState` | ✅ |
-| `error.rs` | 107 | `error.rs` | 140 | `AppError` and its `IntoResponse` | ✅ |
-| `dispatch.rs` | 532 | `executor.rs` | 1 389 | **The domain worker** | ⚖️ Domain |
-| `extract.rs` | 128 | *(in `api/support.rs`)* | — | Strict JSON extractors | ⚠️ Placement |
-| **13 files** | **11 820** | **13 files** | **12 501** | | **11 identical names** |
-
-**11 of 13 top-level modules share an identical name and an identical responsibility.** Both
-exceptions are structural rather than accidental:
-
-- `dispatch.rs` ↔ `executor.rs` is the **only place the two projects genuinely do different things**.
-  One signs and sends outbound HTTP; the other executes local processes under a configured user. The
-  2.6× size difference reflects genuinely different problems, and a shared name would falsely imply a
-  shared threat model.
-- `extract.rs` — see §5.
-
----
-
-## 2. `src/api/` — separation of concerns
-
-| Current | Lines | Peer | Lines | Role | Status |
-| :--- | ---: | :--- | ---: | :--- | :--- |
-| `mod.rs` | 69 | `mod.rs` | 95 | Declarations and flat re-exports. **No executable code** | ✅ |
-| `guards.rs` | 457 | `guards.rs` | 932 | Every authorization decision. Writes nothing | ✅ |
-| `support.rs` | 280 | `support.rs` | 426 | Plumbing used by ≥3 domains. Decides nothing | ✅ |
-| `keys.rs` | 1 365 | `keys.rs` | 1 274 | Key CRUD, `/auth/me`, grants, §6 cascade | ✅ |
-| `audit.rs` | 54 | `audit.rs` | 78 | Audit-trail reads | ✅ |
-| `health.rs` | 121 | `health.rs` | 131 | Unauthenticated probes | ✅ |
-| `records.rs` | 962 | `executions.rs` | — | Domain: resource data | ⚖️ Domain |
-| `groups.rs` | 197 | `hooks.rs` | — | Domain: managed resource | ⚖️ Domain |
-| `webhooks.rs` | 580 | — | — | Domain: creator-private entity | ⚖️ Domain |
-| — | — | `system.rs` | 101 | Effective-configuration readback | ⚠️ Absent here |
-
-**The three structural modules — `mod.rs`, `guards.rs`, `support.rs` — are identically named,
-identically scoped, and governed by the same written rules on both sides:**
-
-| Rule | Current | Peer |
-| :--- | :--- | :--- |
-| `guards` is one module, not one per domain | ✅ stated in the `mod.rs` header | ✅ stated in the `mod.rs` header |
-| Nothing in `support` makes an authorization decision | ✅ | ✅ |
-| Handlers re-exported **flat** so paths survive the split | ✅ | ✅ |
-| `mod.rs` holds no executable code | ✅ | ✅ |
-
-Both split a large monolithic `api.rs` by domain and both re-exported flat so `api::create_api_key`
-still resolves — neither forced its call sites to change. The rationale for keeping `guards` as one
-cross-cutting module rather than one per domain is written down in both headers in almost the same
-terms: the specification's rules are cross-cutting, and splitting them by caller would put one
-sentence of `RBAC_MODEL.md` in three files and invite the copies to drift.
-
-**One asymmetry:** the peer's `api/system.rs` (`get_settings`) has no counterpart here — a missing
-feature, not a misplacement.
-
----
-
-## 3. `src/entities/` — data layer
-
-| Current | Peer | Relationship |
-| :--- | :--- | :--- |
-| `api_key.rs` | `api_key.rs` | ✅ Identical role and name |
-| `audit_log.rs` | `audit_log.rs` | ✅ Identical role and name |
-| `api_key_group_permission.rs` | `api_key_hook_permission.rs` | ⚖️ Same M:N grant role, named for its resource |
-| `ip_group.rs` | `hook.rs` | ⚖️ The **managed resource** |
-| `ip_record.rs` | `hook_parameter.rs` | ⚖️ The **resource data** |
-| `webhook_config.rs` | `execution.rs` | ⚖️ The **creator-private entity** |
-| `ip_record_group_membership.rs` | — | ⚖️ Join table, current project only |
-| `mod.rs`, `prelude.rs` | `mod.rs`, `prelude.rs` | ✅ Identical convention |
-
-The mapping is one-to-one against `RBAC_MODEL.md`'s terminology table for all four generic roles.
-Naming is uniform: `<resource>.rs` per table, `api_key_<resource>_permission.rs` for its grant table.
-Both use the same SeaORM shape (`Model` / `ActiveModel` / `Column` / `Relation`) and both keep
-`prelude.rs` as the `Entity` re-export set.
-
-**One structural difference has a security consequence.** The current project's resource data
-(`ip_records`) is globally unique and reached through a join table, so one record may belong to
-several managed resources; the peer's `hook_parameter.hook_id` is a single foreign key, so its
-resource data belongs to exactly one. That difference is the root of finding **F-2** in the security
-report — an authorization question that simply cannot arise on the peer side.
-
----
-
-## 4. Naming conventions
-
-### Security surface — 25 of 25 symbols identical
-
-| Symbols | Category |
+| Project | Commit |
 | :--- | :--- |
-| `auth_middleware`, `ClientIp` | Middleware |
-| `resolve_client_ip`, `normalize_ip`, `parse_trusted_proxies` | Proxy trust |
-| `canonical_v1_payload`, `compute_signature`, `verify_signature`, `generate_signing_secret` | Signing |
-| `SecretCipher` · `ReplayGuard` | At-rest crypto · Anti-replay |
-| `apply_sqlite_pragmas`, `run_migrations` | Database |
-| `MasterPin`, `pin_at_boot`, `authenticate`, `pinned_to` | §5 identity |
-| `validate_initial_master_key` | Credential validation |
-| `create_audit_log` · `hash_key`, `generate_random_key` | Observability · Credentials |
-| `StrictJson`, `OptionalStrictJson` | Input strictness |
-| `health_check`, `readiness_check` | Probes |
+| `simply_ip_vault` | `14c8fa3` |
+| `example/simply_hook_executor` | `15b8af6` |
+| `example/simply_ip_exporter` | `80a3b31` |
+| `example/simply_ip_sync` | `72cce13` |
 
-**Every one present in both trees under the same name.** No renames outstanding.
+## 1. Module Topology
 
-### Guards, payloads, tests
+### 1.1 Core modules — presence matrix
 
-| Convention | Current | Peer | Status |
+| `src/` module | Vault | Executor | Exporter | Sync | Role |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| `lib.rs` | ✅ | ✅ | ✅ | ✅ | Router assembly, public surface |
+| `main.rs` | ✅ | ✅ | ✅ | ✅ | Boot sequence only |
+| `config.rs` | ✅ | ✅ | ✅ | ✅ | Environment reads, client-IP resolution |
+| `crypto.rs` | ✅ | ✅ | ✅ | ✅ | Signing + secrets at rest |
+| `db.rs` | ✅ | ✅ | ✅ | ✅ | Pool, pragmas, migrations |
+| `error.rs` | ✅ | ✅ | ✅ | ✅ | `AppError` → HTTP mapping |
+| `extract.rs` | ✅ | ✅ | ✅ | ✅ | Strict request extractors |
+| `master.rs` | ✅ | ✅ | ✅ | ✅ | Boot-time Master identity pin |
+| `middleware.rs` | ✅ | ✅ | ✅ | ✅ | Authenticate → authorize ordering |
+| `replay.rs` | ✅ | ✅ | ✅ | ✅ | Single-use signature ledger |
+| `state.rs` | ✅ | ✅ | ✅ | ✅ | Shared `AppState` |
+| `retention.rs` | ✅ | ✅ | ❌ | ❌ | Background expiry worker |
+| `entities/` | ✅ | ✅ | ✅ | ✅ | SeaORM models |
+| `migration/` | ✅ | ✅ | ✅ | ✅ | Versioned DDL |
+| `api/` | ✅ | ✅ | ✅ | ✅ | Handler modules |
+| `api/guards.rs` | ✅ | ✅ | ❌ | ✅ | Centralised permission decisions |
+
+**Eleven core modules are present under identical names in all four services.** The foundational DNA is
+unambiguously shared: any engineer who can navigate one of these repositories can navigate the others.
+
+### 1.2 Domain-specific modules
+
+| Vault | Executor | Exporter | Sync |
 | :--- | :--- | :--- | :--- |
-| Guard prefix | `guard_*` × 7, `require_*` × 0 | `guard_*` × 11, `require_*` × 0 | ✅ Unified |
-| Request payloads | `<Verb><Noun>Payload` × 9 | `<Verb><Noun>Payload` × 6 | ✅ |
-| Response DTOs | `MeResponse`, `<Noun>Response` | identical | ✅ |
-| Compliance tests | `r<N>_…` / `s<N>_…`, 12 prefixes | `r<N>_…` / `s<N>_…`, 12 prefixes | ✅ |
-| Source-hygiene suite | `tests/source_hygiene.rs` | `tests/source_hygiene.rs` | ✅ Same filename |
-| Referential-integrity suite | `schema_integrity_tests.rs` | `referential_integrity.rs` | ⚖️ Same role, different name |
+| `dispatch.rs` (outbound webhooks) | `executor.rs` (process execution) | `feed.rs`, `cache.rs`, `ratelimit.rs`, `ipfilter.rs`, `sync.rs`, `vault_client.rs` | `client.rs`, `scheduler.rs`, `retry.rs`, `jobs/`, `parsers/` |
 
----
+Each service adds exactly the modules its domain requires and no more. The divergence here is expected
+and correct — it is the *core* set above that must converge, not the domain set.
 
-## 5. Divergences, and whether each is justified
+### 1.3 `api/` submodule comparison
 
-| # | Divergence | Justified? | Reasoning |
-| ---: | :--- | :--- | :--- |
-| 1 | `dispatch.rs` ↔ `executor.rs` | ✅ **Yes** | The one genuine domain difference; a shared name would imply a shared threat model that does not exist |
-| 2 | `extract.rs` (top level) vs extractors in `api/support.rs` | ✅ **Yes — current project's is better** | `StrictJson` implements a `RBAC_MODEL.md` §5 *type-level control*. `support.rs` is documented on both sides as "plumbing that decides nothing". Converging would bury a named specification control inside a helper module |
-| 3 | Peer has `api/system.rs`; current project has none | ✅ **Yes** | Missing feature, not misplacement |
-| 4 | Domain modules (`records`/`groups`/`webhooks` vs `executions`/`hooks`) | ✅ **Yes** | Named for what they hold; the mapping to §Terminology is exact |
-| 5 | Referential-integrity suite filename | ⚖️ **Cosmetic** | Same role, same coverage |
-| 6 | Adversarial-test marking convention | ⚖️ **Convention only** | Both load-bearing in their own gate; 5 such tests each |
-| 7 | **Permission-table single-column index** | ❌ **No** | See security finding **F-1**: `hook_id` is unindexed on the peer while `group_id` is indexed here, and both projects run the structurally identical query that needs it |
+| Vault | Executor | Exporter | Sync | Shared concern |
+| :--- | :--- | :--- | :--- | :--- |
+| `audit.rs` | `audit.rs` | `audit.rs` | `audit.rs` | Audit log endpoint |
+| `health.rs` | `health.rs` | `health.rs` | `health.rs` | Liveness/readiness |
+| `keys.rs` | `keys.rs` | `keys.rs` | `keys.rs` | Key lifecycle |
+| `support.rs` | `support.rs` | `support.rs` | `support.rs` | Shared handler plumbing |
+| `guards.rs` | `guards.rs` | — | `guards.rs` | Permission decisions |
+| `mod.rs` | `mod.rs` | `mod.rs` | `mod.rs` | Re-export surface |
+| `groups.rs`, `records.rs`, `webhooks.rs` | `hooks.rs`, `executions.rs`, `system.rs` | `endpoints.rs`, `auth.rs` | `sources.rs`, `vaults.rs`, `sync_tasks.rs`, `sync_logs.rs` | Domain resources |
 
-**One unjustified divergence**, and it is the structural face of F-1. Every other difference traces to
-the domains or is cosmetic.
+Six `api/` files carry the same name and the same responsibility across the ecosystem;
+`simply_ip_exporter` is the sole service missing `guards.rs`.
 
----
+## 2. Naming Conventions
 
-## 6. Error handling — unified
+| Convention | Vault | Executor | Exporter | Sync | Uniform? |
+| :--- | :--- | :--- | :--- | :--- | :---: |
+| Error enum | `AppError` | `AppError` | `AppError` | `AppError` | ✅ |
+| Shared state | `AppState` | `AppState` | `AppState` | `AppState` | ✅ |
+| Strict body extractor | `StrictJson` | `StrictJson` | `StrictJson` | `StrictJson` | ✅ |
+| Strict path extractor | `StrictPath` | `StrictPath` | `StrictPath` | `StrictPath` | ✅ |
+| Master pin type | `MasterPin` | `MasterPin` | `MasterPin` | `MasterPin` | ✅ |
+| Replay ledger | `ReplayGuard` | `ReplayGuard` | `ReplayGuard` | `ReplayGuard` | ✅ |
+| Secret cipher | `SecretCipher` | `SecretCipher` | `SecretCipher` | `SecretCipher` | ✅ |
+| Guard function prefix | `guard_*` | `guard_*` | *(inline)* | `guard_*` | ⚠️ |
+| Payload type suffix | `*Payload` | `*Payload` | `*Payload` | `*Payload` | ✅ |
+| Key digest helper | `hash_key` | `hash_key` | `hash_key` | `hash_key` | ✅ |
+| Key prefix helper | `key_prefix` | `key_prefix` | `key_prefix` | `key_prefix` | ✅ |
+| Signature scheme const | `CANONICAL_V1` | `CANONICAL_V1` | `CANONICAL_V1` | `CANONICAL_V1` | ✅ |
+| Audit writer | `create_audit_log` | `create_audit_log` | `create_audit_log` | `create_audit_log` | ✅ |
 
-| Aspect | Current | Peer | Status |
-| :--- | :--- | :--- | :--- |
-| Error type | `AppError` in `error.rs` | `AppError` in `error.rs` | ✅ |
-| Response body | `{"error": "<message>"}` | `{"error": "<message>"}` | ✅ **Identical shape** |
-| Rendering | `impl IntoResponse for AppError` | identical | ✅ |
+**Naming is standardised to an unusual degree.** Twelve of thirteen tracked identifiers are spelled
+identically across four independently maintained repositories.
 
-| Variant | Current | Peer | HTTP |
-| :--- | :---: | :---: | :--- |
-| `Unauthorized` | ✅ | ✅ | `401` |
-| `Forbidden` | ✅ | ✅ | `403` |
-| `NotFound` | ✅ | ✅ | `404` |
-| `Conflict` | ✅ | ✅ | `409` |
-| `ConflictWithDetails` | ✅ | ✅ | `409` + structured detail |
-| `InvalidInput` · `Json` | ✅ | ✅ | `400` |
-| `BodyRejected` | ✅ | ✅ | **passthrough** — preserves `413` |
-| `DbError` · `Internal` | ✅ | ✅ | `500` |
-| `TooManyRequests` | ❌ | ✅ | `429` — concurrency budget |
+### 2.1 Index naming
 
-**10 of 11 variants shared with identical status mappings.** The single singleton is required by
-exactly one domain: the peer's execution concurrency budget. The current project has nothing to
-rate-limit and inventing a variant for symmetry would be worse than the asymmetry.
+| Project | Convention | Consistent internally? |
+| :--- | :--- | :---: |
+| `simply_ip_vault` | `idx-<table>-<column>` | ⚠️ two legacy `idx_ip_records_*` underscore names remain |
+| `simply_hook_executor` | `idx_<table>_<column>` | ✅ |
+| `simply_ip_exporter` | `idx_<table>_<column>` | ✅ |
+| `simply_ip_sync` | `idx-<table>-<column>` | ✅ |
 
-`BodyRejected` is the most security-relevant agreement: both projects concluded independently that
-normalising the response *shape* must not normalise its *meaning*, so `413` survives rather than being
-flattened into `400`.
+The ecosystem is split two-and-two between hyphen and underscore index naming, and the vault contains
+two stragglers in the minority style. Cosmetic, but it defeats naive cross-repo index audits — a fact
+this audit confirmed the hard way.
 
----
+## 3. Error Handling
 
-## 7. Observability — audit trail
+| Property | Vault | Executor | Exporter | Sync |
+| :--- | :--- | :--- | :--- | :--- |
+| Envelope | `{"error": "…"}` | `{"error": "…"}` | `{"error": "…"}` | `{"error": "…"}` |
+| `AppError` variants | 10 | 11 | 9 | 9 |
+| `NotFound` → 404 | ✅ | ✅ | ✅ | ✅ |
+| `Forbidden` → 403 | ✅ | ✅ | ✅ | ✅ |
+| `Unauthorized` → 401 | ✅ | ✅ | ✅ | ✅ |
+| `InvalidInput` → 400 | ✅ | ✅ | ✅ | ✅ |
+| Internal errors redacted | ✅ | ✅ | ✅ | ✅ |
+| Structured conflict detail | ✅ | ✅ | ❌ | ✅ |
+| Envelope total across `Path`/`Query` rejections | ✅ | ✅ | ⚠️ path only | ✅ |
 
-| Field | Current | Peer | Status |
-| :--- | :---: | :---: | :--- |
-| `id` · `action` · `details` · `timestamp` | ✅ | ✅ | ✅ |
-| `api_key_id` | ✅ | ✅ | ✅ nullable, `ON DELETE SET NULL` both sides |
-| `api_key_name` · `api_key_prefix` · `client_ip` | ✅ | ✅ | ✅ **`NOT NULL` both sides** |
-| `target_address` / `target_resource` | ✅ | ✅ | ⚠️ Same role, different name |
-| `group_names` | ✅ | — | ⚖️ Domain-specific |
+The envelope shape is unified. Three services additionally guarantee the envelope holds for axum's
+built-in extractor rejections, which by default emit **plain text** rather than JSON;
+`simply_ip_exporter` covers `Path` but not `Query`.
 
-**8 of 10 fields identical in name, semantics and nullability.**
+## 4. Observability and Audit
 
-The design agreement underneath is the notable part, and both projects reached it independently: store
-the acting key's name and prefix as a **point-in-time snapshot** rather than relying on the foreign
-key, and choose `SET NULL` over `CASCADE` on `audit_logs.api_key_id` — so deleting a credential cannot
-erase the record of what it did, while the denormalised columns keep the row legible afterwards. The
-`NOT NULL` constraint on those columns is what turns that from a convention into a guarantee: without
-it, a row could have both a nulled foreign key and no name, recording an action with no actor.
+| Column | Vault | Executor | Exporter | Sync |
+| :--- | :---: | :---: | :---: | :---: |
+| `id` | ✅ | ✅ | ✅ | ✅ |
+| `api_key_id` | ✅ | ✅ | ✅ | ✅ |
+| `api_key_name` | ✅ | ✅ | ✅ | ✅ |
+| `api_key_prefix` | ✅ | ✅ | ✅ | ✅ |
+| `client_ip` | ✅ | ✅ | ✅ | ✅ |
+| `action` | ✅ | ✅ | ✅ | ✅ |
+| target column | `target_address` | `target_resource` | `target_resource` | `target_resource` |
+| `group_names` | ✅ | — | — | — |
+| `details` | ✅ | ✅ | ✅ | ✅ |
+| `timestamp` | ✅ | ✅ | ✅ | ✅ |
 
-`target_address` vs `target_resource` is the same column under two names — harmless within a service,
-mildly awkward for a shared log pipeline.
+**The audit schema is unified in eight of nine columns.** The vault diverges by naming its target column
+`target_address` and adding `group_names` — both justified by its domain, in which the audited subject is
+an IP address that may belong to several groups. A consumer writing a cross-service audit reader must
+special-case the vault on exactly one field name.
 
----
+## 5. Structural Divergence Summary
 
-## 8. Executive verdict
+| Divergence | Services affected | Justified? | Rationale |
+| :--- | :--- | :---: | :--- |
+| `retention.rs` absent | Exporter, Sync | ✅ | Neither owns soft-deleted data requiring expiry |
+| Domain modules differ | All | ✅ | Each service's actual problem domain |
+| `guards.rs` absent | Exporter | ❌ | Ownership-only model still merits one decision site |
+| `StrictQuery` absent | Exporter | ❌ | Leaves a plain-text rejection path |
+| `target_address` / `group_names` | Vault | ✅ | Domain-appropriate audit subject |
+| Index naming split | All | ⚠️ | Cosmetic; impedes cross-repo tooling |
+| Skew constant vs configurable | Vault, Sync fixed | ⚠️ | Same 300 s value; differing operability |
+| Adapted vs verbatim `RBAC_MODEL.md` | Sync adapted; Exporter verbatim | ⚠️ | See security report F-3 |
 
-**Convergence level: high, and structural rather than incidental.**
+## 6. Executive Verdict
 
-| Dimension | Result |
+**These four services share a genuine, deliberate, and verifiable common architecture.** Eleven core
+modules appear under identical names with identical responsibilities in every repository. Twelve of
+thirteen tracked security identifiers are spelled the same. The error envelope, the HTTP status mapping,
+and eight of nine audit columns are unified. This is not incidental resemblance between services built by
+the same team — it is enforced convergence, and it holds.
+
+**`simply_ip_vault` is the ecosystem's structural reference implementation.** It carries the complete
+core module set, the most thorough index coverage, the largest test suite, and the only migration that
+structurally forbids unattributed audit rows. Where it diverges — the audit target column, two legacy
+index names — the divergence is either domain-justified or cosmetic.
+
+**`simply_hook_executor` and `simply_ip_sync` are fully converged peers.** Both carry the complete core
+set including `guards.rs`, both wrap all three extractor families, and `simply_ip_sync` additionally
+demonstrates the correct pattern for domain-adapting the normative specification without diluting it.
+
+**`simply_ip_exporter` is structurally converged but incompletely so.** It has every core module except
+`guards.rs`, and its authorization decisions are consequently scattered across handler bodies rather than
+concentrated in one auditable site. Combined with its missing `StrictQuery` and the payload-strictness
+finding in the security report, the pattern is consistent: the exporter adopted the ecosystem's
+*structure* faithfully but not all of its *disciplines*.
+
+**Convergence level:**
+
+| Pairing | Structural convergence |
 | :--- | :--- |
-| Top-level modules with identical names and roles | **11 / 13** |
-| `api/` structural modules (`mod`, `guards`, `support`) | **3 / 3 identical** |
-| Entity mapping onto §Terminology's four generic roles | **4 / 4 exact** |
-| Shared security symbols with identical names | **25 / 25** |
-| Error variants shared, identical status mappings | **10 / 11** |
-| Error response body shape | **identical** |
-| Audit-log fields identical | **8 / 10** |
-| Verification gates present on both sides | **7 / 7** |
-| **Unjustified divergences** | **1** — the missing peer index (F-1) |
-
-These two codebases share a foundational structure. Eleven of the twelve top-level modules that *can*
-be shared are shared by name and by responsibility; the twelfth is the single point where the domains
-genuinely differ, and naming it identically would have been the error rather than the fix. Every
-entity maps one-to-one onto the specification's four generic roles.
-
-What raises this above coincidence is the pattern of **independent convergence**. Both projects split
-a large `api.rs` by domain and both re-exported flat to protect call sites. Both isolated authorization
-into a single cross-cutting `guards` module and wrote down the same justification for not splitting it
-per-domain. Both denormalised the acting key into the audit row and chose `SET NULL` so a deleted
-credential cannot erase its own trail. Both added a `BodyRejected` variant to stop response-shape
-normalisation from destroying `413`. Both factored Master pinning into a `MasterPin` type with the
-same four method names. Both arrived at `tests/source_hygiene.rs` as the filename for the raw-SQL ban.
-Agreement reached twice from the same constraints is worth considerably more than agreement reached
-once and copied.
-
-**Maturity.** The architecture is no longer the notable part; its *enforcement* is. Both repositories
-carry an automated convergence gate, a byte-identity check on the shared specification, a raw-SQL ban
-that runs on every `cargo test`, a referential-integrity suite covering what SQLite cannot express in
-DDL, and a gate that fails when an infrastructure-level rule lacks an adversarial test.
-
-**Verdict: architecturally converged, with one outstanding item.** The missing single-column index on
-the peer's permission table is the only unjustified structural divergence, it is one line of DDL, and
-it is tracked as F-1 in the security report. Every other difference is documented, justified, and in
-each case a consequence of the domains rather than of the engineering.
+| Vault ↔ Executor | **Full** |
+| Vault ↔ Sync | **Full** |
+| Vault ↔ Exporter | **Partial** — core structure shared, three disciplines unadopted |

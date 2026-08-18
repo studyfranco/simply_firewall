@@ -7690,3 +7690,84 @@ to flip rather than a surprise to discover.
 | Test files | 7 | 8 |
 
 `cargo check` clean, `clippy -D warnings` clean, `git diff RBAC_MODEL.md` empty.
+
+---
+
+## Session — Independent ecosystem security & structural convergence audit (2026-08-18)
+
+**Scope:** Read-only clean-room audit of `simply_ip_vault` (`14c8fa3`) against **all three** peers in
+`example/`. Deliverables: `SECURITY_COMPARISON_REPORT.md` (overwritten), `STRUCTURAL_CONVERGENCE_REPORT.md`
+(new), `FILE_MAP.MD` (rewritten), and the `AGENT.MD` "Why `example/` exists" section.
+
+### Task 0 — peer synchronization
+
+All three peers pulled with `GIT_TERMINAL_PROMPT=0 timeout 60 git pull --ff-only` before any file was read.
+
+| Peer | Before | After | Outcome |
+| :--- | :--- | :--- | :--- |
+| `simply_hook_executor` | `1113333` | `15b8af6` | Updated — 12 files, +968/−531 |
+| `simply_ip_exporter` | `52651e5` | `80a3b31` | Updated — 4 files, +588 (both report files new) |
+| `simply_ip_sync` | `c283911` | `72cce13` | Updated — 16 files, +1265/−51 |
+
+**None were "already up to date."** Every peer had moved, which is the case this repository's pull
+directive exists for. An audit run without Task 0 would have described three stale trees.
+
+### Clean-room discipline — how it was actually held
+
+All code analysis was completed **before** any previous report or worklog entry was opened. The audit
+conclusions derive from `RBAC_MODEL.md` plus current `.rs` sources only. This ordering was deliberate:
+reading a prior verdict first makes confirmation of it nearly automatic.
+
+### Checks performed
+
+Enforcement was verified by direct source inspection across all four trees: module topology and `src/`
+line counts; `RBAC_MODEL.md` byte-identity; `GENERATED ALWAYS AS` marker derivation and storage mode;
+`deny_unknown_fields` coverage per payload type; guard-function inventories; permission join-table
+presence; §6 subtree/inventory/resolution logic; §7 index coverage by indexed column; HMAC algorithm,
+skew window, constant-time comparison, replay module, and key-digest algorithm; `AppError` variants and
+envelope shape; `audit_logs` column sets; auth ordering in `middleware.rs`; and test-suite sizes.
+
+### Three checks that produced false results before producing true ones
+
+Recorded because each would silently corrupt a future audit that repeated it:
+
+1. **Index detection by name.** Grepping `.name("idx…")` reported `simply_ip_sync` with **zero** indexes
+   and `simply_hook_executor` with none of the §7 columns. Both false: `simply_hook_executor` builds
+   index names through a `create_index(manager, name, table, col)` helper, so no literal appears at the
+   call site. Re-run by *indexed column* rather than index name, all four pass §7.
+2. **`key_hash` index "missing" in three peers.** The name-agnostic re-run then suggested only the vault
+   indexes `key_hash`. Also false: all four declare it `.unique_key()`, and a unique constraint implies
+   an index. The vault's own migration comment says exactly this and calls its extra explicit index
+   "belt-and-braces". The true finding is the reverse of the apparent one — the vault carries a
+   *redundant* index, not the peers a missing one. Filed as F-4.
+3. **`master_marker` index "absent" in two peers.** A `grep -A8` window around `create_index` missed it
+   in `simply_hook_executor` and `simply_ip_exporter`; direct grep found `idx_api_keys_master_marker` in
+   both.
+
+The pattern in all three: **a check reporting a surprising cluster of failures is far more likely to be a
+broken check than a broken codebase.** Each was resolved by re-running against a different observable
+(column instead of name, declaration instead of index) rather than by trusting the first result.
+
+### Findings
+
+| ID | Service | Severity | Finding |
+| :--- | :--- | :--- | :--- |
+| F-1 | `simply_ip_exporter` | High | Zero `deny_unknown_fields` across all five payload types; unknown fields silently dropped |
+| F-2 | `simply_ip_exporter` | Medium | No §6 pre-flight inventory or subtree cascade on key deletion, despite `parent_key_id` in schema |
+| F-3 | `simply_ip_exporter` | Medium (doc) | Ships the vault's `RBAC_MODEL.md` verbatim, committing itself to R2/R5/R6/R7 and §6 — rules its ownership-only schema has no surface for |
+| F-4 | `simply_ip_vault` | Informational | Redundant explicit `key_hash` index atop the implied unique index |
+| F-5 | `simply_ip_vault` | Informational | Sole service with a `NOT NULL` audit-attribution migration — stronger than peers, not a gap |
+
+**No finding against `simply_ip_vault`, `simply_hook_executor`, or `simply_ip_sync` is actionable.** No
+uniqueness bypass, RBAC rule gap, or authorization flaw was identified in any of the three. All three
+actionable findings belong to `simply_ip_exporter`, and share one root cause: it adopted the ecosystem's
+structure without all of its disciplines.
+
+### Uncommitted state observed, not touched
+
+- `Cargo.toml` carries a pre-existing, unrelated edit unpinning `oxc_*` from `=0.143.0` to `0.144`.
+  This **contradicts the comment directly above it**, which explains the exact pin and states "this one
+  does not float". Deliberately excluded from this documentation commit; it needs its own decision.
+- The sibling working tree at `../simply_ip_sync` holds uncommitted source changes. Its remote has since
+  advanced to `72cce13` with equivalent work already landed. Left untouched per the peer read-only rule;
+  flagged for reconciliation by its owner.

@@ -1,257 +1,220 @@
-# Independent Security Audit — `simply_ip_vault` ↔ `simply_hook_executor`
+# Ecosystem Security Comparison Report
 
-**Date:** 2026-08-11 · **Mode:** strictly read-only. No file under `src/`, `tests/`, `scripts/` or
-`migration/` was modified in either project.
+**Subject:** `simply_ip_vault` (current project) audited against the three peer services vendored in `example/`.
+**Method:** Clean-room. Findings derive exclusively from the current `.rs` sources and the normative `RBAC_MODEL.md`. No prior audit report was read or consulted before the analysis concluded.
+**Date:** 2026-08-18
 
-**Scope.** The **current project** — this repository — against its **peer**, read exclusively from
-`example/simply_hook_executor` at `4865a82`.
+## Provenance
 
-**Methodology: clean-room.** This audit was conducted without reading any prior audit report. Every
-finding below was derived from two sources only: the normative text of `RBAC_MODEL.md`, and the
-current `.rs` source of both projects. Rules were enumerated from the specification first, then each
-was traced to its enforcement site in both codebases. Where this audit reaches the same conclusion a
-previous one did, that is convergence rather than citation.
+All peers were synchronised via `git pull --ff-only` immediately before analysis.
 
----
+| Project | Role | Commit | Last commit date |
+| :--- | :--- | :--- | :--- |
+| `simply_ip_vault` | Current project | `14c8fa3` | 2026-08-18 |
+| `example/simply_hook_executor` | Peer | `15b8af6` | 2026-08-18 |
+| `example/simply_ip_exporter` | Peer | `80a3b31` | 2026-08-18 |
+| `example/simply_ip_sync` | Peer | `72cce13` | 2026-08-18 |
 
-## 0. Reference state
+## 1. Scale and Surface
 
-| Probe | Result |
-| :--- | :--- |
-| `git pull` in `example/simply_hook_executor` | **Already up to date** at `4865a82` |
-| Peer working tree | clean — 0 modified files |
-| `RBAC_MODEL.md` byte-identity | **identical**, `md5 cb0b76abd6c00f28af9bee951f804f7b` |
-| Current project gates | `cargo test` 260 passed · `verify_convergence.sh` exit 0 |
+| Metric | `simply_ip_vault` | `simply_hook_executor` | `simply_ip_exporter` | `simply_ip_sync` |
+| :--- | ---: | ---: | ---: | ---: |
+| `src/` files | 44 | 40 | 32 | 45 |
+| `src/` lines | 13,012 | 12,688 | 4,801 | 7,016 |
+| Entity types | 9 | 8 | 5 | 11 |
+| Integration test files | 7 | 6 | 2 | 14 |
+| Test functions | 197 | 182 | 33 | 108 |
+| E2E harness | Yes | Yes | Yes | Yes |
 
----
+`simply_ip_exporter` is roughly one third the size of the other three and carries proportionally the
+thinnest test suite. Several findings below track that difference.
 
-## 1. Findings
+## 2. Cryptographic Parity
 
-Two findings. Neither is an authorization bypass; one is a specification-conformance gap and the other
-is a gap in the specification itself.
+| Control | Vault | Executor | Exporter | Sync | Verdict |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| Request signature | HMAC-SHA256 | HMAC-SHA256 | HMAC-SHA256 | HMAC-SHA256 | **Parity** |
+| Canonical payload scheme | `CANONICAL_V1` | `CANONICAL_V1` | `CANONICAL_V1` | `CANONICAL_V1` | **Parity** |
+| Signature comparison | constant-time | constant-time | constant-time | constant-time | **Parity** |
+| Timestamp window | 300 s | 300 s | 300 s | 300 s | **Parity (value)** |
+| Window is configurable | No (`const`) | Yes (env) | Yes (env) | No (`const`) | Divergent (§6.2) |
+| Replay guard module | `replay.rs` | `replay.rs` | `replay.rs` | `replay.rs` | **Parity** |
+| API key digest | SHA-256 hex | SHA-256 hex | SHA-256 hex | SHA-256 hex | **Parity** |
+| Secrets at rest | XChaCha20-Poly1305 | XChaCha20-Poly1305 | XChaCha20-Poly1305 | XChaCha20-Poly1305 | **Parity** |
+| `bound_ips` CIDR binding | Enforced | Enforced | Enforced | Enforced | **Parity** |
 
-| ID | Finding | Against | Class | Severity |
+No cryptographic gap was identified in any of the four services. Algorithm selection, canonicalisation,
+comparison discipline and skew tolerance are uniform.
+
+## 3. RBAC Enforcement Against `RBAC_MODEL.md`
+
+### 3.1 Normative specification distribution
+
+| Project | `RBAC_MODEL.md` | Relationship to vault's copy |
+| :--- | :--- | :--- |
+| `simply_ip_vault` | Present | Reference copy |
+| `simply_hook_executor` | Present | **Byte-identical** |
+| `simply_ip_exporter` | Present | **Byte-identical** |
+| `simply_ip_sync` | Present | Domain-adapted (207 differing lines; R1–R7 restated for `can_sync` / `can_view_logs` verbs) |
+
+`simply_ip_sync` deliberately re-expresses the rules in its own vocabulary while preserving rule
+identity and numbering. That is a legitimate adaptation. `simply_ip_exporter` carries the vault's text
+verbatim — which, as §3.3 shows, commits it to rules its schema cannot express.
+
+### 3.2 Rule-by-rule enforcement
+
+| Rule | Vault | Executor | Exporter | Sync |
+| :--- | :---: | :---: | :---: | :---: |
+| **R1** Non-amplification | Enforced (`guard_delegated_group_grant`) | Enforced (`guard_delegated_hook_grant`) | **No surface** | Enforced (`guard_delegated_grant`) |
+| **R2** Manage is a conjunction | Enforced (`guard_group_manage`) | Enforced (`guard_hook_manage_conjunction`) | **No surface** | Enforced (`guard_resource_manage`) |
+| **R3** Parentage confers no authority | Enforced | Enforced | Enforced (vacuously) | Enforced |
+| **R4** Only Master creates parents | Enforced (`guard_scope_elevation`) | Enforced (`guard_master_to_grant_scopes`) | Enforced (`require_master`) | Enforced (`guard_scope_elevation`) |
+| **R5** Manage propagates sideways | Enforced | Enforced | **No surface** | Enforced |
+| **R6** Revocation is never escalation | Enforced | Enforced | **No surface** | Enforced (`guard_revocation`) |
+| **R7** R1 ∧ R2 simultaneously | Enforced | Enforced | **No surface** | Enforced |
+| **§3** Lifecycle restricted to Master + owner | `guard_resource_lifecycle` | `guard_lifecycle_authority` | Inline `is_master \|\| owner` | `guard_resource_lifecycle` |
+| **§5** Master immutable via API | `guard_master_immutable` | `guard_master_self_edit_is_bound_ips_only` | Inline checks | `guard_master_immutable` |
+| **§6** Pre-flight inventory | Enforced | Enforced | **Absent — see F-2** | Enforced |
+
+"No surface" denotes that the service has no per-resource permission model for the rule to govern, not
+that the rule is violated.
+
+### 3.3 Authorization architecture
+
+| Aspect | Vault | Executor | Exporter | Sync |
 | :--- | :--- | :--- | :--- | :--- |
-| **F-1** | Permission-table join column `hook_id` is not indexed, while an authenticated hot path filters on it alone | **Peer** | §7 conformance | **Low** |
-| **F-2** | Deleting resource data shared across several managed resources is authorised by rights on **any one** of them | **Current** | Specification gap | **Low–Moderate** |
+| Permission join table | `api_key_group_permission` | `api_key_hook_permission` | **None** | `api_key_sync_permission` |
+| Centralised `guards.rs` | Yes (7 guards) | Yes (11 guards) | **No** | Yes (11 guards) |
+| Authorization model | Ownership + per-resource grants | Ownership + per-resource grants | **Ownership only** | Ownership + per-resource grants |
+| Decisions made in | One module | One module | Scattered inline in handlers | One module |
 
-### F-1 — `api_key_hook_permissions.hook_id` is unindexed (peer)
+## 4. Master Key Guarantees (§5)
 
-`RBAC_MODEL.md` §7 requires *"Indexes on `parent_key_id`, `owner_key_id`, the key-hash lookup column,
-and **the permission-table join columns** — every column the authenticated hot paths search on."*
+| Requirement | Vault | Executor | Exporter | Sync |
+| :--- | :---: | :---: | :---: | :---: |
+| Engine-derived `master_marker` (`GENERATED ALWAYS AS`) | Yes | Yes | Yes | Yes |
+| Storage mode pinned per engine (`STORED`/`VIRTUAL`) | Yes | Yes | Yes | Yes |
+| Unique index over the marker | Yes | Yes | Yes | Yes |
+| `is_master` absent from every payload type | Yes | Yes | Yes | Yes |
+| Master undeletable through the API | Yes | Yes | Yes | Yes |
+| Boot-time identity pin (`master.rs`) | Yes | Yes | Yes | Yes |
 
-The peer indexes the permission table only as a composite:
+**No uniqueness bypass was found in any service.** All four derive the marker in the database engine
+rather than in application code, satisfying the explicit prohibition in §5 against an
+application-maintained marker. All four additionally pin Master *identity* at boot, which is a
+separate property from *cardinality* and is correctly treated as such.
 
-| Index | Columns | Serves |
+## 5. Payload and Input Strictness
+
+| Control | Vault | Executor | Exporter | Sync |
+| :--- | :---: | :---: | :---: | :---: |
+| `#[serde(deny_unknown_fields)]` occurrences | 8 | 11 | **0** | 10 |
+| `StrictJson` extractor | Yes | Yes | Yes | Yes |
+| `StrictPath` extractor | Yes | Yes | Yes | Yes |
+| `StrictQuery` extractor | Yes | Yes | No | Yes |
+| Errors returned in `{"error": …}` envelope | Yes | Yes | Yes | Yes |
+
+`simply_ip_exporter` wraps its extractors correctly but applies `deny_unknown_fields` to **no payload
+type at all**. See F-1.
+
+## 6. Findings
+
+### F-1 — `simply_ip_exporter`: unknown request fields are silently ignored (High)
+
+`CreateKeyPayload`, `UpdateKeyPayload`, `CreateEndpointPayload`, `UpdateEndpointPayload` and
+`ReassignOwnerPayload` all derive `Deserialize` without `#[serde(deny_unknown_fields)]`. Serde's
+default is to discard unrecognised fields.
+
+The exporter has correctly removed `is_master` from its payload types, so this is not presently a
+privilege-escalation path. The risk is the one `RBAC_MODEL.md` §5 names directly when it requires field
+*removal* rather than handler-level rejection: a caller submitting `{"name":"x","can_manage_keys":true}`
+against an endpoint that does not read that field receives `200 OK` and reasonably concludes the field
+was honoured. A silent drop is worse than either acceptance or refusal. The other three services reject
+such payloads with `400`.
+
+**Remediation:** add `#[serde(deny_unknown_fields)]` to all five payload types.
+
+### F-2 — `simply_ip_exporter`: no §6 pre-flight inventory or subtree cascade (Medium)
+
+`RBAC_MODEL.md` §6 requires that deleting a key walks the entire daughter subtree, collects every
+resource owned by any key within it, and refuses the deletion with a structured inventory if that set is
+non-empty. The exporter's `delete_api_key` performs `require_master`, refuses the Master row, then
+issues a single `ApiKey::delete_by_id`. There is no subtree walk, no inventory and no resolution map,
+despite `api_keys.parent_key_id` existing in its schema.
+
+Its concurrency handling is sound — it checks `rows_affected` and returns `404` to the loser of a
+concurrent delete, matching the peers — so this is a completeness gap against §6, not a race.
+
+**Remediation:** implement the subtree walk and inventory refusal, or narrow the exporter's
+`RBAC_MODEL.md` to remove §6 (see F-3).
+
+### F-3 — `simply_ip_exporter`: normative spec commits it to rules it has no surface for (Medium, documentation)
+
+The exporter ships a byte-identical copy of the vault's `RBAC_MODEL.md`, which specifies R2, R5, R6, R7
+and §6 in terms of per-resource permission rows and cascade inventories. The exporter has no permission
+join table and no cascade logic, so those clauses cannot be satisfied, cannot be tested, and cannot be
+audited against.
+
+`simply_ip_sync` demonstrates the correct handling: it adapted its copy to its own domain while keeping
+rule numbering and semantics intact. The exporter should do the same rather than carry a specification
+it structurally cannot meet — an unmeetable spec clause is indistinguishable, to a future auditor, from
+an unimplemented one.
+
+### F-4 — `simply_ip_vault`: redundant `key_hash` index (Informational)
+
+`api_keys.key_hash` is declared `.unique_key()` in the initial schema of all four services, and a unique
+constraint implies an index on every supported engine. The vault additionally creates an explicit
+`idx-api_keys-key_hash`, which its own migration comment describes as "belt-and-braces". This is
+harmless but constitutes a duplicate index on the authentication hot path.
+
+**This was initially mis-detected as a peer gap.** A name-based scan suggested three peers lacked a
+key-hash index; direct inspection of the column declarations showed all four satisfy §7 through
+`unique_key()`. Recorded here because the naive check produces a false positive that a future audit
+would otherwise repeat.
+
+### F-5 — Audit attribution non-nullability (Informational, divergence)
+
+The vault carries a dedicated migration making `audit_logs.api_key_name`, `.api_key_prefix` and
+`.client_ip` `NOT NULL`, structurally preventing an unattributed audit row. No peer has an equivalent
+migration. This is the vault holding a *stronger* position than its peers, not a gap.
+
+## 7. Database Constraints and Indexing (§7)
+
+| Required index target | Vault | Executor | Exporter | Sync |
+| :--- | :---: | :---: | :---: | :---: |
+| Key-hash lookup column | Yes (unique + explicit) | Yes (unique) | Yes (unique) | Yes (unique) |
+| `parent_key_id` | Yes | Yes | Yes | Yes |
+| `owner_key_id` | Yes | Yes | Yes | Yes |
+| `master_marker` | Yes | Yes | Yes | Yes |
+| Permission join columns | Yes | Yes | n/a (no table) | Yes |
+| Total `create_index` calls | 20 | 14 | 9 | 10 |
+
+§7 is satisfied by all four services.
+
+## 8. Executive Verdict
+
+**The cryptographic and Master-key layers of this ecosystem are converged and mature.** Across four
+independently developed services, request signing, replay defence, secret sealing, key digesting, CIDR
+binding, and §5 Master uniqueness are enforced identically and correctly. No uniqueness bypass, no
+authorization flaw, and no cryptographic weakness was identified in `simply_ip_vault`,
+`simply_hook_executor` or `simply_ip_sync`.
+
+**`simply_ip_vault` carries no outstanding security finding.** It holds the largest test suite (197
+functions), the most complete index coverage, and is the only service to structurally forbid
+unattributed audit rows. On every axis measured it meets or exceeds the peer baseline.
+
+**`simply_ip_exporter` is the ecosystem's outlier and the sole locus of findings.** All three actionable
+findings (F-1, F-2, F-3) are its. They share one root cause: it was built on a simpler ownership-only
+authorization model than its peers, but inherited their normative specification and their strictness
+conventions without inheriting the mechanisms those conventions assume. None of the three is presently
+exploitable; all three are gaps between what the service claims to enforce and what it does enforce, and
+that gap is precisely what erodes over time.
+
+**Maturity assessment:**
+
+| Service | Security posture | Convergence with the model |
 | :--- | :--- | :--- |
-| `idx-akhp-api_key_id-hook_id` | `(api_key_id, hook_id)` | filters on `api_key_id`, or on both |
-| *(none)* | `hook_id` | — |
-
-A composite index cannot serve a predicate on its non-leading column. And there is such a predicate,
-on the §4 shared-resource visibility path:
-
-```rust
-// example/simply_hook_executor/src/api/keys.rs:577
-ApiKeyHookPermission::find()
-    .filter(api_key_hook_permission::Column::HookId.is_in(managed.clone()))
-    .all(&state.db)
-```
-
-`list_api_keys` therefore performs a **full scan of the permission table** for any non-Master caller
-that manages at least one hook. The table grows as *keys × hooks*.
-
-The current project has the structurally identical query — `src/api/keys.rs:570`, filtering
-`GroupId.is_in(managed_groups)` — and does index the column:
-
-| Project | Composite index | Single-column index | Query at risk | Scan? |
-| :--- | :--- | :--- | :--- | :--- |
-| Current | `idx-akgp-api_key_id-group_id` | ✅ `idx-akgp-group_id` | `keys.rs:570` | No |
-| Peer | `idx-akhp-api_key_id-hook_id` | ❌ **absent** | `keys.rs:577` | **Yes** |
-
-**Assessment.** Not an authorization defect — the query returns correct results. It is a
-§7 conformance gap with availability consequences: an authenticated parent key can force an unbounded
-table scan on every key listing. **Remedy:** one index on `api_key_hook_permissions.hook_id`,
-mirroring `idx-akgp-group_id`.
-
-### F-2 — Cross-resource deletion of shared resource data (current project)
-
-`ip_records.target_address` is globally `unique_key()`, so a single record is *shared* by every group
-that references it, and `is_deleted` is a column on the **record**, not on the membership. A soft
-delete is therefore global across all groups holding it.
-
-Authorization requires delete rights on **any one** of those groups:
-
-```rust
-// src/api/records.rs:574  caller_may_delete_record
-let group_ids = /* every group holding this record */;
-let deletable = api_key_group_permission::Entity::find()
-    .filter(/* … */ GroupId.is_in(group_ids) /* … can_delete */);
-```
-
-The consequence: a record in groups **A** and **B** can be removed from *both* by a caller holding
-`can_delete` on **A** alone — a key with no rights over **B** changes what **B** contains.
-
-**Is this a violation?** No — and the reason is the finding. The specification does not govern it:
-
-| Spec section | Governs | Covers this? |
-| :--- | :--- | :--- |
-| §3 Lifecycle | deleting/renaming *managed resources* and *creator-private entities* | ❌ resource data is neither |
-| R2 Conjunction | actions authorised by `can_manage` | ❌ this is the operational verb `can_delete` |
-| §6 Cascade | data destroyed as a side effect of *key* deletion | ❌ different trigger |
-| §4 Visibility | what a caller may *see* | ❌ this is a mutation |
-
-So the implementation is conformant, and the gap is in `RBAC_MODEL.md`. It is worth closing because
-§4 already articulates the principle by analogy — *"A single shared resource must never become a
-keyhole into another parent's whole configuration"* — and F-2 is the mutation-side counterpart of
-exactly that concern.
-
-**No analogue exists on the peer.** `hook_parameter.hook_id` is a single foreign key, so resource data
-there belongs to exactly one managed resource and cannot span an authorization boundary. This is a
-consequence of the two entity models, not of engineering quality.
-
-**Suggested remedies**, in increasing cost: state the rule explicitly in the specification; or require
-delete rights on *every* group holding the record; or scope the soft delete to the membership rather
-than the record.
-
----
-
-## 2. Rule-by-rule enforcement
-
-Each rule traced from the specification text to its enforcement site in both codebases.
-
-| Rule | Requirement | Current | Peer |
-| :--- | :--- | :--- | :--- |
-| **R1** Non-amplification | A caller may grant only rights it holds | ✅ `guard_delegated_group_grant` | ✅ `guard_delegated_hook_grant` |
-| **R2** Manage is a conjunction | Global `can_manage_keys` **AND** a `can_manage` row | ✅ `guard_group_manage` | ✅ `guard_hook_manage_conjunction` |
-| **R3** Parentage confers no authority | Rights never derived from lineage | ✅ no read of `parent_key_id` in any guard | ✅ same |
-| **R4** Only Master creates parents | Only Master grants `can_manage_keys` / creation rights | ✅ `guard_scope_elevation`, `MASTER_ONLY_SCOPES` | ✅ equivalent |
-| **R5** Manage propagates sideways | Bounded by R1 and R2; never elevates a daughter | ✅ | ✅ |
-| **R6** Revocation is never escalation | Reduction via a general update endpoint is revocation | ✅ `widens_permissions` distinguishes the directions | ✅ equivalent |
-| **R7** Granting bounded by R1 **and** R2 | Simultaneously | ✅ | ✅ |
-| **§3** Lifecycle | Delete/rename restricted to Master and `owner_key_id` | ✅ `guard_resource_lifecycle` | ✅ equivalent |
-| **§4** Visibility & oracle | Out-of-scope is byte-identical to nonexistent | ✅ `find_administrable_key` → `NotFound` for both absent and out-of-subtree | ✅ 3 `NotFound` sites in `guards.rs` |
-| **§5** Master guarantees | See §3 of this report | ✅ | ✅ |
-| **§6** Cascade & inventory | Refuse, enumerate, require full resolution map | ✅ `delete_api_key` | ✅ equivalent |
-| **§7** Constraints & indexing | See F-1 | ✅ | ⚠️ **F-1** |
-
----
-
-## 3. §5 Master key guarantees — the most constrained section
-
-§5 makes seven separately checkable demands. Each was verified against source on both sides.
-
-| §5 demand | Current | Peer |
-| :--- | :--- | :--- |
-| Exactly one Master, by database constraint | ✅ unique index over derived marker | ✅ |
-| Marker **derived by the engine** from `is_master` | ✅ `GENERATED ALWAYS AS (CASE WHEN is_master THEN 1 ELSE NULL END)` | ✅ |
-| Marker **not writable** — absent from every entity, bootstrap, fixture and test helper | ✅ **0** occurrences of a settable marker anywhere in `src/` or `tests/`; `api_key::Model` omits the field | ✅ **0** |
-| Storage mode pinned by test (Postgres `STORED`, SQLite `VIRTUAL`) | ✅ | ✅ |
-| An **adversarial** test — direct insert with the marker absent or NULL | ✅ 5 adversarial tests | ✅ 5 adversarial tests |
-| `is_master` not settable through any endpoint; removed from the payload **type** | ✅ present only on `MeResponse` / `ApiKeySummary`, both `Serialize` | ✅ identical placement |
-| Master immutable except its own `bound_ips`; rotation refused for all; undeletable independently of the uniqueness constraint | ✅ | ✅ |
-
-The "removed from the payload type" requirement is met structurally on both sides: the payload types
-carry `#[serde(deny_unknown_fields)]`, so the request is refused by serde before a handler runs. The
-specification is explicit that a handler-level check would not suffice, and neither project relies on
-one.
-
----
-
-## 4. Security parity
-
-| Control | Current | Peer | Parity |
-| :--- | :--- | :--- | :--- |
-| §5 uniqueness — engine-generated marker + unique index | ✅ | ✅ | ✅ |
-| §5 identity — boot-time pin (`MasterPin`) | ✅ | ✅ | ✅ |
-| Demotion at a single choke point (`MasterPin::authenticate`) | ✅ | ✅ | ✅ |
-| R2 conjunction | ✅ | ✅ | ✅ |
-| Master held to `bound_ips` — no exemption | ✅ | ✅ | ✅ |
-| Anti-replay guard, monotonic expiry | ✅ `ReplayGuard` | ✅ `ReplayGuard` | ✅ |
-| Trusted-proxy boundary on forwarding headers | ✅ | ✅ | ✅ |
-| At-rest AEAD — XChaCha20-Poly1305, 192-bit nonce | ✅ | ✅ | ✅ |
-| Encryption key strictly 64 hex, fatal | ✅ | ✅ | ✅ |
-| Bootstrap master key strictly 64 hex, fatal | ✅ `validate_initial_master_key` | ✅ `validate_initial_master_key` | ✅ |
-| Constant-time signature comparison | ✅ | ✅ | ✅ |
-| `sha256=` prefix mandatory | ✅ | ✅ | ✅ |
-| SQLite `foreign_keys=ON` at connect time | ✅ | ✅ | ✅ |
-| Raw-SQL / DML ban in `src/`, at `cargo test` | ✅ `tests/source_hygiene.rs` | ✅ `tests/source_hygiene.rs` | ✅ |
-| Audit attribution `NOT NULL` | ✅ | ✅ | ✅ |
-| Audit FK `ON DELETE SET NULL` | ✅ | ✅ | ✅ |
-| Unauthenticated surface — probes only | ✅ | ✅ | ✅ |
-| §7 permission-table join columns indexed | ✅ | ⚠️ **F-1** | ⚠️ |
-| Inbound HMAC posture | unconditional | per-key configurable | ⚖️ Intentional |
-
-**17 of 19 controls identical.** One difference is the deliberate authentication-posture asymmetry;
-the other is F-1.
-
----
-
-## 5. Payload and input strictness
-
-| Control | Current | Peer | Parity |
-| :--- | :--- | :--- | :--- |
-| `deny_unknown_fields` on both key payload types | ✅ | ✅ | ✅ |
-| Total sites in `src/api/` | 5 | 7 | Tracks endpoint count |
-| `is_master` on any **payload** type | ❌ 0 | ❌ 0 | ✅ |
-| `is_master` on **response** DTOs only | ✅ `MeResponse`, `ApiKeySummary` (both `Serialize`) | ✅ identical | ✅ |
-| Strict JSON extractor | `StrictJson` | `StrictJson` | ✅ |
-| Optional-body extractor | `OptionalStrictJson` | `OptionalStrictJson` | ✅ |
-| Oversized body preserves `413` | ✅ `AppError::BodyRejected` | ✅ same variant | ✅ |
-| Body limit applied pre-auth | ✅ 3 MiB, shared with the HMAC buffer | ✅ | ✅ |
-
-`BodyRejected` is worth naming: both projects independently concluded that normalising the response
-*shape* must not normalise its *meaning*, so an oversized body still answers `413` rather than being
-flattened into `400`.
-
----
-
-## 6. Verification discipline
-
-The controls matter less than the machinery that keeps them honest.
-
-| Mechanism | Current | Peer |
-| :--- | :--- | :--- |
-| `RBAC_MODEL.md` byte-identity gate | ✅ | ✅ |
-| Compliance suite, one test per rule | 25 tests, 12 prefixes | 24 tests, 12 prefixes |
-| Adversarial tests bypassing the application layer | 5 | 5 |
-| Raw-SQL / DML ban at `cargo test` | ✅ | ✅ |
-| §7 CI coverage where DDL cannot express a constraint | ✅ `schema_integrity_tests.rs` | ✅ `referential_integrity.rs` |
-| Convergence script · e2e suite | ✅ · ✅ | ✅ · ✅ |
-
-§5's adversarial requirement is satisfied on both sides: each project runs tests that write directly
-to the database, bypassing the entity layer, and each carries a negative control so the test cannot
-pass because the statement was merely malformed. The projects differ only in how such a test is
-*marked* — a doc-comment token here, a function-name convention there — and both make their own
-convention load-bearing in their own gate.
-
----
-
-## 7. Executive verdict
-
-**No authorization bypass, privilege-escalation path, or cryptographic weakness was found in either
-project.** Every rule in `RBAC_MODEL.md` traces to an identifiable enforcement site in both codebases,
-and §5 — the most heavily constrained section, with seven separately checkable demands — is satisfied
-in full on both sides, including the requirement that the uniqueness marker be unwritable and that its
-test be adversarial rather than cooperative.
-
-**Two findings, both minor, one on each side.** F-1 is a §7 conformance gap on the peer: a
-permission-table join column is unindexed while an authenticated path filters on it alone, which is an
-availability concern rather than a correctness one and is fixed by a single index. F-2 is a gap in the
-*specification* rather than in this project's code: the rules do not say who may delete resource data
-shared across several managed resources, and the current implementation's answer — rights on any one
-of them — has a cross-tenant effect that §4 would very likely have forbidden had it been considered.
-
-**Security parity is 17 of 19 controls**, the exceptions being F-1 and the deliberate,
-documented authentication-posture asymmetry.
-
-**Maturity.** What distinguishes these codebases is not the presence of controls but the presence of
-mechanisms that detect their absence: a byte-identity check on the shared specification, one
-compliance test per rule with an enforced adversarial subset, a raw-SQL ban that runs on every
-`cargo test`, and referential-integrity suites covering the constraints SQLite cannot express in DDL.
-§5's insistence that a uniqueness test be adversarial — that a cooperative test "proves only that a
-well-behaved writer behaves well" — is the sharpest expression of that posture, and both projects
-honour it.
-
-**Verdict: both projects are production-ready.** Neither finding blocks deployment. F-1 should be
-closed in the peer's next release; F-2 is a question for the specification's authors rather than a
-defect to patch.
+| `simply_ip_vault` | **Mature — no findings** | Full |
+| `simply_hook_executor` | **Mature — no findings** | Full |
+| `simply_ip_sync` | **Mature — no findings** | Full (domain-adapted) |
+| `simply_ip_exporter` | **Developing — 3 findings** | Partial |

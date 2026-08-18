@@ -10,20 +10,53 @@ To keep this context clean and modular, responsibilities are split across three 
 1. **`AGENT.MD`** *(This file)*: Core architectural rules, security constraints, documentation standards, and testing directives.
 2. **`SCHEMA.MD`**: Official Database Schema, SeaORM Entity relations, M:N RBAC definitions, and Enum specifications.
 3. **`AGENT_NOTES.MD`**: Agent worklog. You MUST update this file with architectural decisions, progress notes, or pending tasks after completing significant modifications.
-4. **`example/`**: You can find the code of other similar/linked project inside.
+4. **`example/`**: You can find the code of other similar/linked project inside. **Read [Peer Repository Synchronization](#-peer-repository-synchronization) before reading anything in here.**
 
 ---
 
 ## 🔄 Peer Repository Synchronization
 
-`example/` holds working clones of the sibling services this project is kept convergent with —
-currently `example/simply_hook_executor`. They are **real git clones with their own remotes**, not
-flat snapshots.
+`example/` holds **live git clones** of the peer services, not flat snapshots.
+They are what `scripts/verify_convergence.sh` compares against and what every convergence or security report describes.
+
+### Why `example/` exists
+
+`simply_ip_vault` is not a standalone service. It is one member of a family of Rust services built on a
+deliberately shared foundation: the same authentication scheme, the same `AppError` envelope, the same
+`RBAC_MODEL.md` governance rules, the same module topology, and the same testing philosophy.
+
+That convergence **originated with two foundational sibling projects — `simply_ip_vault` and
+`simply_hook_executor`.** Those two were aligned first and most tightly, and they remain the ecosystem's
+gold standard: where a question of "what is the correct pattern here?" arises, the answer is whatever
+those two do in agreement. The family has since grown, and every newer service is measured against that
+baseline rather than inventing its own.
+
+The peers currently vendored here:
+
+| Peer | Domain | Standing |
+| :--- | :--- | :--- |
+| `simply_hook_executor` | Signed execution of server-side hooks | **Gold standard** — co-reference with this project |
+| `simply_ip_sync` | Ingests external feeds, syncs vault instances | Fully converged peer |
+| `simply_ip_exporter` | Serves filtered IP feeds to downstream consumers | Converging; simpler ownership-only authorization model |
+
+`example/` is therefore **not sample code and not documentation**. It is a set of live reference
+implementations, kept at their real upstream revisions, that exist so an agent working in this
+repository can answer three questions by reading rather than guessing:
+
+1. **Security posture parity.** How does a converged peer enforce a given `RBAC_MODEL.md` rule? If this
+   project enforces it differently, one of the two is wrong and the difference must be explained.
+2. **Architectural alignment.** Where does a given concern belong — `guards.rs`, `support.rs`,
+   `middleware.rs`, `extract.rs`? The peers already answer this, consistently.
+3. **Testing strategy.** What does an adversarial test for this property look like? The peers carry
+   proven test patterns worth adapting rather than reinventing.
+
+Divergence from the peers is permitted, but it is never free: it must be *deliberate*, *domain-justified*,
+and *written down* in `AGENT_NOTES.MD` or a convergence report. Undocumented drift is the failure mode
+this directory exists to prevent.
 
 ### Mandatory: pull before you analyse
 
-**Before reading any source under `example/`, and before producing a convergence, parity, or security
-report, run:**
+**Before reading any file under `example/`, and before generating a convergence, parity, or security report, you MUST run:**
 
 ```bash
 git -C example/<peer_repo> pull
@@ -42,13 +75,13 @@ a reference anyone can check later.
 requirement for its own comparisons. It does **not** satisfy it for reports you write by reading files
 directly — do it yourself in that case.
 
-### Two things not to do
+### Rules
 
-- **Do not `rsync` over a peer clone.** `rsync --delete` *protects* excluded paths rather than
-  removing them, so `--exclude=.git` leaves the clone's git directory intact but its worktree
-  overwritten — and any local commits unreachable. Use `git pull`.
-- **Do not commit inside `example/`.** These are read-only references. `example/*` is gitignored here,
-  so changes made there are invisible to this repository's history and will be lost on the next sync.
+- **Pull first, read second.** Not "pull if it looks stale" — staleness is invisible from inside the tree.
+- **State the revision.** A report that does not name the peer commit it audited cannot be reproduced or re-checked. Both reports in this repository carry the peer's short SHA in their header.
+- **A failed pull is reportable, not ignorable.** If the remote is unreachable, say so in the report and name the local `HEAD` being analysed instead. Silent analysis of an unknown revision is the thing this section exists to prevent.
+- **Never commit the peer.** `example/` is `.gitignore`d. Reports about the peer belong in this repository; the peer's own code does not.
+- **Read-only.** Never modify, stage, or commit inside a peer checkout. `git pull --ff-only` is the only write this repository's tooling performs there.
 
 ---
 
