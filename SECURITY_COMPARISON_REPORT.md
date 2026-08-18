@@ -13,7 +13,7 @@ All peers were synchronised via `git pull --ff-only` immediately before analysis
 | `simply_ip_vault` | Current project | `14c8fa3` | 2026-08-18 |
 | `example/simply_hook_executor` | Peer | `15b8af6` | 2026-08-18 |
 | `example/simply_ip_exporter` | Peer | `80a3b31` | 2026-08-18 |
-| `example/simply_ip_sync` | Peer | `72cce13` | 2026-08-18 |
+| `example/simply_ip_sync` | Peer | `0061099` | 2026-08-18 |
 
 ## 1. Scale and Surface
 

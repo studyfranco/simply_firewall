@@ -9,7 +9,7 @@
 | `simply_ip_vault` | `14c8fa3` |
 | `example/simply_hook_executor` | `15b8af6` |
 | `example/simply_ip_exporter` | `80a3b31` |
-| `example/simply_ip_sync` | `72cce13` |
+| `example/simply_ip_sync` | `0061099` |
 
 ## 1. Module Topology
 

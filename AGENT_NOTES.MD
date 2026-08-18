@@ -7771,3 +7771,29 @@ structure without all of its disciplines.
 - The sibling working tree at `../simply_ip_sync` holds uncommitted source changes. Its remote has since
   advanced to `72cce13` with equivalent work already landed. Left untouched per the peer read-only rule;
   flagged for reconciliation by its owner.
+
+### Re-verification pass (same day)
+
+The audit brief was re-issued after the reports landed in `4e4faef`. Rather than regenerate the
+analysis, Task 0 was re-run to establish whether anything had actually moved:
+
+| Peer | Result |
+| :--- | :--- |
+| `simply_hook_executor` | `15b8af6` — already up to date |
+| `simply_ip_exporter` | `80a3b31` — already up to date |
+| `simply_ip_sync` | `72cce13` → `0061099` — **documentation only**; `git diff --name-only` returns no `.rs`, `.sh` or `Cargo` path |
+
+`simply_ip_vault`'s own `src/` and `tests/` were likewise unchanged across `14c8fa3..HEAD` (the two
+intervening commits touch `Cargo.toml` only).
+
+**No source file changed in any of the four projects between the audit and this re-check, so every
+finding in both reports stands unmodified.** The only correction applied was the provenance SHA for
+`simply_ip_sync`, updated `72cce13` → `0061099` in both report headers — the reports require a peer
+revision a reader can reproduce against, so a stale SHA there is a real defect even when the
+conclusions it supports are unaffected. Re-deriving identical findings would have added nothing
+except the risk of drift between two runs of the same analysis.
+
+The `Cargo.toml` `oxc` pin flagged in the previous entry was resolved by the maintainer in `53ac499`
+and `25a5c4d`: the dependencies now float at `0.145` rather than being pinned at `=0.143.0`. The
+rationale comment above them still describes the older pinning decision and no longer matches the
+manifest.
