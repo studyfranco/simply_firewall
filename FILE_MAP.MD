@@ -3,7 +3,7 @@
 An index of every file under `src/`, its size, and its exact purpose. Written for future agents: read
 this before searching the tree, and update it when you add, remove, or repurpose a file.
 
-**Revision:** `14c8fa3` · **Generated:** 2026-08-18 · **Files indexed:** 44 · **Total:** 13,012 lines
+**Revision:** `b479539` (plus this session's uncommitted changes) · **Generated:** 2026-08-18 · **Files indexed:** 44 · **Total:** 13,395 lines
 
 ---
 
@@ -12,12 +12,12 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | File | Lines | Purpose |
 | :--- | ---: | :--- |
 | `lib.rs` | 166 | Crate root. Assembles the axum router, declares module visibility, and exposes `create_app` / `setup_state` — the two entry points integration tests build against. |
-| `main.rs` | 316 | Process entry point and nothing else. The boot sequence in strict order: connect → pragmas → migrate → bootstrap Master → pin Master → build state → start workers → bind → serve → graceful shutdown. The only writer of `is_master = true` in the service. |
+| `main.rs` | 494 | Process entry point and nothing else. The boot sequence in strict order: connect → pragmas → migrate → bootstrap Master → **verify the encryption key opens a real sealed secret** → pin Master → build state → start workers → bind → serve → graceful shutdown. The only writer of `is_master = true` in the service. `verify_encryption_key` refuses to start rather than deferring a `VAULT_ENCRYPTION_KEY` mismatch to the first authenticated request's `500`; carries its own `#[cfg(test)]` integration tests against a real in-memory database. |
 | `config.rs` | 1,508 | All environment reads, each `OnceLock`-cached and fail-soft with a warning, plus the client-IP resolution policy (trusted proxies, `X-Forwarded-For` handling). Also holds fatal validators for bootstrap credentials. |
-| `crypto.rs` | 839 | Two responsibilities: `CANONICAL_V1` request signing (HMAC-SHA256, constant-time verification, 300 s skew window) and signing-secret encryption at rest (XChaCha20-Poly1305 via `SecretCipher`). |
+| `crypto.rs` | 928 | Two responsibilities: `CANONICAL_V1` request signing (HMAC-SHA256, constant-time verification, 300 s skew window) and signing-secret encryption at rest (XChaCha20-Poly1305 via `SecretCipher`). Also `check_key_canary` — a pure, boot-time check that a configured `SecretCipher` actually opens a given stored secret, called from `main.rs::verify_encryption_key`. |
 | `db.rs` | 537 | Connection pool construction, SQLite session pragmas (WAL, `synchronous=NORMAL`, `foreign_keys=ON`), migration runner, and a dialect-aware `has_index` used by migrations. SQLite is capped at one connection — DDL breaks above it. |
 | `error.rs` | 107 | `AppError` and its `IntoResponse` mapping. The single definition of the `{"error": "…"}` envelope and of which internal failures are redacted before reaching a client. |
-| `extract.rs` | 128 | Strict request extractors (`StrictJson`, `StrictPath`, `StrictQuery`). Makes rejection a property of the *type* rather than of a handler, so no endpoint can accidentally emit axum's default plain-text rejection. |
+| `extract.rs` | 208 | Strict request extractors (`StrictJson`, `OptionalStrictJson`, `StrictPath`, `StrictQuery`). Makes rejection a property of the *type* rather than of a handler, so no endpoint can accidentally emit axum's default plain-text rejection. `StrictPath`/`StrictQuery` pass through axum's own rejection status (`400` for a malformed segment, `500` only for a route/handler mismatch) rather than hardcoding one — converged with `simply_hook_executor`'s wrapper of the same name. Every handler in `src/api/` uses these, never the bare axum extractors. |
 | `master.rs` | 322 | Boot-time pinning of the Master key **identity** (`MasterPin`), and the per-request demotion that enforces it. Distinct from the database's uniqueness constraint, which governs *cardinality* — an attacker with DB write access does not need two Masters, only to promote itself. |
 | `middleware.rs` | 328 | Authentication middleware: key lookup by hash, signature verification, timestamp validation, replay rejection, and `bound_ips` CIDR enforcement — in that order, so an unauthenticated caller cannot probe key bindings via 401-vs-403. |
 | `replay.rs` | 440 | `ReplayGuard`: the single-use ledger for `CANONICAL_V1` signatures. Fails closed on a poisoned lock, and prunes only genuinely expired entries — never wholesale, which would let every live signature replay at once. |
@@ -31,12 +31,12 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | :--- | ---: | :--- |
 | `mod.rs` | 69 | Module declarations and the re-export surface the router binds against. |
 | `guards.rs` | 457 | **The single place a permission decision is made.** Holds `guard_resource_lifecycle`, `guard_group_manage`, `guard_may_administer_any_group`, `guard_delegated_group_grant`, `guard_scope_elevation`, `guard_master_target`, `guard_master_immutable`. Read this before touching any authorization logic. |
-| `support.rs` | 311 | Shared handler plumbing: `hash_key`, `key_prefix`, `generate_random_key`, `normalize_ip_or_cidr` (masks CIDR host bits at ingestion), and `create_audit_log` — which takes its actor **by value, not `Option`**, so an unattributed write is unrepresentable. |
-| `keys.rs` | 1,365 | API key endpoints: identity (`/auth/me`), creation, listing, lifecycle, rotation, and per-group grants. Implements the §6 cascade with pre-flight inventory and resolution map. The largest handler module. |
-| `records.rs` | 1,446 | IP record endpoints: ban/whitelist upsert, listing with delta (`since`) support, batch upsert/full-replace, soft delete, restore, and hard purge. |
-| `groups.rs` | 197 | IP Group endpoints: creation, listing, deletion, owner reassignment. |
-| `webhooks.rs` | 611 | Webhook config endpoints: creation, listing, update, deletion, owner reassignment, and the four auth modes. |
-| `audit.rs` | 54 | Audit log query endpoint. Master-only. |
+| `support.rs` | 312 | Shared handler plumbing: `hash_key`, `key_prefix`, `generate_random_key`, `normalize_ip_or_cidr` (masks CIDR host bits at ingestion), and `create_audit_log` — which takes its actor **by value, not `Option`**, so an unattributed write is unrepresentable. |
+| `keys.rs` | 1,374 | API key endpoints: identity (`/auth/me`), creation, listing, lifecycle, rotation, and per-group grants. Implements the §6 cascade with pre-flight inventory and resolution map. The largest handler module. |
+| `records.rs` | 1,458 | IP record endpoints: ban/whitelist upsert, listing with delta (`since`) support, batch upsert/full-replace, soft delete, restore, and hard purge. |
+| `groups.rs` | 201 | IP Group endpoints: creation, listing, deletion, owner reassignment. |
+| `webhooks.rs` | 616 | Webhook config endpoints: creation, listing, update, deletion, owner reassignment, and the four auth modes. |
+| `audit.rs` | 58 | Audit log query endpoint. Master-only. |
 | `health.rs` | 121 | Unauthenticated liveness (`/health`, `/healthz`) and readiness (`/ready`, `/readyz`) probes. Liveness deliberately does not touch the database, so an outage cannot become a restart loop. |
 
 ## `src/entities/` — SeaORM models
@@ -45,7 +45,7 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | :--- | ---: | :--- |
 | `mod.rs` | 19 | Entity module declarations, mirroring the tables in `SCHEMA.MD`. |
 | `prelude.rs` | 16 | Convenience re-exports of every entity type. |
-| `api_key.rs` | 118 | `api_keys`: authentication tokens, global rights, CIDR bindings, lineage (`parent_key_id`), and the engine-derived `master_marker`. |
+| `api_key.rs` | 119 | `api_keys`: authentication tokens, global rights, CIDR bindings, lineage (`parent_key_id`), and the engine-derived `master_marker`. `signing_secret`'s doc names the actual read path (`AppState::cipher`'s `SecretCipher::open`) and cipher (XChaCha20-Poly1305). |
 | `ip_record.rs` | 76 | `ip_records`: banned/whitelisted addresses and subnets, with soft-delete columns. |
 | `ip_group.rs` | 87 | `ip_groups`: named collections of IP rules (`fail2ban`, `sshd`, …), each with an `owner_key_id`. |
 | `webhook_config.rs` | 247 | `webhook_configs`: downstream HTTP endpoints notified on IP events, including auth mode and templating. |
@@ -85,7 +85,7 @@ which file owns which property saves adding a test to the wrong one.
 | `schema_integrity_tests.rs` | What the **engine** does — foreign-key cascades, orphan refusal, address canonicalisation against the UNIQUE constraint, and everything `m20260811_000010`'s table rebuild had to carry across. File-backed, opened through `db::connect`, because `PRAGMA foreign_keys` is per-connection |
 | `rbac_integration_tests.rs` | The features working, end to end through the router |
 | `source_hygiene.rs` | Properties of the source tree: no raw SQL and no hand-written DML in `src/`, outside two startup-only exemptions. Carries a meta-test proving the scanner can see a violation |
-| `concurrency_and_contracts.rs` | Races and interface contracts. Replay-ledger atomicity under real thread contention, concurrent-delete idempotency, and a map of the response shape returned for every kind of malformed input — including the two extractors that fall outside the `{"error": …}` envelope. Name shared with the peer's suite of the same purpose |
+| `concurrency_and_contracts.rs` | Races and interface contracts. Replay-ledger atomicity under real thread contention, concurrent-delete idempotency, a map of the response shape returned for every kind of malformed input across every extractor (`StrictJson`/`StrictPath`/`StrictQuery`, all in the `{"error": …}` envelope), and `deny_unknown_fields` refused across every domain payload (groups, ban, white, webhooks). Name shared with the peer's suite of the same purpose |
 | `frontend_syntax_test.rs` | `static/app.js` parses. Nothing else compiles or executes it |
 
 **`source_hygiene.rs` deliberately duplicates `verify_convergence.sh::check_no_raw_sql`**, and the two
@@ -122,3 +122,5 @@ Full standards live in `AGENT.MD` § *SeaORM Migration Standards*. The two that 
 - **`master_marker` is engine-derived and must never become settable** on any entity, fixture, or test helper (`RBAC_MODEL.md` §5).
 - **SQLite runs at one pool connection.** Raising it breaks DDL, and it means concurrent requests serialize — HTTP-level tests cannot demonstrate handler races.
 - **Guards live in `guards.rs`.** An inline permission check in a handler is drift, and it is what separates the converged peers from the diverging one.
+- **Every handler takes `StrictJson`/`StrictPath`/`StrictQuery`, never the bare axum extractor.** A single bare `Path<Uuid>` left in a new handler is one route where a malformed input answers `text/plain` instead of `{"error": …}` — `tests/concurrency_and_contracts.rs::malformed_input_is_refused_on_every_extractor` asserts this across the whole crate for exactly that reason.
+- **New request-payload structs need `#[serde(deny_unknown_fields)]`.** The one exception is a struct with a `#[serde(flatten)]` field — serde refuses to compile the two together; put the annotation on the flattened type instead (see `keys.rs`'s `Resolution`/`ResolutionEntry`).

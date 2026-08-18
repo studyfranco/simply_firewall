@@ -18,9 +18,10 @@ pub struct Model {
     /// The key's HMAC-SHA256 signing secret, used to verify the `X-Signature-256` request header.
     ///
     /// Unlike [`Self::key_hash`], this cannot be a one-way hash — verifying a signature requires
-    /// the secret verbatim — so it is instead encrypted with AES-GCM-256 whenever
-    /// `VAULT_ENCRYPTION_KEY` is configured, and stored raw otherwise (development fallback). Always
-    /// read it through [`crate::crypto::open_signing_secret`] rather than using the field directly.
+    /// the secret verbatim — so it is instead sealed with XChaCha20-Poly1305 whenever
+    /// `VAULT_ENCRYPTION_KEY` is configured, and stored hex-encoded but unencrypted otherwise
+    /// (development fallback). Always read it through [`crate::state::AppState::cipher`]'s
+    /// [`open`](crate::crypto::SecretCipher::open) rather than using the field directly.
     ///
     /// `None` for keys created before this column existed; such keys cannot authenticate and must be
     /// rotated (`POST /api/keys/{id}/rotate`) to obtain a secret.

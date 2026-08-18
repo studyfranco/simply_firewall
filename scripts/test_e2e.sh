@@ -1030,10 +1030,15 @@ check_jq "length" "1" "and sees the seeded address"
 
 log_section "9. Webhook Lifecycle (Create / List / Delete)"
 
-log "Omitting the mandatory 'name' field reproduces the originally-reported 422 bug..."
+log "Omitting the mandatory 'name' field is refused in the standard JSON envelope..."
 api_call POST "/api/webhooks" "$MASTER_KEY" \
     "{\"target_url\":\"https://webhook.site/e2e-missing-name\",\"secret_token\":\"whsec_e2e\",\"payload_template\":\"{}\",\"group_id\":\"$GROUP_A_ID\"}"
-check "422" "creating a webhook without 'name' is rejected with 422 (missing required field)"
+# Was 422 (axum's bare `Json<T>` default) before `create_webhook` moved onto `StrictJson`. 400 is
+# now correct and consistent: it is what every other `StrictJson`-covered endpoint in this service
+# already answers for the identical "well-formed JSON, wrong shape" failure — see
+# `src/extract.rs`'s `StrictJson` doc for why that remap is deliberate rather than axum's default.
+check "400" "creating a webhook without 'name' is rejected with 400 (missing required field, StrictJson envelope)"
+check_jq '.error != null' "true" "and the refusal carries the standard error field"
 
 log "Creating a webhook with the correct payload shape (name/target_url/secret_token/payload_template/group_id)..."
 api_call POST "/api/webhooks" "$MASTER_KEY" \
@@ -2844,14 +2849,19 @@ check "200" "#6 read the reassigned group's records"
 check_true '[.[] | select(.target_address == "203.0.113.211")] | length == 1' \
     "#6 resource data is never destroyed implicitly (§6)"
 
-# --- 27d. Stored secrets are opened strictly, or not at all -----------------------------------
+# --- 27d. A wrong-but-well-formed encryption key refuses startup, not just a request -----------
 #
 # `SecretCipher::open` refuses any value without a recognized storage prefix, and any sealed value
-# it cannot authenticate. Both fail closed as a `500` — an operator fault — rather than a `401`,
-# which would send whoever is debugging to look at the client instead of at the database.
+# it cannot authenticate. §26 above covers a *malformed* key (wrong length/hex); this covers a key
+# that is syntactically fine but is not the one the data at rest was actually sealed under — the
+# shape a botched key rotation or a restored-from-the-wrong-vault deployment actually produces.
 #
-# Asserted by sealing under one key and reading under another, which is the shape a botched key
-# rotation or a restored-from-the-wrong-vault deployment actually produces.
+# `verify_encryption_key`'s boot-time canary (`src/main.rs`) opens one stored `signing_secret`
+# before the listener binds specifically so this case is caught here rather than on the first
+# authenticated request. Before the canary existed, this instance would start cleanly, report ready,
+# and only fail — as a `500` — the moment a real client tried to authenticate; every credential in
+# the database would silently stop working the instant it did. Asserted the same way §26 asserts a
+# malformed key: the process must exit on its own before ever binding a listener.
 
 STRICT_PORT=$((VAULT_PORT + 63))
 STRICT_DB="$WORK_DIR/strict.db"
@@ -2898,40 +2908,33 @@ fi
 kill "$STRICT_PID" 2>/dev/null || true
 wait "$STRICT_PID" 2>/dev/null || true
 
-log "Re-opening the same database under a different VAULT_ENCRYPTION_KEY..."
+log "Re-opening the same database under a different VAULT_ENCRYPTION_KEY (expected to refuse to start)..."
 DATABASE_URL="sqlite://$STRICT_DB?mode=rwc" RUST_LOG=info \
     VAULT_ENCRYPTION_KEY="$STRICT_KEY_2" PORT="$STRICT_PORT" \
     "$PROJECT_ROOT/target/debug/simply_ip_vault" >"$STRICT_LOG_B" 2>&1 &
 STRICT_PID_B=$!
 
-STRICT_READY_B=0
-for _ in $(seq 1 60); do
-    if ! kill -0 "$STRICT_PID_B" 2>/dev/null; then break; fi
-    SC=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:$STRICT_PORT/api/ips" 2>/dev/null)
-    case "$SC" in 200|401|403|404|500) STRICT_READY_B=1; break ;; esac
-    sleep 0.5
+# It must exit on its own, and before ever answering a request — the canary runs after migrations
+# and before `TcpListener::bind`, so a caller can never race it. Same wait shape as §26's malformed
+# -key check: watch the PID, not the port.
+STRICT_EXITED_B=0
+for _ in $(seq 1 40); do
+    if ! kill -0 "$STRICT_PID_B" 2>/dev/null; then STRICT_EXITED_B=1; break; fi
+    sleep 0.25
 done
-check_local "$STRICT_READY_B" "1" "#27 the mismatched-key instance still starts (the key itself is well-formed)"
-
-if [ "$STRICT_READY_B" == "1" ]; then
-    next_timestamp "STRICT|B"
-    STRICT_TS_B="$SIGNED_TS"
-    STRICT_SIG_B=$(hmac_sign "$MASTER_SIGNING_SECRET" "GET" "/api/auth/me" "$STRICT_TS_B" "")
-    RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" \
-        -H "X-API-Key: $STRICT_MASTER" -H "X-Timestamp: $STRICT_TS_B" -H "X-Signature-256: $STRICT_SIG_B" \
-        "http://127.0.0.1:$STRICT_PORT/api/auth/me")
-    RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "500" "#27 an unopenable stored secret fails closed as an operator fault, not a 401"
-
-    if grep -qi "could not be decrypted\|cipher error" "$STRICT_LOG_B" 2>/dev/null; then
-        check_local "logged" "logged" "#27 the decryption failure is logged for the operator"
-    else
-        check_local "missing" "logged" "#27 the decryption failure is logged for the operator"
-    fi
+if [ "$STRICT_EXITED_B" != "1" ]; then
+    kill "$STRICT_PID_B" 2>/dev/null || true
 fi
-
-kill "$STRICT_PID_B" 2>/dev/null || true
 wait "$STRICT_PID_B" 2>/dev/null || true
+
+check_local "$STRICT_EXITED_B" "1" \
+    "#27 a wrong-but-well-formed encryption key aborts startup instead of starting and failing later"
+if grep -qi "could not be decrypted" "$STRICT_LOG_B" 2>/dev/null; then
+    check_local "named" "named" "#27 the startup refusal names the key mismatch as the reason"
+else
+    check_local "$(head -c 200 "$STRICT_LOG_B" 2>/dev/null)" "named" \
+        "#27 the startup refusal names the key mismatch as the reason"
+fi
 
 # --- 27e. WAL is written to the file header and survives reconnection --------------------------
 #

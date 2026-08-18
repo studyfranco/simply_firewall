@@ -3,7 +3,7 @@
 //! The specification's *managed resource* — shared, carrying per-key permission rows, and governed
 //! by the R2 conjunction.
 
-use axum::{Extension, extract::{Json, Path, State}, response::IntoResponse};
+use axum::{Extension, extract::{Json, State}, response::IntoResponse};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter, SqlErr,
 };
@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::entities::prelude::IpGroup;
 use crate::entities::{api_key, api_key_group_permission, ip_group};
 use crate::error::AppError;
+use crate::extract::{StrictJson, StrictPath};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
@@ -25,8 +26,11 @@ use super::{
 // Admin CRUD — IP Groups
 // ─────────────────────────────────────────────────────────────
 
-/// Payload for creating an IP group
+/// Payload for creating an IP group. `deny_unknown_fields` so an unrecognized field is refused
+/// rather than silently ignored — see `crate::extract`'s module doc for why a silent drop is worse
+/// than either accepting or rejecting it.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateIpGroupPayload {
     /// Group Name
     pub name: String,
@@ -41,7 +45,7 @@ pub async fn create_ip_group(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Json(payload): Json<CreateIpGroupPayload>,
+    StrictJson(payload): StrictJson<CreateIpGroupPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_create_groups {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -134,7 +138,7 @@ pub async fn delete_ip_group(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     let group = IpGroup::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
     guard_resource_lifecycle(&key, group.owner_key_id, "group", "delete")?;
@@ -162,8 +166,8 @@ pub async fn reassign_group_owner(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<ReassignOwnerPayload>,
+    StrictPath(id): StrictPath<Uuid>,
+    StrictJson(payload): StrictJson<ReassignOwnerPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
         return Err(AppError::Forbidden(

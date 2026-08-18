@@ -305,6 +305,7 @@ pub(crate) async fn resolve_group_ref_flexible(
 /// different domain modules and must accept exactly the same body, and two copies of a payload
 /// struct are two things to keep `deny_unknown_fields` in step across.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReassignOwnerPayload {
     /// The key to make the new owner, or `null` to leave the resource unowned.
     pub owner_key_id: Option<Uuid>,

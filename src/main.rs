@@ -175,6 +175,64 @@ async fn bootstrap_master_key(
     Ok(())
 }
 
+/// Startup canary for `VAULT_ENCRYPTION_KEY`: proves the configured key is the one
+/// `api_keys.signing_secret` was actually sealed under, and refuses to start if it is not.
+///
+/// Must run after [`bootstrap_master_key`], so a fresh database has at least the master's own
+/// sealed secret to check against, and before `TcpListener::bind`, so the canary can never be
+/// bypassed by a request arriving before it completes.
+///
+/// Without this, [`simply_ip_vault::crypto::SecretCipher::from_env`] accepts any syntactically
+/// valid 64-hex-character key — it has no way to know whether that key matches what the data at
+/// rest was sealed under — and the mismatch surfaces only in [`simply_ip_vault::middleware`], as a
+/// `500` on the first authenticated request. By then the daemon is bound, `/health` is answering,
+/// and every credential in the database has silently stopped authenticating. This turns that into a
+/// boot-time refusal instead.
+async fn verify_encryption_key(
+    db: &DatabaseConnection,
+    cipher: &simply_ip_vault::crypto::SecretCipher,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use entities::{api_key, prelude::ApiKey};
+    use simply_ip_vault::crypto::{check_key_canary, KeyCanary};
+
+    let sample = ApiKey::find()
+        .filter(api_key::Column::SigningSecret.is_not_null())
+        .one(db)
+        .await?
+        .and_then(|key| key.signing_secret);
+
+    match check_key_canary(cipher, sample.as_deref()) {
+        Ok(KeyCanary::Verified) => {
+            tracing::info!(
+                "Encryption key canary passed: the stored signing secret opens with the \
+                 configured {}.",
+                simply_ip_vault::crypto::ENCRYPTION_KEY_ENV
+            );
+            Ok(())
+        }
+        Ok(KeyCanary::NoSealedSecrets) => {
+            tracing::info!(
+                "Encryption key canary skipped: no sealed signing secret is stored yet."
+            );
+            Ok(())
+        }
+        Err(e) => {
+            // Logged before returning, for the same reason as the master-pin refusal below: `main`
+            // returns `Box<dyn Error>`, which the runtime renders with `Debug`, and propagating
+            // this alone would print the enum variant rather than the operator-facing remedy in its
+            // `Display` message.
+            tracing::error!(
+                "Refusing to start: the stored signing secret could not be decrypted with the \
+                 configured {} ({e}). This means the key does not match the one secrets were \
+                 sealed under — restore the previous key, or rotate every affected key's signing \
+                 secret (POST /api/keys/{{id}}/rotate-secret) under the new one before retrying.",
+                simply_ip_vault::crypto::ENCRYPTION_KEY_ENV
+            );
+            Err(Box::new(e))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
@@ -253,6 +311,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     bootstrap_master_key(&db, &cipher).await?;
 
+    verify_encryption_key(&db, &cipher).await?;
+
     // Resolve every configured hostname once, now, so a typo is reported at boot rather than
     // discovered as an unexplained 403 later. Detached and non-blocking: an unresolvable entry is
     // retried after a grace period and disabled meanwhile, never a reason to refuse to start.
@@ -313,4 +373,122 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("Graceful shutdown complete.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::Database;
+    use simply_ip_vault::crypto::{CryptoError, SecretCipher};
+
+    /// `sqlite::memory:` — none of the pragmas `db::connect` applies matter here, only that
+    /// migrations have run and a row exists to check the canary against.
+    async fn seeded_db() -> DatabaseConnection {
+        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
+        simply_ip_vault::db::run_migrations(&db).await.expect("every migration applies");
+        db
+    }
+
+    async fn insert_key_with_secret(
+        db: &DatabaseConnection,
+        cipher: &SecretCipher,
+        signing_secret: &str,
+    ) {
+        use entities::api_key;
+        let now = chrono::Utc::now().naive_utc();
+        let model = api_key::ActiveModel {
+            id: Set(Uuid::new_v4()),
+            key_hash: Set(api::hash_key("irrelevant-for-this-test")),
+            signing_secret: Set(Some(cipher.seal(signing_secret).expect("sealing succeeds"))),
+            name: Set("Test Key".to_owned()),
+            prefix: Set("testtest".to_owned()),
+            bound_ips: Set(None),
+            is_master: Set(false),
+            can_manage_keys: Set(false),
+            can_manage_webhooks: Set(false),
+            can_create_groups: Set(false),
+            parent_key_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+        };
+        model.insert(db).await.expect("insert seeded key");
+    }
+
+    const KEY_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const KEY_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    /// The property this task exists for: startup must refuse to proceed when the configured key
+    /// cannot open a secret that is already in the database, rather than starting and deferring the
+    /// failure to the first authenticated request.
+    #[tokio::test]
+    async fn startup_refuses_when_the_configured_key_cannot_decrypt_an_existing_record() {
+        let db = seeded_db().await;
+        let written_with = SecretCipher::from_hex_key(KEY_A).expect("valid key");
+        insert_key_with_secret(&db, &written_with, "the-real-secret").await;
+
+        let configured_with = SecretCipher::from_hex_key(KEY_B).expect("valid key");
+        let result = verify_encryption_key(&db, &configured_with).await;
+
+        assert!(
+            result.is_err(),
+            "a wrong-but-well-formed VAULT_ENCRYPTION_KEY must fail startup, not be accepted silently"
+        );
+    }
+
+    /// The matching positive: the correct key must not be refused, or the canary would take down
+    /// every ordinary deployment on every boot.
+    #[tokio::test]
+    async fn startup_proceeds_when_the_configured_key_matches_the_stored_secret() {
+        let db = seeded_db().await;
+        let cipher = SecretCipher::from_hex_key(KEY_A).expect("valid key");
+        insert_key_with_secret(&db, &cipher, "the-real-secret").await;
+
+        let result = verify_encryption_key(&db, &cipher).await;
+        assert!(result.is_ok(), "the correct key must not be refused: {result:?}");
+    }
+
+    /// A fresh database has nothing sealed to check against yet. The canary must not treat that as
+    /// a failure — it would otherwise make first boot on a brand-new deployment impossible.
+    #[tokio::test]
+    async fn startup_proceeds_on_a_fresh_database_with_no_sealed_secrets() {
+        let db = seeded_db().await;
+        let cipher = SecretCipher::from_hex_key(KEY_A).expect("valid key");
+
+        let result = verify_encryption_key(&db, &cipher).await;
+        assert!(result.is_ok(), "an empty database must not fail the canary: {result:?}");
+    }
+
+    /// Switching to `Plaintext` (unsetting `VAULT_ENCRYPTION_KEY`) against a database holding a
+    /// row sealed under a real key must also be refused — the stored envelope cannot be opened
+    /// without a cipher, and that is exactly the same operator mistake in the other direction.
+    #[tokio::test]
+    async fn startup_refuses_plaintext_mode_against_a_previously_encrypted_database() {
+        let db = seeded_db().await;
+        let written_with = SecretCipher::from_hex_key(KEY_A).expect("valid key");
+        insert_key_with_secret(&db, &written_with, "the-real-secret").await;
+
+        let result = verify_encryption_key(&db, &SecretCipher::Plaintext).await;
+        assert!(
+            result.is_err(),
+            "unsetting the encryption key against an already-encrypted database must fail startup"
+        );
+    }
+
+    /// The error propagated out of `verify_encryption_key` must be the crypto error itself
+    /// (downcastable), not a generic string — an operator or a monitoring hook further up needs to
+    /// be able to distinguish "wrong key" from any other startup failure.
+    #[tokio::test]
+    async fn the_refusal_is_downcastable_to_the_underlying_crypto_error() {
+        let db = seeded_db().await;
+        let written_with = SecretCipher::from_hex_key(KEY_A).expect("valid key");
+        insert_key_with_secret(&db, &written_with, "the-real-secret").await;
+
+        let configured_with = SecretCipher::from_hex_key(KEY_B).expect("valid key");
+        let err = verify_encryption_key(&db, &configured_with).await.unwrap_err();
+
+        assert!(
+            err.downcast_ref::<CryptoError>().is_some(),
+            "expected the boxed error to be a CryptoError, got: {err}"
+        );
+    }
 }

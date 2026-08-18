@@ -3,7 +3,7 @@
 //! The specification's *creator-private entity* — visible only to its `owner_key_id` and Master,
 //! never exposed by the shared-resource visibility rule (§4).
 
-use axum::{Extension, extract::{Json, Path, State}, response::IntoResponse};
+use axum::{Extension, extract::{Json, State}, response::IntoResponse};
 use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::entities::prelude::WebhookConfig;
 use crate::entities::{api_key, webhook_config};
 use crate::error::AppError;
+use crate::extract::{StrictJson, StrictPath};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
@@ -26,8 +27,8 @@ pub async fn reassign_webhook_owner(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<ReassignOwnerPayload>,
+    StrictPath(id): StrictPath<Uuid>,
+    StrictJson(payload): StrictJson<ReassignOwnerPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
         return Err(AppError::Forbidden(
@@ -65,8 +66,10 @@ pub async fn reassign_webhook_owner(
 // Admin CRUD — Webhooks
 // ─────────────────────────────────────────────────────────────
 
-/// Payload for webhook creation
+/// Payload for webhook creation. `deny_unknown_fields` so a typo'd or stale field is refused
+/// rather than silently dropped.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CreateWebhookPayload {
     /// Webhook name
     pub name: String,
@@ -116,7 +119,7 @@ pub async fn create_webhook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Json(payload): Json<CreateWebhookPayload>,
+    StrictJson(payload): StrictJson<CreateWebhookPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_webhooks {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -319,7 +322,9 @@ impl From<webhook_config::Model> for WebhookSummary {
 ///
 /// `secret_token` is deliberately **not** settable to an empty string here — see
 /// [`update_webhook`] for why a repointed webhook must always end up with a fresh secret.
+/// `deny_unknown_fields` so a typo'd or stale field is refused rather than silently dropped.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct UpdateWebhookPayload {
     /// New human-readable name.
     pub name: Option<String>,
@@ -379,8 +384,8 @@ pub async fn update_webhook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<UpdateWebhookPayload>,
+    StrictPath(id): StrictPath<Uuid>,
+    StrictJson(payload): StrictJson<UpdateWebhookPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_webhooks {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -581,7 +586,7 @@ pub async fn delete_webhook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_webhooks {
         return Err(AppError::Forbidden("Permission denied".to_owned()));

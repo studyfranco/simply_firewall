@@ -7862,3 +7862,127 @@ All five gates run clean, no warnings:
 
 Metrics are unchanged from the previous session, as expected for a documentation-only change — recorded
 here so a future reader can tell that the gates were actually run rather than assumed.
+
+---
+
+## Session — Encryption-key startup canary, strict Path/Query envelopes, deny_unknown_fields audit (2026-08-18)
+
+**Scope:** Three hardening tasks against `simply_ip_vault` itself (not a peer): a boot-time canary
+proving `VAULT_ENCRYPTION_KEY` actually opens what is in the database, closing the last gap in the
+`{"error": "..."}` envelope contract, and an exhaustive `deny_unknown_fields` audit across every
+domain payload. `RBAC_MODEL.md` untouched.
+
+### Task 1 — encryption-key startup canary
+
+Added `crypto::check_key_canary` (pure, testable — `KeyCanary::{NoSealedSecrets, Verified}` /
+`Result<_, CryptoError>`) and `main.rs::verify_encryption_key`, which queries one
+`api_keys.signing_secret` and opens it with the configured cipher. Runs after `bootstrap_master_key`
+(so a fresh database has at least the bootstrap Master's own sealed secret to check against) and
+before `TcpListener::bind` (so no request can arrive before the canary completes). A refusal is
+logged before being returned — the same `main` returns `Box<dyn Error>` / renders with `Debug`
+pattern already established for the master-pin refusal a few lines below it.
+
+Only `api_keys.signing_secret` is sealed via `SecretCipher`; `webhook_configs.secret_token` (the
+brief's other named candidate) is stored as a plain `String` and was never a candidate. Narrowed the
+canary to the one field that actually exists.
+
+Corrected a stale doc comment on `api_key::Model::signing_secret` in the same pass: it named
+`crate::crypto::open_signing_secret` (no such function; the real call site is
+`state.cipher.open(stored)`) and "AES-GCM-256" (retired in favor of XChaCha20-Poly1305 well before
+this session — see `SecretCipher::open`'s own doc). Found only because Task 1 required reading the
+field's documented contract closely; left as found in every other session, but a one-line factual
+error immediately adjacent to security-relevant code was worth the two-line fix.
+
+**5 unit tests** in `crypto.rs` (`check_key_canary`: no-sample, correct key, wrong-but-well-formed
+key, no-key-configured-against-a-sealed-row, malformed stored value) and **5 integration tests** in
+`main.rs` itself (`#[cfg(test)] mod tests`, run via `cargo test --bin simply_ip_vault`) against a real
+`sqlite::memory:` database with migrations applied: wrong key refused, correct key accepted, empty
+database accepted, `Plaintext` mode refused against an already-sealed row, and the returned error is
+downcastable to `CryptoError` rather than an opaque string. Mutation-verified: silencing the `Err`
+arm in `verify_encryption_key` (returning `Ok(())` unconditionally) was caught by 3 of the 5
+integration tests.
+
+`scripts/test_e2e.sh` §27d previously asserted the *old* behavior directly — "the mismatched-key
+instance still starts" — because that was the documented gap before this session. Rewritten to boot
+under a wrong-but-well-formed key against a database already sealed under a different one and assert
+the process **exits on its own before ever binding a listener**, mirroring §26's existing
+malformed-key pattern (watch the PID, not the port). The two live-request checks that used to follow
+(querying the now-nonexistent server for a `500`) were removed as inapplicable; the log-message check
+was kept, adjusted to the canary's own wording.
+
+### Task 2 — StrictPath / StrictQuery, and the status-code correction mid-session
+
+Added `StrictPath<T>` and `StrictQuery<T>` to `src/extract.rs`, converted **every** bare
+`axum::extract::Path`/`Query` binding across `src/api/{audit,groups,keys,records,webhooks}.rs`
+(15 call sites) to the strict versions, and converted 8 handler bindings still using bare `axum::Json`
+(bypassing `StrictJson` entirely) to `StrictJson` as well — `GroupPermInput`,
+`CreateIpGroupPayload`/`ReassignOwnerPayload` (×2), `CreateWebhookPayload`, `UpdateWebhookPayload`,
+`BanWhitePayload` (×2). Axum's built-in `Json`/`Path`/`Query` rejections all render as `text/plain`
+by default (confirmed by reading `axum-core`'s `__define_rejection!` macro — `(status, $body:literal)`
+sets no JSON content type), so all three families had the identical envelope gap; the brief named two
+of them, the audit found the third had 8 live call sites still open.
+
+**A design decision reversed mid-implementation, worth recording.** `StrictPath`'s first draft
+collapsed every rejection into `AppError::NotFound` (`404`), reasoned from `RBAC_MODEL.md` §4's oracle
+discipline: a malformed id and a well-formed-but-absent id would then be indistinguishable. Before
+wiring it into every handler, checked what the ecosystem's confirmed gold-standard peer
+(`example/simply_hook_executor`, per this repository's own `AGENT.MD` — "the tightest structural
+alignment") actually does for the identical problem, and it does not collapse the status at all: it
+passes through axum's own rejection status (`400` for an unparseable segment, `500` only when the
+*route* declares a parameter the handler doesn't — a service bug, never the caller's fault) inside the
+`{"error": …}` envelope. §4's oracle-discipline text governs a caller's *visibility scope* — an
+existing-but-hidden resource versus a nonexistent one — not a segment that fails to parse at all;
+extending it to cover parse failures was this session's own inference, not something the rule states,
+and it would have put `simply_ip_vault` out of step with the peer this repository's own `AGENT.MD` was
+updated one session ago to name as the standard to converge on. Rewrote both extractors to pass the
+rejection's real status through (via the pre-existing `AppError::BodyRejected(StatusCode, String)`,
+the same vehicle `StrictJson` already uses), matching `simply_hook_executor` exactly. Caught before any
+handler shipped with the wrong behavior — worth writing down so a future session doesn't have to
+re-derive it from scratch, and so the reasoning that was actually rejected is on record and not just
+the reasoning that won.
+
+`ResolutionEntry` (in `keys.rs`) is the one payload that structurally **cannot** carry
+`#[serde(deny_unknown_fields)]`: it `#[serde(flatten)]`s the internally-tagged `Resolution` enum, and
+serde refuses to compile `deny_unknown_fields` on a struct with a flattened field. `Resolution` itself
+carries the constraint instead (`#[serde(tag = "action", deny_unknown_fields)]`), which closes the
+same surface one level down — documented in-line rather than left as a silent gap in the audit table.
+
+`tests/concurrency_and_contracts.rs::malformed_input_is_refused_on_every_extractor` carried two
+`PINNED GAP` assertions written specifically to document this hole and invert once closed. Both
+assertions flipped (`!body.contains("\"error\"")` → `body.contains("\"error\"")`), the module doc
+rewritten from "records a real gap" to describing the closed contract, and the comparison table
+updated to show every row as JSON. Mutation-verified: reverting one handler (`delete_ip_record`) to a
+bare `axum::extract::Path` was caught by the inverted assertion.
+
+### Task 3 — `deny_unknown_fields` audit
+
+Exhaustive sweep of every `#[derive(Deserialize)]` struct/enum under `src/api/`: **19 found, 17
+carry `deny_unknown_fields`, 1 is the documented `ResolutionEntry` exception above, and 1
+(`BatchMode`) is a false positive of the sweep itself** — a plain unit-variant enum deserialized from
+a bare string, where serde's default enum matching is already closed over its variant names and the
+annotation is inapplicable. Thirteen structs/enums gained the annotation this session:
+`AuditLogQuery`, `CreateIpGroupPayload`, `GroupPermInput`, `Resolution`, `DeleteKeyPayload`,
+`BanWhitePayload`, `QueryFilters`, `DeleteRecordQuery`, `PurgeIpsPayload`, `DeleteIpQuery`,
+`ReassignOwnerPayload`, `CreateWebhookPayload`, `UpdateWebhookPayload`.
+
+New test `tests/concurrency_and_contracts.rs::unknown_fields_are_refused_across_every_domain_payload`
+covers the four domains the brief named explicitly (groups, ban, white, webhooks) that
+`rbac_model_compliance.rs`'s existing `deny_unknown_fields` coverage (key administration, an
+`RBAC_MODEL.md` §5-named control) did not reach. Mutation-verified: removing the annotation from
+`BanWhitePayload` was caught.
+
+### Task 4 — quality gates
+
+All five clean:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean, zero warnings |
+| `cargo test` | **300 passed** (was 289; +5 `crypto.rs` canary unit tests, +5 `main.rs` binary integration tests, +1 `unknown_fields_are_refused_across_every_domain_payload`), 0 failed |
+| `./scripts/test_e2e.sh` | **544 checks passed** (unchanged net count: −1 in §27d's rewritten mismatched-key section, +1 on the webhook-strictness check, +1 net elsewhere), 0 failed |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+12 files touched, all `src/`/`tests/`/`scripts/`: `main.rs`, `crypto.rs`, `extract.rs`,
+`entities/api_key.rs`, `api/{audit,groups,keys,records,support,webhooks}.rs`,
+`tests/concurrency_and_contracts.rs`, `scripts/test_e2e.sh`. `RBAC_MODEL.md` untouched, as required.

@@ -126,3 +126,83 @@ where
         })
     }
 }
+
+/// `Path<T>`, with a rejected (unparseable) path segment reported as [`AppError::BodyRejected`]
+/// instead of axum's default plain-text body.
+///
+/// # The rejection's own status is passed through, not hardcoded to `400`
+///
+/// `GET /api/ips/not-a-uuid` is the case this exists for, and it does answer `400` — but that is
+/// axum's `PathRejection` status for a segment that fails to parse, not a constant this wrapper
+/// chose. `PathRejection::MissingPathParams` is a `500`, and it means the *route* and the handler
+/// disagree about how many parameters exist — a defect in this service, which must not be reported
+/// to the caller as though their request were malformed. Converging on `simply_hook_executor`'s
+/// `StrictPath`, which carries the identical rationale.
+///
+/// The message is axum's own (`rejection.body_text()`), naming the segment that failed to parse, so
+/// wrapping the shape does not mean withholding the reason.
+pub struct StrictPath<T>(pub T);
+
+impl<S, T> axum::extract::FromRequestParts<S> for StrictPath<T>
+where
+    axum::extract::Path<T>:
+        axum::extract::FromRequestParts<S, Rejection = axum::extract::rejection::PathRejection>,
+    T: Send,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match axum::extract::Path::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Path(value)) => Ok(Self(value)),
+            Err(rejection) => {
+                use axum::extract::rejection::PathRejection;
+                Err(AppError::BodyRejected(
+                    PathRejection::status(&rejection),
+                    PathRejection::body_text(&rejection),
+                ))
+            }
+        }
+    }
+}
+
+/// `Query<T>`, with a rejected (unparseable) query string reported as [`AppError::BodyRejected`]
+/// instead of axum's default plain-text body.
+///
+/// `?limit=abc` against a `u64` field is the shape here. Note this governs only *malformed* query
+/// strings — a value that parses but fails validation is a handler's judgement and already returns
+/// [`AppError::InvalidInput`], which renders correctly; the two are deliberately distinguishable
+/// (same status, different body detail), and this wrapper does not blur that.
+///
+/// The rejection's own status is passed through rather than hardcoded, for the same reason as
+/// [`StrictPath`].
+pub struct StrictQuery<T>(pub T);
+
+impl<S, T> axum::extract::FromRequestParts<S> for StrictQuery<T>
+where
+    axum::extract::Query<T>:
+        axum::extract::FromRequestParts<S, Rejection = axum::extract::rejection::QueryRejection>,
+    T: Send,
+    S: Send + Sync,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &S,
+    ) -> Result<Self, Self::Rejection> {
+        match axum::extract::Query::<T>::from_request_parts(parts, state).await {
+            Ok(axum::extract::Query(value)) => Ok(Self(value)),
+            Err(rejection) => {
+                use axum::extract::rejection::QueryRejection;
+                Err(AppError::BodyRejected(
+                    QueryRejection::status(&rejection),
+                    QueryRejection::body_text(&rejection),
+                ))
+            }
+        }
+    }
+}

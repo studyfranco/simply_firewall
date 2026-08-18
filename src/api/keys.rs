@@ -4,7 +4,7 @@
 //! delegate to other keys, so subtree walking, visibility scoping and permission grants are one
 //! subject. Splitting them would put a rule's mechanism in one file and its guard in another.
 
-use axum::{Extension, extract::{Json, Path, State}, response::IntoResponse};
+use axum::{Extension, extract::{Json, State}, response::IntoResponse};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use sea_orm::{
@@ -17,7 +17,7 @@ use uuid::Uuid;
 use crate::entities::prelude::{ApiKey, IpGroup, WebhookConfig};
 use crate::entities::{api_key, api_key_group_permission, ip_group, webhook_config};
 use crate::error::AppError;
-use crate::extract::{OptionalStrictJson, StrictJson};
+use crate::extract::{OptionalStrictJson, StrictJson, StrictPath};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
@@ -118,6 +118,7 @@ pub async fn get_me(
 
 /// Input to update group permissions
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GroupPermInput {
     /// Target group, by ID *or* by name (a plain string, not a strictly-typed UUID, so passing a
     /// name here doesn't trip Axum's deserialization). Provide this or `group_name`, not both.
@@ -621,7 +622,7 @@ pub struct OwnedEntity {
 
 /// What to do with one inventoried entity.
 #[derive(Deserialize)]
-#[serde(tag = "action", rename_all = "snake_case")]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Resolution {
     /// Destroy the entity along with the keys.
     Delete,
@@ -635,6 +636,13 @@ pub enum Resolution {
 
 
 /// One entry in the resolution map.
+///
+/// Deliberately **not** `#[serde(deny_unknown_fields)]`: serde refuses to compile that combined
+/// with `#[serde(flatten)]` on `resolution` below (the flattened field's unknown-key detection and
+/// the container's cannot coexist). [`Resolution`] itself carries the constraint instead — it denies
+/// unknown fields per variant — so an unrecognized field inside the `action`-tagged payload is still
+/// refused; only a field sitting *outside* both `entity_type`/`id` and the flattened variant's own
+/// fields would pass through unnoticed, and there is no such field for one to occupy.
 #[derive(Deserialize)]
 pub struct ResolutionEntry {
     /// Must match the inventory entry's `entity_type`.
@@ -649,6 +657,7 @@ pub struct ResolutionEntry {
 
 /// Optional body for `DELETE /api/v1/keys/:id`.
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteKeyPayload {
     /// One entry per inventoried entity. Partial maps are refused.
     #[serde(default)]
@@ -746,7 +755,7 @@ pub async fn delete_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
     // `OptionalStrictJson` rather than `Json<T>`: `DELETE` has always been callable with no body at
     // all, and every existing client calls it that way — an empty body means "no resolutions", which
     // is exactly the request that gets the inventory back. See [`crate::extract::OptionalStrictJson`]
@@ -948,7 +957,7 @@ pub async fn update_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
     StrictJson(payload): StrictJson<UpdateApiKeyPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
@@ -1055,7 +1064,7 @@ pub async fn rotate_api_key(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -1115,7 +1124,7 @@ pub async fn rotate_signing_secret(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master && !key.can_manage_keys {
         return Err(AppError::Forbidden("Permission denied".to_owned()));
@@ -1158,8 +1167,8 @@ pub async fn update_key_group_permissions(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
-    Json(payload): Json<GroupPermInput>,
+    StrictPath(id): StrictPath<Uuid>,
+    StrictJson(payload): StrictJson<GroupPermInput>,
 ) -> Result<impl IntoResponse, AppError> {
 
     // R2 in its group-independent form, run before any lookup so a caller with no administrative
@@ -1315,7 +1324,7 @@ pub async fn revoke_key_group_permission(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path((id, group_identifier)): Path<(Uuid, String)>,
+    StrictPath((id, group_identifier)): StrictPath<(Uuid, String)>,
 ) -> Result<impl IntoResponse, AppError> {
     // R2 in its group-independent form, kept ahead of the group lookup so a caller with no
     // administrative standing anywhere is refused without learning whether the group exists. *Which*

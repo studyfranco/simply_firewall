@@ -17,9 +17,10 @@
 //!
 //! # And why contracts do
 //!
-//! A `400` is not a contract; a `400` with a body a client can parse is. The last test here maps the
-//! shape actually returned for each way a request can be malformed, and records where that shape is
-//! *not* the documented one.
+//! A `400` is not a contract; a `400` with a body a client can parse is. The tests here map the shape
+//! actually returned for each way a request can be malformed, across every extractor and across every
+//! domain module — the envelope is only a contract if it holds with no exceptions, so it is asserted
+//! that way rather than on one representative route.
 
 use std::sync::Arc;
 
@@ -321,27 +322,29 @@ async fn two_concurrent_deletes_of_the_same_record_are_idempotent() {
 // Contracts
 // ─────────────────────────────────────────────────────────────
 
-/// **Every way a request can be malformed is refused with `400` — but not every refusal is JSON.**
+/// **Every way a request can be malformed is refused with `400` — and every refusal is JSON.**
 ///
-/// This maps the shape actually returned for each malformed input, and it records a real gap rather
-/// than asserting the one we would prefer.
+/// This maps the shape actually returned for each malformed input.
 ///
 /// `error.rs` renders every `AppError` as `{"error": "..."}`, and `FILE_MAP.MD` describes that as the
-/// contract these routes honour. **Two extractors sit outside it.** Axum's built-in `Path<Uuid>` and
-/// `Query<T>` rejections are emitted by axum itself, before any handler runs, as `text/plain`:
+/// contract these routes honour. It used to have two exceptions: axum's built-in `Path<Uuid>` and
+/// `Query<T>` rejections are emitted by axum itself, before any handler runs, as `text/plain`, and no
+/// handler in the crate had a chance to translate them. `src/extract.rs`'s `StrictPath` and
+/// `StrictQuery` close that — every handler in `src/api/` now takes them instead of the bare axum
+/// extractors, converging on the same wrapper `simply_hook_executor` already used.
 ///
 /// | Request | Status | Body |
 /// | :--- | :--- | :--- |
-/// | `DELETE /api/ips/not-a-uuid` | `400` | `Invalid URL: Cannot parse …` — **plain text** |
-/// | `GET /api/ips?limit=abc` | `400` | `Failed to deserialize query string: …` — **plain text** |
-/// | `GET /api/ips?since=<out of range>` | `400` | `{"error": "Invalid \`since\` timestamp"}` — JSON |
+/// | `DELETE /api/ips/not-a-uuid` | `400` | `{"error": "Invalid URL: Cannot parse …"}` — JSON, via `StrictPath` |
+/// | `GET /api/ips?limit=abc` | `400` | `{"error": "Failed to deserialize query string: …"}` — JSON, via `StrictQuery` |
+/// | `GET /api/ips?since=<out of range>` | `400` | `{"error": "Invalid \`since\` timestamp"}` — JSON, handler-level |
 /// | malformed JSON body | `400` | `{"error": "..."}` — JSON, via `StrictJson` |
 ///
-/// So a client doing `response.json().error` gets `null` for the first two and a message for the
-/// last two, at the same status. That is a genuine inconsistency; closing it means giving those two
-/// extractors custom rejections at every call site, which is a change to handler signatures rather
-/// than a test, and is left for a deliberate pass. Pinned here so it is discoverable and so a future
-/// fix has a test to flip.
+/// A client doing `response.json().error` now gets a message on every row above, at the same status.
+/// The two extractor-level rows and the two handler-level rows are still worth telling apart in the
+/// assertions below — same envelope, different origin — since a regression that reintroduces a bare
+/// `Path`/`Query` anywhere in `src/api/` would otherwise only show up as a missing `error` field on
+/// whichever route it was left on, easy to miss in a suite of hundreds of assertions.
 #[tokio::test]
 async fn malformed_input_is_refused_on_every_extractor() {
     let db = setup_test_db().await;
@@ -388,22 +391,21 @@ async fn malformed_input_is_refused_on_every_extractor() {
     assert!(body.contains("\"error\""), "and stays JSON: {body}");
     assert!(body.contains("nope"), "and names the offending field: {body}");
 
-    // 3. An unparseable UUID path parameter — axum's own rejection, **plain text**.
+    // 3. An unparseable UUID path parameter — routed through `StrictPath`, so it keeps the JSON
+    //    shape even though axum itself rejects it before any handler runs.
     let (status, body) = call("DELETE", "/api/ips/not-a-uuid".to_owned(), "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an unparseable path id is a 400: {body}");
-    assert!(!body.is_empty(), "the refusal says something rather than returning an empty body");
     assert!(
-        !body.contains("\"error\""),
-        "PINNED GAP: axum's Path rejection is plain text, outside the {{\"error\": …}} contract. If \
-         this assertion starts failing, the gap has been closed — invert it. Body: {body}"
+        body.contains("\"error\""),
+        "`StrictPath` wraps axum's own rejection in the documented envelope: {body}"
     );
 
-    // 4. A non-numeric query parameter — likewise plain text.
+    // 4. A non-numeric query parameter — routed through `StrictQuery`, likewise wrapped.
     let (status, body) = call("GET", "/api/ips?limit=abc".to_owned(), "").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "a non-numeric limit is a 400: {body}");
     assert!(
-        !body.contains("\"error\""),
-        "PINNED GAP: axum's Query rejection is plain text. Invert when closed. Body: {body}"
+        body.contains("\"error\""),
+        "`StrictQuery` wraps axum's own rejection in the documented envelope: {body}"
     );
 
     // 5. A query parameter that parses but is out of range reaches our handler, so it *is* JSON.
@@ -422,6 +424,97 @@ async fn malformed_input_is_refused_on_every_extractor() {
     assert_eq!(status, StatusCode::OK, "a well-formed request still works: {body}");
 }
 
+/// **`#[serde(deny_unknown_fields)]` refuses an unrecognized field on every domain payload, not just
+/// the key-administration ones §5 names explicitly.**
+///
+/// `rbac_model_compliance.rs` already pins this for `CreateApiKeyPayload`/`UpdateApiKeyPayload`,
+/// where it is a named RBAC §5 control (`is_master` must be unreachable, not merely rejected at a
+/// handler). This test covers the same property on the payloads that carry no such named control but
+/// would have exactly the same silent-drop failure mode if the annotation were ever removed: an IP
+/// group, a ban, a whitelist entry, and a webhook — one caller-supplied unrecognized field each,
+/// asserted refused with `400` and the field named in the JSON envelope, not silently accepted and
+/// dropped.
+#[tokio::test]
+async fn unknown_fields_are_refused_across_every_domain_payload() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state.clone());
+
+    let master = insert_master_key(&db, "Strictness Fuzzer").await;
+    let secret = test_signing_secret(&master);
+    state.master_pin.pin_at_boot(&db).await.expect("the master pins");
+    let group_id = insert_group(&db, "strictness-fuzzer-group").await;
+
+    let mut tick = 0i64;
+    let mut post = |uri: &'static str, body: String| {
+        tick += 1;
+        let builder = inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        );
+        let request = signed_at(builder, &secret, chrono::Utc::now().timestamp() + tick, &body);
+        let app = app.clone();
+        async move { send(&app, request).await }
+    };
+
+    // Otherwise well-formed groups payload, plus one field CreateIpGroupPayload does not declare.
+    let (status, body) = post(
+        "/api/groups",
+        r#"{"name":"strictness-test-group","group_type":"banlist","not_a_real_field":true}"#.to_owned(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown field on group creation is a 400: {body}");
+    assert!(body.contains("\"error\""), "and keeps the JSON envelope: {body}");
+    assert!(body.contains("not_a_real_field"), "and names the offending field: {body}");
+
+    // Ban: otherwise well-formed BanWhitePayload, plus an unrecognized field.
+    let (status, body) = post(
+        "/api/ban",
+        format!(
+            r#"{{"target_address":"203.0.113.50","group_id":"{group_id}","cause":"test","admin_override":true}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown field on /api/ban is a 400: {body}");
+    assert!(body.contains("\"error\""), "and keeps the JSON envelope: {body}");
+    assert!(body.contains("admin_override"), "and names the offending field: {body}");
+
+    // Whitelist: same struct, same control, different route — proving the annotation is on
+    // `BanWhitePayload` itself rather than duplicated (and potentially missed) at one call site.
+    let (status, body) = post(
+        "/api/white",
+        format!(
+            r#"{{"target_address":"203.0.113.60","group_id":"{group_id}","cause":"test","admin_override":true}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown field on /api/white is a 400: {body}");
+    assert!(body.contains("\"error\""), "and keeps the JSON envelope: {body}");
+    assert!(body.contains("admin_override"), "and names the offending field: {body}");
+
+    // Webhook: otherwise well-formed CreateWebhookPayload, plus an unrecognized field.
+    let (status, body) = post(
+        "/api/webhooks",
+        format!(
+            r#"{{"name":"strictness-test-hook","target_url":"https://example.invalid/hook",
+                "payload_template":"{{}}","group_id":"{group_id}","not_a_real_field":true}}"#
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown field on webhook creation is a 400: {body}");
+    assert!(body.contains("\"error\""), "and keeps the JSON envelope: {body}");
+    assert!(body.contains("not_a_real_field"), "and names the offending field: {body}");
+
+    // The control: the same four payloads, well-formed, all succeed — so the refusals above are the
+    // unrecognized field and not something incidental about the request shape.
+    let (status, body) =
+        post("/api/groups", r#"{"name":"strictness-control-group","group_type":"banlist"}"#.to_owned()).await;
+    assert_eq!(status, StatusCode::OK, "the well-formed control request must still work: {body}");
+}
 
 /// **The replay ledger admits exactly one winner when genuinely contended.**
 ///

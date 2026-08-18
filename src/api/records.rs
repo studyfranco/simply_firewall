@@ -3,7 +3,7 @@
 //! The specification's *resource data* — records live inside IP Groups and inherit their
 //! authorization from the group's permission row rather than carrying one of their own.
 
-use axum::{Extension, extract::{Json, Path, Query, State}, response::IntoResponse};
+use axum::{Extension, extract::{Json, State}, response::IntoResponse};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use sea_orm::{
@@ -17,6 +17,7 @@ use crate::entities::{
     api_key, api_key_group_permission, ip_group, ip_record, ip_record_group_membership,
 };
 use crate::error::AppError;
+use crate::extract::{StrictJson, StrictPath, StrictQuery};
 use crate::middleware::ClientIp;
 use crate::state::{AppState, WebhookEvent};
 
@@ -29,8 +30,10 @@ use super::{
 // IP Ban / Whitelist
 // ─────────────────────────────────────────────────────────────
 
-/// Payload for banning or whitelisting an IP address
+/// Payload for banning or whitelisting an IP address. `deny_unknown_fields` so a typo'd or
+/// stale field is refused rather than silently dropped.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct BanWhitePayload {
     /// The target IP address or CIDR range
     pub target_address: String,
@@ -49,7 +52,7 @@ pub async fn handle_ban(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Json(payload): Json<BanWhitePayload>,
+    StrictJson(payload): StrictJson<BanWhitePayload>,
 ) -> Result<impl IntoResponse, AppError> {
     handle_ip_upsert(state, key, client_ip.0, payload, false).await
 }
@@ -97,7 +100,7 @@ pub async fn handle_white(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Json(payload): Json<BanWhitePayload>,
+    StrictJson(payload): StrictJson<BanWhitePayload>,
 ) -> Result<impl IntoResponse, AppError> {
     handle_ip_upsert(state, key, client_ip.0, payload, true).await
 }
@@ -340,8 +343,10 @@ pub(crate) async fn handle_ip_upsert(
 // IP Record Listing & Deletion
 // ─────────────────────────────────────────────────────────────
 
-/// Query parameters for IP listing
+/// Query parameters for IP listing. `deny_unknown_fields` so a misspelled filter (`groups_name`
+/// for `group_name`) is refused with `400` rather than silently matching everything.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryFilters {
     /// Filter by groups (comma-separated group names)
     pub groups: Option<String>,
@@ -438,7 +443,7 @@ pub struct IpRecordResponse {
 pub async fn list_ips(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Query(filters): Query<QueryFilters>,
+    StrictQuery(filters): StrictQuery<QueryFilters>,
 ) -> Result<impl IntoResponse, AppError> {
 
     // Manual join fetching because of M:N
@@ -690,8 +695,10 @@ pub(crate) async fn caller_may_delete_record(
 }
 
 
-/// Query parameters for [`delete_ip_record`].
+/// Query parameters for [`delete_ip_record`]. `deny_unknown_fields` so a typo'd parameter is
+/// refused rather than silently ignored.
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteRecordQuery {
     /// Master-only: drop the row outright instead of soft-deleting it.
     pub hard: Option<bool>,
@@ -716,8 +723,8 @@ pub async fn delete_ip_record(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
-    Query(params): Query<DeleteRecordQuery>,
+    StrictPath(id): StrictPath<Uuid>,
+    StrictQuery(params): StrictQuery<DeleteRecordQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     let record = ip_record::Entity::find_by_id(id)
         .one(&state.db)
@@ -811,7 +818,7 @@ pub async fn restore_ip_record(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Path(id): Path<Uuid>,
+    StrictPath(id): StrictPath<Uuid>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
         return Err(AppError::Forbidden(
@@ -864,7 +871,9 @@ pub async fn restore_ip_record(
 
 
 /// Body for [`purge_ip_records`]. Optional; an empty body uses the configured retention window.
+/// `deny_unknown_fields` so a typo'd field is refused rather than silently ignored.
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct PurgeIpsPayload {
     /// Override the retention window for this sweep only, in days.
     ///
@@ -932,7 +941,10 @@ pub async fn purge_ip_records(
 /// Parameters for deleting an IP record from a group. Every field is optional here because this
 /// same shape is used to parse both the URL query string and an optional JSON body — the handler
 /// merges the two and only then checks that the required combination was actually supplied.
+/// `deny_unknown_fields` applies uniformly to both parses: the query string through
+/// [`crate::extract::StrictQuery`], the body through the handler's own `serde_json::from_slice`.
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct DeleteIpQuery {
     /// IP to delete
     pub target_address: Option<String>,
@@ -963,7 +975,7 @@ pub async fn delete_ip(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    Query(query_params): Query<DeleteIpQuery>,
+    StrictQuery(query_params): StrictQuery<DeleteIpQuery>,
     body: axum::body::Bytes,
 ) -> Result<impl IntoResponse, AppError> {
     let body_params: DeleteIpQuery = if body.is_empty() {
@@ -1172,7 +1184,7 @@ pub async fn batch_records(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
     Extension(client_ip): Extension<ClientIp>,
-    crate::extract::StrictJson(payload): crate::extract::StrictJson<BatchRecordsPayload>,
+    StrictJson(payload): StrictJson<BatchRecordsPayload>,
 ) -> Result<impl IntoResponse, AppError> {
     if payload.records.len() > MAX_BATCH_RECORDS {
         return Err(AppError::InvalidInput(format!(

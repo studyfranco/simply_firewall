@@ -198,7 +198,7 @@ pub fn verify_signature(
 }
 
 /// Failure modes for building the cipher or opening a stored secret.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
 pub enum CryptoError {
     /// The configured encryption key is not exactly 64 hex characters.
     #[error(
@@ -410,6 +410,40 @@ impl SecretCipher {
         // into silently-wrong HMAC key material.
         Err(CryptoError::MalformedCiphertext)
     }
+}
+
+/// Outcome of the boot-time [`ENCRYPTION_KEY_ENV`] canary. See [`check_key_canary`].
+#[derive(Debug, PartialEq, Eq)]
+pub enum KeyCanary {
+    /// The database holds no sealed `signing_secret` yet (a fresh database, or every key still
+    /// running unencrypted). There is nothing to check the configured key against.
+    NoSealedSecrets,
+    /// A stored secret was opened successfully: the configured key is the one the data at rest was
+    /// actually sealed under.
+    Verified,
+}
+
+/// Proves — once, at startup — that [`ENCRYPTION_KEY_ENV`] is the key `api_keys.signing_secret` was
+/// actually sealed under, by opening one stored row.
+///
+/// Without this, a syntactically valid but *wrong* key passes [`SecretCipher::from_env`] cleanly
+/// (64 hex characters is all that function checks) and the mismatch is discovered only on the first
+/// authenticated request, in [`crate::middleware`], as a `500` — by which point the daemon has bound
+/// its listener, is reporting healthy, and every credential in the database has silently stopped
+/// authenticating. Failing here instead converts that into a refusal to start, which is the
+/// recoverable outcome: no request has been served under the wrong key, and the operator still has
+/// the previous one to restore.
+///
+/// `sample` is any stored `api_keys.signing_secret` value; `None` means the table is empty or every
+/// row predates encryption. Deliberately a free function taking the sample by parameter, rather than
+/// a method that queries the database itself, so it stays testable without one — the boot wrapper in
+/// `main.rs` is the only caller that supplies a real row.
+pub fn check_key_canary(cipher: &SecretCipher, sample: Option<&str>) -> Result<KeyCanary, CryptoError> {
+    let Some(stored) = sample else {
+        return Ok(KeyCanary::NoSealedSecrets);
+    };
+    cipher.open(stored)?;
+    Ok(KeyCanary::Verified)
 }
 
 #[cfg(test)]
@@ -835,5 +869,60 @@ mod tests {
         assert!(rendered.contains("redacted"));
         assert!(!rendered.contains(TEST_KEY));
         assert_eq!(format!("{:?}", SecretCipher::Plaintext), "SecretCipher::Plaintext");
+    }
+
+    /// A second, distinct valid-format key — the canary's whole reason to exist is telling this
+    /// apart from [`TEST_KEY`], since both are 64 hex characters and equally acceptable to
+    /// [`SecretCipher::from_hex_key`].
+    const OTHER_KEY: &str = "f1e1d1c1b1a191817161514131211101f0e0d0c0b0a090807060504030201000";
+
+    #[test]
+    fn no_stored_secret_is_not_a_failure() {
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        assert_eq!(check_key_canary(&cipher, None), Ok(KeyCanary::NoSealedSecrets));
+    }
+
+    #[test]
+    fn the_configured_key_opens_the_stored_secret() {
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        let stored = cipher.seal("real-signing-secret").expect("sealing succeeds");
+        assert_eq!(check_key_canary(&cipher, Some(&stored)), Ok(KeyCanary::Verified));
+    }
+
+    /// The property this whole module exists for: a syntactically valid but *wrong* key must be
+    /// refused, not silently accepted as though it opened the row.
+    #[test]
+    fn a_wrong_but_well_formed_key_fails_the_canary() {
+        let written_with = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        let stored = written_with.seal("real-signing-secret").expect("sealing succeeds");
+
+        let configured_with = SecretCipher::from_hex_key(OTHER_KEY).expect("valid key");
+        assert_eq!(
+            check_key_canary(&configured_with, Some(&stored)),
+            Err(CryptoError::DecryptionFailed)
+        );
+    }
+
+    /// A stored row with no key configured at all must also fail closed, not be handed back as
+    /// though the ciphertext were the plaintext secret.
+    #[test]
+    fn a_sealed_row_with_no_key_configured_fails_the_canary() {
+        let written_with = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        let stored = written_with.seal("real-signing-secret").expect("sealing succeeds");
+
+        assert_eq!(
+            check_key_canary(&SecretCipher::Plaintext, Some(&stored)),
+            Err(CryptoError::DecryptionFailed)
+        );
+    }
+
+    /// A corrupted/truncated row must fail closed rather than being treated as a plaintext secret.
+    #[test]
+    fn a_malformed_stored_value_fails_the_canary() {
+        let cipher = SecretCipher::from_hex_key(TEST_KEY).expect("valid key");
+        assert_eq!(
+            check_key_canary(&cipher, Some("not-a-recognized-envelope")),
+            Err(CryptoError::MalformedCiphertext)
+        );
     }
 }

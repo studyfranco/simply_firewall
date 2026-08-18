@@ -3,20 +3,24 @@
 //! Master-only, and its own module rather than a tail on another: it is the one read surface that
 //! spans every domain, so filing it under any single one would be arbitrary.
 
-use axum::{Extension, extract::{Json, Query, State}, response::IntoResponse};
+use axum::{Extension, extract::{Json, State}, response::IntoResponse};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::Deserialize;
 
 use crate::entities::{api_key, audit_log};
 use crate::error::AppError;
+use crate::extract::StrictQuery;
 use crate::state::AppState;
 
 // ─────────────────────────────────────────────────────────────
 // Audit Logs
 // ─────────────────────────────────────────────────────────────
 
-/// Query parameters for audit log listing
+/// Query parameters for audit log listing. `deny_unknown_fields` so a misspelled parameter (a
+/// caller writing `actions` for `action`) is refused with `400` rather than silently ignored and
+/// answered as though no filter had been given.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuditLogQuery {
     /// Filter by exact action type (e.g. `IP_ADD`)
     pub action: Option<String>,
@@ -33,7 +37,7 @@ pub struct AuditLogQuery {
 pub async fn list_audit_logs(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
-    Query(query): Query<AuditLogQuery>,
+    StrictQuery(query): StrictQuery<AuditLogQuery>,
 ) -> Result<impl IntoResponse, AppError> {
     if !key.is_master {
         return Err(AppError::Forbidden("Only master keys can view audit logs".to_owned()));
