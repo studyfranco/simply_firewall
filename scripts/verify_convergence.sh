@@ -793,10 +793,17 @@ echo
 
 # ─────────────────────────────────────────────────────────────
 echo "${BOLD}Pillar 5 — Authentication posture (asymmetric by design)${RESET}"
-echo "  ${BLUE}note${RESET}     simply_ip_vault requires full-URI HMAC + anti-replay on every key;"
-echo "           simply_hook_executor keeps a per-key posture for third-party senders."
-echo "           This asymmetry is intentional — see AGENT_NOTES.MD, Convergence Parity Check."
-# What must hold on *this* service is that there is no way to opt out.
+echo "  ${BLUE}note${RESET}     simply_ip_vault requires full-URI HMAC + anti-replay on every key, with"
+echo "           no opt-out anywhere in its API surface. simply_hook_executor's asymmetry moved,"
+echo "           not away: it used to sit on api_keys.hmac_mode (a per-key choice, since retired to"
+echo "           CANONICAL_V1-only); it now sits on hooks.auth_mode — a per-hook door that lets the"
+echo "           three routes that actually invoke a hook (execute/test/webhook alias) accept a"
+echo "           keyless caller when that specific hook opts in (HMAC_ONLY/NONE), while every other"
+echo "           route keeps requiring a key exactly as before. This asymmetry is intentional — see"
+echo "           AGENT_NOTES.MD, Convergence Parity Check."
+# What must hold on *this* service is that there is no way to opt out — no per-key HMAC mode ever
+# existed here, and there is no per-hook (or per-resource) equivalent either: unlike the peer,
+# nothing in this service's outbound webhook or inbound API model has ever had a keyless door.
 assert_absent "no per-key HMAC mode exists on this service" \
     "hmac_mode|HmacMode|REQUIRE_SIGNED_REQUESTS"
 echo

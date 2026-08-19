@@ -3251,14 +3251,37 @@ check_true '.[0].cause == "mixed case, compressed"' "#30 and the re-submission u
 # mode — so there is no fifth hook to provision; a hook named for `BODY_ONLY` would have nowhere to
 # point that `HMAC_ONLY`'s hook does not already cover identically.
 #
+# ## Body-only HMAC is a *signing-content* choice, not a mode — proven both with and without a key
+#
+# `BODY_ONLY` is not a fifth mode; it is what happens when the signed material is reduced to just
+# the payload. That reduction is reachable two structurally different ways, and both are proven
+# below rather than only the one `HMAC_ONLY`'s name suggests:
+#
+# - **Without an API key** — `AuthMode::HmacOnly`/`BODY_ONLY_LEGACY` on the vault's side, `HmacOnly`
+#   on a *hook* on the executor's side. No key header at all; the executor identifies which secret
+#   to verify against from the hook the request path names, not from any credential. This is the
+#   keyless HMAC_ONLY/BODY_ONLY block already described above.
+# - **With an API key** — a `CANONICAL_V1` webhook whose `hmac_template` is reduced to exactly
+#   `{body}` (the only requirement is that it *contain* `{body}`; nothing requires the other three
+#   placeholders too), paired on the executor's side with an ordinary key whose own
+#   `canonical_template` override carries no format requirement either. `X-API-Key` and
+#   `X-Timestamp` are both still sent — CANONICAL_V1 always adds them — but the signature itself
+#   covers the body alone, identically to the keyless case, just attributable to a real credential
+#   this time. Proven in its own block below, wire shape first (contrasted directly against the
+#   keyless capture) and then against the live executor.
+#
 # ## What "custom HMAC template" coverage this can and cannot add
 #
-# The executor's own CANONICAL_V1 verification format is fixed: it always signs
-# `METHOD\nPATH_AND_QUERY\nTIMESTAMP\nBODY`, with no per-key template. A vault webhook whose
-# hmac_template hardcodes a different path (already covered in §23) produces a signature the
-# executor's own fixed verifier will never accept — an executor-side constraint, not a vault
-# defect, so that edge case stays where §23 already proves it, against the flexible Python capture
-# receiver rather than the executor.
+# An earlier version of this comment claimed the executor's CANONICAL_V1 verification format is
+# fixed with no per-key customization. That was wrong even at the time it was written — re-reading
+# `src/api/keys.rs` while building the "keyed body-only HMAC" block below found
+# `api_keys.canonical_template`: an ordinary (non-`can_manage_keys`) key can override the string it
+# signs over with no format requirement at all, and the block below relies on exactly that to prove
+# a keyed, body-only signature against a live executor. §23's path-override edge case could
+# therefore also be proven against the executor now, by setting the matching key's
+# `canonical_template` to the same hardcoded path — left where §23 already proves it, against the
+# raw capture receiver, since that coverage is adequate and duplicating it against a second receiver
+# would only be a slower copy of the same assertion.
 #
 # A *body-excluding* template was going to be tested the same way — until running it once showed
 # `src/api/webhooks.rs` refuses any `hmac_template` omitting `{body}` at the API layer, on both
@@ -3505,6 +3528,222 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
         -d "$HMACONLY_TAMPERED_BODY" "$HOOK_EXECUTOR_BASE/webhook/vault_trigger_hmaconly")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     check "401" "a keyless HMAC_ONLY request signed with the wrong secret is refused, not accepted"
+
+    # ── BODY_ONLY: the legacy input alias for HMAC_ONLY, proven at the wire and live ────────────
+    #
+    # `AuthMode::BODY_ONLY_LEGACY` (`src/entities/webhook_config.rs`) is not a distinct mode — it is
+    # accepted on input and immediately normalised to `HMAC_ONLY`; the stored row and every byte the
+    # dispatcher later sends are identical to a webhook created with `"HMAC_ONLY"` directly. §14
+    # already proves the alias round-trips for the *deprecated field name* (`signature_mode:
+    # "BODY_ONLY"`, against a URL that is never actually dispatched to). What has not been proven
+    # anywhere yet is the *current* field spelled the *legacy* way — `"auth_mode": "BODY_ONLY"` —
+    # carried all the way through a live dispatch. Two receivers, same webhook creation call: the
+    # local capture script for the exact wire shape, then the live executor for genuine verification
+    # and execution — the same split used for CANONICAL_V1/HMAC_ONLY above.
+    if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+        BODYONLY_SECRET="body-only-legacy-alias-secret"
+        : > "$RECEIVER_LOG"
+
+        api_call POST "/api/webhooks" "$MASTER_KEY" \
+            "{\"name\":\"bodyonly-wire-capture\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/bodyonly-legacy\",\"secret_token\":\"$BODYONLY_SECRET\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"BODY_ONLY\",\"events\":\"IP_ADD\"}"
+        check "200" "create a webhook using the legacy 'auth_mode':'BODY_ONLY' input spelling"
+        check_true '.auth_mode == "HMAC_ONLY"' \
+            "and it is normalised to HMAC_ONLY in the response, identically to the canonical spelling"
+        BODYONLY_CAPTURE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+        api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.38","group_name":"hook-executor-group","cause":"body-only wire capture"}'
+        check "200" "ban an address to trigger the BODY_ONLY-labelled dispatch"
+
+        for _ in $(seq 1 40); do
+            [ -s "$RECEIVER_LOG" ] && break
+            sleep 0.25
+        done
+
+        if [ -s "$RECEIVER_LOG" ]; then
+            HIT=$(head -n 1 "$RECEIVER_LOG")
+            BO_SIG=$(echo "$HIT" | jq -r '.signature // empty')
+            BO_TS=$(echo "$HIT" | jq -r '.timestamp // empty')
+            BO_KEY=$(echo "$HIT" | jq -r '.api_key // empty')
+            BO_BODY=$(echo "$HIT" | jq -r '.body // empty')
+            BO_EXPECTED="sha256=$(printf '%s' "$BO_BODY" | openssl dgst -sha256 -hmac "$BODYONLY_SECRET" | sed 's/^.*= //')"
+
+            if [ -n "$BO_SIG" ] && [ "$BO_SIG" == "$BO_EXPECTED" ]; then
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} BODY_ONLY: X-Signature-256 is sha256=HMAC(RAW_BODY), computed strictly over the body" >&2
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} BODY_ONLY: signature mismatch (got '$BO_SIG', expected '$BO_EXPECTED')" >&2
+            fi
+
+            if [ -z "$BO_TS" ]; then
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} BODY_ONLY: X-Timestamp is absent" >&2
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} BODY_ONLY: unexpectedly sent X-Timestamp: $BO_TS" >&2
+            fi
+
+            if [ -z "$BO_KEY" ]; then
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} BODY_ONLY: X-API-Key is absent, same as HMAC_ONLY" >&2
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} BODY_ONLY: unexpectedly sent X-API-Key: $BO_KEY" >&2
+            fi
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} the BODY_ONLY-labelled webhook was never delivered" >&2
+        fi
+
+        api_call DELETE "/api/webhooks/$BODYONLY_CAPTURE_WEBHOOK_ID" "$MASTER_KEY"
+        check "204" "delete the BODY_ONLY wire-capture webhook"
+    else
+        warn "Local webhook receiver unavailable — skipping the BODY_ONLY wire-shape capture."
+    fi
+
+    # Same alias, now against the live executor's HmacOnly hook — proving simply_hook_executor
+    # actually validates the signature and executes, not merely that the vault sent well-formed
+    # bytes. Reuses the same hook/secret as the HMAC_ONLY block above: the wire format is identical,
+    # so the executor cannot tell these two webhooks apart, which is the entire point of the alias.
+    BEFORE=$(executor_success_count "$HOOK_HMACONLY_ID")
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"bodyonly-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger_hmaconly\",\"secret_token\":\"$HOOK_HMAC_SECRET\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"BODY_ONLY\",\"events\":\"IP_ADD\"}"
+    check "200" "create a BODY_ONLY-labelled webhook targeting the live executor's HmacOnly hook"
+    check_true '.auth_mode == "HMAC_ONLY"' "and its stored auth_mode is HMAC_ONLY, not BODY_ONLY"
+    BODYONLY_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.39","group_name":"hook-executor-group","cause":"body-only live dispatch"}'
+    check "200" "ban an address to trigger the BODY_ONLY-labelled live dispatch"
+
+    AFTER=0
+    for _ in $(seq 1 40); do
+        AFTER=$(executor_success_count "$HOOK_HMACONLY_ID")
+        [ "$AFTER" -gt "$BEFORE" ] 2>/dev/null && break
+        sleep 0.25
+    done
+    check_local "$AFTER" "$((BEFORE + 1))" \
+        "BODY_ONLY: exactly one new successful execution was recorded on the live executor"
+
+    hook_api_call GET "/api/executions?hook=$HOOK_HMACONLY_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
+    check_true '.[0].stdout | contains("vault-triggered:203.0.113.39")' \
+        "BODY_ONLY: simply_hook_executor validated the signature and executed with the correct payload"
+
+    api_call DELETE "/api/webhooks/$BODYONLY_EXEC_WEBHOOK_ID" "$MASTER_KEY"
+    check "204" "delete the BODY_ONLY executor webhook"
+
+    # ── Body-only HMAC, WITH an API key ─────────────────────────────────────
+    #
+    # HMAC_ONLY/BODY_ONLY above are body-only *and* keyless — that pairing is what the mode exists
+    # for, but it is not the only way to get a body-only signature. `hmac_template` only has to
+    # *contain* `{body}`; nothing requires the other three placeholders, so a CANONICAL_V1 webhook
+    # (which still sends X-API-Key and X-Timestamp) can be pointed at a template of exactly
+    # `"{body}"` and sign nothing else. The executor mirrors this on the keyed side: an ordinary
+    # key's `canonical_template` override has no format requirement at all (only a
+    # can_manage_keys-holding key is pinned to the service-wide default), so a dedicated key set to
+    # `"{body}"` verifies the identical, minimal signature. Two independent customization surfaces,
+    # same resulting wire shape, each checked from its own side of the connection: the vault's
+    # "must contain {body}" rule below, the executor's "no format requirement for an ordinary key"
+    # above.
+    hook_api_call POST "/api/keys" "$HOOK_EXECUTOR_MASTER_KEY" \
+        '{"name":"vault-dispatcher-body-only-template","canonical_template":"{body}"}'
+    check "200" "create a second executor key whose own canonical_template is just {body}"
+    BODYKEYED_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+    BODYKEYED_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+    BODYKEYED_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
+
+    hook_api_call POST "/api/keys/$BODYKEYED_KEY_ID/permissions" "$HOOK_EXECUTOR_MASTER_KEY" \
+        "{\"hook_id\":\"$HOOK_CANONICAL_ID\",\"can_execute\":true,\"can_manage\":false}"
+    check "200" "grant the body-only-template key execute rights on the CANONICAL_V1 hook"
+
+    # Wire capture first, against the local receiver: X-API-Key and X-Timestamp both present (this
+    # is still nominally a CANONICAL_V1 dispatch — the key is sent and the header is always added in
+    # that branch) but the signature covers the body alone, contrasting directly with the keyless
+    # BODY_ONLY capture above.
+    if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+        : > "$RECEIVER_LOG"
+        api_call POST "/api/webhooks" "$MASTER_KEY" \
+            "{\"name\":\"keyed-body-only-wire-capture\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/keyed-body-only\",\"secret_token\":\"$BODYKEYED_SECRET\",\"api_key\":\"$BODYKEYED_KEY\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"hmac_template\":\"{body}\",\"events\":\"IP_ADD\"}"
+        check "200" "create a CANONICAL_V1 webhook whose hmac_template is exactly {body}"
+        KEYEDBODY_CAPTURE_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+        api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.40","group_name":"hook-executor-group","cause":"keyed body-only wire capture"}'
+        check "200" "ban an address to trigger the keyed body-only dispatch"
+
+        for _ in $(seq 1 40); do
+            [ -s "$RECEIVER_LOG" ] && break
+            sleep 0.25
+        done
+
+        if [ -s "$RECEIVER_LOG" ]; then
+            HIT=$(head -n 1 "$RECEIVER_LOG")
+            KB_SIG=$(echo "$HIT" | jq -r '.signature // empty')
+            KB_TS=$(echo "$HIT" | jq -r '.timestamp // empty')
+            KB_KEY=$(echo "$HIT" | jq -r '.api_key // empty')
+            KB_BODY=$(echo "$HIT" | jq -r '.body // empty')
+            KB_EXPECTED="sha256=$(printf '%s' "$KB_BODY" | openssl dgst -sha256 -hmac "$BODYKEYED_SECRET" | sed 's/^.*= //')"
+
+            if [ "$KB_KEY" == "$BODYKEYED_KEY" ]; then
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} keyed body-only: X-API-Key is present, unlike the keyless BODY_ONLY case" >&2
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} keyed body-only: expected X-API-Key '$BODYKEYED_KEY', got '$KB_KEY'" >&2
+            fi
+
+            if [ -n "$KB_TS" ]; then
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} keyed body-only: X-Timestamp is present — CANONICAL_V1 always sends it, regardless of what the template signs" >&2
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} keyed body-only: X-Timestamp is unexpectedly absent" >&2
+            fi
+
+            if [ -n "$KB_SIG" ] && [ "$KB_SIG" == "$KB_EXPECTED" ]; then
+                PASS_COUNT=$((PASS_COUNT + 1))
+                echo -e "$(ts)   ${GREEN}✓ PASS${RESET} keyed body-only: the signature covers the body alone, ignoring the timestamp it is sent alongside" >&2
+            else
+                FAIL_COUNT=$((FAIL_COUNT + 1))
+                echo -e "$(ts)   ${RED}✗ FAIL${RESET} keyed body-only: signature mismatch (got '$KB_SIG', expected '$KB_EXPECTED')" >&2
+            fi
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} the keyed body-only webhook was never delivered" >&2
+        fi
+
+        api_call DELETE "/api/webhooks/$KEYEDBODY_CAPTURE_WEBHOOK_ID" "$MASTER_KEY"
+        check "204" "delete the keyed body-only wire-capture webhook"
+    else
+        warn "Local webhook receiver unavailable — skipping the keyed body-only wire-shape capture."
+    fi
+
+    # Now the live executor: the dedicated key's own canonical_template ({body}) must independently
+    # arrive at the same signature the vault computed, and actually execute.
+    BEFORE=$(executor_success_count "$HOOK_CANONICAL_ID")
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"keyed-body-only-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger_canonical\",\"secret_token\":\"$BODYKEYED_SECRET\",\"api_key\":\"$BODYKEYED_KEY\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"hmac_template\":\"{body}\",\"events\":\"IP_ADD\"}"
+    check "200" "create the keyed body-only webhook targeting the live executor"
+    KEYEDBODY_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.41","group_name":"hook-executor-group","cause":"keyed body-only live dispatch"}'
+    check "200" "ban an address to trigger the keyed body-only live dispatch"
+
+    AFTER=0
+    for _ in $(seq 1 40); do
+        AFTER=$(executor_success_count "$HOOK_CANONICAL_ID")
+        [ "$AFTER" -gt "$BEFORE" ] 2>/dev/null && break
+        sleep 0.25
+    done
+    check_local "$AFTER" "$((BEFORE + 1))" \
+        "keyed body-only: exactly one new successful execution was recorded, with an API key present"
+
+    hook_api_call GET "/api/executions?hook=$HOOK_CANONICAL_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
+    check_true '.[0].stdout | contains("vault-triggered:203.0.113.41")' \
+        "keyed body-only: the executor verified the body-only signature against the key's own canonical_template and executed"
+    check_true '.[0].api_key_id != null' \
+        "keyed body-only: the execution IS attributed to the presenting key, unlike the keyless HMAC_ONLY/BODY_ONLY cases above"
+
+    api_call DELETE "/api/webhooks/$KEYEDBODY_EXEC_WEBHOOK_ID" "$MASTER_KEY"
+    check "204" "delete the keyed body-only executor webhook"
 
     # ── NONE: no headers at all — genuinely accepted, keyless and unsigned ──
     BEFORE=$(executor_success_count "$HOOK_NOAUTH_ID")

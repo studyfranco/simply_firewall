@@ -8197,3 +8197,85 @@ All five clean:
 
 Peer provenance: `example/simply_hook_executor` pulled to `ddebc84` before any of this session's
 analysis, per `AGENT.MD`'s mandatory-pull rule.
+
+---
+
+## Session — BODY_ONLY as a signing-content derivative, keyed and keyless, plus Pillar 5 docs (2026-08-19)
+
+**Scope:** `scripts/test_e2e.sh` §31, `scripts/verify_convergence.sh` Pillar 5 prose only. No `src/`
+file, no `static/` file, `RBAC_MODEL.md` untouched.
+
+### The framing correction
+
+The user opened with: *"body only is not a mode, it is a derivate of hmac … configure both side to
+create a complete test … do it with API key and without API key."* This matches exactly what both
+prior sessions independently found from source (`AuthMode::BODY_ONLY_LEGACY` on the vault,
+`m20260819_141730`'s retirement on the executor) — `BODY_ONLY` is what happens when the signed
+material is reduced to the payload alone, not a fifth mode. What the prior session's §31 had not yet
+covered was that this reduction is reachable **two structurally different ways**, and only tested
+one of them.
+
+### Without an API key (already built last session, unchanged)
+
+`AuthMode::HmacOnly`/`BODY_ONLY_LEGACY` on the vault, a **hook's own** `HmacOnly` `auth_mode` on the
+executor. No key header; the executor resolves which secret to check from the hook the request path
+names.
+
+### With an API key (new this session)
+
+Found by re-checking a claim this file itself had made and not re-verifying: the §31 header
+previously asserted "the executor's CANONICAL_V1 verification format is fixed... with no per-key
+template." Re-reading `example/simply_hook_executor/src/api/keys.rs` while designing this addition
+showed that claim was already wrong when written — `api_keys.canonical_template` lets an *ordinary*
+key (anything not holding `can_manage_keys`) override the string it signs over, with **no format
+requirement** (`guard_canonical_v1_for_key_management` only pins the standard template for a
+`can_manage_keys` holder). Paired with the vault's own `hmac_template` rule — it only has to
+*contain* `{body}`, never required to contain `{method}`/`{path}`/`{timestamp}` too — this makes a
+**keyed, body-only signature** a real, provisionable configuration on both sides: a `CANONICAL_V1`
+webhook with `hmac_template: "{body}"`, verified by an executor key whose own `canonical_template`
+is also `"{body}"`. `X-API-Key` and `X-Timestamp` are still sent (CANONICAL_V1 always adds both,
+unconditionally, in the dispatcher's `CanonicalV1` branch — that does not depend on what the
+template actually signs), but the signature covers only the body, identically to the keyless case.
+
+New §31 blocks, in order: (1) the keyless `BODY_ONLY`-labelled webhook, wire-shape captured against
+the local receiver (signature/timestamp/key-absence, mirroring §22's existing `HMAC_ONLY` capture
+but for the literal legacy input spelling on the *current* field name — §22 only ever tested the
+legacy *field* name, `signature_mode`, not the legacy *value* on `auth_mode`) and then dispatched
+live against the executor's `HmacOnly` hook for a genuine `SUCCESS` execution; (2) the keyed
+body-only variant — a second dedicated executor key with `canonical_template: "{body}"`, same
+wire-capture-then-live-dispatch shape, asserting `X-API-Key` present (contrasted directly against
+the keyless capture), `X-Timestamp` present, the signature body-only, and the resulting execution
+attributed to the presenting key (`api_key_id != null`, the mirror of the keyless case's
+`api_key_id == null`).
+
+Also corrected the §31 header comment that had made the "no per-key template" claim, since leaving a
+disproven claim standing next to the code that disproves it is worse than not having written the
+comment at all.
+
+### Task 2 — Pillar 5 documentation
+
+`scripts/verify_convergence.sh`'s Pillar 5 note previously read "`simply_hook_executor` keeps a
+per-key posture for third-party senders" — accurate when written, describing `api_keys.hmac_mode`
+before its retirement, and flagged as stale (but not fixed) in the session before this one. Updated
+to describe the asymmetry as it actually stands: the vault has no opt-out anywhere, ever; the
+executor's opt-out moved from a per-*key* choice to a per-*hook* one (`hooks.auth_mode`), scoped to
+only the three invocation routes. The `assert_absent` check itself needed no change — it has always
+searched only this repository's own `src/`, and the vault's own posture (which is what it actually
+verifies) has not changed.
+
+### Quality gates
+
+All five clean:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean, zero warnings |
+| `cargo test` | **300 passed**, 0 failed (unchanged — no Rust source touched) |
+| `./scripts/test_e2e.sh` | **621 checks passed** (up from 594), 0 failed |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+Peer provenance: `example/simply_hook_executor` pulled per `AGENT.MD`'s mandatory rule and
+reported already up to date at `ddebc84`. Its source was re-read from disk rather than assumed
+unchanged from the prior session's notes, which is what surfaced the stale "no per-key template"
+claim above.
