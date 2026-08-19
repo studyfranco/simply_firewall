@@ -660,6 +660,34 @@ body {
     min-height: 12rem;
 }
 
+/* ─── Full-height Audit Logs view ───────────────────────── */
+/*
+ * The same flex chain as `#tab-firewall` above, one level shallower: Audit Logs has no
+ * `.list-section` wrapper of its own, so the chain runs tab-panel → `.card` → `.table-scroll`
+ * directly. Same reasoning throughout — no hardcoded subtrahend, `min-height: 0` at every link so
+ * the scroller (not the page) absorbs the extra rows, `flex: 1` so the card claims whatever the
+ * viewport leaves once the header and pagination take their natural height.
+ */
+#tab-audit.tab-panel.active {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+#tab-audit .audit-section {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-height: 0;
+}
+
+#tab-audit .table-scroll {
+    flex: 1 1 auto;
+    max-height: none;
+    min-height: 12rem;
+}
+
 /* The header cells carry the background, not <thead>: a transparent sticky row lets body rows
    show through as they scroll beneath it. */
 .table-scroll .data-table th {
@@ -1642,6 +1670,24 @@ body {
     line-height: 1.5;
 }
 
+/* Exactly two element children are meant to stack here: the lead sentence, then the italic aside.
+   A flex container blockifies *every* element child, not only the ones meant to sit on their own
+   line — an unwrapped `<strong>`/`<code>` sitting as a direct child would get the same treatment as
+   `<em>` and land on its own line mid-sentence. `.hint-lead` is what keeps that from happening: it
+   is the single element the whole first sentence lives inside, so blockification lands on it once,
+   and its own descendants (`<strong>`, `<code>`) are ordinary inline content that wraps normally. */
+.auth-mode-hint .hint-lead,
+.auth-mode-hint em {
+    display: block;
+}
+
+.auth-mode-hint .hint-lead {
+    /* Reduces single-word orphans (a lone "and" or "when" stranded at a line start) when the
+       sentence genuinely needs to wrap. Supported by every evergreen browser this dashboard
+       targets; browsers without it fall back to ordinary wrapping, which is still correct. */
+    text-wrap: pretty;
+}
+
 /* "Sends:" leads every hint; making it the one emphasised token keeps the four descriptions
    scannable as a set rather than as four paragraphs that happen to sit in the same box. */
 .auth-mode-hint strong {
@@ -1650,7 +1696,6 @@ body {
 }
 
 .auth-mode-hint em {
-    display: block;
     margin-top: 0.3rem;
     color: var(--text-muted);
     font-style: normal;

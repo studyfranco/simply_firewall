@@ -391,25 +391,37 @@ class FirewallClient {
     //
     // Trusted, author-written HTML assigned via innerHTML; no interpolation of anything
     // user-supplied happens here or at the assignment site.
+    //
+    // Every hint is `<span class="hint-lead">…</span> <em>…</em>` — never bare `<strong>`/`<code>`
+    // elements as direct children of `.auth-mode-hint`. That box is `display: flex; flex-direction:
+    // column` (see style.css) so its two lines stack instead of the hint pushing the form around
+    // when the mode changes, but CSS blockifies *every* element child of a flex container, not just
+    // the ones meant to be a line of their own — an unwrapped `<code>` sitting next to `<strong>`
+    // becomes its own flex item exactly like the `<em>` does, landing on its own line rather than
+    // flowing inline with the sentence around it. `.hint-lead` absorbs that: it is the one element
+    // child holding the whole first sentence, so blockification happens once, on a container whose
+    // own children (the `<strong>`/`<code>` inside it) are free to wrap normally as ordinary inline
+    // text. The trailing `<em>` is still its own flex item, deliberately — that is the second line.
     static AUTH_MODE_HINTS = {
         CANONICAL_V1:
-            '<strong>Sends:</strong> signature + <code>X-Timestamp</code>, and <code>X-API-Key</code> ' +
-            'when one is set. Signs the canonical template below, so a dispatch authenticates ' +
-            'directly against another Simply IP Vault instance or a hook executor. ' +
-            '<em>Use this between our own services.</em>',
+            '<span class="hint-lead"><strong>Sends:</strong> signature + <code>X-Timestamp</code>, ' +
+            'and <code>X-API-Key</code> when one is set. Signs the canonical template below, so a ' +
+            'dispatch authenticates directly against another Simply IP Vault instance or a hook ' +
+            'executor.</span> <em>Use this between our own services.</em>',
         HMAC_ONLY:
-            '<strong>Sends:</strong> the signature and nothing else — no key header, no timestamp. ' +
-            'Signs the payload alone, the way GitHub-style receivers expect. ' +
-            '<em>Use this for third-party endpoints that verify a signature.</em>',
+            '<span class="hint-lead"><strong>Sends:</strong> the signature and nothing else — no ' +
+            'key header, no timestamp. Signs the payload alone, the way GitHub-style receivers ' +
+            'expect.</span> <em>Use this for third-party endpoints that verify a signature.</em>',
         API_KEY_ONLY:
-            '<strong>Sends:</strong> <code>X-API-Key</code> only. Nothing is signed, so the key is ' +
-            'the entire credential and anyone who captures it can replay the request. ' +
-            '<em>Use this only over TLS, for receivers that accept nothing else.</em>',
+            '<span class="hint-lead"><strong>Sends:</strong> <code>X-API-Key</code> only. Nothing ' +
+            'is signed, so the key is the entire credential and anyone who captures it can replay ' +
+            'the request.</span> <em>Use this only over TLS, for receivers that accept nothing ' +
+            'else.</em>',
         NONE:
-            '<strong>Sends:</strong> no authentication headers at all. ' +
-            '<em>Use this only when the receiver is already protected some other way</em> — a ' +
-            'private listener reachable from this host alone, or a credential you have set as a ' +
-            'custom header below.'
+            '<span class="hint-lead"><strong>Sends:</strong> no authentication headers at all. ' +
+            'Appropriate when the receiver is already protected some other way — a private ' +
+            'listener reachable from this host alone, or a credential set as a custom header ' +
+            'below.</span> <em>Use this only when nothing else is available.</em>'
     };
 
     constructor() {

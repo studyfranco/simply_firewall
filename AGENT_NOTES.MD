@@ -7986,3 +7986,132 @@ All five clean:
 12 files touched, all `src/`/`tests/`/`scripts/`: `main.rs`, `crypto.rs`, `extract.rs`,
 `entities/api_key.rs`, `api/{audit,groups,keys,records,support,webhooks}.rs`,
 `tests/concurrency_and_contracts.rs`, `scripts/test_e2e.sh`. `RBAC_MODEL.md` untouched, as required.
+
+---
+
+## Session — UI layout fixes, webhook field reorder, and live simply_hook_executor E2E integration (2026-08-19)
+
+**Scope:** `static/` layout/copy fixes, `scripts/test_e2e.sh` expansion. No Rust source touched;
+`RBAC_MODEL.md` untouched. Verified in a real browser (headless Chromium driven over CDP via a
+~150-line stdlib-only Python client, since no browser automation package was installed) before and
+after each fix, per this repository's own rule that UI changes must be checked in a browser rather
+than assumed from CSS text.
+
+### Task 1 — webhook field reorder, and the actual auth-mode-hint bug
+
+**Field order** (`static/index.html`): swapped so Webhook Name is first, Target URL second. Simple
+markup swap; handlers read both fields by `id`, so order carried no logic dependency.
+
+**Auth-mode hint layout.** Screenshotting the live form (not reasoning from the CSS alone) showed
+the actual defect: `<strong>Sends:</strong> signature + <code>X-Timestamp</code>, and <code>X-API-
+Key</code> when one is set…` rendered as *one fragment per line* — "signature +", then
+`X-Timestamp` alone, then the orphaned ", and", then `X-API-Key` alone, then the trailing text. The
+brief described the symptom ("orphaned punctuation… stray line breaks before X-Timestamp") without
+the mechanism, and the mechanism was not what a first read of the CSS suggests (no `code` selector
+exists in `style.css` at all).
+
+**Actual cause, confirmed via `getComputedStyle`/`getBoundingClientRect` on the live DOM**:
+`.auth-mode-hint` is `display: flex; flex-direction: column`, and CSS blockifies *every element
+child* of a flex container, not only the ones meant to occupy their own line. `<strong>`, each
+`<code>`, and the trailing `<em>` were all direct children, so all four were blockified onto
+separate lines — the `<em>` deliberately (that line break is intended), the others by accident.
+Fix: `app.js`'s `AUTH_MODE_HINTS` now wraps the whole first sentence in one `<span class="hint-
+lead">`, so blockification happens once, on a container whose own children flow as ordinary inline
+text. `style.css` makes the two-line structure explicit (`.hint-lead`, `em { display: block }`)
+rather than relying on the blockification side effect, and adds `text-wrap: pretty` to reduce
+orphans on lines that still wrap legitimately. Verified against all four modes
+(CANONICAL_V1/HMAC_ONLY/API_KEY_ONLY/NONE) — the dropdown has exactly these four; `BODY_ONLY` is a
+legacy input alias, not a live fifth mode (`m20260811_000012`), so the brief's mention of it was
+folded into HMAC_ONLY's copy rather than added as a nonexistent option.
+
+### Task 2 — table stretch: the brief named the reference tab backwards
+
+The brief asked to make IP Records "match the behavior of the Webhooks tab" and Audit Logs "mirror
+[Webhooks]". Reading `style.css` before touching anything showed the opposite: `#tab-firewall` (IP
+Records) already carries the full flex-chain (`#dashboard-container` → `.tab-panel.active` →
+`.list-section` → `.table-scroll`, `min-height: 0` at every link) documented in a prior session's
+entry above. Webhooks and Audit Logs both use a plain `.table-container` — the whole page scrolls,
+no sticky header, no stretch. Webhooks was the reference *named*, not the one *with* the behavior.
+
+Treated as a naming error rather than a literal instruction: extended IP Records' proven, working
+chain onto Audit Logs (Task 2's actual named target), left IP Records itself untouched, and left
+Webhooks itself untouched (Task 2's scope is titled "IP Records & Audit Logs"). `#tab-audit` now
+carries the equivalent chain one level shallower (`.tab-panel.active` → `.audit-section` →
+`.table-scroll`, no intervening `.list-section` since Audit Logs has no filter bar).
+
+Verified in-browser at two viewport heights (900px, 620px). At 620px both IP Records and Audit Logs
+overflow the page by roughly the same, expected amount (Audit Logs' `docScrollHeight` 784 vs.
+Firewall's 831, at identical `windowInnerHeight: 620`) — both hit the same deliberate `min-height:
+12rem` floor on `.table-scroll`, confirming Audit Logs now behaves consistently with IP Records
+rather than regressing it.
+
+### Task 3 — live `simply_hook_executor` E2E integration: three corrected premises
+
+New `scripts/test_e2e.sh` §31 (~370 lines) builds and boots a real `simply_hook_executor` from
+`example/simply_hook_executor`, using it as a genuine second service rather than a capture script.
+Degrades to a warning + skip if the checkout is absent, fails to build, or does not come up —
+mirroring the existing `python3` soft-dependency pattern for §13.
+
+Three things the brief assumed were checked by reading the peer's source **before** writing the
+test, each changing what the test could honestly assert:
+
+1. **`simply_hook_executor` requires `X-API-Key` on every request, unconditionally, before anything
+   else** (`middleware.rs`: the header is read and looked up before a signature is even
+   considered; a signature is optional *per request* by default, not mandatory per key). This means
+   `HMAC_ONLY` (which sends no key header at all — that is its whole defining property) and `NONE`
+   can never authenticate against it, structurally. Not a bug to route around: it is exactly the
+   "Pillar 5" auth-posture asymmetry `verify_convergence.sh` already documents between the two
+   services. Both modes are still tested against the live executor — proving it *correctly refuses*
+   them (poll for zero new executions, then a raw-curl replication of the exact wire shape pinning
+   the precise `401 "Missing credentials: provide an X-API-Key header"`) — rather than skipped or
+   faked as a success.
+2. **Only CANONICAL_V1 and API_KEY_ONLY can succeed end to end**, and both do: a real hook (a
+   throwaway shell script under a canonicalized `ALLOWED_SCRIPT_ROOTS`) is triggered by a real vault
+   `POST /api/ban`, and the assertion polls the executor's own `GET /api/executions` for a new
+   `SUCCESS` row whose `stdout` contains the actual banned address — proving data flowed through the
+   whole pipeline, not just that a `200` came back.
+3. **The brief's "custom hmac_template excluding `{body}`, asserting execution succeeds" is not
+   reachable at all.** Discovered by running the drafted live-delivery version of this test and
+   watching it fail: `src/api/webhooks.rs` refuses any `hmac_template` omitting `{body}` at both
+   creation and update, with `"a signature that does not cover the payload authenticates nothing"`.
+   There is no route through the API that ever produces a live webhook row with such a template, so
+   no receiver — real or captured — can ever be asked to accept one. Rewritten to assert the actual,
+   valuable property: the refusal itself, on both the create and update paths, with the exact
+   message pinned. Left as a genuine record of a **failed first draft** rather than cleaned up
+   silently, because the failure is what proved the premise wrong; a test that had "worked" by
+   accident (e.g. against a target that happened to 404 for an unrelated reason) would have been
+   worse than the failure was.
+
+**Also skipped by design, not by oversight:** a full 10-second dispatch-timeout test
+(`WEBHOOK_TIMEOUT` in `dispatch.rs`) was considered and cut to keep the suite's added runtime
+bounded — one genuine wall-clock wait of that length for a single scenario was judged not worth it
+against the suite's existing sub-two-minute run time. "Single-pass escape resolution" and "literal
+path overrides" were not re-implemented at the shell level: the former is already proven by
+`cargo test` (`dispatch::tests`, including an adversarial "hostile body" case), the latter by the
+existing §23; duplicating either would only be a slower copy of an assertion already made.
+
+**What *was* added beyond the brief's literal five-mode list**, inspired by reading
+`simply_hook_executor`'s own e2e suite as instructed: a tampered-secret dispatch (mirrors their
+`"definitely-not-the-secret"` pattern — confirms a wrong signature is rejected, not silently
+accepted) and an authenticated dispatch to a hook name that does not exist (confirms the vault's
+dispatch worker survives an authenticated-but-404 receiver response without wedging — the next
+`/health` call still answers `200`).
+
+### Task 4 — quality gates
+
+All five clean:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean, zero warnings |
+| `cargo test` | **300 passed**, 0 failed (unchanged — no Rust source touched this session) |
+| `./scripts/test_e2e.sh` | **587 checks passed** (up from 544; +43 net, all in the new §31), 0 failed |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+`tests/frontend_syntax_test.rs::app_js_has_no_syntax_errors` specifically re-verified against the
+modified `app.js` (part of the `cargo test` run above, called out separately since it is the one
+existing Rust test that actually covers this session's changes).
+
+Files touched: `static/{index.html,app.js,style.css}`, `scripts/test_e2e.sh`. No `src/` file, no
+`RBAC_MODEL.md`.

@@ -3,7 +3,7 @@
 An index of every file under `src/`, its size, and its exact purpose. Written for future agents: read
 this before searching the tree, and update it when you add, remove, or repurpose a file.
 
-**Revision:** `b479539` (plus this session's uncommitted changes) · **Generated:** 2026-08-18 · **Files indexed:** 44 · **Total:** 13,395 lines
+**Revision:** `cd8b247` (plus this session's uncommitted changes) · **Generated:** 2026-08-19 · **Files indexed:** 44 · **Total:** 13,395 lines (`src/` unchanged this session — see the `static/`/`scripts/` note below for what did change)
 
 ---
 
@@ -96,6 +96,24 @@ near the word "pragma" — and each reported CLEAN against a deliberately plante
 failures were invisible because neither had a meta-test. This file has one.
 
 ---
+
+## `static/` and `scripts/` — outside this map's `src/` scope, noted briefly
+
+This map indexes `src/`; the dashboard (`static/index.html`, `app.js`, `style.css`, ~4,900 lines)
+and the E2E harness (`scripts/test_e2e.sh`, ~3,600 lines / 587 checks) are large enough to deserve
+their own maps if they keep growing, but do not have one yet. Two things worth knowing without
+reading either in full:
+
+- **A flex container blockifies every element child, not only the ones meant to occupy their own
+  line.** `static/style.css`'s `.auth-mode-hint` is `display: flex; flex-direction: column` so its
+  two intended lines stack; an unwrapped `<strong>`/`<code>` sitting as a *direct* child gets the
+  same treatment as the `<em>` line and lands on its own line too, fragmenting a sentence one word
+  at a time. `static/app.js`'s `AUTH_MODE_HINTS` wraps everything but the trailing `<em>` in one
+  `<span class="hint-lead">` for exactly this reason — do the same for any future hint added there.
+- **`scripts/test_e2e.sh` §31 builds and boots a real `example/simply_hook_executor`** as a second
+  live service, not a capture script — the one section in the suite that proves a sibling service
+  actually *accepts* what the vault sends, rather than only capturing the bytes. Degrades to a
+  warning + skip if that checkout is absent, matching §13's `python3` soft-dependency pattern.
 
 ## Reading order for a new agent
 
