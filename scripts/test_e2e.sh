@@ -3216,22 +3216,40 @@ check_true '.[0].cause == "mixed case, compressed"' "#30 and the re-submission u
 # standard peer this project converges with (`AGENT.MD`), and unlike the capture script it performs
 # its own authentication and executes a real command as a result.
 #
-# ## Which of the four auth modes this can actually prove, and why
+# ## All four real auth modes are now genuinely end-to-end testable
 #
-# `simply_hook_executor`'s own auth middleware requires an `X-API-Key` header on *every* request,
-# unconditionally, before anything else is even considered — confirmed by reading
-# `example/simply_hook_executor/src/middleware.rs`. A signature is optional per request there (its
-# `hmac_mode` only decides which signature header/scheme is *accepted if one is sent*; it does not
-# make one mandatory unless `REQUIRE_SIGNED_REQUESTS` is set, which this section does not set).
+# An earlier version of this section concluded HMAC_ONLY and NONE could never authenticate against
+# the executor, because at the time `X-API-Key` was mandatory on every route, unconditionally.
+# `example/simply_hook_executor` has since grown a second, keyless authentication path
+# (`middleware::invocation_auth_middleware`, `src/entities/hook.rs::AuthMode`) that applies only to
+# the three routes that actually invoke a hook. Re-read from current source before writing anything
+# below, since the prior conclusion was reached against an older checkout and does not hold now:
 #
-# That makes CANONICAL_V1 and API_KEY_ONLY genuinely end-to-end testable: both send `X-API-Key`, so
-# the executor can identify the caller and run the hook. HMAC_ONLY and NONE cannot succeed against
-# it, structurally — HMAC_ONLY's entire defining property is that it sends *no key header of any
-# kind* (see `AuthMode::HmacOnly`'s own doc in `src/entities/webhook_config.rs`), and the executor's
-# very first auth step rejects any request missing one. This is not a gap to route around; it is the
-# two services' documented "Pillar 5" auth asymmetry (`AGENT_NOTES.MD`) showing up as a concrete,
-# provable boundary rather than a documentation claim. Both of those modes are still tested here —
-# against the real executor, proving it correctly refuses them — rather than skipped.
+# - A **keyed** caller (`X-API-Key` present) authenticates exactly as before, on every route,
+#   regardless of the target hook's own `auth_mode` — that field "only ever *adds* a way in for a
+#   keyless caller; it never removes the always-available keyed path" (`hook.rs`'s own doc). This is
+#   what CANONICAL_V1 and API_KEY_ONLY below still use, unchanged from the previous version of this
+#   section.
+# - A **keyless** caller (no `X-API-Key`) is now judged entirely by the target *hook's* `auth_mode`:
+#   `CanonicalV1`/`ApiKeyOnly` still refuse it (a key is required for those); `HmacOnly` accepts it
+#   if the configured header carries a valid HMAC-SHA256 over the raw body against the **hook's
+#   own** `hmac_secret` (never a key's) — no timestamp, no key, the exact shape the vault's
+#   `HMAC_ONLY` mode sends; `NoAuth` accepts it outright, provided the deployment-wide
+#   `REQUIRE_SIGNED_REQUESTS` is `false` (the default) and no stray signature material is present.
+#
+# Both keyless modes are therefore provisioned with their own dedicated hook below and driven to a
+# genuine `SUCCESS` execution, the same way CANONICAL_V1/API_KEY_ONLY already were.
+#
+# ## Four real modes, not five
+#
+# `hook::AuthMode` has exactly four variants — `CanonicalV1`, `ApiKeyOnly`, `HmacOnly`, `NoAuth`
+# ("NONE") — confirmed directly from the enum in `src/entities/hook.rs`. There is no `BODY_ONLY`
+# among them: it was retired as an *api_keys* `hmac_mode` value in `m20260819_141730` (SCHEMA.MD),
+# and the keyless third-party-webhook use case it used to serve is exactly what a hook's own
+# `HmacOnly` `auth_mode` now provides. This mirrors the vault's own side precisely — `BODY_ONLY` is
+# likewise a retired, input-only alias for `HMAC_ONLY` there (`m20260811_000012`), not a fifth live
+# mode — so there is no fifth hook to provision; a hook named for `BODY_ONLY` would have nowhere to
+# point that `HMAC_ONLY`'s hook does not already cover identically.
 #
 # ## What "custom HMAC template" coverage this can and cannot add
 #
@@ -3339,25 +3357,55 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
         RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
     }
 
+    # Four hooks, one per real auth_mode, all pointed at the same echo script — the mode is a
+    # property of the hook row, not the script. HMAC_ONLY's own secret is chosen here (never an
+    # api_key's); the other three need none of their own.
+    HOOK_HMAC_SECRET="executor-hook-own-hmac-secret-not-a-key-secret"
+
     hook_api_call POST "/api/hooks" "$HOOK_EXECUTOR_MASTER_KEY" \
-        "{\"name\":\"vault_trigger\",\"script_path\":\"$HOOK_ECHO_SCRIPT\",\"default_timeout_seconds\":10,\"parameters\":[{\"param_key\":\"target\",\"is_required\":true}]}"
-    check "200" "create the hook the vault's dispatches will trigger"
-    TRIGGER_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+        "{\"name\":\"vault_trigger_canonical\",\"script_path\":\"$HOOK_ECHO_SCRIPT\",\"default_timeout_seconds\":10,\"auth_mode\":\"CANONICAL_V1\",\"parameters\":[{\"param_key\":\"target\",\"is_required\":true}]}"
+    check "200" "create the CANONICAL_V1 hook the vault's fully-signed dispatches will trigger"
+    HOOK_CANONICAL_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    hook_api_call POST "/api/hooks" "$HOOK_EXECUTOR_MASTER_KEY" \
+        "{\"name\":\"vault_trigger_apikeyonly\",\"script_path\":\"$HOOK_ECHO_SCRIPT\",\"default_timeout_seconds\":10,\"auth_mode\":\"API_KEY_ONLY\",\"parameters\":[{\"param_key\":\"target\",\"is_required\":true}]}"
+    check "200" "create the API_KEY_ONLY hook the vault's bare-key dispatches will trigger"
+    HOOK_APIKEYONLY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    # `auth_mode` governs only the *keyless* door — a keyed caller authenticates the same way
+    # regardless of it (see the module comment above). These two hooks' auth_mode names the operator
+    # intent the naming documents; a keyed CANONICAL_V1/API_KEY_ONLY dispatch would in fact succeed
+    # against any of the four hooks below just as well.
+
+    hook_api_call POST "/api/hooks" "$HOOK_EXECUTOR_MASTER_KEY" \
+        "{\"name\":\"vault_trigger_hmaconly\",\"script_path\":\"$HOOK_ECHO_SCRIPT\",\"default_timeout_seconds\":10,\"auth_mode\":\"HMAC_ONLY\",\"hmac_secret\":\"$HOOK_HMAC_SECRET\",\"parameters\":[{\"param_key\":\"target\",\"is_required\":true}]}"
+    check "200" "create the HMAC_ONLY hook — keyless, verified against the hook's own hmac_secret"
+    HOOK_HMACONLY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    hook_api_call POST "/api/hooks" "$HOOK_EXECUTOR_MASTER_KEY" \
+        "{\"name\":\"vault_trigger_noauth\",\"script_path\":\"$HOOK_ECHO_SCRIPT\",\"default_timeout_seconds\":10,\"auth_mode\":\"NONE\",\"parameters\":[{\"param_key\":\"target\",\"is_required\":true}]}"
+    check "200" "create the NONE hook — keyless, unauthenticated (REQUIRE_SIGNED_REQUESTS defaults to false)"
+    HOOK_NOAUTH_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
     hook_api_call POST "/api/keys" "$HOOK_EXECUTOR_MASTER_KEY" '{"name":"vault-dispatcher"}'
-    check "200" "create the worker key the vault's dispatches will authenticate as"
+    check "200" "create the worker key the vault's keyed dispatches will authenticate as"
     TRIGGER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
     TRIGGER_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
     TRIGGER_SECRET=$(echo "$RESP_BODY" | jq -r '.signing_secret')
 
-    hook_api_call POST "/api/keys/$TRIGGER_KEY_ID/permissions" "$HOOK_EXECUTOR_MASTER_KEY" \
-        "{\"hook_id\":\"$TRIGGER_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
-    check "200" "grant the worker key execute rights on the hook"
+    # Only the two keyed hooks actually need the grant — the keyless pair is never reached through
+    # this key at all — but granting all four costs nothing and keeps the setup uniform.
+    for GRANT_HOOK_ID in "$HOOK_CANONICAL_ID" "$HOOK_APIKEYONLY_ID" "$HOOK_HMACONLY_ID" "$HOOK_NOAUTH_ID"; do
+        hook_api_call POST "/api/keys/$TRIGGER_KEY_ID/permissions" "$HOOK_EXECUTOR_MASTER_KEY" \
+            "{\"hook_id\":\"$GRANT_HOOK_ID\",\"can_execute\":true,\"can_manage\":false}"
+        check "200" "grant the worker key execute rights on hook $GRANT_HOOK_ID"
+    done
 
-    # Successful executions recorded against the hook so far, so each mode below can assert its own
+    # Successful executions recorded against one hook so far, so each mode below can assert its own
     # *delta* rather than an absolute count that would be wrong the second time this loop runs.
     executor_success_count() {
-        hook_api_call GET "/api/executions?hook=$TRIGGER_HOOK_ID&status=SUCCESS&limit=1000" "$HOOK_EXECUTOR_MASTER_KEY"
+        local hook_id="$1"
+        hook_api_call GET "/api/executions?hook=$hook_id&status=SUCCESS&limit=1000" "$HOOK_EXECUTOR_MASTER_KEY"
         echo "$RESP_BODY" | jq -r 'length' 2>/dev/null || echo 0
     }
 
@@ -3366,9 +3414,9 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     HOOKEXEC_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
     # ── CANONICAL_V1: full signing, genuinely end to end ────────────────────
-    BEFORE=$(executor_success_count)
+    BEFORE=$(executor_success_count "$HOOK_CANONICAL_ID")
     api_call POST "/api/webhooks" "$MASTER_KEY" \
-        "{\"name\":\"canonical-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger\",\"secret_token\":\"$TRIGGER_SECRET\",\"api_key\":\"$TRIGGER_KEY\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"events\":\"IP_ADD\"}"
+        "{\"name\":\"canonical-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger_canonical\",\"secret_token\":\"$TRIGGER_SECRET\",\"api_key\":\"$TRIGGER_KEY\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"events\":\"IP_ADD\"}"
     check "200" "create a CANONICAL_V1 webhook targeting the live executor"
     CANON_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
@@ -3377,13 +3425,13 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
 
     AFTER=0
     for _ in $(seq 1 40); do
-        AFTER=$(executor_success_count)
+        AFTER=$(executor_success_count "$HOOK_CANONICAL_ID")
         [ "$AFTER" -gt "$BEFORE" ] 2>/dev/null && break
         sleep 0.25
     done
     check_local "$AFTER" "$((BEFORE + 1))" "CANONICAL_V1: exactly one new successful execution was recorded"
 
-    hook_api_call GET "/api/executions?hook=$TRIGGER_HOOK_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
+    hook_api_call GET "/api/executions?hook=$HOOK_CANONICAL_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
     check_true '.[0].stdout | contains("vault-triggered:203.0.113.31")' \
         "CANONICAL_V1: the executed script actually saw the banned address, end to end"
 
@@ -3391,9 +3439,9 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
     check "204" "delete the CANONICAL_V1 executor webhook"
 
     # ── API_KEY_ONLY: bare key, no signature, still end to end ─────────────
-    BEFORE=$(executor_success_count)
+    BEFORE=$(executor_success_count "$HOOK_APIKEYONLY_ID")
     api_call POST "/api/webhooks" "$MASTER_KEY" \
-        "{\"name\":\"apikeyonly-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger\",\"api_key\":\"$TRIGGER_KEY\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"API_KEY_ONLY\",\"events\":\"IP_ADD\"}"
+        "{\"name\":\"apikeyonly-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger_apikeyonly\",\"api_key\":\"$TRIGGER_KEY\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"API_KEY_ONLY\",\"events\":\"IP_ADD\"}"
     check "200" "create an API_KEY_ONLY webhook targeting the live executor"
     APIKEY_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
@@ -3402,90 +3450,111 @@ if [ "$HOOK_EXECUTOR_AVAILABLE" -eq 1 ]; then
 
     AFTER=0
     for _ in $(seq 1 40); do
-        AFTER=$(executor_success_count)
+        AFTER=$(executor_success_count "$HOOK_APIKEYONLY_ID")
         [ "$AFTER" -gt "$BEFORE" ] 2>/dev/null && break
         sleep 0.25
     done
     check_local "$AFTER" "$((BEFORE + 1))" "API_KEY_ONLY: exactly one new successful execution was recorded"
 
-    hook_api_call GET "/api/executions?hook=$TRIGGER_HOOK_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
+    hook_api_call GET "/api/executions?hook=$HOOK_APIKEYONLY_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
     check_true '.[0].stdout | contains("vault-triggered:203.0.113.32")' \
         "API_KEY_ONLY: the bare-key dispatch still executed with the correct payload"
 
     api_call DELETE "/api/webhooks/$APIKEY_EXEC_WEBHOOK_ID" "$MASTER_KEY"
     check "204" "delete the API_KEY_ONLY executor webhook"
 
-    # ── HMAC_ONLY: structurally cannot authenticate — prove the refusal ────
+    # ── HMAC_ONLY: keyless, verified against the hook's own hmac_secret ─────
     #
-    # HMAC_ONLY sends no X-API-Key at all (see the module comment above), and the executor's own
-    # auth middleware requires one before it looks at anything else. The vault dispatch below must
-    # therefore produce *zero* new executions; the raw curl beneath it pins the exact reason.
-    BEFORE=$(executor_success_count)
+    # No X-API-Key, no X-Timestamp — matching AuthMode::HmacOnly's wire shape exactly (already
+    # proven at the byte level against the Python receiver in §22). What is new here is that a real
+    # peer now accepts it: the vault's secret_token must equal the *hook's* hmac_secret, not any
+    # key's, since the executor verifies this keyless path against the hook row alone.
+    BEFORE=$(executor_success_count "$HOOK_HMACONLY_ID")
     api_call POST "/api/webhooks" "$MASTER_KEY" \
-        "{\"name\":\"hmaconly-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger\",\"secret_token\":\"$TRIGGER_SECRET\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"HMAC_ONLY\",\"events\":\"IP_ADD\"}"
-    check "200" "create an HMAC_ONLY webhook targeting the live executor"
+        "{\"name\":\"hmaconly-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger_hmaconly\",\"secret_token\":\"$HOOK_HMAC_SECRET\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"HMAC_ONLY\",\"events\":\"IP_ADD\"}"
+    check "200" "create an HMAC_ONLY webhook targeting the live executor's keyless HMAC_ONLY hook"
     HMACONLY_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
     api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.33","group_name":"hook-executor-group","cause":"hmac-only live dispatch"}'
     check "200" "ban an address to trigger the HMAC_ONLY dispatch"
-    sleep 2
-    AFTER=$(executor_success_count)
-    check_local "$AFTER" "$BEFORE" "HMAC_ONLY: the executor recorded no new execution (it cannot identify the caller)"
+
+    AFTER=0
+    for _ in $(seq 1 40); do
+        AFTER=$(executor_success_count "$HOOK_HMACONLY_ID")
+        [ "$AFTER" -gt "$BEFORE" ] 2>/dev/null && break
+        sleep 0.25
+    done
+    check_local "$AFTER" "$((BEFORE + 1))" "HMAC_ONLY: exactly one new successful execution was recorded, keyless"
+
+    hook_api_call GET "/api/executions?hook=$HOOK_HMACONLY_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
+    check_true '.[0].stdout | contains("vault-triggered:203.0.113.33")' \
+        "HMAC_ONLY: the keyless dispatch still executed with the correct payload, end to end"
+    check_true '.[0].api_key_id == null' \
+        "HMAC_ONLY: the execution is recorded as keyless (no api_key_id), not attributed to the shared worker key"
 
     api_call DELETE "/api/webhooks/$HMACONLY_EXEC_WEBHOOK_ID" "$MASTER_KEY"
     check "204" "delete the HMAC_ONLY executor webhook"
 
-    # The exact wire shape §22 already proved the vault sends for HMAC_ONLY (sha256=HMAC(body),
-    # nothing else), replicated directly against the live executor to pin the precise refusal.
-    HMACONLY_BODY='{"target":"raw-hmac-only-probe"}'
-    HMACONLY_SIG="sha256=$(printf '%s' "$HMACONLY_BODY" | openssl dgst -sha256 -hmac "$TRIGGER_SECRET" | sed 's/^.*= //')"
+    # A wrong secret must still be refused on this same keyless path — the point of it accepting no
+    # key at all is not that it accepts anything.
+    HMACONLY_TAMPERED_BODY='{"target":"tampered-hmac-only-probe"}'
+    HMACONLY_TAMPERED_SIG="sha256=$(printf '%s' "$HMACONLY_TAMPERED_BODY" \
+        | openssl dgst -sha256 -hmac "definitely-not-the-hook-secret" | sed 's/^.*= //')"
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "X-Signature-256: $HMACONLY_SIG" -H "Content-Type: application/json" \
-        -d "$HMACONLY_BODY" "$HOOK_EXECUTOR_BASE/webhook/vault_trigger")
+        -H "X-Signature-256: $HMACONLY_TAMPERED_SIG" -H "Content-Type: application/json" \
+        -d "$HMACONLY_TAMPERED_BODY" "$HOOK_EXECUTOR_BASE/webhook/vault_trigger_hmaconly")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "401" "a bare HMAC_ONLY-shaped request (signature, no key) is refused by the executor"
-    check_jq ".error" "Missing credentials: provide an X-API-Key header" \
-        "and refused for exactly the reason the module comment predicts"
+    check "401" "a keyless HMAC_ONLY request signed with the wrong secret is refused, not accepted"
 
-    # ── NONE: no headers at all — same story, one level further ────────────
-    BEFORE=$(executor_success_count)
+    # ── NONE: no headers at all — genuinely accepted, keyless and unsigned ──
+    BEFORE=$(executor_success_count "$HOOK_NOAUTH_ID")
     api_call POST "/api/webhooks" "$MASTER_KEY" \
-        "{\"name\":\"none-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"NONE\",\"events\":\"IP_ADD\"}"
-    check "200" "create a NONE webhook targeting the live executor"
+        "{\"name\":\"none-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger_noauth\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"NONE\",\"events\":\"IP_ADD\"}"
+    check "200" "create a NONE webhook targeting the live executor's keyless NONE hook"
     NONE_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
     api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.34","group_name":"hook-executor-group","cause":"none live dispatch"}'
     check "200" "ban an address to trigger the NONE dispatch"
-    sleep 2
-    AFTER=$(executor_success_count)
-    check_local "$AFTER" "$BEFORE" "NONE: the executor recorded no new execution (no credential of any kind was sent)"
+
+    AFTER=0
+    for _ in $(seq 1 40); do
+        AFTER=$(executor_success_count "$HOOK_NOAUTH_ID")
+        [ "$AFTER" -gt "$BEFORE" ] 2>/dev/null && break
+        sleep 0.25
+    done
+    check_local "$AFTER" "$((BEFORE + 1))" "NONE: exactly one new successful execution was recorded, with zero authentication headers"
+
+    hook_api_call GET "/api/executions?hook=$HOOK_NOAUTH_ID&status=SUCCESS&limit=1" "$HOOK_EXECUTOR_MASTER_KEY"
+    check_true '.[0].stdout | contains("vault-triggered:203.0.113.34")' \
+        "NONE: the fully unauthenticated dispatch still executed with the correct payload"
 
     api_call DELETE "/api/webhooks/$NONE_EXEC_WEBHOOK_ID" "$MASTER_KEY"
     check "204" "delete the NONE executor webhook"
 
+    # Stray signature material against a NONE hook must be refused outright, not silently ignored —
+    # `signature_material_present`'s own doc names this as the gap it exists to close.
     RESP_STATUS=$(curl -s -o "$RESP_BODY_FILE" -w "%{http_code}" -X POST \
-        -H "Content-Type: application/json" -d '{"target":"raw-none-probe"}' \
-        "$HOOK_EXECUTOR_BASE/webhook/vault_trigger")
+        -H "X-Signature-256: sha256=0000000000000000000000000000000000000000000000000000000000000000" \
+        -H "Content-Type: application/json" -d '{"target":"stray-signature-on-noauth-probe"}' \
+        "$HOOK_EXECUTOR_BASE/webhook/vault_trigger_noauth")
     RESP_BODY=$(cat "$RESP_BODY_FILE" 2>/dev/null || true)
-    check "401" "a request with zero authentication headers is refused by the executor"
-    check_jq ".error" "Missing credentials: provide an X-API-Key header" \
-        "and refused for the same, precise reason as HMAC_ONLY above"
+    check "401" "a NONE hook refuses a keyless request that carries stray signature material"
 
     # ── Proactive: a tampered secret is refused, not silently accepted ─────
     #
     # Same shape as the executor's own e2e suite's "definitely-not-the-secret" check, applied here
     # to prove the *vault's* dispatch of a CANONICAL_V1 webhook is meaningfully verified on arrival
     # rather than merely well-formed.
-    BEFORE=$(executor_success_count)
+    BEFORE=$(executor_success_count "$HOOK_CANONICAL_ID")
     api_call POST "/api/webhooks" "$MASTER_KEY" \
-        "{\"name\":\"tampered-secret-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger\",\"secret_token\":\"definitely-not-the-registered-secret\",\"api_key\":\"$TRIGGER_KEY\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"events\":\"IP_ADD\"}"
+        "{\"name\":\"tampered-secret-to-executor\",\"target_url\":\"$HOOK_EXECUTOR_BASE/webhook/vault_trigger_canonical\",\"secret_token\":\"definitely-not-the-registered-secret\",\"api_key\":\"$TRIGGER_KEY\",\"payload_template\":\"{\\\"target\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$HOOKEXEC_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"events\":\"IP_ADD\"}"
     check "200" "create a CANONICAL_V1 webhook signed with the wrong secret"
     TAMPERED_EXEC_WEBHOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
 
     api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"203.0.113.35","group_name":"hook-executor-group","cause":"tampered secret dispatch"}'
     check "200" "ban an address to trigger the mis-signed dispatch"
     sleep 2
-    AFTER=$(executor_success_count)
+    AFTER=$(executor_success_count "$HOOK_CANONICAL_ID")
     check_local "$AFTER" "$BEFORE" "a dispatch signed with the wrong secret is rejected, not silently accepted"
 
     api_call DELETE "/api/webhooks/$TAMPERED_EXEC_WEBHOOK_ID" "$MASTER_KEY"

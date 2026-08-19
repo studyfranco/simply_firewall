@@ -8115,3 +8115,85 @@ existing Rust test that actually covers this session's changes).
 
 Files touched: `static/{index.html,app.js,style.css}`, `scripts/test_e2e.sh`. No `src/` file, no
 `RBAC_MODEL.md`.
+
+---
+
+## Session — Correction: `simply_hook_executor` now supports keyless HMAC_ONLY/NONE dispatch (2026-08-19)
+
+**Scope:** `scripts/test_e2e.sh` §31 only. No `src/` file, no `static/` file, `RBAC_MODEL.md`
+untouched. Corrects the previous session's conclusion that HMAC_ONLY and NONE could never
+authenticate against a live `simply_hook_executor` — a conclusion that was accurate when written
+and is not accurate now, because the peer's own architecture changed underneath it.
+
+### What actually happened, and why the prior session wasn't simply wrong
+
+The user's brief opened by asserting HMAC_ONLY/NONE *are* supported on a per-hook basis. Given the
+prior session's conclusion was reached from a direct reading of `middleware.rs` plus a live,
+passing test proving the opposite, the obvious first move was not to trust either claim but to
+`git pull` the peer (per `AGENT.MD`'s own mandatory-pull-before-analysis rule) and re-read the
+current source before writing anything. The peer had moved: `ddebc84` now carries
+`middleware::invocation_auth_middleware` and `entities::hook::AuthMode`, neither of which existed
+in whatever revision the prior session analyzed. The prior session's empirical proof (a live 401
+from a real running instance) was correct **for that revision**; it does not survive an upstream
+change to the thing it was testing. Recorded here so a future session doesn't re-litigate which of
+the two conflicting claims was "right" — both were, at different points in the peer's history.
+
+### The corrected model, verified by reading `src/middleware.rs` and `src/entities/hook.rs` directly
+
+- **`X-API-Key` is no longer unconditionally mandatory.** Only `admin_routes` (`/api/hooks`,
+  `/api/keys`, `/api/executions`, …) still sit behind the old always-keyed `auth_middleware`. The
+  three routes that actually *invoke* a hook — `POST /api/hooks/{id}/execute`, `.../test`, and
+  `POST /webhook/{identifier}` — now sit behind `invocation_auth_middleware`, which accepts a
+  keyless caller when the **target hook's own** `auth_mode` permits it.
+- **`auth_mode` is a property of a `hook` row, not an `api_key` row**, and it only ever adds a
+  keyless door — a keyed caller authenticates exactly as before, regardless of the target hook's
+  `auth_mode`, since "the field is not consulted at all for that caller" (`hook.rs`'s own doc).
+- **Four real values, confirmed from the `AuthMode` enum itself**: `CanonicalV1`/`ApiKeyOnly` (both
+  refuse a keyless caller — they exist to record intent about a *keyed* caller, not to open a door),
+  `HmacOnly` (keyless, HMAC-SHA256 over the raw body verified against the **hook's own**
+  `hmac_secret` — never a key's — no timestamp, no anti-replay), `NoAuth` (keyless, unauthenticated
+  outright, gated on the deployment-wide `REQUIRE_SIGNED_REQUESTS` being `false`, which is the
+  default).
+- **There is no fifth, `BODY_ONLY`, value — on either service, now.** `api_keys.hmac_mode` retired
+  it in `m20260819_141730` (SCHEMA.MD), and the keyless third-party-webhook use case it used to
+  serve is exactly what `hooks.auth_mode = HMAC_ONLY` now provides. This mirrors the vault's own
+  `AuthMode::BODY_ONLY_LEGACY` — an input-only alias for `HMAC_ONLY`, not a live mode — found in the
+  session before this one. The brief's five-hook list was adjusted to four for the same reason in
+  both places: the fifth name has nowhere to point that the fourth does not already cover
+  identically. Flagged rather than silently dropped, so a reader does not wonder where hook #5 went.
+
+### What changed in §31
+
+Provisions four hooks on the live executor now (`vault_trigger_canonical`, `_apikeyonly`,
+`_hmaconly`, `_noauth`), one per real `hook::AuthMode`, instead of one shared hook. HMAC_ONLY and
+NONE are driven to a genuine `SUCCESS` execution exactly like CANONICAL_V1/API_KEY_ONLY already
+were — polling the executor's `GET /api/executions` for a new `SUCCESS` row and asserting the
+executed script's `stdout` contains the actual banned address. HMAC_ONLY's execution is additionally
+asserted `api_key_id == null`, pinning that it is recorded as genuinely keyless rather than
+attributed to the shared worker key by coincidence. Both keyless modes also keep a negative
+assertion neighbouring the positive one: a wrong secret against the HMAC_ONLY hook, and stray
+signature material against the NoAuth hook, are each still refused with `401` — the point of a
+keyless door is not that it accepts anything.
+
+**Not touched, and worth a future session:** `scripts/verify_convergence.sh`'s own "Pillar 5" note
+— "`simply_hook_executor` keeps a per-key posture for third-party senders" — describes the
+*previous* architecture (`api_keys.hmac_mode`) this session found retired in favor of the per-*hook*
+`auth_mode` mechanism above. The gate still passes (it asserts no per-key HMAC mode exists on this
+service, which remains true), but the prose is now describing a superseded mechanism rather than the
+one actually in place. Out of scope for this session — the brief asked only for §31 — but noted so
+it isn't mistaken for current documentation later.
+
+### Quality gates
+
+All five clean:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean, zero warnings |
+| `cargo test` | **300 passed**, 0 failed (unchanged — no Rust source touched) |
+| `./scripts/test_e2e.sh` | **594 checks passed** (up from 587, +7 net — four new per-hook creation checks and the added keyless-attribution/tamper/stray-signature assertions, offset by the removed "recorded no new execution" checks the two modes no longer need), 0 failed |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+Peer provenance: `example/simply_hook_executor` pulled to `ddebc84` before any of this session's
+analysis, per `AGENT.MD`'s mandatory-pull rule.
