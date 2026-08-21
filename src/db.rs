@@ -8,6 +8,16 @@
 //! connection **pragmas** — they configure how the engine behaves, not what it is asked — and they
 //! are skipped entirely on any backend that is not SQLite.
 //!
+//! # Pool tuning is PostgreSQL/MySQL-only, and that split is structural
+//!
+//! `config::database_max_connections`/`database_min_connections`/`database_idle_timeout`/
+//! `database_acquire_timeout` (`src/config.rs`) apply only on the [`Database::connect`] path this
+//! module's [`connect`] takes for every non-SQLite URL. The SQLite branch never constructs the
+//! `ConnectOptions` those four calls configure — it builds a separate `SqlitePoolOptions` by hand —
+//! so there is no code path by which an operator's pool-tuning environment variables could reach
+//! SQLite even by mistake. The single-writer invariant below does not rest on remembering to leave
+//! four settings alone; it rests on them having nowhere to apply.
+//!
 //! # The SQLite pool holds exactly one connection, and that is load-bearing
 //!
 //! SeaORM pins `max_connections = 1` for SQLite — measured, not assumed — because SQLite permits a
@@ -89,6 +99,23 @@ pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
     // Everything downstream reads `get_database_backend()` instead; this is the one place that
     // cannot.
     if !db_url.starts_with("sqlite:") {
+        // PostgreSQL/MySQL pool tuning — `config::database_*`, all environment-configurable. Set
+        // here rather than left to SeaORM's own defaults (`max_connections: 10`, no floor, no
+        // acquire timeout) because those defaults are what produced the slow-pool-acquisition
+        // symptom this function exists to address: a burst of concurrent webhook dispatches
+        // fetching their config rows can outrun ten connections long before the database itself is
+        // the bottleneck, and with no `acquire_timeout` the caller waits however long its own HTTP
+        // client allows rather than failing fast and legibly.
+        //
+        // These four calls have **no effect on SQLite** — the branch below never constructs this
+        // `opt` at all, let alone reads these fields off it. See the module header and
+        // `config::database_max_connections`'s own doc for why that separation is deliberate
+        // rather than an oversight: SQLite's pool is pinned to `SQLITE_MAX_CONNECTIONS` (1),
+        // unconditionally, for the single-writer reason documented there.
+        opt.max_connections(crate::config::database_max_connections())
+            .min_connections(crate::config::database_min_connections())
+            .idle_timeout(crate::config::database_idle_timeout())
+            .acquire_timeout(crate::config::database_acquire_timeout());
         return Database::connect(opt).await;
     }
 

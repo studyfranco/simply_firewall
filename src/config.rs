@@ -199,6 +199,94 @@ pub fn max_body_bytes() -> usize {
     })
 }
 
+// ─────────────────────────────────────────────────────────────
+// Database pool tuning
+// ─────────────────────────────────────────────────────────────
+//
+// PostgreSQL/MySQL only. **None of these four apply to SQLite**: `src/db.rs::connect` builds the
+// SQLite pool from a hand-constructed `SqlitePoolOptions` that never reads `ConnectOptions` at all,
+// so a value set here has no path to reach it — not a value the SQLite branch reads and discards,
+// but one it is structurally incapable of seeing. `SQLITE_MAX_CONNECTIONS` (`src/db.rs`) is the
+// single source of truth there, for the single-writer reason documented in that module's header.
+//
+// Defaults are chosen for a deployment fielding the production symptom this was added for
+// (`sqlx::pool::acquire: acquired connection exceeded slow threshold`): 50 max / 10 min gives
+// headroom under a webhook-dispatch burst without the pool constantly growing and shrinking from
+// zero, and a 10s acquire timeout turns a starved pool into a clear, bounded `500` instead of a
+// request hanging for as long as the caller's own client timeout allows.
+
+/// Maximum PostgreSQL/MySQL pool connections. Env `DATABASE_MAX_CONNECTIONS`, default 50.
+pub const DATABASE_MAX_CONNECTIONS_ENV: &str = "DATABASE_MAX_CONNECTIONS";
+
+/// Minimum PostgreSQL/MySQL connections kept warm. Env `DATABASE_MIN_CONNECTIONS`, default 10.
+pub const DATABASE_MIN_CONNECTIONS_ENV: &str = "DATABASE_MIN_CONNECTIONS";
+
+/// Idle duration before a pooled PostgreSQL/MySQL connection is closed, in seconds. Env
+/// `DATABASE_IDLE_TIMEOUT_SECS`, default 600.
+pub const DATABASE_IDLE_TIMEOUT_ENV: &str = "DATABASE_IDLE_TIMEOUT_SECS";
+
+/// Maximum time a request waits to acquire a pooled PostgreSQL/MySQL connection, in seconds. Env
+/// `DATABASE_ACQUIRE_TIMEOUT_SECS`, default 10.
+pub const DATABASE_ACQUIRE_TIMEOUT_ENV: &str = "DATABASE_ACQUIRE_TIMEOUT_SECS";
+
+/// Clamps a requested pool ceiling to at least 1 — `sqlx::Pool` panics on `0`.
+///
+/// Split out from [`database_max_connections`] purely so it is unit-testable. That wrapper's own
+/// value is cached in a `OnceLock` seeded from the real environment on first call, which makes it
+/// unsuitable for a test that wants to see what several different inputs clamp to in one process —
+/// the same reason `db::has_index`'s catalog-query selection was split from `db::has_index` itself.
+fn clamp_pool_max(requested: u32) -> u32 {
+    requested.max(1)
+}
+
+/// Clamps a requested pool floor to at most `max` — sqlx accepts `min > max` at the API level and
+/// the pool simply never reaches the requested minimum, which reads as the setting being silently
+/// ignored rather than the misconfiguration it is. Split out for the same testability reason as
+/// [`clamp_pool_max`].
+fn clamp_pool_min(requested: u32, max: u32) -> u32 {
+    requested.min(max)
+}
+
+/// Clamps a requested acquire timeout to at least 1 second — `0` is indistinguishable from "never
+/// wait" to sqlx, which would turn ordinary pool contention into a guaranteed failure on any
+/// request that did not win the race. Split out for the same testability reason as
+/// [`clamp_pool_max`].
+fn clamp_acquire_timeout_secs(requested: u64) -> u64 {
+    requested.max(1)
+}
+
+/// The pool's connection ceiling. **Clamped to at least 1** — see [`clamp_pool_max`].
+pub fn database_max_connections() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| clamp_pool_max(numeric_env::<u32>(DATABASE_MAX_CONNECTIONS_ENV, 50)))
+}
+
+/// The pool's warm-connection floor. **Clamped to at most [`database_max_connections`]** — see
+/// [`clamp_pool_min`].
+pub fn database_min_connections() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        clamp_pool_min(numeric_env::<u32>(DATABASE_MIN_CONNECTIONS_ENV, 10), database_max_connections())
+    })
+}
+
+/// How long an idle pooled connection may sit before being closed.
+pub fn database_idle_timeout() -> std::time::Duration {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_secs(*VALUE.get_or_init(|| {
+        numeric_env::<u64>(DATABASE_IDLE_TIMEOUT_ENV, 600)
+    }))
+}
+
+/// How long a request waits for the pool to hand back a connection before failing. **Clamped to at
+/// least 1 second** — see [`clamp_acquire_timeout_secs`].
+pub fn database_acquire_timeout() -> std::time::Duration {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    std::time::Duration::from_secs(*VALUE.get_or_init(|| {
+        clamp_acquire_timeout_secs(numeric_env::<u64>(DATABASE_ACQUIRE_TIMEOUT_ENV, 10))
+    }))
+}
+
 /// Environment variable overriding the generated bootstrap master key.
 pub const INITIAL_MASTER_KEY_ENV: &str = "INITIAL_MASTER_KEY";
 
@@ -1504,5 +1592,93 @@ mod tests {
             TrustedProxies::from_env().expect("unset is not an error")
         });
         assert!(trusted.is_empty(), "unset means trust nothing");
+    }
+
+    // ── Database pool tuning ────────────────────────────────────────────
+
+    /// Runs `body` with environment variable `name` set to `value` (or unset when `None`),
+    /// restoring whatever was there before. Unlike [`with_trusted_proxies_env`], this takes the
+    /// variable name as a parameter rather than being pinned to one — every test below uses its own
+    /// name (`CONFIG_TEST_*`, never a real `DATABASE_*`/`WEBHOOK_*` constant), so no `ENV_LOCK`-style
+    /// mutex is needed: two tests using two different names cannot race on either.
+    fn with_env<T>(name: &str, value: Option<&str>, body: impl FnOnce() -> T) -> T {
+        let previous = std::env::var(name).ok();
+        // SAFETY: `name` is a `CONFIG_TEST_*` name unique to the calling test, never a real
+        // production variable and never shared with another test, so no other thread reads or
+        // writes it while this body runs.
+        unsafe {
+            match value {
+                Some(raw) => std::env::set_var(name, raw),
+                None => std::env::remove_var(name),
+            }
+        }
+        let outcome = body();
+        unsafe {
+            match previous {
+                Some(raw) => std::env::set_var(name, raw),
+                None => std::env::remove_var(name),
+            }
+        }
+        outcome
+    }
+
+    /// [`numeric_env`] itself is untested despite backing seven public settings (`WEBHOOK_WORKERS`,
+    /// `MAX_BODY_SIZE_MIB`, and now the four `DATABASE_*` pool settings) — this is the first direct
+    /// coverage of the shared parser all of them go through, not only the new callers.
+    #[test]
+    fn numeric_env_parses_falls_back_and_recovers_from_garbage() {
+        with_env("CONFIG_TEST_NUMERIC_VALID", Some("42"), || {
+            assert_eq!(numeric_env::<u32>("CONFIG_TEST_NUMERIC_VALID", 7), 42);
+        });
+        with_env("CONFIG_TEST_NUMERIC_UNSET", None, || {
+            assert_eq!(numeric_env::<u32>("CONFIG_TEST_NUMERIC_UNSET", 7), 7, "missing falls back to the default");
+        });
+        with_env("CONFIG_TEST_NUMERIC_GARBAGE", Some("not-a-number"), || {
+            assert_eq!(numeric_env::<u32>("CONFIG_TEST_NUMERIC_GARBAGE", 7), 7, "unparseable falls back rather than panicking");
+        });
+        with_env("CONFIG_TEST_NUMERIC_WHITESPACE", Some("  15  "), || {
+            assert_eq!(numeric_env::<u32>("CONFIG_TEST_NUMERIC_WHITESPACE", 7), 15, "surrounding whitespace is trimmed");
+        });
+    }
+
+    /// `DATABASE_MAX_CONNECTIONS=0` must not reach `sqlx::Pool`, which panics on it.
+    #[test]
+    fn pool_max_connections_is_clamped_to_at_least_one() {
+        assert_eq!(clamp_pool_max(0), 1);
+        assert_eq!(clamp_pool_max(1), 1);
+        assert_eq!(clamp_pool_max(50), 50, "an ordinary value passes through unchanged");
+    }
+
+    /// `DATABASE_MIN_CONNECTIONS` greater than the configured max must not silently be ignored by
+    /// sqlx (which accepts the pair and simply never reaches the requested floor) — it is clamped
+    /// down to the max here instead, where the effective value is visible.
+    #[test]
+    fn pool_min_connections_is_clamped_to_the_configured_max() {
+        assert_eq!(clamp_pool_min(10, 50), 10, "a min below max passes through unchanged");
+        assert_eq!(clamp_pool_min(100, 50), 50, "a min above max is pulled down to it");
+        assert_eq!(clamp_pool_min(50, 50), 50, "min == max is not treated as a violation");
+    }
+
+    /// `DATABASE_ACQUIRE_TIMEOUT_SECS=0` is indistinguishable from "never wait" to sqlx, which
+    /// would turn ordinary pool contention into a guaranteed failure on any request that lost the
+    /// race for a connection.
+    #[test]
+    fn acquire_timeout_is_clamped_to_at_least_one_second() {
+        assert_eq!(clamp_acquire_timeout_secs(0), 1);
+        assert_eq!(clamp_acquire_timeout_secs(1), 1);
+        assert_eq!(clamp_acquire_timeout_secs(10), 10, "an ordinary value passes through unchanged");
+    }
+
+    /// The four `DATABASE_*_ENV` constants are exactly the names `AGENT_NOTES.MD` and `db.rs`'s
+    /// module header document, and exactly the names `scripts/test_e2e.sh` sets when it boots a
+    /// throwaway instance to prove these are read without aborting startup. A rename here that is
+    /// not mirrored in either of those two places would desynchronise silently — this pins the
+    /// three-way agreement's vault-side half.
+    #[test]
+    fn env_var_names_match_what_is_documented() {
+        assert_eq!(DATABASE_MAX_CONNECTIONS_ENV, "DATABASE_MAX_CONNECTIONS");
+        assert_eq!(DATABASE_MIN_CONNECTIONS_ENV, "DATABASE_MIN_CONNECTIONS");
+        assert_eq!(DATABASE_IDLE_TIMEOUT_ENV, "DATABASE_IDLE_TIMEOUT_SECS");
+        assert_eq!(DATABASE_ACQUIRE_TIMEOUT_ENV, "DATABASE_ACQUIRE_TIMEOUT_SECS");
     }
 }

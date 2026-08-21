@@ -8279,3 +8279,147 @@ Peer provenance: `example/simply_hook_executor` pulled per `AGENT.MD`'s mandator
 reported already up to date at `ddebc84`. Its source was re-read from disk rather than assumed
 unchanged from the prior session's notes, which is what surfaced the stale "no per-key template"
 claim above.
+
+---
+
+## Session — Postgres/MySQL pool tuning, dispatch DB/HTTP audit, and hook_executor's new bearer-only keys (2026-08-21)
+
+**Scope:** `src/config.rs`, `src/db.rs`, `src/dispatch.rs`, `scripts/test_e2e.sh`. No `RBAC_MODEL.md`
+change. Triggered by a production report: `WARN sqlx::pool::acquire: acquired connection exceeded
+slow threshold acquired_after_secs=3.07s` during webhook dispatch.
+
+### Task 1 — configurable pool options
+
+Four new env vars, `numeric_env`-backed exactly like the existing `WEBHOOK_*`/`MAX_BODY_SIZE_MIB`
+settings: `DATABASE_MAX_CONNECTIONS` (default 50), `DATABASE_MIN_CONNECTIONS` (default 10, clamped
+to at most the resolved max), `DATABASE_IDLE_TIMEOUT_SECS` (default 600),
+`DATABASE_ACQUIRE_TIMEOUT_SECS` (default 10, clamped to at least 1). Applied in `db::connect` via
+`ConnectOptions::max_connections`/`min_connections`/`idle_timeout`/`acquire_timeout` — SeaORM's own
+generic wrapper around `PgPoolOptions`/`MySqlPoolOptions`, so there is one call site rather than a
+per-backend branch on top of the backend branch that already exists there.
+
+**The SQLite exclusion is structural, not a guard clause.** All four calls sit inside the
+`if !db_url.starts_with("sqlite:")` branch; the SQLite branch below it builds its own
+`SqlitePoolOptions` by hand and never constructs (or reads) the `ConnectOptions` these four calls
+configure. There is no code path by which a `DATABASE_*` value could reach SQLite, which is a
+stronger guarantee than "read and ignored" — confirmed the hard way when a first draft of the new
+e2e check (§29b) asserted a malformed value would produce a warning even on SQLite, and it didn't,
+because `numeric_env` is never called for that value on that path at all. Fixed to assert the
+correct, stronger property (silence, not a soft-fail warning) once the wrong assumption showed
+itself as a failing check.
+
+Testability: the four public functions are `OnceLock`-cached exactly like the pre-existing
+`webhook_workers()`/`max_body_bytes()`, and — confirmed by checking — **neither of those has ever
+had a direct unit test**, for the same reason mine can't either: an env-driven value cached once per
+process can't be re-exercised with different inputs inside one test binary. Resolved the way
+`db::has_index`/`index_catalog_query` already resolved the identical problem in this file's sibling:
+split the pure clamping logic (`clamp_pool_max`, `clamp_pool_min`, `clamp_acquire_timeout_secs`) out
+of the cached wrappers and unit-test the pure functions directly — 6 new tests in `config.rs`,
+including the first-ever direct coverage of the shared `numeric_env` parser itself (valid, missing,
+garbled, whitespace-padded).
+
+### Task 2 — dispatch.rs audit: already compliant
+
+Exhaustive, not sampled: every reference to `db`/`&db` in `dispatch.rs` (`grep -n "&db\b\|db\."`)
+returns exactly three lines — the parameter, one per-worker `.clone()`, and the single
+`WebhookConfig::find()...all(&db).await` that returns an **owned `Vec`** before the per-config loop
+begins. The `join_set.spawn(async move { ... client.post(...).send().await ... })` that performs the
+actual HTTP call captures `client`/`headers`/`payload`/`target_url` by value; it does not capture
+`db`, and cannot, since the closure's `move` list is written out explicitly in the source with
+nothing named `db` in it. **No code change was needed** — the property the brief asked to audit for
+already held, by construction, before this session started.
+
+Audited rather than assumed: added
+`dispatch::tests::the_db_connection_is_released_before_the_slow_http_call_returns`, a real,
+non-tautological proof rather than a restatement of the code-reading conclusion above. It boots a
+real `sqlite::memory:` pool (`SQLITE_MAX_CONNECTIONS = 1`, so there is nowhere for a second
+connection to come from), points a webhook at a raw TCP listener that sleeps 2s before answering,
+triggers a dispatch, and — 300ms later, well before the slow response — issues a concurrent,
+unrelated query against the *same* pool with a 750ms timeout. If the dispatcher held its connection
+across the HTTP call, the concurrent query would have nowhere to acquire from and would either time
+out or itself take ~2s; it does neither.
+
+**Mutation-verified, not merely written and left**: planted the exact defect this test exists to
+catch — wrapped the spawned task's HTTP call in `db.begin().await`, held un-committed until after
+`.send().await` — and reran. The test failed, reporting the concurrent query blocked for 751ms
+(hitting its own timeout) with a message naming the held connection as the cause. Reverted; the test
+passes clean again. This is the same discipline this repository's other adversarial tests already
+hold themselves to (`rbac_model_compliance.rs`'s `ADVERSARIAL(§N)` markers, `source_hygiene.rs`'s
+"the syntax check rejects the defect it exists to catch") — a test that has never been shown able to
+fail is not yet evidence of anything.
+
+### Task 3 — `simply_hook_executor` re-pulled: bearer-only keys, and a rewritten §31
+
+Per `AGENT.MD`'s mandatory-pull rule, `example/simply_hook_executor` was pulled before any of this
+session's analysis: `ddebc84` → `99b0bd1`, 25 files, +4393/−614. The two schema migrations in that
+range (`sample_payload_json`, `args_template`) are additive/optional and unrelated to
+authentication. The relevant change is in `src/api/keys.rs`:
+**`CreateApiKeyPayload::generate_signing_secret`** (default `true`), which — set to `false` — mints
+a bearer credential with **no `key_id`/`signing_secret` at all** (both fields are now
+`Option<String>`, previously non-optional). This is structurally distinct from "a signing-capable
+key that was simply not asked to sign": the new shape cannot sign under any circumstance, since
+there is no secret to sign with.
+
+§31 rewritten around this. **Two hooks, not four**: `hook::AuthMode` (unchanged this round —
+confirmed by diffing `src/entities/hook.rs` directly) only ever governs the *keyless* door, and
+"only ever adds a way in for a keyless caller; it never removes the always-available keyed path" is
+the entity's own doc comment, not an inference — so a `CanonicalV1`- or `ApiKeyOnly`-auth_mode hook
+behaves identically to any other hook for a keyed caller, and dedicating one to each would prove
+nothing a shared hook does not. Provisioned instead: `HmacOnly` and `NoAuth`, one per real keyless
+door. **Two keys**: `TRIGGER_KEY` (default, signing-capable — "API Key + Hmac") and `BEARERONLY_KEY`
+(`generate_signing_secret: false` — "API Key only"), both granted `can_execute` on both hooks. The
+resulting matrix is more thorough than the brief's four-line list on its own: `CANONICAL_V1` (fully
+signed) is dispatched at the *`HmacOnly`* hook and `API_KEY_ONLY` (bare key) at the *`NoAuth`* hook —
+each keyed test deliberately targets the hook whose own `auth_mode` says something else — so a
+passing run proves "the hook's auth_mode does not gate a keyed caller" directly, not merely by
+citing the doc comment. `HMAC_ONLY` and `NONE` remain keyless against their own hooks, as before.
+Every one of the four now also asserts `.[0].api_key_id` — non-null and attributed to the specific
+presenting key for the two keyed cases, `null` for the two keyless ones — which the previous version
+of this section checked only for the keyless pair.
+
+The keyed-body-only-HMAC and `BODY_ONLY`-legacy-alias blocks (added two sessions ago) were repointed
+at the surviving `HmacOnly` hook rather than the removed `CanonicalV1`-labelled one; their assertions
+are otherwise unchanged and still pass.
+
+**Self-correction, left in place rather than smoothed over:** this section's own header comment
+previously claimed "the executor's CANONICAL_V1 verification format is fixed... with no per-key
+template" — used as the reason the keyed body-only test could only run against the raw capture
+receiver. Re-reading `src/api/keys.rs` while building *this* session's changes showed that claim was
+already false when written: `api_keys.canonical_template` lets an ordinary key override what it
+signs over with no format constraint. The comment now says so, and names what it means (§23's
+path-override edge case could also run against the executor now, left where it already has adequate
+coverage rather than duplicated).
+
+### A real finding in `simply_hook_executor` itself, reported separately
+
+`src/crypto.rs::render_canonical_template` builds the verified string via four sequential,
+whole-string `.replace()` calls (`.replace("{method}", …).replace("{path}", …).replace("{timestamp}",
+…).replace("{body}", …)`), each rescanning the *entire current string* rather than only the text just
+inserted. Traced by hand: a request path/query containing the literal substring `{timestamp}` (axum's
+`path_and_query()` returns the raw wire value; `{`/`}` are not rejected there) survives the `{path}`
+substitution as literal text, and is then caught and overwritten by the *next* call, exactly as if it
+had been a real placeholder. This is precisely the "two-phase substitution lets a caller-controlled
+field inject placeholder syntax" bug this codebase's own `dispatch::resolve_hmac_template` was
+deliberately built single-pass to prevent — its own doc comment and
+`dispatch::tests::substituted_values_are_never_rescanned` name the exact failure mode.
+Severity is real but not a from-scratch forgery: the attacker still needs the secret to produce a
+matching signature for whatever string results, so this is a canonicalization-ambiguity /
+signature-malleability weakness (two different request shapes can canonicalize to the same signed
+string) rather than an authentication bypass on its own. Reported to the user directly, with the
+single-pass fix already proven and running in this codebase as the suggested remedy — not filed as
+a fix in `example/simply_hook_executor` itself, which stays read-only per `AGENT.MD`.
+
+### Quality gates
+
+All five clean:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean, zero warnings |
+| `cargo test` | **306 passed** (up from 300: +5 `config.rs` pool tests, +1 `dispatch.rs` connection-release regression test), 0 failed |
+| `./scripts/test_e2e.sh` | **629 checks passed** (up from 621: +2 in the rewritten §31's `api_key_id` attribution assertions net of the removed hooks, +6 new §29b pool-env-var boot checks), 0 failed |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+Peer provenance: `example/simply_hook_executor` pulled to `99b0bd1` before any analysis, per
+`AGENT.MD`'s mandatory-pull rule.

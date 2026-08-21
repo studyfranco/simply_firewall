@@ -613,4 +613,137 @@ mod tests {
         assert_eq!(AuthMode::from_stored("canonical_v1"), AuthMode::CanonicalV1);
         assert_eq!(AuthMode::from_stored(" NONE "), AuthMode::None);
     }
+
+    /// **The database connection used to fetch a webhook's targets must be released well before
+    /// the outbound HTTP call returns — not merely "eventually", but before a slow receiver's
+    /// response arrives.**
+    ///
+    /// This is the property a production report asked to have audited: `sqlx::pool::acquire`
+    /// warnings during webhook dispatch, consistent with a connection being held across the HTTP
+    /// round trip. Reading `dispatch_worker` shows exactly one database call in the whole function
+    /// (`WebhookConfig::find()...all(&db)`), returning an owned `Vec` *before* the per-config loop
+    /// begins, and the `join_set.spawn` that performs the actual `client.post(...).send().await`
+    /// captures `client`/`headers`/`payload`/`target_url` by value — never `db`. That is a static
+    /// read of the code; this test is the dynamic proof; on SQLite's single-connection pool
+    /// (`db::SQLITE_MAX_CONNECTIONS = 1`), if the dispatcher held its connection across the HTTP
+    /// call, a concurrent, unrelated query against the same pool would have nowhere to go and would
+    /// block for as long as the slow receiver takes to answer. It does not.
+    #[tokio::test]
+    async fn the_db_connection_is_released_before_the_slow_http_call_returns() {
+        use sea_orm::{ActiveModelTrait, Database, Set};
+        use sea_orm_migration::MigratorTrait;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
+        crate::migration::Migrator::up(&db, None).await.expect("migrations apply");
+
+        // A receiver that accepts the connection, reads the request, then sits on its hands for
+        // far longer than a healthy pool acquisition should ever take before answering. The delay
+        // is the whole point: if the dispatcher's DB connection were still checked out while this
+        // is in flight, the concurrent query below would be made to wait for it too.
+        const SLOW_RESPONSE_DELAY: Duration = Duration::from_secs(2);
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
+        let addr = listener.local_addr().expect("listener has a local address");
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                tokio::time::sleep(SLOW_RESPONSE_DELAY).await;
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await;
+            }
+        });
+
+        let group_id = uuid::Uuid::new_v4();
+        crate::entities::ip_group::ActiveModel {
+            id: Set(group_id),
+            name: Set("dispatch-release-test-group".to_owned()),
+            group_type: Set("banlist".to_owned()),
+            owner_key_id: Set(None),
+            description: Set(None),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+        }
+        .insert(&db)
+        .await
+        .expect("group inserts");
+
+        crate::entities::webhook_config::ActiveModel {
+            id: Set(uuid::Uuid::new_v4()),
+            name: Set("slow-receiver".to_owned()),
+            target_url: Set(format!("http://{addr}/slow")),
+            secret_token: Set(String::new()),
+            auth_mode: Set(AuthMode::NONE.to_owned()),
+            api_key: Set(None),
+            hmac_template: Set(None),
+            signature_header: Set(None),
+            signature_prefix: Set(None),
+            headers_json: Set(None),
+            payload_template: Set("{}".to_owned()),
+            group_id: Set(group_id),
+            is_active: Set(true),
+            events: Set(None),
+            owner_key_id: Set(None),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+        }
+        .insert(&db)
+        .await
+        .expect("webhook config inserts");
+
+        // The target is loopback, which the SSRF filter blocks by default — this is the documented
+        // escape hatch `dispatch_worker` reads once at startup, not a security-relevant bypass of
+        // anything this test is checking.
+        // SAFETY: no other test in this binary spawns `run_webhook_worker`, so nothing else reads
+        // or writes this variable concurrently.
+        unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
+
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let worker_db = db.clone();
+        let worker = tokio::spawn(async move {
+            run_webhook_worker(worker_db, rx).await;
+        });
+
+        tx.send(WebhookEvent {
+            action: "IP_ADD".to_owned(),
+            address: "203.0.113.77".to_owned(),
+            is_whitelist: false,
+            group_id: Some(group_id),
+            cause: None,
+        })
+        .await
+        .expect("the worker's channel accepts the event");
+
+        // Give the worker a moment to pick up the event, run its one DB query, and reach the point
+        // of dialing the slow socket — comfortably inside the 2s the receiver will make it wait,
+        // so if a connection were still held at this instant, the query below would observe it.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let concurrent_query_started = std::time::Instant::now();
+        let concurrent_result = tokio::time::timeout(
+            Duration::from_millis(750),
+            crate::entities::ip_group::Entity::find().all(&db),
+        )
+        .await;
+        let concurrent_elapsed = concurrent_query_started.elapsed();
+
+        // SAFETY: same single-writer justification as the `set_var` above.
+        unsafe { std::env::remove_var("ALLOW_PRIVATE_WEBHOOKS") };
+
+        assert!(
+            concurrent_result.is_ok(),
+            "a concurrent, unrelated query on the same 1-connection pool timed out after {concurrent_elapsed:?} \
+             while a slow webhook dispatch was in flight — the dispatcher is holding the database \
+             connection across the HTTP call"
+        );
+        assert!(
+            concurrent_elapsed < SLOW_RESPONSE_DELAY,
+            "the concurrent query took {concurrent_elapsed:?}, at least as long as the slow \
+             receiver's {SLOW_RESPONSE_DELAY:?} delay — it was made to wait for a connection the \
+             dispatch worker should already have released"
+        );
+
+        drop(tx);
+        let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
+    }
 }
