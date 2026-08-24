@@ -9080,3 +9080,161 @@ an addition to an existing document — `Edit` is the only tool that appends.
 `cargo test` **328 passed** (up from 321: +3 `dispatch.rs` unit tests, +4 `security_tests.rs`
 cases), 0 failed; `./scripts/test_e2e.sh` **686 checks passed** (up from 661: +25, §25a), 0 failed;
 `./scripts/verify_convergence.sh` 63 matching, 0 unexplained divergences, exit 0.
+
+### Addendum 6 — `target_url` templating, a richer Executions API, and a full Executions/Edit-Webhook UI redesign
+
+Seven-part request: (1) verify/implement `$variable` templating in `target_url`, logging the
+resolved URL; (2) rich query filters plus a `DELETE` for individual execution rows; (3) redesign the
+Executions tab into a compact table with a filter bar and a View-detail modal, mirroring
+`simply_hook_executor`'s layout; (4) a Template Variables reference in the UI; (5) reorder and
+simplify the Edit Webhook modal's fields; (6) widen modals/detail panels on large screens; (7) tests
+and gates.
+
+**Task 1 — `target_url` templating.** Confirmed the premise first: `target_url` was used verbatim in
+`prepare_dispatch` (`config.target_url.clone()`), while `payload_template` already had a *different*,
+narrower substitution (`$target_address`/`$ip`/`$cause`/`$group_name` — and `$group_name` was itself
+a latent bug, expanding to the group's UUID, not its name, contradicting its own name and
+`AGENT.MD`/`SCHEMA.MD`'s documented example). Fixed both by extracting one evaluator,
+`dispatch::resolve_event_variables`, built on a new `substitute_placeholders` helper that carries
+`resolve_hmac_template`'s single left-to-right, no-rescan discipline into a second, differently-keyed
+placeholder set (`$name`, not `{name}`) — deliberately not a literal reuse of `resolve_hmac_template`
+itself, since that function's backslash-escape layer exists only because a canonical string needs
+real newlines through a single-line HTML input, which neither a URL nor a JSON payload needs or
+wants (a `\n`-expanded webhook URL would be silently broken; JSON already escapes its own newlines).
+Variables: `$target_address`/`$ip`, `$action`/`$event` (the previously-missing one — no field
+exposed the event's action anywhere before this), `$cause`, `$group_name` (now the *real* name,
+threaded through a new `WebhookEvent.group_name` populated at all three construction sites —
+`records.rs`'s IP_ADD/IP_UPDATE and IP_DELETE sites already had the name in scope for audit logging;
+`webhooks.rs`'s synthetic `TEST` event needed one extra `ip_group` lookup), `$group_id`, `$timestamp`
+(one value, computed once at the top of `prepare_dispatch` and reused for both template substitution
+and `CANONICAL_V1`'s `X-Timestamp`/signature, rather than two `Utc::now()` calls that would merely
+usually agree).
+
+The one genuinely delicate part: `CANONICAL_V1`'s signed `{path}` was derived from
+`config.target_url` directly — with a templated URL, that path still contains the literal `$action`,
+so the signature would cover a path the receiver's real request line never has, breaking independent
+verification on every dispatch. Fixed by deriving `{path}` from the *resolved* URL instead.
+Mutation-tested by reverting to the raw template: the new
+`canonical_v1_signs_the_resolved_path_not_the_template` test failed exactly as expected (two
+different actions produced identical signatures, which they must not).
+
+`PreparedDispatch.target_url` now holds the resolved URL unconditionally, which is what makes the
+SSRF re-screen, the actual HTTP call, and the persisted `webhook_executions` row all agree for free
+— no separate resolution step needed at each of those three sites. Documented the residual risk
+explicitly (in `SCHEMA.MD`, `AGENT.MD`, and the UI's Template Variables modal): a hostile `$cause` in
+the URL's *host* can still redirect a dispatch to a different public host, since the SSRF filter only
+blocks private/internal addresses, not "any host other than the one the operator intended." Judged
+acceptable — it requires the *operator* to have put an event-derived variable in the authority
+position of their own template, and the SSRF filter still bounds the blast radius — and written up
+rather than engineered around, matching how this codebase already documents rather than forbids
+`hmac_template`/`signature_prefix` footguns.
+
+**Log the resolved URL.** New migration `m20260824_140000` adds
+`webhook_executions.resolved_target_url`/`target_address`/`cause` (three separate `alter_table`
+calls — SQLite allows one `ADD COLUMN` per statement, per `m20260801_000005`'s already-documented
+constraint). All three nullable, `NULL` on pre-migration rows, populated unconditionally on every row
+from here on. Required widening `log_execution`'s signature, which was already growing scalar
+parameters one rename at a time (`error_message` -> `response_body` last round) toward
+`too_many_arguments`; introduced a `DispatchContext` struct (`webhook_id`/`webhook_name`/
+`event_type`/`target_address`/`cause`) threaded through `dispatch_with_retries`/
+`dispatch_with_retries_config` instead, which also let `#[allow(clippy::too_many_arguments)]` be
+dropped from `dispatch_with_retries_config` entirely (6 params now, was 8).
+
+**Task 2 — richer executions API.** `WebhookExecutionQuery` gained `status` (`success`/`failed`/a
+bare numeric HTTP code — kept `is_success` too, for whatever already depends on it), `search` (OR
+across the owning webhook's name — resolved to ids first, `list_ips`'s own pattern for a cross-table
+match with no raw join — the triggering event's address, and its cause), `group_id` (via the
+webhook's *current* group, not a historical pin), `ip` (substring on `target_address`, reusing
+`normalize_ip_or_cidr`), and `from_date`/`to_date` (Unix timestamps, mirroring `list_ips`'s `since`).
+Every new filter is `AND`-combined with the pre-existing ownership scoping, so none of them can widen
+a non-master caller's visibility — verified directly by mutation (removing the `group_id`
+join-filter, the `search` OR-arm, and the numeric-status branch each made their own new test fail for
+exactly that reason, not a different one).
+
+New `DELETE /api/webhooks/executions/{id}`, ownership-scoped the same way the listing already is —
+confirmed via the Explore-agent research this round opened with that RBAC_MODEL.md has no
+pre-flight-inventory concern here at all (§6 is scoped to key-deletion cascades; this table carries
+no rights and no children), so a single ownership check is the whole authority question, mirroring
+`delete_webhook`. `404`, not `403`, for an execution the caller may not delete.
+
+**Tasks 3-6 — the UI redesign.** Executions tab: compact 5-column table (Time/Webhook/Status/
+Duration/Actions, per the brief's exact spec — `event_type` moved into the detail modal rather than
+staying a 6th column), a filter bar mirroring IP Records' own (search/status-select/event-select/
+date-range/clear), and a View-detail modal surfacing everything the compact row has no room for
+(resolved target URL, address, cause, response body) plus its own Delete action. `openExecutionDetailModal`
+reads from the *full* locally-cached execution set (`executionsCache.items`), not just the current
+page — there is no single-execution `GET` endpoint, and the row must already have been fetched for
+its View button to exist.
+
+Template Variables: one shared modal (not duplicated inline text) opened from three trigger points
+— the create form's Target URL hint, and the Edit Webhook modal's Target URL and Payload Template
+hints. Found and fixed a real stacking bug building this: every `.modal-overlay` shares one fixed
+z-index, so when the reference modal opens *over* an already-open Edit Webhook modal (the whole
+point — reading it while filling in the form), whichever happened to sit later in the DOM painted on
+top, which was the wrong one. Fixed with a `#template-vars-modal { z-index: 20010; }` override rather
+than reordering markup, since the correct one to win should not depend on where either modal's HTML
+happens to live relative to the other. Caught by actually opening both together in a headless
+browser and looking at the screenshot — the JS-level "is it unhidden" check alone would have reported
+success on the broken version too.
+
+Edit Webhook modal: reordered to the brief's exact sequence (Name, Target URL, Target Group, API
+Key, Signature Header & Prefix, HMAC Template, then Auth Mode/Secret/Headers/Payload
+Template/Events/Active as "remaining settings") and removed the "Clear the configured API key"
+checkbox. Since Auth Mode now sits *below* the fields it used to conditionally hide, kept-hiding
+those fields by mode would have made them disappear above a control the operator hasn't reached yet
+— so `syncEditWebhookAuthFields()` was simplified to update only the mode-hint text; every field is
+now always visible (none of them are `required`, so nothing blocks submission of the rest). The
+checkbox's job — "leave blank to keep the current key, clear it to remove it" being ambiguous once
+"blank" always meant "unchanged" — is now a `dataset`-free "touched" flag
+(`state.editApiKeyTouched`, set by the field's own `input` listener, reset on modal open):
+untouched omits `api_key` from the request entirely; touched sends whatever is currently in the
+field, blank included, since clearing it *is* the removal action now.
+
+Responsive widths: `.modal-card` (simple/confirm modals) `460px` -> `min(90vw, 480px)`;
+`.modal-card-form` (every form modal, now including Execution Detail and Template Variables) `520px`
+-> `min(92vw, 720px)`. Added `.kv-grid` (a `dt`/`dd` two-column layout for the Execution Detail
+modal's summary fields — real semantic pairing, not another bespoke `<p>` layout) and `.btn-link` (an
+inline `<button>` styled as a hyperlink, for the "see all template variables" triggers — a real
+button rather than a hrefless `<a>`, since it opens a modal rather than navigating).
+
+**Verified live**, not just in Rust/E2E tests: booted a throwaway instance with
+`ALLOW_PRIVATE_WEBHOOKS=true`, created a webhook with `target_url` containing `$action`/`$ip`,
+triggered a real dispatch, and confirmed via direct API calls that `resolved_target_url` showed
+`$action`/`$ip` already expanded. Then drove the dashboard in headless Chromium through: the
+Executions tab's compact table and filter bar, the View-detail modal's every field, row-level
+Delete (through the real confirm-modal flow, row count 4 -> 3), the Edit Webhook modal's exact field
+order (read every `<label>` in DOM order and compared against the brief's numbered list), the
+absent clear-checkbox, the API-key touched-tracking (typed a value, confirmed `has_api_key` flipped
+true after save), and the Template Variables modal from both the create form and the edit modal
+(the z-index bug above was caught here). No dedicated automated headless-browser suite exists in
+this repo (UI verification has always been manual-but-real screenshots, this round included) — noted
+so a future session doesn't go looking for one.
+
+New E2E section, **§25c "Target URL Templating & the Executions Endpoint's Rich Filters/Delete"**
+(after §25b, against the real local receiver from §13): a webhook whose `target_url` is
+`.../tmpl-hooks/$action` is confirmed to hit the *resolved* path
+(`count_receiver_hits_for_path("/tmpl-hooks/IP_ADD")`, not the literal template); the resulting
+execution row's `resolved_target_url`/`target_address`/`cause` are read back and asserted; each new
+filter (`status=success`, `search=<cause>`, `ip=<address>`, `group_id`, `from_date` excluding a
+just-created row) is proven to actually narrow; an invalid `status` value is a `400`; and
+`DELETE .../executions/{id}` is proven to both remove the row (absent from a follow-up listing) and
+`404` on a second attempt (genuinely gone, not merely hidden). Mutation-tested by reverting the
+`target_url` resolution call: exactly the two checks that depend on it failed (`got '0'` hits at the
+resolved path; `resolved_target_url` came back with the literal `$action` still in it), nothing else
+— reverted, clean again.
+
+New Rust tests, all mutation-tested individually: `dispatch.rs` gained
+`resolve_event_variables_expands_every_documented_placeholder`,
+`resolve_event_variables_falls_back_sensibly_when_event_data_is_absent`,
+`substitute_placeholders_never_rescans_an_inserted_value`,
+`target_url_variables_are_resolved_by_prepare_dispatch`,
+`canonical_v1_signs_the_resolved_path_not_the_template`, and
+`a_dispatch_persists_the_resolved_url_and_event_context`;
+`rbac_integration_tests.rs` gained `s4_webhook_executions_endpoint_supports_rich_filters` and
+`s4_webhook_execution_delete_is_scoped_to_ownership`.
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` **336 passed** (up from 328: +6 `dispatch.rs`, +2 `rbac_integration_tests.rs`), 0
+failed; `./scripts/test_e2e.sh` **704 checks passed** (up from 686: +18, §25c), 0 failed;
+`./scripts/verify_convergence.sh` 63 matching, 0 unexplained divergences, exit 0 (peer repo pulled
+fresh — picked up unrelated `simply_hook_executor` UI changes with no convergence impact).

@@ -207,7 +207,7 @@ Defines HTTP endpoints to notify when IP events occur within a specific group.
 | :--- | :--- | :--- | :--- |
 | `id` | `UUID` | Primary Key, Auto-Gen | Unique webhook configuration ID |
 | `name` | `String` | Not Null | Human-readable name for the webhook |
-| `target_url` | `String` | Not Null | HTTP/HTTPS target endpoint URL |
+| `target_url` | `String` | Not Null | HTTP/HTTPS target endpoint URL. Supports the same `$variable` substitution as `payload_template` (see below), resolved fresh against each triggering event before every dispatch |
 | `secret_token` | `String` | Not Null | Shared secret used to generate the HMAC SHA-256 signature (`X-Signature-256`). Empty string in the modes that compute no signature. Never returned by `GET /api/webhooks` |
 | `auth_mode` | `Text` | Not Null, Default: `'CANONICAL_V1'` | How dispatches authenticate — one of `'CANONICAL_V1'`, `'HMAC_ONLY'`, `'API_KEY_ONLY'`, `'NONE'` (see the table below). Unrecognized stored values fall back to `'HMAC_ONLY'`, never to `'NONE'` |
 | `api_key` | `Text` | Nullable | Value sent as the `X-API-Key` header by `'CANONICAL_V1'` and `'API_KEY_ONLY'`. A plaintext credential for the *receiving* system, so it is stored verbatim (there is nothing here to verify it against) and never returned by `GET /api/webhooks` — the listing reports only `has_api_key` |
@@ -215,7 +215,7 @@ Defines HTTP endpoints to notify when IP events occur within a specific group.
 | `signature_header` | `String` | Nullable | Header the signature is sent in. NULL means `X-Signature-256`. For receivers expecting a different name (`X-Hub-Signature-256`). Added by `m20260811_000012` |
 | `signature_prefix` | `String` | Nullable | Prefix on the hex digest. NULL means `sha256=`; an explicit `""` sends a bare digest. The empty string is a *meaningful* value here, not an unset one. Added by `m20260811_000012` |
 | `headers_json` | `Text` | Nullable | Custom JSON key-value object of HTTP headers to inject into requests |
-| `payload_template` | `Text` | Not Null | Template string with dynamic variables (e.g. `{"ip":"$target_address","group":"$group_name"}`) |
+| `payload_template` | `Text` | Not Null | Template string with dynamic variables (e.g. `{"ip":"$target_address","action":"$action","group":"$group_name"}`) |
 | `group_id` | `UUID` | FK -> `ip_groups.id` (CASCADE) | Monitored IP Group |
 | `is_active` | `Boolean` | Default: `true` | Toggle to enable/disable webhook dispatching |
 | `events` | `String` | Nullable | Comma-separated subset of `IP_ADD`/`IP_UPDATE`/`IP_DELETE` this webhook fires on. `NULL` means all events |
@@ -256,6 +256,25 @@ inferred. It is still accepted on input for compatibility and is never emitted.
 - `{body}` is mandatory (enforced with `400` at the API boundary): a signature that does not cover the
   payload is replayable across payloads.
 
+*`target_url`/`payload_template` substitution rules (`dispatch::resolve_event_variables`):*
+
+- Placeholders: `$target_address`/`$ip` (the event's address), `$action`/`$event`
+  (`IP_ADD`/`IP_UPDATE`/`IP_DELETE`/`TEST`), `$cause` (the event's cause, or `"Unknown"` if none),
+  `$group_name`/`$group_id` (the event's group, or empty if it has none), `$timestamp` (the
+  dispatch's Unix timestamp — the same value `CANONICAL_V1` signs and sends as `X-Timestamp`).
+- One evaluator, shared by both columns, so a webhook's destination can route on the same event data
+  its body carries. Resolution happens *before* `CANONICAL_V1`'s `{path}` is derived, so the
+  signature always covers the path the receiver actually gets on the wire, never the unresolved
+  template.
+- Same single left-to-right, no-rescan discipline as `hmac_template` above, and for the same reason:
+  `cause` is caller-controlled (via `/api/ban`/`/api/white`), so a value that happens to contain
+  another variable's placeholder text (e.g. a cause of `"$group_name"`) must not be expanded a
+  second time.
+- The resolved `target_url` is re-screened by the SSRF filter on every dispatch like any other
+  target — a variable is safest confined to the path or query; putting one in the URL's host trades
+  some of the operator's own control over the destination to whoever can set that variable's source
+  field (see the Web UI's Template Variables reference for the operator-facing version of this note).
+
 ---
 
 ### 7. `webhook_executions`
@@ -271,6 +290,9 @@ failed twice before succeeding leaves three rows, not one. Added by `m20260824_0
 | `is_success` | `Boolean` | Not Null | Whether the receiver answered `2xx`. The column filtered on for status and for retention — `status_code` is diagnostic detail |
 | `duration_ms` | `Integer` | Not Null | Wall-clock duration of this one attempt. Not cumulative across a delivery's retries |
 | `response_body` | `Text` | Nullable | Whatever the receiver said back, truncated (see `dispatch::RESPONSE_SNIPPET_MAX_BYTES`), captured on **every** attempt that reached the network — success or failure alike. `NULL` only when no response was ever received at all (a network-level error, timeout, DNS failure), in which case the failure reason is stored here instead. Renamed from `error_message` by `m20260824_110000` — see that migration's module header |
+| `resolved_target_url` | `Text` | Nullable | The destination this attempt actually dialed — `webhook_configs.target_url` with every `$variable` already expanded against the triggering event. May differ from the webhook's *current* `target_url` even on an unedited webhook, whenever the template itself varies per event. `NULL` on rows predating `m20260824_140000` |
+| `target_address` | `Text` | Nullable | The address the triggering event concerned. `NULL` on rows predating `m20260824_140000` |
+| `cause` | `Text` | Nullable | The triggering event's freeform cause, if it had one. `NULL` either because the event had no cause or because the row predates `m20260824_140000` — the two are not distinguished |
 | `created_at` | `DateTimeUtc` | Not Null, Indexed | When this attempt was made |
 
 **Why `webhook_id` is `CASCADE`, not `SET NULL` like `audit_logs.api_key_id`.** This table carries no

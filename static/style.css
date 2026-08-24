@@ -847,6 +847,27 @@ body {
     color: var(--text-muted);
 }
 
+/* An inline text trigger that reads as a hyperlink but is a real `<button>` — used for the
+   "see all template variables" links inside a `.field-hint`, which open a modal rather than
+   navigate anywhere, so an `<a>` with no `href` (or a `href="#"` that fights the router) would be
+   the wrong element semantically and for keyboard/screen-reader users alike. */
+.btn-link {
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    font-size: inherit;
+    color: var(--highlight);
+    text-decoration: underline;
+    cursor: pointer;
+}
+
+.btn-link:hover,
+.btn-link:focus-visible {
+    color: var(--text-main);
+}
+
 /* Key Reveal Box */
 .key-reveal {
     margin-top: 1rem;
@@ -1587,9 +1608,12 @@ body {
     display: flex !important;
 }
 
+/* `min(90vw, 480px)`, not a bare fixed px value: on a narrow viewport the modal still fits with
+   room either side, and on a wide/ultra-wide one it grows past the old hard 460px ceiling instead
+   of sitting cramped in the middle of the screen regardless of how much space is actually there. */
 .modal-card {
     width: 100%;
-    max-width: 460px;
+    max-width: min(90vw, 480px);
     box-shadow: var(--shadow-lg);
     animation: fadeIn var(--transition-slow);
 }
@@ -1632,15 +1656,51 @@ body {
 }
 
 /* A form is taller than a confirmation prompt, so it scrolls inside the card rather than
-   overflowing the viewport on a short window. */
+   overflowing the viewport on a short window. Wider than `.modal-card`'s own cap for the same
+   reason it needs the extra height: these hold long target URLs, JSON payload templates, and
+   (in the Execution Detail modal) a receiver's raw response body — content that reads as a wall of
+   wrapped fragments at 520px on anything wider than a phone. `min(92vw, 720px)` grows with the
+   viewport instead of leaving that space unused on a large screen. */
 .modal-card-form {
-    max-width: 520px;
+    max-width: min(92vw, 720px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
 }
 
 .modal-card-form .form-actions {
     justify-content: flex-end;
+}
+
+/* Label/value pairs in a compact two-column grid — the Execution Detail modal's summary fields.
+   `dt`/`dd` rather than another bespoke `<p>` layout: it's the element pair built for exactly this,
+   and screen readers announce the pairing for free. */
+.kv-grid {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.4rem 1rem;
+    margin: 0 0 1rem;
+}
+
+.kv-grid dt {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    font-weight: 500;
+}
+
+.kv-grid dd {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 0.85rem;
+    word-break: break-word;
+}
+
+/* The Template Variables reference is meant to be opened *while* the create form or the Edit
+   Webhook modal is already up — that's the point, reading it alongside the field you're filling in
+   — so two `.modal-overlay`s can be visible at once. Every `.modal-overlay` shares one fixed
+   z-index, so which one paints on top would otherwise depend on DOM order alone; this one needs to
+   win regardless of where its markup happens to sit relative to whatever opened it. */
+#template-vars-modal {
+    z-index: 20010;
 }
 
 /* ─── Compact Form Grid ─────────────────────────────────── */

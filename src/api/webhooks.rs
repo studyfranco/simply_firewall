@@ -4,7 +4,10 @@
 //! never exposed by the shared-resource visibility rule (§4).
 
 use axum::{Extension, extract::{Json, State}, response::IntoResponse};
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
+    QueryOrder, QuerySelect,
+};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -16,8 +19,8 @@ use crate::middleware::ClientIp;
 use crate::state::AppState;
 
 use super::{
-    caller_group_permission, create_audit_log, IP_EVENT_ACTIONS, ReassignOwnerPayload,
-    resolve_owner_assignment, resource_owner,
+    caller_group_permission, create_audit_log, normalize_ip_or_cidr, IP_EVENT_ACTIONS,
+    ReassignOwnerPayload, resolve_owner_assignment, resource_owner,
 };
 
 /// Handles PUT /api/v1/webhooks/:id/owner — the dispatch-target counterpart to
@@ -762,11 +765,20 @@ pub async fn test_webhook(
         return Err(AppError::NotFound);
     }
 
+    // Fetched purely so the synthetic test event's `$group_name` template variable expands to the
+    // same real name a live dispatch would see — a group deleted out from under a still-configured
+    // webhook (orphaning `group_id`) degrades to `None` rather than failing the test outright.
+    let group_name = crate::entities::ip_group::Entity::find_by_id(target.group_id)
+        .one(&state.db)
+        .await?
+        .map(|g| g.name);
+
     let event = crate::state::WebhookEvent {
         action: "TEST".to_owned(),
         address: "127.0.0.1/32".to_owned(),
         is_whitelist: false,
         group_id: Some(target.group_id),
+        group_name,
         cause: Some("Manual test dispatch from the dashboard".to_owned()),
     };
 
@@ -798,17 +810,44 @@ pub async fn test_webhook(
 /// Query parameters for `GET /api/v1/webhooks/executions`. `deny_unknown_fields` so a misspelled
 /// filter (`success` for `is_success`) is refused with `400` rather than silently ignored and
 /// answered as though no filter had been given — the same reasoning as `AuditLogQuery`.
+///
+/// Every filter below is combined with every other by `AND`, and all of them are combined by `AND`
+/// with the caller's own ownership scoping (see [`list_webhook_executions`]) — a non-master caller
+/// narrowing by, say, `group_id` never sees a row outside webhooks it owns, no matter how broad the
+/// filter itself would otherwise be. A filter matching nothing the caller may see returns an empty
+/// page, never an error that would confirm something exists outside that scope.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebhookExecutionQuery {
-    /// Narrow to one webhook's delivery history. Combined with the caller's own ownership scoping
-    /// below (`AND`, not `OR`) — asking for a webhook the caller does not own returns an empty page,
-    /// never another tenant's rows and never an error that would confirm the id exists.
+    /// Narrow to one webhook's delivery history.
     pub webhook_id: Option<Uuid>,
     /// Filter by exact event type (`IP_ADD`, `IP_UPDATE`, `IP_DELETE`, `TEST`).
     pub event_type: Option<String>,
-    /// Filter to only successful (`true`) or only failed (`false`) attempts.
+    /// Filter to only successful (`true`) or only failed (`false`) attempts. Superseded by `status`
+    /// when both are given; kept for callers already using it.
     pub is_success: Option<bool>,
+    /// Richer status filter: `"success"`, `"failed"`, or a bare HTTP status code (e.g. `"503"`).
+    /// A code matches `status_code` exactly, so it only ever returns rows that received that exact
+    /// response — a `5xx` that was retried and eventually succeeded still has a `"503"` row for the
+    /// attempt that got one, distinct from the later `"200"` row for the one that didn't.
+    pub status: Option<String>,
+    /// Free-text search across the owning webhook's name, the triggering event's address, and its
+    /// cause — the three fields an operator is likely to recognise a delivery by by eye. Matches
+    /// any one of the three (`OR`), not all three at once.
+    pub search: Option<String>,
+    /// Narrow to executions whose webhook currently targets this group. Reflects the webhook's
+    /// *current* `group_id`, not whatever it was at dispatch time — `webhook_configs.group_id` is
+    /// itself editable (see `update_webhook`), and this table does not separately pin a historical
+    /// value the way `target_address`/`cause` do.
+    pub group_id: Option<Uuid>,
+    /// Substring filter on the triggering event's address, normalized the same way `GET /api/ips`'s
+    /// own `ip` filter is — a full parseable address/CIDR is canonicalized first so it still matches
+    /// the stored form, while a genuine fragment passes through unchanged.
+    pub ip: Option<String>,
+    /// Lower bound on `created_at`, as a Unix timestamp in seconds (inclusive).
+    pub from_date: Option<i64>,
+    /// Upper bound on `created_at`, as a Unix timestamp in seconds (inclusive).
+    pub to_date: Option<i64>,
     /// Pagination limit. Defaults to 50, matching `AuditLogQuery`.
     pub limit: Option<u64>,
     /// Pagination offset.
@@ -868,9 +907,139 @@ pub async fn list_webhook_executions(
         q = q.filter(webhook_execution::Column::IsSuccess.eq(is_success));
     }
 
+    if let Some(status) = &query.status
+        && !status.is_empty()
+    {
+        match status.to_ascii_lowercase().as_str() {
+            "success" => q = q.filter(webhook_execution::Column::IsSuccess.eq(true)),
+            "failed" | "failure" | "error" => {
+                q = q.filter(webhook_execution::Column::IsSuccess.eq(false));
+            }
+            code => {
+                let parsed: u16 = code.parse().map_err(|_| {
+                    AppError::InvalidInput(format!(
+                        "Invalid status filter '{status}': must be 'success', 'failed', or a \
+                         numeric HTTP status code"
+                    ))
+                })?;
+                q = q.filter(webhook_execution::Column::StatusCode.eq(i32::from(parsed)));
+            }
+        }
+    }
+
+    if let Some(group_id) = query.group_id {
+        let group_webhook_ids: Vec<Uuid> = WebhookConfig::find()
+            .filter(webhook_config::Column::GroupId.eq(group_id))
+            .select_only()
+            .column(webhook_config::Column::Id)
+            .into_tuple()
+            .all(&state.db)
+            .await?;
+        q = q.filter(webhook_execution::Column::WebhookId.is_in(group_webhook_ids));
+    }
+
+    if let Some(ip) = &query.ip
+        && !ip.is_empty()
+    {
+        q = q.filter(webhook_execution::Column::TargetAddress.contains(normalize_ip_or_cidr(ip.trim())));
+    }
+
+    if let Some(search) = &query.search
+        && !search.trim().is_empty()
+    {
+        let term = search.trim();
+        // A webhook whose *name* matches is resolved to ids first, same pattern `list_ips` uses for
+        // `groups`/`group_name` — SeaORM has no cross-table OR without a raw join, and this repo's
+        // own hygiene tests forbid raw SQL outside a documented allowlist this file is not on.
+        let name_matched_ids: Vec<Uuid> = WebhookConfig::find()
+            .filter(webhook_config::Column::Name.contains(term))
+            .select_only()
+            .column(webhook_config::Column::Id)
+            .into_tuple()
+            .all(&state.db)
+            .await?;
+        q = q.filter(
+            Condition::any()
+                .add(webhook_execution::Column::TargetAddress.contains(term))
+                .add(webhook_execution::Column::Cause.contains(term))
+                .add(webhook_execution::Column::WebhookId.is_in(name_matched_ids)),
+        );
+    }
+
+    if let Some(from) = query.from_date {
+        let threshold = chrono::DateTime::from_timestamp(from, 0)
+            .ok_or_else(|| AppError::InvalidInput("Invalid `from_date` timestamp".to_owned()))?
+            .naive_utc();
+        q = q.filter(webhook_execution::Column::CreatedAt.gte(threshold));
+    }
+    if let Some(to) = query.to_date {
+        let threshold = chrono::DateTime::from_timestamp(to, 0)
+            .ok_or_else(|| AppError::InvalidInput("Invalid `to_date` timestamp".to_owned()))?
+            .naive_utc();
+        q = q.filter(webhook_execution::Column::CreatedAt.lte(threshold));
+    }
+
     let limit = query.limit.unwrap_or(50);
     let offset = query.offset.unwrap_or(0);
     let executions = q.limit(limit).offset(offset).all(&state.db).await?;
 
     Ok(Json(executions))
+}
+
+
+/// Handles `DELETE /api/v1/webhooks/executions/{id}` — removes a single execution-history row.
+///
+/// Same base gate as every other endpoint in this file, and the same ownership scoping
+/// [`list_webhook_executions`] applies: a non-master caller may delete only an execution whose
+/// webhook it owns. This table has no `owner_key_id` of its own, so the check joins through
+/// `webhook_id` exactly like the listing does, just for one row instead of filtering a page of them.
+///
+/// `404`, not `403`, for an execution the caller may not delete — whether because it does not exist
+/// at all or because its webhook belongs to someone else, matching every other handler in this
+/// file's oracle discipline: a row outside the caller's scope must be indistinguishable from a row
+/// that was never there.
+///
+/// Not pre-flight-inventoried under `RBAC_MODEL.md` §6: an execution row confers no rights and has
+/// no children of its own to resolve first — see the schema migration's module header for why this
+/// table sits outside §6 entirely, the same as `audit_logs`. A single ownership check is the whole
+/// authority question, same as [`delete_webhook`].
+pub async fn delete_webhook_execution(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath(id): StrictPath<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_webhooks {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let execution = webhook_execution::Entity::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+
+    if !key.is_master {
+        let owner = WebhookConfig::find_by_id(execution.webhook_id)
+            .one(&state.db)
+            .await?
+            .and_then(|w| w.owner_key_id);
+        if owner != Some(key.id) {
+            return Err(AppError::NotFound);
+        }
+    }
+
+    let result = webhook_execution::Entity::delete_by_id(id).exec(&state.db).await?;
+    if result.rows_affected == 0 {
+        return Err(AppError::NotFound);
+    }
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "WEBHOOK_EXECUTION_DELETE",
+        None,
+        None,
+        Some(id.to_string()),
+    )
+    .await?;
+
+    Ok(axum::http::StatusCode::NO_CONTENT)
 }

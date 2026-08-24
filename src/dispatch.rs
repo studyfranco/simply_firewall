@@ -212,6 +212,85 @@ pub fn resolve_hmac_template(
     out
 }
 
+/// Expands `$name` placeholders in `template` against a fixed `(placeholder, value)` table, in a
+/// single left-to-right pass with no rescanning: once a value is inserted it is copied to the
+/// output verbatim and never checked again for a placeholder of its own.
+///
+/// That discipline is shared with [`resolve_hmac_template`] and load-bearing for the same reason:
+/// `cause` in particular is arbitrary caller-supplied text (anyone with `can_write` on a group may
+/// set it via `/api/ban`/`/api/white`), and a two-phase "substitute, then rescan for more
+/// placeholders" evaluator would let a `cause` of `"$group_name"` have *its own* placeholder text
+/// expanded by a later substitution — one variable's value influencing what another variable
+/// expands to, which is not what either an operator writing a template or a caller writing a cause
+/// string could reasonably expect.
+///
+/// No placeholder here may be a prefix of another (`$ip` vs `$ip_v6`, say) — `find`-then-`starts_with`
+/// resolves ties by iteration order, not longest-match, so a prefix relationship would make the
+/// shorter placeholder shadow the longer one. The fixed set in [`resolve_event_variables`] has none.
+fn substitute_placeholders(template: &str, substitutions: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+
+    while !rest.is_empty() {
+        let Some(idx) = rest.find('$') else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        rest = &rest[idx..];
+
+        match substitutions.iter().find(|(placeholder, _)| rest.starts_with(placeholder)) {
+            Some((placeholder, value)) => {
+                out.push_str(value);
+                rest = &rest[placeholder.len()..];
+            }
+            None => {
+                out.push('$');
+                rest = &rest[1..];
+            }
+        }
+    }
+
+    out
+}
+
+/// The one evaluator behind both `payload_template` and `target_url` — so a webhook's destination
+/// can route on the same event data its body carries, and so a change to what a variable means
+/// never has to be made twice.
+///
+/// Available variables: `$target_address`/`$ip` (the address the event concerns), `$action`/`$event`
+/// (`IP_ADD`/`IP_UPDATE`/`IP_DELETE`/`TEST`), `$cause` (the freeform reason, or `"Unknown"` if none
+/// was given), `$group_name` (the target group's name, or empty if the event has none),
+/// `$group_id` (the target group's UUID, or empty), and `$timestamp` (the dispatch's Unix
+/// timestamp, in seconds — the same value `CANONICAL_V1` signs and sends as `X-Timestamp`, so a
+/// receiver correlating the two sees one number, not two that merely happen to be close).
+///
+/// **On using an event-derived variable in `target_url`'s host/authority**: every dispatch
+/// re-screens its *resolved* URL through [`is_url_safe`] before connecting, so a hostile `$cause`
+/// steering a naively-templated host cannot reach a private or link-local address — but it can
+/// still redirect the request to a different *public* host than the operator intended. Variables
+/// are safest confined to the path or query; putting one in the host trades some of the operator's
+/// own control over the destination to whoever can set that variable's source field.
+fn resolve_event_variables(template: &str, event: &WebhookEvent, timestamp: &str) -> String {
+    let group_id = event.group_id.map(|g| g.to_string()).unwrap_or_default();
+    let group_name = event.group_name.as_deref().unwrap_or("");
+    let cause = event.cause.as_deref().unwrap_or("Unknown");
+
+    substitute_placeholders(
+        template,
+        &[
+            ("$target_address", event.address.as_str()),
+            ("$ip", event.address.as_str()),
+            ("$action", event.action.as_str()),
+            ("$event", event.action.as_str()),
+            ("$cause", cause),
+            ("$group_name", group_name),
+            ("$group_id", group_id.as_str()),
+            ("$timestamp", timestamp),
+        ],
+    )
+}
+
 /// Builds the HTTP client every outbound webhook call — dispatch or live test — is made through.
 ///
 /// One function so the two paths cannot drift on the properties that matter: the timeout, and
@@ -240,6 +319,10 @@ fn allow_private_webhooks() -> bool {
 /// any signature), and the body. Everything about *how* a `webhook_config` row and a [`WebhookEvent`]
 /// become an HTTP request lives in [`prepare_dispatch`]; this is just its output.
 struct PreparedDispatch {
+    /// The fully **resolved** destination — every `$variable` in `webhook_configs.target_url`
+    /// already expanded against the triggering event. Everything downstream (the SSRF re-screen,
+    /// the actual HTTP call, the persisted `webhook_executions` row) reads this field and never the
+    /// raw template, so a resolution bug can only be visible here, in one place.
     target_url: String,
     headers: HeaderMap,
     payload: String,
@@ -261,14 +344,18 @@ fn prepare_dispatch(
     config: &webhook_config::Model,
     event: &WebhookEvent,
 ) -> Result<PreparedDispatch, String> {
-    let mut payload = config.payload_template.clone();
-    payload = payload.replace("$target_address", &event.address);
-    payload = payload.replace("$ip", &event.address);
-    payload = payload.replace("$cause", event.cause.as_deref().unwrap_or("Unknown"));
-    payload = payload.replace(
-        "$group_name",
-        &event.group_id.map(|g| g.to_string()).unwrap_or_default(),
-    );
+    // Computed once and reused everywhere a timestamp is needed in this dispatch — the `$timestamp`
+    // template variable and (for `CANONICAL_V1`) the signed `X-Timestamp` header both mean "when
+    // this attempt was prepared", so they must be the same number, not two calls to `Utc::now()`
+    // a few instructions apart that happen to usually agree.
+    let timestamp = chrono::Utc::now().timestamp().to_string();
+
+    let payload = resolve_event_variables(&config.payload_template, event, &timestamp);
+    // Resolved *before* anything downstream reads it: the SSRF re-screen, the HTTP client, and the
+    // `CANONICAL_V1` path derivation below must all see the real destination, not the unexpanded
+    // template — a signature computed over `{path}` derived from the template would not match the
+    // path the receiver actually gets on the wire.
+    let target_url = resolve_event_variables(&config.target_url, event, &timestamp);
 
     let mut headers = HeaderMap::new();
     headers.insert("Content-Type", HeaderValue::from_static("application/json"));
@@ -330,11 +417,12 @@ fn prepare_dispatch(
         // another instance's /api/* route (and against `simply_hook_executor`, which has always
         // required the prefix).
         AuthMode::CanonicalV1 => {
-            let timestamp = chrono::Utc::now().timestamp().to_string();
-            // The path is taken from the target URL; a URL that failed to parse cannot be
-            // dispatched at all, so failing here loses nothing (`is_url_safe` would reject it
-            // moments later regardless).
-            let path = reqwest::Url::parse(&config.target_url)
+            // The path is taken from the *resolved* target URL — the template with any
+            // `$action`/`$ip`/etc. variables already expanded — so the signature covers the path a
+            // receiver will actually see on the wire, not a literal `$action` that was never
+            // dispatched anywhere. A URL that failed to parse cannot be dispatched at all, so
+            // failing here loses nothing (`is_url_safe` would reject it moments later regardless).
+            let path = reqwest::Url::parse(&target_url)
                 .map_err(|e| format!("unparseable webhook target URL: {e}"))?
                 .path()
                 .to_owned();
@@ -366,7 +454,7 @@ fn prepare_dispatch(
         headers.insert(name, hv);
     }
 
-    Ok(PreparedDispatch { target_url: config.target_url.clone(), headers, payload })
+    Ok(PreparedDispatch { target_url, headers, payload })
 }
 
 /// Truncates a response body to [`RESPONSE_SNIPPET_MAX_BYTES`] for logging or the "Test Webhook" UI,
@@ -431,6 +519,22 @@ async fn attempt_delivery(
     }
 }
 
+/// Identity and event context for one dispatch attempt — everything [`log_execution`] needs to
+/// describe *which* delivery a `webhook_executions` row belongs to, beyond what [`PreparedDispatch`]
+/// already carries. Bundled so passing it through [`dispatch_with_retries`]/
+/// [`dispatch_with_retries_config`] doesn't keep growing their own parameter lists as more of an
+/// event's data becomes worth persisting per attempt.
+struct DispatchContext {
+    webhook_id: Uuid,
+    webhook_name: String,
+    event_type: String,
+    /// The address the triggering event concerned — persisted per attempt (not read back from
+    /// `webhook_configs`, which has no address of its own) so the Executions tab can search and
+    /// filter by it.
+    target_address: String,
+    cause: Option<String>,
+}
+
 /// Delivers one webhook, retrying transient failures with exponential backoff up to
 /// `config::webhook_max_retries` times before giving up.
 ///
@@ -441,20 +545,16 @@ async fn attempt_delivery(
 async fn dispatch_with_retries(
     client: Client,
     prepared: PreparedDispatch,
-    webhook_name: String,
+    ctx: DispatchContext,
     db: DatabaseConnection,
-    webhook_id: Uuid,
-    event_type: String,
 ) {
     dispatch_with_retries_config(
         client,
         prepared,
-        webhook_name,
+        ctx,
         crate::config::webhook_max_retries(),
         crate::config::webhook_retry_backoff_ms(),
         db,
-        webhook_id,
-        event_type,
     )
     .await
 }
@@ -467,8 +567,8 @@ async fn dispatch_with_retries(
 /// would make the observability feature a new way for dispatch to break, which is backwards.
 async fn log_execution(
     db: &DatabaseConnection,
-    webhook_id: Uuid,
-    event_type: &str,
+    ctx: &DispatchContext,
+    resolved_target_url: &str,
     status_code: Option<u16>,
     is_success: bool,
     duration_ms: i64,
@@ -476,18 +576,21 @@ async fn log_execution(
 ) {
     let row = webhook_execution::ActiveModel {
         id: Set(Uuid::new_v4()),
-        webhook_id: Set(webhook_id),
-        event_type: Set(event_type.to_owned()),
+        webhook_id: Set(ctx.webhook_id),
+        event_type: Set(ctx.event_type.clone()),
         status_code: Set(status_code.map(i32::from)),
         is_success: Set(is_success),
         // `duration_ms` is `i32` in the schema — a single HTTP attempt exceeding ~24 days is not a
         // real value to preserve exactly, so this saturates rather than panicking or wrapping.
         duration_ms: Set(duration_ms.try_into().unwrap_or(i32::MAX)),
         response_body: Set(response_body.map(str::to_owned)),
+        resolved_target_url: Set(Some(resolved_target_url.to_owned())),
+        target_address: Set(Some(ctx.target_address.clone())),
+        cause: Set(ctx.cause.clone()),
         created_at: Set(chrono::Utc::now().naive_utc()),
     };
     if let Err(e) = row.insert(db).await {
-        error!(webhook_id = %webhook_id, "Failed to record webhook execution history: {e}");
+        error!(webhook_id = %ctx.webhook_id, "Failed to record webhook execution history: {e}");
     }
 }
 
@@ -500,16 +603,13 @@ async fn log_execution(
 /// Every attempt — including ones that will be retried — is also persisted to `webhook_executions`
 /// via [`log_execution`], so the dashboard's Executions tab shows the same retry history these logs
 /// describe.
-#[allow(clippy::too_many_arguments)]
 async fn dispatch_with_retries_config(
     client: Client,
     prepared: PreparedDispatch,
-    webhook_name: String,
+    ctx: DispatchContext,
     max_retries: u32,
     base_backoff_ms: u64,
     db: DatabaseConnection,
-    webhook_id: Uuid,
-    event_type: String,
 ) {
     let PreparedDispatch { target_url, headers, payload } = prepared;
 
@@ -523,16 +623,16 @@ async fn dispatch_with_retries_config(
         match outcome {
             DispatchOutcome::Success { status } => {
                 info!(
-                    webhook = %webhook_name, url = %target_url, status, attempt,
+                    webhook = %ctx.webhook_name, url = %target_url, status, attempt,
                     body = %body.as_deref().unwrap_or(""), "Webhook delivered"
                 );
-                log_execution(&db, webhook_id, &event_type, Some(status), true, duration_ms, body.as_deref())
+                log_execution(&db, &ctx, &target_url, Some(status), true, duration_ms, body.as_deref())
                     .await;
                 return;
             }
             DispatchOutcome::Permanent { status, reason } => {
                 error!(
-                    webhook = %webhook_name, url = %target_url, status, attempt, reason = %reason,
+                    webhook = %ctx.webhook_name, url = %target_url, status, attempt, reason = %reason,
                     body = %body.as_deref().unwrap_or(""),
                     "Webhook delivery failed with a non-retryable error; not retrying"
                 );
@@ -540,7 +640,7 @@ async fn dispatch_with_retries_config(
                 // only ever the computed `"HTTP {status}"` string, which the body (when present) is
                 // strictly more informative than.
                 let detail = body.as_deref().or(Some(reason.as_str()));
-                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, detail).await;
+                log_execution(&db, &ctx, &target_url, status, false, duration_ms, detail).await;
                 return;
             }
             DispatchOutcome::Transient { status, reason } if attempt <= max_retries => {
@@ -550,24 +650,24 @@ async fn dispatch_with_retries_config(
                 // `webhook_max_retries` is itself clamped to at most 10, so this never approaches it.
                 let backoff_ms = base_backoff_ms.saturating_mul(1u64 << (attempt - 1).min(20));
                 warn!(
-                    webhook = %webhook_name, url = %target_url, status, attempt, max_retries,
+                    webhook = %ctx.webhook_name, url = %target_url, status, attempt, max_retries,
                     backoff_ms, reason = %reason, body = %body.as_deref().unwrap_or(""),
                     "Webhook delivery failed with a transient error; retrying"
                 );
                 let detail = body.as_deref().or(Some(reason.as_str()));
-                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, detail).await;
+                log_execution(&db, &ctx, &target_url, status, false, duration_ms, detail).await;
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 attempt += 1;
             }
             DispatchOutcome::Transient { status, reason } => {
                 error!(
-                    webhook = %webhook_name, url = %target_url, status, attempt, max_retries,
+                    webhook = %ctx.webhook_name, url = %target_url, status, attempt, max_retries,
                     reason = %reason, body = %body.as_deref().unwrap_or(""),
                     "Webhook delivery failed with a transient error and exhausted its retries; \
                      giving up"
                 );
                 let detail = body.as_deref().or(Some(reason.as_str()));
-                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, detail).await;
+                log_execution(&db, &ctx, &target_url, status, false, duration_ms, detail).await;
                 return;
             }
         }
@@ -681,6 +781,14 @@ async fn send_test_dispatch_with_privacy(
         }
     };
 
+    let ctx = DispatchContext {
+        webhook_id: config.id,
+        webhook_name: config.name.clone(),
+        event_type: "TEST".to_owned(),
+        target_address: event.address.clone(),
+        cause: event.cause.clone(),
+    };
+
     let started = std::time::Instant::now();
     let outcome = client.post(&prepared.target_url).headers(prepared.headers).body(prepared.payload).send().await;
     let duration_ms = started.elapsed().as_millis() as i64;
@@ -699,7 +807,8 @@ async fn send_test_dispatch_with_privacy(
             // Whatever the receiver said back, on success or failure alike — not the computed
             // `error` summary, which the body (when present) is strictly more informative than.
             let detail = body.as_deref().or(error.as_deref());
-            log_execution(db, config.id, "TEST", Some(status.as_u16()), success, duration_ms, detail).await;
+            log_execution(db, &ctx, &prepared.target_url, Some(status.as_u16()), success, duration_ms, detail)
+                .await;
             WebhookTestResult {
                 success,
                 status: Some(status.as_u16()),
@@ -711,7 +820,7 @@ async fn send_test_dispatch_with_privacy(
         }
         Err(e) => {
             let reason = e.to_string();
-            log_execution(db, config.id, "TEST", None, false, duration_ms, Some(&reason)).await;
+            log_execution(db, &ctx, &prepared.target_url, None, false, duration_ms, Some(&reason)).await;
             WebhookTestResult {
                 success: false,
                 status: None,
@@ -831,18 +940,21 @@ async fn dispatch_worker(
             };
 
             let client = client.clone();
-            let webhook_name = config.name.clone();
-            let webhook_id = config.id;
-            let event_type = event.action.clone();
+            let ctx = DispatchContext {
+                webhook_id: config.id,
+                webhook_name: config.name.clone(),
+                event_type: event.action.clone(),
+                target_address: event.address.clone(),
+                cause: event.cause.clone(),
+            };
             let exec_db = db.clone();
 
             join_set.spawn(async move {
                 if !is_url_safe(&prepared.target_url, allow_private_webhooks()).await {
-                    warn!(url = %prepared.target_url, webhook = %webhook_name, "Webhook blocked by SSRF protection");
+                    warn!(url = %prepared.target_url, webhook = %ctx.webhook_name, "Webhook blocked by SSRF protection");
                     return;
                 }
-                dispatch_with_retries(client, prepared, webhook_name, exec_db, webhook_id, event_type)
-                    .await;
+                dispatch_with_retries(client, prepared, ctx, exec_db).await;
             });
         }
 
@@ -921,6 +1033,142 @@ mod tests {
         let a = resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ban", "1700", "x");
         let b = resolve_hmac_template(DEFAULT_HMAC_TEMPLATE, "POST", "/api/ba", "n1700", "x");
         assert_ne!(a, b, "the \\n delimiter must keep adjacent fields unambiguous");
+    }
+
+    fn sample_event() -> WebhookEvent {
+        WebhookEvent {
+            action: "IP_ADD".to_owned(),
+            address: "203.0.113.42".to_owned(),
+            is_whitelist: false,
+            group_id: Some(Uuid::nil()),
+            group_name: Some("hijack-group".to_owned()),
+            cause: Some("suspicious traffic".to_owned()),
+        }
+    }
+
+    /// `$action`/`$event`, `$ip`/`$target_address`, `$cause`, `$group_name`, and `$group_id` all
+    /// expand — the exact set `target_url` gained templating support for, checked against the one
+    /// evaluator both it and `payload_template` now share.
+    #[test]
+    fn resolve_event_variables_expands_every_documented_placeholder() {
+        let event = sample_event();
+        let resolved = resolve_event_variables(
+            "https://x.example/$action/$event/$ip/$target_address/$cause/$group_name/$group_id/$timestamp",
+            &event,
+            "1700",
+        );
+        assert_eq!(
+            resolved,
+            "https://x.example/IP_ADD/IP_ADD/203.0.113.42/203.0.113.42/suspicious traffic/\
+             hijack-group/00000000-0000-0000-0000-000000000000/1700"
+        );
+    }
+
+    /// A `cause` of `"Unknown"` and empty group fields are what an event with no cause and no group
+    /// expands to — not a literal `$cause`/`$group_name` left in the URL, which is what a caller
+    /// forgetting to handle the `None` case would produce.
+    #[test]
+    fn resolve_event_variables_falls_back_sensibly_when_event_data_is_absent() {
+        let event = WebhookEvent {
+            action: "TEST".to_owned(),
+            address: "127.0.0.1/32".to_owned(),
+            is_whitelist: false,
+            group_id: None,
+            group_name: None,
+            cause: None,
+        };
+        let resolved = resolve_event_variables("$cause|$group_name|$group_id|", &event, "0");
+        assert_eq!(resolved, "Unknown|||");
+    }
+
+    /// The injection-safety property `resolve_hmac_template` already has, carried over to the new
+    /// evaluator: a `cause` a caller fully controls (via `/api/ban`/`/api/white`) must not be able to
+    /// inject a *different* variable's placeholder text and have a later substitution expand it.
+    #[test]
+    fn substitute_placeholders_never_rescans_an_inserted_value() {
+        let mut event = sample_event();
+        event.cause = Some("$group_name".to_owned());
+        let resolved = resolve_event_variables("cause=$cause group=$group_name", &event, "1700");
+        assert_eq!(
+            resolved,
+            "cause=$group_name group=hijack-group",
+            "the literal text a caller wrote into `cause` must survive verbatim, not be expanded a \
+             second time because it happens to match another placeholder"
+        );
+    }
+
+    /// `target_url` templating end to end: `prepare_dispatch` must resolve `$action`/`$ip` in the
+    /// target URL, not just in the payload — this is the property that was entirely missing before,
+    /// since `target_url` was previously used verbatim.
+    #[test]
+    fn target_url_variables_are_resolved_by_prepare_dispatch() {
+        let config = webhook_config::Model {
+            id: Uuid::new_v4(),
+            name: "templated-target".to_owned(),
+            target_url: "https://x.example/hooks/$action?ip=$ip".to_owned(),
+            secret_token: String::new(),
+            auth_mode: AuthMode::NONE.to_owned(),
+            api_key: None,
+            hmac_template: None,
+            signature_header: None,
+            signature_prefix: None,
+            headers_json: None,
+            payload_template: "{}".to_owned(),
+            group_id: Uuid::new_v4(),
+            is_active: true,
+            events: None,
+            owner_key_id: None,
+            created_at: chrono::Utc::now().naive_utc(),
+        };
+        let event = sample_event();
+
+        let prepared = prepare_dispatch(&config, &event).expect("a plain-text target resolves");
+        assert_eq!(prepared.target_url, "https://x.example/hooks/IP_ADD?ip=203.0.113.42");
+    }
+
+    /// `CANONICAL_V1` must sign the path of the *resolved* target URL. Before this, the path fed to
+    /// `resolve_hmac_template` came from `config.target_url` directly — with a templated URL, that
+    /// path would still contain the literal `$action`, so the signature would cover a path the
+    /// receiver's own request line never has, and the receiver's independent verification would
+    /// fail every dispatch.
+    #[test]
+    fn canonical_v1_signs_the_resolved_path_not_the_template() {
+        let mut config = webhook_config::Model {
+            id: Uuid::new_v4(),
+            name: "templated-canonical".to_owned(),
+            target_url: "https://x.example/hooks/$action".to_owned(),
+            secret_token: "shared-secret".to_owned(),
+            auth_mode: AuthMode::CanonicalV1.as_str().to_owned(),
+            api_key: None,
+            hmac_template: None,
+            signature_header: None,
+            signature_prefix: None,
+            headers_json: None,
+            payload_template: "{}".to_owned(),
+            group_id: Uuid::new_v4(),
+            is_active: true,
+            events: None,
+            owner_key_id: None,
+            created_at: chrono::Utc::now().naive_utc(),
+        };
+        let event = sample_event();
+
+        let prepared_add = prepare_dispatch(&config, &event).expect("resolves");
+        let sig_add = prepared_add.headers.get("X-Signature-256").expect("signed").clone();
+
+        // A different action resolves to a different path — `/hooks/IP_DELETE`, not `/hooks/IP_ADD`
+        // — so if the signature covered the unresolved template (constant regardless of `$action`),
+        // these two would be identical. They must not be.
+        config.target_url = "https://x.example/hooks/$action".to_owned();
+        let mut delete_event = event.clone();
+        delete_event.action = "IP_DELETE".to_owned();
+        let prepared_delete = prepare_dispatch(&config, &delete_event).expect("resolves");
+        let sig_delete = prepared_delete.headers.get("X-Signature-256").expect("signed").clone();
+
+        assert_ne!(
+            sig_add, sig_delete,
+            "the signature must cover the resolved path, which differs between the two actions"
+        );
     }
 
     /// The SSRF blocklist, exercised as a pure function over resolved addresses.
@@ -1083,6 +1331,7 @@ mod tests {
             address: "203.0.113.77".to_owned(),
             is_whitelist: false,
             group_id: Some(group_id),
+            group_name: None,
             cause: None,
         })
         .await
@@ -1170,6 +1419,18 @@ mod tests {
 
     fn dummy_prepared(target_url: String) -> PreparedDispatch {
         PreparedDispatch { target_url, headers: HeaderMap::new(), payload: "{}".to_owned() }
+    }
+
+    /// A minimal [`DispatchContext`] for tests that only care about the retry loop's behaviour, not
+    /// the event data now persisted alongside it.
+    fn dummy_ctx(webhook_id: Uuid, event_type: &str) -> DispatchContext {
+        DispatchContext {
+            webhook_id,
+            webhook_name: "test-webhook".to_owned(),
+            event_type: event_type.to_owned(),
+            target_address: "203.0.113.1".to_owned(),
+            cause: None,
+        }
     }
 
     /// Like [`spawn_status_sequence_server`] but answers with a real body instead of
@@ -1329,12 +1590,10 @@ mod tests {
         dispatch_with_retries_config(
             client,
             dummy_prepared(format!("http://{addr}/")),
-            "test-webhook".to_owned(),
+            dummy_ctx(webhook_id, "IP_ADD"),
             /* max_retries */ 5,
             /* base_backoff_ms */ 1,
             db.clone(),
-            webhook_id,
-            "IP_ADD".to_owned(),
         )
         .await;
 
@@ -1363,12 +1622,10 @@ mod tests {
         dispatch_with_retries_config(
             client,
             dummy_prepared(format!("http://{addr}/")),
-            "test-webhook".to_owned(),
+            dummy_ctx(webhook_id, "IP_ADD"),
             /* max_retries */ 5,
             /* base_backoff_ms */ 1,
             db.clone(),
-            webhook_id,
-            "IP_ADD".to_owned(),
         )
         .await;
 
@@ -1401,12 +1658,10 @@ mod tests {
         dispatch_with_retries_config(
             client,
             dummy_prepared(format!("http://{addr}/")),
-            "test-webhook".to_owned(),
+            dummy_ctx(webhook_id, "IP_ADD"),
             /* max_retries */ 2,
             /* base_backoff_ms */ 1,
             db.clone(),
-            webhook_id,
-            "IP_ADD".to_owned(),
         )
         .await;
 
@@ -1436,12 +1691,10 @@ mod tests {
         dispatch_with_retries_config(
             client,
             dummy_prepared(format!("http://{addr}/")),
-            "test-webhook".to_owned(),
+            dummy_ctx(webhook_id, "IP_ADD"),
             /* max_retries */ 5,
             /* base_backoff_ms */ 1,
             db.clone(),
-            webhook_id,
-            "IP_ADD".to_owned(),
         )
         .await;
 
@@ -1459,6 +1712,47 @@ mod tests {
         );
     }
 
+    /// A dispatch's `webhook_executions` row must record the resolved target URL it actually dialed
+    /// and the triggering event's address/cause — the data Task 2's search and filters (`ip`,
+    /// `search`, `group_id`) depend on existing per-row, not only on the parent `webhook_configs`
+    /// row, since the same webhook's resolved URL and event data vary attempt to attempt.
+    #[tokio::test]
+    async fn a_dispatch_persists_the_resolved_url_and_event_context() {
+        let addr = spawn_status_sequence_server(vec![200]).await.0;
+        let client = build_webhook_client().expect("client builds");
+        let db = migrated_memory_db().await;
+        let webhook_id = seed_test_webhook(&db).await;
+
+        let resolved_url = format!("http://{addr}/hooks/IP_ADD");
+        let ctx = DispatchContext {
+            webhook_id,
+            webhook_name: "context-test-webhook".to_owned(),
+            event_type: "IP_ADD".to_owned(),
+            target_address: "203.0.113.99".to_owned(),
+            cause: Some("port scan".to_owned()),
+        };
+
+        dispatch_with_retries_config(
+            client,
+            dummy_prepared(resolved_url.clone()),
+            ctx,
+            /* max_retries */ 5,
+            /* base_backoff_ms */ 1,
+            db.clone(),
+        )
+        .await;
+
+        let rows = webhook_execution::Entity::find()
+            .filter(webhook_execution::Column::WebhookId.eq(webhook_id))
+            .all(&db)
+            .await
+            .expect("querying execution rows succeeds");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].resolved_target_url.as_deref(), Some(resolved_url.as_str()));
+        assert_eq!(rows[0].target_address.as_deref(), Some("203.0.113.99"));
+        assert_eq!(rows[0].cause.as_deref(), Some("port scan"));
+    }
+
     /// A permanently-failed dispatch's `webhook_executions` row must hold the receiver's actual
     /// reply when one was received, in preference to the computed "HTTP 403" reason string — the
     /// body is strictly more informative whenever it is present.
@@ -1472,12 +1766,10 @@ mod tests {
         dispatch_with_retries_config(
             client,
             dummy_prepared(format!("http://{addr}/")),
-            "test-webhook".to_owned(),
+            dummy_ctx(webhook_id, "IP_ADD"),
             /* max_retries */ 5,
             /* base_backoff_ms */ 1,
             db.clone(),
-            webhook_id,
-            "IP_ADD".to_owned(),
         )
         .await;
 
@@ -1526,6 +1818,7 @@ mod tests {
             address: "127.0.0.1/32".to_owned(),
             is_whitelist: false,
             group_id: Some(config.group_id),
+            group_name: None,
             cause: Some("unit test".to_owned()),
         };
 
@@ -1580,6 +1873,7 @@ mod tests {
             address: "127.0.0.1/32".to_owned(),
             is_whitelist: false,
             group_id: Some(config.group_id),
+            group_name: None,
             cause: None,
         };
 

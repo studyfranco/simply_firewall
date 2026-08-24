@@ -102,6 +102,7 @@ pub fn create_app(state: AppState) -> Router {
         // already prefers a literal segment over a path parameter at the same position regardless
         // of registration order, so `executions` can never be swallowed by `{id}`.
         .route("/webhooks/executions", get(api::list_webhook_executions))
+        .route("/webhooks/executions/{id}", delete(api::delete_webhook_execution))
         .route("/webhooks/{id}", put(api::update_webhook))
         .route("/webhooks/{id}", delete(api::delete_webhook))
         .route("/webhooks/{id}/owner", put(api::reassign_webhook_owner))

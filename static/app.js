@@ -469,7 +469,11 @@ class FirewallClient {
             // above — the create form and the edit modal can both be present in the DOM at once
             // (the form is always visible; the modal only overlays it), so one shared array would
             // let opening the editor for an existing webhook clobber whatever the create form had.
-            editWebhookHeaders: []
+            editWebhookHeaders: [],
+            // Whether the Edit Webhook modal's API-key input has been interacted with since it was
+            // last opened — see `submitEditWebhook()`'s own comment for why this replaces the old
+            // "Clear the configured API key" checkbox.
+            editApiKeyTouched: false
         };
 
         // IP records and audit logs are both large, append-only lists — fetched from the server
@@ -1052,8 +1056,35 @@ class FirewallClient {
         } catch(e) {}
     }
 
+    // Filter values are read fresh on every call (not captured once) for the same reason
+    // `fetchIpsChunk` does — a background prefetch mid-typing session must reflect whatever was
+    // actually searched, not stale values from when the tab was first opened.
     async fetchExecutionsChunk(offset, limit) {
         const params = new URLSearchParams({ limit, offset });
+
+        const search = document.getElementById('executions-search').value.trim();
+        if (search) params.append('search', search);
+
+        const status = document.getElementById('executions-status-filter').value;
+        if (status) params.append('status', status);
+
+        const eventType = document.getElementById('executions-event-filter').value;
+        if (eventType) params.append('event_type', eventType);
+
+        // Both bounds go to the server — unlike IP Records' `date-to`, this endpoint has a real
+        // `to_date` parameter, so there is no client-side upper-bound filter to layer on afterward.
+        const from = document.getElementById('executions-date-from').value;
+        if (from) {
+            const start = new Date(`${from}T00:00:00`);
+            if (!Number.isNaN(start.getTime())) params.append('from_date', Math.floor(start.getTime() / 1000));
+        }
+        const to = document.getElementById('executions-date-to').value;
+        if (to) {
+            // Inclusive of the whole chosen day, matching `ipDateFilter()`'s own convention.
+            const end = new Date(`${to}T23:59:59.999`);
+            if (!Number.isNaN(end.getTime())) params.append('to_date', Math.floor(end.getTime() / 1000));
+        }
+
         return await this.apiFetch(`/webhooks/executions?${params.toString()}`);
     }
 
@@ -1065,6 +1096,13 @@ class FirewallClient {
             this.renderExecutionsTable();
             this.updateExecutionsPaginationUI();
         } catch(e) {}
+    }
+
+    // Discards the current executions cache and fetches fresh from the server with whatever's
+    // currently in the filter inputs — the explicit "search" action, never fired on every
+    // keystroke, matching `triggerIpSearch()`'s own contract.
+    triggerExecutionsSearch() {
+        this.loadExecutions();
     }
 
     // ───────────────────────────────────────────────────────
@@ -1745,30 +1783,86 @@ class FirewallClient {
         return `<span class="badge badge-exec-failed">Error</span>`;
     }
 
+    /** One compact row per execution — timestamp, webhook name only (no target URL cluttering the
+     * table; that and every other verbose field live in the View modal), status, duration, and
+     * actions. Mirrors `simply_hook_executor`'s single-line execution row layout. */
     renderExecutionsTable() {
         const tbody = document.getElementById('executions-table-body');
         const rows = this.executionsCache.currentPageItems;
         if (rows.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No webhook executions recorded.</td></tr>';
+            tbody.innerHTML = '<tr><td colspan="5" class="text-center text-muted">No webhook executions recorded.</td></tr>';
             return;
         }
 
         tbody.innerHTML = rows.map(e => {
             const webhook = this.state.webhooks.find(w => w.id === e.webhook_id);
-            const webhookDisplay = webhook
-                ? `<strong>${escapeHtml(webhook.name)}</strong><br><span class="text-muted text-sm font-mono">${escapeHtml(webhook.target_url)}</span>`
-                : `<span class="text-muted font-mono">${escapeHtml(e.webhook_id)}</span>`;
+            const webhookName = webhook ? webhook.name : e.webhook_id;
             return `
             <tr>
                 <td class="text-sm">${formatTimestamp(e.created_at)}</td>
-                <td>${webhookDisplay}</td>
-                <td><span class="badge badge-scope">${escapeHtml(e.event_type)}</span></td>
+                <td>${escapeHtml(webhookName)}</td>
                 <td>${this.executionStatusBadge(e)}</td>
                 <td class="text-sm">${e.duration_ms} ms</td>
-                <td class="text-sm">${escapeHtml(e.response_body || '-')}</td>
+                <td>
+                    <button class="btn btn-sm btn-secondary" onclick="window.app.openExecutionDetailModal('${e.id}')">View</button>
+                    <button class="btn btn-sm btn-batch-delete" onclick="window.app.deleteExecutionRow('${e.id}')">Delete</button>
+                </td>
             </tr>
         `;
         }).join('');
+    }
+
+    /**
+     * Opens the Execution Detail modal for a row already present in the local cache — every field a
+     * compact table row has no room for: the webhook name, event type, the resolved target URL
+     * (post-`$variable`-expansion — see `dispatch::resolve_event_variables`), the triggering event's
+     * address/cause, and the receiver's response.
+     *
+     * Reads from `this.executionsCache.items` (the *full* locally cached set, not just the current
+     * page) rather than issuing a fresh request: there is no `GET /api/webhooks/executions/{id}`
+     * endpoint, and the row must already have been rendered — and therefore already fetched — for
+     * its View button to exist at all.
+     */
+    openExecutionDetailModal(id) {
+        const e = this.executionsCache.items.find(x => x.id === id);
+        if (!e) return;
+
+        const webhook = this.state.webhooks.find(w => w.id === e.webhook_id);
+        document.getElementById('execution-detail-webhook').textContent = webhook ? webhook.name : e.webhook_id;
+        document.getElementById('execution-detail-event').textContent = e.event_type;
+        document.getElementById('execution-detail-time').textContent = formatTimestamp(e.created_at);
+        document.getElementById('execution-detail-status').innerHTML = this.executionStatusBadge(e);
+        document.getElementById('execution-detail-duration').textContent = `${e.duration_ms} ms`;
+        document.getElementById('execution-detail-address').textContent = e.target_address || '—';
+        document.getElementById('execution-detail-cause').textContent = e.cause || '—';
+        document.getElementById('execution-detail-url').textContent = e.resolved_target_url || '(not recorded — this row predates resolved-URL logging)';
+        document.getElementById('execution-detail-response').textContent = e.response_body || '(no response recorded)';
+
+        document.getElementById('execution-detail-delete').dataset.executionId = id;
+        document.getElementById('execution-detail-modal').classList.remove('hidden');
+    }
+
+    closeExecutionDetailModal() {
+        document.getElementById('execution-detail-modal').classList.add('hidden');
+    }
+
+    /** Wired to both the table row's Delete button and the detail modal's own Delete button — the
+     * latter reads the id off `dataset.executionId` rather than taking a parameter, since it is
+     * bound once in `bindEvents()` rather than re-bound every time the modal opens. */
+    async deleteExecutionRow(id) {
+        const ok = await this.showConfirmModal({
+            title: 'Delete Execution Record',
+            message: 'Delete this webhook execution record? This cannot be undone.',
+            confirmText: 'Delete',
+            danger: true
+        });
+        if (!ok) return;
+        try {
+            await this.apiFetch(`/webhooks/executions/${id}`, { method: 'DELETE' });
+            this.closeExecutionDetailModal();
+            await this.loadExecutions();
+            this.showToast('Execution record deleted', 'success');
+        } catch(e) {}
     }
 
     updateExecutionsPaginationUI() {
@@ -2178,24 +2272,26 @@ class FirewallClient {
     }
 
     /**
-     * The Edit Webhook modal's counterpart to `syncWebhookAuthFields()` — same field-visibility
-     * rule, applied to the edit form's own (edit-prefixed) elements. Nothing here is `required`:
-     * unlike the create form, every field in the edit modal has a fallback ("leave blank to keep
-     * the current value"), so hiding a field must never block submission of the rest.
+     * The Edit Webhook modal's counterpart to `syncWebhookAuthFields()` — but unlike the create
+     * form, it does not hide fields by mode. The create form's field order puts the mode selector
+     * first, so hiding what it doesn't need reads as guidance; the edit modal's field order (Task 5)
+     * puts API Key/HMAC Header/Prefix/Template *above* Auth Mode, so a field disappearing because of
+     * a selector below it would read as the form losing data, not as help. Every field here already
+     * has a "leave blank to keep the current value" fallback, so nothing is lost by always showing
+     * all of them — only the hint text changes with the selected mode.
      */
     syncEditWebhookAuthFields() {
         const mode = document.getElementById('edit-webhook-auth-mode').value;
-        const needsSecret = mode === 'CANONICAL_V1' || mode === 'HMAC_ONLY';
-        const needsApiKey = mode === 'CANONICAL_V1' || mode === 'API_KEY_ONLY';
-        const needsTemplate = mode === 'CANONICAL_V1';
-
-        document.getElementById('edit-webhook-hmac-template-group').classList.toggle('hidden', !needsTemplate);
-        document.getElementById('edit-webhook-secret-group').classList.toggle('hidden', !needsSecret);
-        document.getElementById('edit-webhook-api-key-group').classList.toggle('hidden', !needsApiKey);
-        document.getElementById('edit-webhook-sig-transport-group').classList.toggle('hidden', !needsSecret);
-
         document.getElementById('edit-webhook-auth-mode-hint').innerHTML =
             FirewallClient.AUTH_MODE_HINTS[mode] || '';
+    }
+
+    openTemplateVarsModal() {
+        document.getElementById('template-vars-modal').classList.remove('hidden');
+    }
+
+    closeTemplateVarsModal() {
+        document.getElementById('template-vars-modal').classList.add('hidden');
     }
 
     // ───────────────────────────────────────────────────────
@@ -2467,8 +2563,11 @@ class FirewallClient {
         document.getElementById('edit-webhook-auth-mode').value = mode;
         document.getElementById('edit-webhook-api-key-badge').classList.toggle('hidden', !w.has_api_key);
         document.getElementById('edit-webhook-api-key').value = '';
-        document.getElementById('edit-webhook-api-key').disabled = false;
-        document.getElementById('edit-webhook-api-key-clear').checked = false;
+        // Reset for this opening: `submitEditWebhook()` only sends `api_key` at all once this
+        // becomes true, which happens the first time the user interacts with the field below —
+        // typing a replacement or clearing it to blank are both "touched", and both are meant to be
+        // sent; only never touching it at all means "leave the current key alone".
+        this.state.editApiKeyTouched = false;
         document.getElementById('edit-webhook-hmac-template').value = w.hmac_template || '';
         document.getElementById('edit-webhook-secret').value = '';
         document.getElementById('edit-webhook-sig-header').value = w.signature_header || '';
@@ -2522,27 +2621,22 @@ class FirewallClient {
             events
         };
 
-        if (!document.getElementById('edit-webhook-hmac-template-group').classList.contains('hidden')) {
-            payload.hmac_template = document.getElementById('edit-webhook-hmac-template').value;
-        }
+        // Every field below is always visible now (Task 5), so all of them are always sent —
+        // there is no more "hidden group" to gate on, and re-sending an unchanged value is a
+        // harmless no-op server-side (`update_webhook` only rotates/gates on an actual change).
+        payload.hmac_template = document.getElementById('edit-webhook-hmac-template').value;
+        payload.signature_header = document.getElementById('edit-webhook-sig-header').value.trim();
+        payload.signature_prefix = document.getElementById('edit-webhook-sig-prefix').value;
+
         const newSecret = document.getElementById('edit-webhook-secret').value;
         if (newSecret) payload.secret_token = newSecret;
 
-        // `api_key` is write-only, so — like the secret above — a blank input means "leave it as
-        // is" and is left out of the request entirely, not sent as an empty string. Clearing an
-        // existing key is instead an explicit action (the checkbox), since an empty string here has
-        // its own meaning to the server: it wipes the stored key rather than leaving it untouched.
-        const newApiKey = document.getElementById('edit-webhook-api-key').value;
-        const clearApiKey = document.getElementById('edit-webhook-api-key-clear').checked;
-        if (clearApiKey) {
-            payload.api_key = '';
-        } else if (newApiKey) {
-            payload.api_key = newApiKey;
-        }
-
-        if (!document.getElementById('edit-webhook-sig-transport-group').classList.contains('hidden')) {
-            payload.signature_header = document.getElementById('edit-webhook-sig-header').value.trim();
-            payload.signature_prefix = document.getElementById('edit-webhook-sig-prefix').value;
+        // `api_key` is write-only, so a field the user never touched must be left out of the
+        // request entirely (omitted means "leave the current key alone" server-side) — but once
+        // touched, whatever is currently in the field is sent verbatim, blank included: clearing it
+        // to empty and saving is how a key is removed, no separate checkbox needed for that anymore.
+        if (this.state.editApiKeyTouched) {
+            payload.api_key = document.getElementById('edit-webhook-api-key').value;
         }
 
         const headers = this.editHeaderMap();
@@ -2788,13 +2882,29 @@ class FirewallClient {
         document.getElementById('edit-webhook-headers-add').addEventListener('click', () => this.addEditHeaderRow());
         document.getElementById('edit-webhook-test').addEventListener('click', () => this.testWebhook());
         document.getElementById('edit-webhook-auth-mode').addEventListener('change', () => this.syncEditWebhookAuthFields());
-        // "Clear the configured API key" and typing a replacement are mutually exclusive actions;
-        // checking the box disables the text field so the two can't be set at once and leave it
-        // ambiguous which one submitEditWebhook() should honour.
-        document.getElementById('edit-webhook-api-key-clear').addEventListener('change', (e) => {
-            const input = document.getElementById('edit-webhook-api-key');
-            input.disabled = e.target.checked;
-            if (e.target.checked) input.value = '';
+        // Marks the API-key field "touched" the first time the user interacts with it at all —
+        // typing a replacement or selecting-all-and-deleting to leave it genuinely blank are both
+        // "touched"; `submitEditWebhook()` sends `api_key` only when this is true, so an operator
+        // who never clicks into the field keeps the current key untouched by default.
+        document.getElementById('edit-webhook-api-key').addEventListener('input', () => {
+            this.state.editApiKeyTouched = true;
+        });
+
+        // Template Variables reference modal — three trigger points (create form's Target URL
+        // hint, and the Edit Webhook modal's Target URL hint and Payload Template hint) all open
+        // the one shared modal.
+        ['webhook-vars-help-btn', 'edit-webhook-vars-help-btn', 'edit-webhook-vars-help-btn-2'].forEach(btnId => {
+            document.getElementById(btnId).addEventListener('click', () => this.openTemplateVarsModal());
+        });
+        document.getElementById('template-vars-close').addEventListener('click', () => this.closeTemplateVarsModal());
+        document.getElementById('template-vars-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'template-vars-modal') this.closeTemplateVarsModal();
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            if (!document.getElementById('template-vars-modal').classList.contains('hidden')) {
+                this.closeTemplateVarsModal();
+            }
         });
         document.addEventListener('keydown', (e) => {
             if (e.key !== 'Escape') return;
@@ -2854,6 +2964,52 @@ class FirewallClient {
             await this.executionsCache.nextPage();
             this.renderExecutionsTable();
             this.updateExecutionsPaginationUI();
+        });
+
+        // Execution history filter bar — same "search fires on Enter/button/select-change only"
+        // rule as the IP Records filter bar, not on every keystroke.
+        document.getElementById('executions-search-btn').addEventListener('click', () => this.triggerExecutionsSearch());
+        document.getElementById('executions-search').addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') { e.preventDefault(); this.triggerExecutionsSearch(); }
+        });
+        document.getElementById('executions-status-filter').addEventListener('change', () => this.triggerExecutionsSearch());
+        document.getElementById('executions-event-filter').addEventListener('change', () => this.triggerExecutionsSearch());
+        ['executions-date-from', 'executions-date-to'].forEach(id => {
+            document.getElementById(id).addEventListener('change', () => {
+                document.getElementById('executions-date-clear').hidden =
+                    !document.getElementById('executions-date-from').value && !document.getElementById('executions-date-to').value;
+                this.triggerExecutionsSearch();
+            });
+        });
+        document.getElementById('executions-date-clear').addEventListener('click', () => {
+            document.getElementById('executions-date-from').value = '';
+            document.getElementById('executions-date-to').value = '';
+            document.getElementById('executions-date-clear').hidden = true;
+            this.triggerExecutionsSearch();
+        });
+        document.getElementById('executions-clear-filters-btn').addEventListener('click', () => {
+            document.getElementById('executions-search').value = '';
+            document.getElementById('executions-status-filter').value = '';
+            document.getElementById('executions-event-filter').value = '';
+            document.getElementById('executions-date-from').value = '';
+            document.getElementById('executions-date-to').value = '';
+            document.getElementById('executions-date-clear').hidden = true;
+            this.triggerExecutionsSearch();
+        });
+
+        // Execution Detail modal: close on button / backdrop / Escape, plus its own Delete button.
+        document.getElementById('execution-detail-close').addEventListener('click', () => this.closeExecutionDetailModal());
+        document.getElementById('execution-detail-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'execution-detail-modal') this.closeExecutionDetailModal();
+        });
+        document.getElementById('execution-detail-delete').addEventListener('click', (e) => {
+            this.deleteExecutionRow(e.target.dataset.executionId);
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            if (!document.getElementById('execution-detail-modal').classList.contains('hidden')) {
+                this.closeExecutionDetailModal();
+            }
         });
     }
 }

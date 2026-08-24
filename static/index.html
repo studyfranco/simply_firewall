@@ -378,6 +378,11 @@
                             <div class="form-group">
                                 <label for="webhook-url">Target URL <span>*</span></label>
                                 <input type="url" id="webhook-url" placeholder="https://example.com" required class="input-field">
+                                <small class="field-hint">
+                                    Supports the same <code>$variable</code> substitution as the
+                                    payload template —
+                                    <button type="button" class="btn-link" id="webhook-vars-help-btn">see all template variables</button>.
+                                </small>
                             </div>
                             <div class="form-group">
                                 <label for="webhook-group-search">Target Group <span>*</span></label>
@@ -529,21 +534,46 @@
                     history; any other key sees only its own webhooks'. Successful rows are kept for
                     24 hours, failed rows for 7 days, then purged automatically.
                 </p>
+                <div class="list-header">
+                    <div class="filters">
+                        <input type="text" id="executions-search" placeholder="Search webhook, IP, or cause..." class="input-field">
+                        <select id="executions-status-filter" class="input-field select-field">
+                            <option value="">All Statuses</option>
+                            <option value="success">Success</option>
+                            <option value="failed">Failed</option>
+                        </select>
+                        <select id="executions-event-filter" class="input-field select-field">
+                            <option value="">All Events</option>
+                            <option value="IP_ADD">IP_ADD</option>
+                            <option value="IP_UPDATE">IP_UPDATE</option>
+                            <option value="IP_DELETE">IP_DELETE</option>
+                            <option value="TEST">TEST</option>
+                        </select>
+                        <div class="date-range" role="group" aria-label="Filter by attempt date range">
+                            <label for="executions-date-from" class="date-range-label">From</label>
+                            <input type="date" id="executions-date-from" class="input-field date-input" aria-label="Start date">
+                            <label for="executions-date-to" class="date-range-label">To</label>
+                            <input type="date" id="executions-date-to" class="input-field date-input" aria-label="End date">
+                            <button type="button" id="executions-date-clear" class="btn btn-icon" title="Clear the date range" hidden>&times;</button>
+                        </div>
+                        <button type="button" id="executions-search-btn" class="btn btn-icon" title="Search (or press Enter in a filter field)">🔍</button>
+                        <button type="button" id="executions-clear-filters-btn" class="btn btn-secondary btn-sm">Clear Filters</button>
+                    </div>
+                </div>
                 <div class="table-container table-scroll">
                     <table class="data-table">
                         <thead>
                             <tr>
                                 <th>Time</th>
                                 <th>Webhook</th>
-                                <th>Event</th>
                                 <th>Status</th>
                                 <th>Duration</th>
-                                <th>Detail</th>
+                                <th>Actions</th>
                             </tr>
                         </thead>
                         <tbody id="executions-table-body">
                             <tr>
-                                <td colspan="6" class="text-center text-muted">Loading data...</td>
+                                <td colspan="5" class="text-center text-muted">Loading data...</td>
                             </tr>
                         </tbody>
                     </table>
@@ -555,6 +585,80 @@
                 </div>
             </section>
         </main>
+
+        <!-- Execution Detail Modal — the verbose fields a compact table row has no room for:
+             resolved target URL, the triggering event's address/cause, and the receiver's response. -->
+        <div id="execution-detail-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+             aria-labelledby="execution-detail-modal-title">
+            <div class="modal-card modal-card-form card">
+                <h3 id="execution-detail-modal-title">Execution Detail</h3>
+                <dl class="kv-grid">
+                    <dt>Webhook</dt><dd id="execution-detail-webhook"></dd>
+                    <dt>Event</dt><dd id="execution-detail-event"></dd>
+                    <dt>Time</dt><dd id="execution-detail-time"></dd>
+                    <dt>Status</dt><dd id="execution-detail-status"></dd>
+                    <dt>Duration</dt><dd id="execution-detail-duration"></dd>
+                    <dt>Target Address</dt><dd id="execution-detail-address"></dd>
+                    <dt>Cause</dt><dd id="execution-detail-cause"></dd>
+                </dl>
+                <div class="form-group">
+                    <label>Resolved Target URL</label>
+                    <pre id="execution-detail-url" class="test-result-detail"></pre>
+                </div>
+                <div class="form-group">
+                    <label>Response</label>
+                    <pre id="execution-detail-response" class="test-result-detail"></pre>
+                </div>
+                <div class="form-actions mt-4">
+                    <button type="button" id="execution-detail-delete" class="btn btn-batch-delete">Delete</button>
+                    <button type="button" id="execution-detail-close" class="btn btn-cancel">Close</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Template Variables reference — opened from the small "see all template variables" links
+             next to Target URL / Payload Template in both the create form and the Edit Webhook
+             modal. One shared modal rather than duplicated inline text in each place, so the list
+             stays in exactly one spot to keep current as variables are added. -->
+        <div id="template-vars-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+             aria-labelledby="template-vars-modal-title">
+            <div class="modal-card modal-card-form card">
+                <h3 id="template-vars-modal-title">Template Variables</h3>
+                <p class="subtitle">
+                    Available in both <strong>Target URL</strong> and <strong>Payload Template</strong> —
+                    the same triggering event fills in both, so a URL can route on the same data the
+                    body carries (e.g. <code>https://host/hooks/$action</code>). Every substitution is
+                    a single left-to-right pass with no re-scanning, so a value that happens to
+                    contain another variable's placeholder text is never expanded a second time.
+                </p>
+                <div class="table-container">
+                    <table class="data-table">
+                        <thead>
+                            <tr><th>Variable</th><th>Expands to</th></tr>
+                        </thead>
+                        <tbody>
+                            <tr><td><code>$target_address</code> / <code>$ip</code></td><td>The IP address or CIDR the event concerns.</td></tr>
+                            <tr><td><code>$action</code> / <code>$event</code></td><td><code>IP_ADD</code>, <code>IP_UPDATE</code>, <code>IP_DELETE</code>, or <code>TEST</code>.</td></tr>
+                            <tr><td><code>$cause</code></td><td>The record's freeform cause, or <code>Unknown</code> if none was given.</td></tr>
+                            <tr><td><code>$group_name</code></td><td>The target group's name, or empty if the event has none.</td></tr>
+                            <tr><td><code>$group_id</code></td><td>The target group's UUID, or empty.</td></tr>
+                            <tr><td><code>$timestamp</code></td><td>The dispatch's Unix timestamp (seconds) — the same value <code>CANONICAL_V1</code> signs and sends as <code>X-Timestamp</code>.</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+                <p class="field-hint mt-2">
+                    Putting a variable in Target URL's host/domain (rather than its path or query)
+                    hands whoever can set that variable's source field — e.g. <code>$cause</code>,
+                    which anyone with write access to the group can set — some influence over which
+                    <em>public</em> host the dispatch goes to. Every dispatch still re-screens its
+                    resolved URL for private/internal addresses regardless, but the safest place for
+                    a variable is the path or query, not the host.
+                </p>
+                <div class="form-actions mt-4">
+                    <button type="button" id="template-vars-close" class="btn btn-cancel">Close</button>
+                </div>
+            </div>
+        </div>
 
         <!-- ═══════════════════════════════════════════════ -->
         <!-- TAB: Audit Logs                                 -->
@@ -681,19 +785,26 @@
             <h3 id="edit-webhook-modal-title">Edit Webhook</h3>
             <form id="form-edit-webhook">
                 <input type="hidden" id="edit-webhook-id">
+
+                <!-- 1. Name -->
                 <div class="form-group">
                     <label for="edit-webhook-name">Webhook Name <span>*</span></label>
                     <input type="text" id="edit-webhook-name" required class="input-field">
                 </div>
+
+                <!-- 2. Target URL -->
                 <div class="form-group">
                     <label for="edit-webhook-url">Target URL <span>*</span></label>
                     <input type="url" id="edit-webhook-url" required class="input-field">
                     <small class="field-hint" id="edit-webhook-url-hint">
                         Repointing this webhook (changing the URL from what it currently is) forces its
-                        signing secret to rotate — see the secret field below.
+                        signing secret to rotate — see the secret field below. Supports
+                        <code>$variable</code> substitution —
+                        <button type="button" class="btn-link" id="edit-webhook-vars-help-btn">see all template variables</button>.
                     </small>
                 </div>
 
+                <!-- 3. Target Group -->
                 <div class="form-group">
                     <label for="edit-webhook-group-search">Target Group <span>*</span></label>
                     <div class="combobox" id="edit-webhook-group-combobox">
@@ -709,15 +820,52 @@
                     </small>
                 </div>
 
-                <!-- Auth mode, api_key, and signature header/prefix are all editable. On a webhook
-                     that already carries a non-empty api_key ("privileged" — its dispatches
-                     authenticate as a real caller on the receiving system), changing target_url,
-                     hmac_template, auth_mode, or api_key is master-only; every other field here
-                     stays editable by any owner. -->
-                <!-- Stacked, not the create form's side-by-side `.auth-mode-row`: that layout needs
-                     ~700px to fit the select and hint side by side, and this modal card is capped at
-                     520px — at modal width the two-column grid has nowhere to put the hint but
-                     overlapping the field above it. -->
+                <!-- 4. API Key. On a webhook that already carries a non-empty api_key
+                     ("privileged" — its dispatches authenticate as a real caller on the receiving
+                     system), changing target_url, hmac_template, auth_mode, or api_key is
+                     master-only; every other field here stays editable by any owner. -->
+                <div class="form-group" id="edit-webhook-api-key-group">
+                    <label for="edit-webhook-api-key">API Key
+                        <span id="edit-webhook-api-key-badge" class="badge badge-scope hidden">key configured</span>
+                    </label>
+                    <input type="password" id="edit-webhook-api-key" placeholder="Leave blank to keep the current key"
+                           class="input-field" autocomplete="off">
+                    <small class="field-hint">
+                        Stored as given, never shown again. Leave untouched to keep the current key;
+                        clear the field and save to remove it. On a webhook that already carries a
+                        key, changing or clearing it is master-only.
+                    </small>
+                </div>
+
+                <!-- 5. HMAC Signature Header & Signature Prefix -->
+                <div class="compact-grid">
+                    <div class="form-group">
+                        <label for="edit-webhook-sig-header">Signature Header</label>
+                        <input type="text" id="edit-webhook-sig-header" class="input-field font-mono"
+                               placeholder="X-Signature-256" autocomplete="off" spellcheck="false">
+                    </div>
+                    <div class="form-group">
+                        <label for="edit-webhook-sig-prefix">Signature Prefix</label>
+                        <input type="text" id="edit-webhook-sig-prefix" class="input-field font-mono"
+                               placeholder="sha256=" autocomplete="off" spellcheck="false">
+                    </div>
+                </div>
+
+                <!-- 6. HMAC Signature Template -->
+                <div class="form-group">
+                    <label for="edit-webhook-hmac-template">HMAC Signature Template <span>*</span></label>
+                    <input type="text" id="edit-webhook-hmac-template" class="input-field font-mono"
+                           spellcheck="false" autocomplete="off">
+                    <small class="field-hint">
+                        Changing this also forces the signing secret to rotate — it decides what the
+                        signature attests to. <code>{body}</code> is mandatory.
+                    </small>
+                </div>
+
+                <!-- 7. Remaining event/auth settings. Every field above and below is shown
+                     unconditionally regardless of the selected Auth Mode — unlike the create form,
+                     nothing here is `required`, so hiding by mode would only cost the operator the
+                     ability to stage a value for a mode they're about to switch into. -->
                 <div class="form-group">
                     <label for="edit-webhook-auth-mode">Auth Mode <span>*</span></label>
                     <select id="edit-webhook-auth-mode" class="input-field select-field">
@@ -729,55 +877,15 @@
                 </div>
                 <p class="auth-mode-hint field-hint mb-4" id="edit-webhook-auth-mode-hint" aria-live="polite"></p>
 
-                <div class="form-group" id="edit-webhook-hmac-template-group">
-                    <label for="edit-webhook-hmac-template">HMAC Signature Template <span>*</span></label>
-                    <input type="text" id="edit-webhook-hmac-template" class="input-field font-mono"
-                           spellcheck="false" autocomplete="off">
+                <div class="form-group">
+                    <label for="edit-webhook-secret">New Secret <span class="text-muted text-sm">(optional)</span></label>
+                    <input type="password" id="edit-webhook-secret" placeholder="Leave blank to keep the current secret"
+                           class="input-field" autocomplete="off">
                     <small class="field-hint">
-                        Changing this also forces the signing secret to rotate — it decides what the
-                        signature attests to. <code>{body}</code> is mandatory.
+                        Only used if you supply one, or if repointing the URL/template/auth mode
+                        above forces a rotation — in which case a secret is generated for you and
+                        shown once if you leave this blank.
                     </small>
-                </div>
-
-                <div class="compact-grid">
-                    <div class="form-group" id="edit-webhook-secret-group">
-                        <label for="edit-webhook-secret">New Secret <span class="text-muted text-sm">(optional)</span></label>
-                        <input type="password" id="edit-webhook-secret" placeholder="Leave blank to keep the current secret"
-                               class="input-field" autocomplete="off">
-                        <small class="field-hint">
-                            Only used if you supply one, or if repointing the URL/template/auth mode
-                            above forces a rotation — in which case a secret is generated for you and
-                            shown once if you leave this blank.
-                        </small>
-                    </div>
-                    <div class="form-group" id="edit-webhook-api-key-group">
-                        <label for="edit-webhook-api-key">API Key
-                            <span id="edit-webhook-api-key-badge" class="badge badge-scope hidden">key configured</span>
-                        </label>
-                        <input type="password" id="edit-webhook-api-key" placeholder="Leave blank to keep the current key"
-                               class="input-field" autocomplete="off">
-                        <label class="checkbox-container mt-2">
-                            <input type="checkbox" id="edit-webhook-api-key-clear">
-                            <span class="checkmark"></span> Clear the configured API key
-                        </label>
-                        <small class="field-hint">
-                            Stored as given, never shown again. On a webhook that already carries a
-                            key, changing or clearing it is master-only.
-                        </small>
-                    </div>
-                </div>
-
-                <div class="compact-grid" id="edit-webhook-sig-transport-group">
-                    <div class="form-group" id="edit-webhook-sig-header-group">
-                        <label for="edit-webhook-sig-header">Signature Header</label>
-                        <input type="text" id="edit-webhook-sig-header" class="input-field font-mono"
-                               placeholder="X-Signature-256" autocomplete="off" spellcheck="false">
-                    </div>
-                    <div class="form-group" id="edit-webhook-sig-prefix-group">
-                        <label for="edit-webhook-sig-prefix">Signature Prefix</label>
-                        <input type="text" id="edit-webhook-sig-prefix" class="input-field font-mono"
-                               placeholder="sha256=" autocomplete="off" spellcheck="false">
-                    </div>
                 </div>
 
                 <div class="form-group">
@@ -790,6 +898,9 @@
                 <div class="form-group">
                     <label for="edit-webhook-template">Payload Template <span>*</span></label>
                     <textarea id="edit-webhook-template" required class="input-field font-mono" rows="3"></textarea>
+                    <small class="field-hint">
+                        <button type="button" class="btn-link" id="edit-webhook-vars-help-btn-2">See all template variables</button>.
+                    </small>
                 </div>
 
                 <div class="form-group">

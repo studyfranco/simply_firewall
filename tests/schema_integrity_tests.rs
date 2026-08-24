@@ -235,6 +235,9 @@ async fn seed_execution(db: &DatabaseConnection, webhook: Uuid) -> Uuid {
         is_success: Set(true),
         duration_ms: Set(5),
         response_body: Set(None),
+        resolved_target_url: Set(None),
+        target_address: Set(None),
+        cause: Set(None),
         created_at: Set(Utc::now().naive_utc()),
     })
     .exec(db)

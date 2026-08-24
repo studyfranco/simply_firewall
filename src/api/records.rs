@@ -323,7 +323,7 @@ pub(crate) async fn handle_ip_upsert(
         client_ip,
         action,
         Some(normalized_address.clone()),
-        Some(resolved_group_name),
+        Some(resolved_group_name.clone()),
         Some(format!("Added IP to group. Whitelist: {}", is_whitelist))
     ).await?;
 
@@ -332,6 +332,7 @@ pub(crate) async fn handle_ip_upsert(
         address: normalized_address,
         is_whitelist,
         group_id: Some(target_group_id),
+        group_name: Some(resolved_group_name),
         cause: payload.cause,
     };
     state.enqueue_webhook(event);
@@ -1051,6 +1052,7 @@ pub async fn delete_ip(
         address: record.target_address.clone(),
         is_whitelist: group.group_type == "whitelist",
         group_id: Some(group.id),
+        group_name: Some(group.name.clone()),
         cause: Some("Deleted via API".to_owned()),
     };
     state.enqueue_webhook(event);

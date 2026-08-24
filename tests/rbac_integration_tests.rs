@@ -5165,6 +5165,9 @@ async fn s4_webhook_executions_are_scoped_to_ownership_not_can_manage_keys() {
                 is_success: Set(true),
                 duration_ms: Set(5),
                 response_body: Set(None),
+                resolved_target_url: Set(None),
+                target_address: Set(None),
+                cause: Set(None),
                 created_at: Set(chrono::Utc::now().naive_utc()),
             }
             .insert(&db)
@@ -5281,6 +5284,9 @@ async fn s4_webhook_executions_endpoint_filters_paginates_and_rejects_unknown_fi
                 is_success: Set(is_success),
                 duration_ms: Set(5),
                 response_body: Set(None),
+                resolved_target_url: Set(None),
+                target_address: Set(None),
+                cause: Set(None),
                 created_at: Set(chrono::Utc::now().naive_utc()),
             }
             .insert(&db)
@@ -5358,6 +5364,281 @@ async fn s4_webhook_executions_endpoint_filters_paginates_and_rejects_unknown_fi
     // An unrecognized query parameter is refused, not silently ignored.
     let (status, body) = query("?not_a_real_filter=1".to_owned(), 9).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown query parameter must be a 400: {body}");
+}
+
+/// **`GET /api/webhooks/executions`'s newer filters**: `status` (success/failed/a numeric code),
+/// `group_id`, `ip`, `search` (webhook name / address / cause), and `from_date`/`to_date` each
+/// narrow the result set on their own, the way `webhook_id`/`event_type`/`is_success` already do —
+/// exercised separately from that test so a regression in one of these five is not masked by the
+/// others still passing.
+#[tokio::test]
+async fn s4_webhook_executions_endpoint_supports_rich_filters() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let group_a = insert_group_row(&db, "rich-filter-group-a").await;
+    let group_b = insert_group_row(&db, "rich-filter-group-b").await;
+
+    let seed_webhook = |name: &'static str, group_id: Uuid| {
+        let db = db.clone();
+        async move {
+            let webhook_id = Uuid::new_v4();
+            simply_ip_vault::entities::webhook_config::ActiveModel {
+                id: Set(webhook_id),
+                name: Set(name.to_owned()),
+                target_url: Set("https://example.com/hook".to_owned()),
+                secret_token: Set(String::new()),
+                auth_mode: Set("NONE".to_owned()),
+                api_key: Set(None),
+                hmac_template: Set(None),
+                signature_header: Set(None),
+                signature_prefix: Set(None),
+                headers_json: Set(None),
+                payload_template: Set("{}".to_owned()),
+                group_id: Set(group_id),
+                is_active: Set(true),
+                events: Set(None),
+                owner_key_id: Set(None),
+                created_at: Set(chrono::Utc::now().naive_utc()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            webhook_id
+        }
+    };
+    #[allow(clippy::too_many_arguments)]
+    let seed_execution = |webhook_id: Uuid,
+                          status_code: i32,
+                          is_success: bool,
+                          target_address: &'static str,
+                          cause: &'static str,
+                          age_hours: i64| {
+        let db = db.clone();
+        async move {
+            let created_at =
+                (chrono::Utc::now() - chrono::Duration::hours(age_hours)).naive_utc();
+            simply_ip_vault::entities::webhook_execution::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                webhook_id: Set(webhook_id),
+                event_type: Set("IP_ADD".to_owned()),
+                status_code: Set(Some(status_code)),
+                is_success: Set(is_success),
+                duration_ms: Set(5),
+                response_body: Set(None),
+                resolved_target_url: Set(Some(format!("https://receiver.example/{target_address}"))),
+                target_address: Set(Some(target_address.to_owned())),
+                cause: Set(Some(cause.to_owned())),
+                created_at: Set(created_at),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+    };
+
+    let hook_a = seed_webhook("alerting-hook", group_a).await;
+    let hook_b = seed_webhook("other-hook", group_b).await;
+    // hook_a: a success and a 503, both "recent" (0h old), one address/cause each.
+    seed_execution(hook_a, 200, true, "203.0.113.10", "first sighting", 0).await;
+    seed_execution(hook_a, 503, false, "203.0.113.11", "port scan", 0).await;
+    // hook_b: one success, deliberately old (200h) so the date-range filter has something to exclude.
+    seed_execution(hook_b, 200, true, "198.51.100.5", "unrelated", 200).await;
+
+    let query = |qs: String, ts: i64| {
+        let app = app.clone();
+        let master_key = master_key.clone();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .uri(format!("/api/webhooks/executions{qs}"))
+                .header("X-API-Key", &master_key)), ts, "");
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap_or(serde_json::Value::Null);
+            (status, body)
+        }
+    };
+
+    // `status=success` / `status=failed`.
+    let (status, body) = query("?status=success".to_owned(), 1).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 2, "both successes, across both webhooks: {body}");
+
+    let (status, body) = query("?status=failed".to_owned(), 2).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "exactly the one failed row: {body}");
+    assert_eq!(rows[0]["status_code"], 503);
+
+    // `status=<numeric code>` narrows to that exact status.
+    let (status, body) = query("?status=503".to_owned(), 3).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 1, "the numeric-code form matches status_code exactly: {body}");
+
+    // An unparseable, non-keyword status is a 400, not a silent no-op.
+    let (status, body) = query("?status=not-a-status".to_owned(), 4).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an invalid status filter must be refused: {body}");
+
+    // `group_id` narrows to the webhook currently targeting that group.
+    let (status, body) = query(format!("?group_id={group_b}"), 5).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only hook_b's execution, via its group: {body}");
+    assert_eq!(rows[0]["webhook_id"], hook_b.to_string());
+
+    // `ip` substring-matches the triggering event's address.
+    let (status, body) = query("?ip=203.0.113".to_owned(), 6).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 2, "both hook_a rows share the 203.0.113.x prefix: {body}");
+
+    // `search` matches webhook name, address, or cause — tried one at a time so a match on the
+    // wrong field can't hide a broken one.
+    let (status, body) = query("?search=alerting-hook".to_owned(), 7).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 2, "search matches by webhook name: {body}");
+
+    let (status, body) = query("?search=port+scan".to_owned(), 8).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "search matches by cause: {body}");
+    assert_eq!(rows[0]["cause"], "port scan");
+
+    let (status, body) = query("?search=198.51.100.5".to_owned(), 9).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 1, "search matches by address: {body}");
+
+    // `from_date` excludes the 200-hour-old row; a cutoff of "now minus 1 hour" as a Unix timestamp
+    // keeps only the two rows seeded at age 0.
+    let recent_cutoff = (chrono::Utc::now() - chrono::Duration::hours(1)).timestamp();
+    let (status, body) = query(format!("?from_date={recent_cutoff}"), 10).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 2, "from_date excludes the old row: {body}");
+
+    // `to_date` is the mirror image: a cutoff before the two recent rows keeps only the old one.
+    let old_cutoff = (chrono::Utc::now() - chrono::Duration::hours(100)).timestamp();
+    let (status, body) = query(format!("?to_date={old_cutoff}"), 11).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 1, "to_date excludes the two recent rows: {body}");
+}
+
+/// **`DELETE /api/webhooks/executions/{id}`**: master may delete any execution row; a non-master may
+/// delete only one belonging to a webhook it owns, and gets `404` — not `403` — for one it does not,
+/// matching every other handler's oracle discipline in this file. A successful delete actually
+/// removes the row, not just reports success.
+#[tokio::test]
+async fn s4_webhook_execution_delete_is_scoped_to_ownership() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (owner_id, owner_key) = insert_key(&db, "Owner", false, false, true, false).await;
+    let (_stranger_id, stranger_key) = insert_key(&db, "Stranger", false, false, true, false).await;
+    let group_id = insert_group_row(&db, "execution-delete-group").await;
+    grant_perm(&db, owner_id, group_id, true, true, true, false).await;
+
+    let webhook_id = Uuid::new_v4();
+    simply_ip_vault::entities::webhook_config::ActiveModel {
+        id: Set(webhook_id),
+        name: Set("owned-hook".to_owned()),
+        target_url: Set("https://example.com/hook".to_owned()),
+        secret_token: Set(String::new()),
+        auth_mode: Set("NONE".to_owned()),
+        api_key: Set(None),
+        hmac_template: Set(None),
+        signature_header: Set(None),
+        signature_prefix: Set(None),
+        headers_json: Set(None),
+        payload_template: Set("{}".to_owned()),
+        group_id: Set(group_id),
+        is_active: Set(true),
+        events: Set(None),
+        owner_key_id: Set(Some(owner_id)),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let seed_execution = || {
+        let db = db.clone();
+        async move {
+            let id = Uuid::new_v4();
+            simply_ip_vault::entities::webhook_execution::ActiveModel {
+                id: Set(id),
+                webhook_id: Set(webhook_id),
+                event_type: Set("IP_ADD".to_owned()),
+                status_code: Set(Some(200)),
+                is_success: Set(true),
+                duration_ms: Set(5),
+                response_body: Set(None),
+                resolved_target_url: Set(None),
+                target_address: Set(None),
+                cause: Set(None),
+                created_at: Set(chrono::Utc::now().naive_utc()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            id
+        }
+    };
+
+    let delete = |key: &str, id: Uuid, ts: i64| {
+        let app = app.clone();
+        let key = key.to_owned();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("DELETE")
+                .uri(format!("/api/webhooks/executions/{id}"))
+                .header("X-API-Key", &key)), ts, "");
+            app.oneshot(req).await.unwrap().status()
+        }
+    };
+
+    // A stranger — no relationship to the owning webhook at all — gets 404, not 403: the row's
+    // existence is not confirmable from outside the owner's own scope.
+    let exec_for_stranger_check = seed_execution().await;
+    assert_eq!(
+        delete(&stranger_key, exec_for_stranger_check, 1).await,
+        StatusCode::NOT_FOUND,
+        "a caller with no relationship to the owning webhook must not be able to delete its executions"
+    );
+    assert!(
+        simply_ip_vault::entities::webhook_execution::Entity::find_by_id(exec_for_stranger_check)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_some(),
+        "the refused delete must not have removed the row"
+    );
+
+    // The owner may delete its own execution, and the row is actually gone afterward.
+    let exec_for_owner = seed_execution().await;
+    assert_eq!(delete(&owner_key, exec_for_owner, 2).await, StatusCode::NO_CONTENT);
+    assert!(
+        simply_ip_vault::entities::webhook_execution::Entity::find_by_id(exec_for_owner)
+            .one(&db)
+            .await
+            .unwrap()
+            .is_none(),
+        "a successful delete must actually remove the row, not just report success"
+    );
+
+    // Deleting the same id again is a 404 — it is genuinely gone, not merely hidden.
+    assert_eq!(delete(&owner_key, exec_for_owner, 3).await, StatusCode::NOT_FOUND);
+
+    // Master may delete any execution, owner or not.
+    let exec_for_master = seed_execution().await;
+    assert_eq!(delete(&master_key, exec_for_master, 4).await, StatusCode::NO_CONTENT);
+
+    // A nonexistent id is a 404 for everyone, master included.
+    assert_eq!(delete(&master_key, Uuid::new_v4(), 5).await, StatusCode::NOT_FOUND);
 }
 
 // ─────────────────────────────────────────────────────────────

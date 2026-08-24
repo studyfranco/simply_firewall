@@ -37,6 +37,11 @@ pub struct WebhookEvent {
     pub is_whitelist: bool,
     /// Associated group ID
     pub group_id: Option<Uuid>,
+    /// The group's name at the moment the event was raised — carried alongside `group_id` so the
+    /// dispatcher's `$group_name` template variable can expand to an actual name rather than
+    /// requiring a database lookup from inside `prepare_dispatch` (a synchronous, DB-free function
+    /// by design). `None` only when no group is associated with the event at all.
+    pub group_name: Option<String>,
     /// Cause for the event
     pub cause: Option<String>,
 }

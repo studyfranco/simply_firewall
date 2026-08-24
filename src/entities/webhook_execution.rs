@@ -37,6 +37,20 @@ pub struct Model {
     /// no body to have kept in that case. Renamed from `error_message` by
     /// `m20260824_110000_webhook_execution_response_body`; see that migration's module header.
     pub response_body: Option<String>,
+    /// The fully resolved destination this attempt actually dialed — every `$variable` in
+    /// `webhook_configs.target_url` already expanded against the triggering event (see
+    /// `dispatch::resolve_event_variables`). May differ from the *current* `webhook_configs.target_url`
+    /// even for an unedited webhook, whenever the template itself varies per event. `None` on rows
+    /// from before `m20260824_140000_webhook_execution_event_context`, which predate the concept.
+    pub resolved_target_url: Option<String>,
+    /// The address the triggering event concerned — `WebhookEvent::address` at the moment this
+    /// attempt was dispatched. `None` on rows predating the same migration as `resolved_target_url`.
+    pub target_address: Option<String>,
+    /// The triggering event's freeform cause, if it had one. `None` either because the event carried
+    /// no cause or because this row predates the migration that added the column — the two are not
+    /// distinguished, matching how every other nullable column on this table already treats
+    /// "unknown" and "genuinely absent" as one state rather than two.
+    pub cause: Option<String>,
     /// When this attempt was made.
     pub created_at: DateTime,
 }

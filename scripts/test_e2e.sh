@@ -2496,6 +2496,92 @@ else
     warn "Edit-verification checks skipped (no local webhook receiver — see §13)."
 fi
 
+log_section "25c. Target URL Templating & the Executions Endpoint's Rich Filters/Delete"
+
+# `target_url` gained the same `$variable` templating `payload_template` already had — proven here
+# against the real local receiver: a webhook whose target_url contains `$action` must dial the
+# resolved path, not the literal template, and the resulting `webhook_executions` row must record
+# that resolved URL alongside the triggering event's address and cause.
+if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+    api_call POST "/api/groups" "$MASTER_KEY" '{"name":"tmpl-url-group"}'
+    check "200" "#25c create the group backing the templated-URL webhook"
+    TMPLURL_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"tmpl-url-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/tmpl-hooks/\$action\",\"payload_template\":\"{}\",\"group_id\":\"$TMPLURL_GROUP_ID\",\"auth_mode\":\"NONE\"}"
+    check "200" "#25c create a webhook whose target_url contains \$action"
+    TMPLURL_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/ban" "$MASTER_KEY" \
+        '{"target_address":"192.0.2.170","group_name":"tmpl-url-group","cause":"templating-e2e-cause"}'
+    check "200" "#25c IP_ADD to trigger the templated webhook"
+
+    TMPLURL_HITS=0
+    for _ in $(seq 1 20); do
+        TMPLURL_HITS=$(count_receiver_hits_for_path "/tmpl-hooks/IP_ADD")
+        [ "${TMPLURL_HITS:-0}" -ge 1 ] && break
+        sleep 0.2
+    done
+    check_local "$TMPLURL_HITS" "1" \
+        "the receiver was hit at the \$action-resolved path /tmpl-hooks/IP_ADD, not the literal template"
+
+    # The execution row must record the resolved URL and the triggering event's own address/cause —
+    # not just the webhook's (unresolved) target_url template.
+    EXEC_WAIT=0
+    for _ in $(seq 1 20); do
+        api_call GET "/api/webhooks/executions?webhook_id=$TMPLURL_HOOK_ID" "$MASTER_KEY"
+        EXEC_WAIT=$(echo "$RESP_BODY" | jq 'length')
+        [ "${EXEC_WAIT:-0}" -ge 1 ] && break
+        sleep 0.2
+    done
+    check "200" "#25c list this webhook's executions"
+    check_jq ".[0].resolved_target_url" "http://127.0.0.1:$RECEIVER_PORT/tmpl-hooks/IP_ADD" \
+        "the execution row's resolved_target_url has \$action already expanded"
+    check_jq ".[0].target_address" "192.0.2.170" "the execution row records the triggering event's address"
+    check_jq ".[0].cause" "templating-e2e-cause" "the execution row records the triggering event's cause"
+    TMPLURL_EXEC_ID=$(echo "$RESP_BODY" | jq -r '.[0].id')
+
+    # Rich filters, each proven to actually narrow (not merely accepted) against this real row.
+    api_call GET "/api/webhooks/executions?status=success" "$MASTER_KEY"
+    check_true '[.[] | select(.id == "'"$TMPLURL_EXEC_ID"'")] | length == 1' \
+        "#25c status=success includes the templated hook's successful delivery"
+
+    api_call GET "/api/webhooks/executions?search=templating-e2e-cause" "$MASTER_KEY"
+    check_true 'length == 1 and .[0].id == "'"$TMPLURL_EXEC_ID"'"' \
+        "#25c search matches by cause and returns exactly this row"
+
+    api_call GET "/api/webhooks/executions?ip=192.0.2.170" "$MASTER_KEY"
+    check_true 'length == 1 and .[0].id == "'"$TMPLURL_EXEC_ID"'"' \
+        "#25c ip filter matches the triggering event's address"
+
+    api_call GET "/api/webhooks/executions?group_id=$TMPLURL_GROUP_ID" "$MASTER_KEY"
+    check_true '[.[] | select(.id == "'"$TMPLURL_EXEC_ID"'")] | length == 1' \
+        "#25c group_id filter matches via the webhook's current group"
+
+    FUTURE_CUTOFF=$(( $(date +%s) + 3600 ))
+    api_call GET "/api/webhooks/executions?from_date=$FUTURE_CUTOFF" "$MASTER_KEY"
+    check_true '[.[] | select(.id == "'"$TMPLURL_EXEC_ID"'")] | length == 0' \
+        "#25c from_date an hour in the future excludes a row created now"
+
+    api_call GET "/api/webhooks/executions?status=bogus-status" "$MASTER_KEY"
+    check "400" "#25c an unrecognized status filter value is refused, not silently ignored"
+
+    # DELETE /api/webhooks/executions/{id} — the row is actually gone afterward, not just reported
+    # as deleted.
+    api_call DELETE "/api/webhooks/executions/$TMPLURL_EXEC_ID" "$MASTER_KEY"
+    check "204" "#25c delete the templated hook's execution row"
+    api_call GET "/api/webhooks/executions?webhook_id=$TMPLURL_HOOK_ID" "$MASTER_KEY"
+    check_true '[.[] | select(.id == "'"$TMPLURL_EXEC_ID"'")] | length == 0' \
+        "#25c the deleted execution row no longer appears in the listing"
+    api_call DELETE "/api/webhooks/executions/$TMPLURL_EXEC_ID" "$MASTER_KEY"
+    check "404" "#25c deleting the same execution id again is a 404 — it is genuinely gone"
+
+    api_call DELETE "/api/webhooks/$TMPLURL_HOOK_ID" "$MASTER_KEY"
+    check "204" "#25c delete the templated-URL webhook"
+else
+    warn "Target URL templating / executions rich-filter checks skipped (no local webhook receiver — see §13)."
+fi
+
 # ─────────────────────────────────────────────────────────────
 log_section "26. Convergence — Full-URI Signing, Anti-Replay & Fail-Closed Crypto"
 # ─────────────────────────────────────────────────────────────

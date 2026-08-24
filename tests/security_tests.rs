@@ -3134,6 +3134,9 @@ async fn webhook_execution_retention_purges_each_outcome_on_its_own_window() {
                 is_success: Set(is_success),
                 duration_ms: Set(10),
                 response_body: Set(None),
+                resolved_target_url: Set(None),
+                target_address: Set(None),
+                cause: Set(None),
                 created_at: Set(age_hours(hours_old)),
             }
             .insert(&db)
@@ -4651,6 +4654,7 @@ async fn test_webhook_queue_overflow_non_blocking() {
                 address: format!("198.51.100.{}", i % 250),
                 is_whitelist: false,
                 group_id: Some(group_id),
+                group_name: None,
                 cause: None,
             });
         }
