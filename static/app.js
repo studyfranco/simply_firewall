@@ -2354,12 +2354,16 @@ class FirewallClient {
 
     /**
      * The Edit Webhook modal's counterpart to `syncWebhookAuthFields()` — but unlike the create
-     * form, it does not hide fields by mode. The create form's field order puts the mode selector
-     * first, so hiding what it doesn't need reads as guidance; the edit modal's field order (Task 5)
-     * puts API Key/HMAC Header/Prefix/Template *above* Auth Mode, so a field disappearing because of
-     * a selector below it would read as the form losing data, not as help. Every field here already
-     * has a "leave blank to keep the current value" fallback, so nothing is lost by always showing
-     * all of them — only the hint text changes with the selected mode.
+     * form, it does not hide fields by mode, even though Auth Mode now sits directly above API
+     * Key/Signature Header/Signature Prefix/HMAC Template, the same position the create form uses
+     * to justify hiding what the selected mode doesn't need. The two forms still differ in what a
+     * field disappearing would mean: on the create form every hidden field is genuinely unset, so
+     * hiding it costs nothing. Here, every field can already hold a *saved* value the operator may
+     * want to inspect or leave untouched — switching Auth Mode back and forth must not make an
+     * existing API key or HMAC template blink in and out of the form, since that reads as data loss,
+     * not guidance. Every field already has a "leave blank to keep the current value" fallback, so
+     * nothing is lost by always showing all of them — only the hint text changes with the selected
+     * mode.
      */
     syncEditWebhookAuthFields() {
         const mode = document.getElementById('edit-webhook-auth-mode').value;

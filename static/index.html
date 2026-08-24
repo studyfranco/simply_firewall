@@ -820,7 +820,22 @@
                     </small>
                 </div>
 
-                <!-- 4. API Key. On a webhook that already carries a non-empty api_key
+                <!-- 4. Auth Mode. Every field below is shown unconditionally regardless of which
+                     mode is selected — unlike the create form, nothing here is `required`, so
+                     hiding a field by mode would only cost the operator the ability to stage a
+                     value for a mode they're about to switch into. -->
+                <div class="form-group">
+                    <label for="edit-webhook-auth-mode">Auth Mode <span>*</span></label>
+                    <select id="edit-webhook-auth-mode" class="input-field select-field">
+                        <option value="CANONICAL_V1">CANONICAL_V1 (Simply IP Vault / hook executor)</option>
+                        <option value="HMAC_ONLY">HMAC_ONLY (signature only, no key)</option>
+                        <option value="API_KEY_ONLY">API_KEY_ONLY (key header, no signature)</option>
+                        <option value="NONE">NONE (no auth headers)</option>
+                    </select>
+                </div>
+                <p class="auth-mode-hint field-hint mb-4" id="edit-webhook-auth-mode-hint" aria-live="polite"></p>
+
+                <!-- 5. API Key. On a webhook that already carries a non-empty api_key
                      ("privileged" — its dispatches authenticate as a real caller on the receiving
                      system), changing target_url, hmac_template, auth_mode, or api_key is
                      master-only; every other field here stays editable by any owner. -->
@@ -837,7 +852,7 @@
                     </small>
                 </div>
 
-                <!-- 5. HMAC Signature Header & Signature Prefix -->
+                <!-- 6. HMAC Signature Header & Signature Prefix -->
                 <div class="compact-grid">
                     <div class="form-group">
                         <label for="edit-webhook-sig-header">Signature Header</label>
@@ -851,7 +866,7 @@
                     </div>
                 </div>
 
-                <!-- 6. HMAC Signature Template -->
+                <!-- 7. HMAC Signature Template -->
                 <div class="form-group">
                     <label for="edit-webhook-hmac-template">HMAC Signature Template <span>*</span></label>
                     <input type="text" id="edit-webhook-hmac-template" class="input-field font-mono"
@@ -862,21 +877,7 @@
                     </small>
                 </div>
 
-                <!-- 7. Remaining event/auth settings. Every field above and below is shown
-                     unconditionally regardless of the selected Auth Mode — unlike the create form,
-                     nothing here is `required`, so hiding by mode would only cost the operator the
-                     ability to stage a value for a mode they're about to switch into. -->
-                <div class="form-group">
-                    <label for="edit-webhook-auth-mode">Auth Mode <span>*</span></label>
-                    <select id="edit-webhook-auth-mode" class="input-field select-field">
-                        <option value="CANONICAL_V1">CANONICAL_V1 (Simply IP Vault / hook executor)</option>
-                        <option value="HMAC_ONLY">HMAC_ONLY (signature only, no key)</option>
-                        <option value="API_KEY_ONLY">API_KEY_ONLY (key header, no signature)</option>
-                        <option value="NONE">NONE (no auth headers)</option>
-                    </select>
-                </div>
-                <p class="auth-mode-hint field-hint mb-4" id="edit-webhook-auth-mode-hint" aria-live="polite"></p>
-
+                <!-- 8. Remaining settings. -->
                 <div class="form-group">
                     <label for="edit-webhook-secret">New Secret <span class="text-muted text-sm">(optional)</span></label>
                     <input type="password" id="edit-webhook-secret" placeholder="Leave blank to keep the current secret"

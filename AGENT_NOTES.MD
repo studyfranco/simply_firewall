@@ -9385,3 +9385,66 @@ divergence, 0 unexplained**, exit 0 — the SQLite-pragma-count comparison flipp
 `apply_sqlite_pragmas` bodies genuinely differ; the comparison's own `expected` wording ("applies 4
 pragmas") was updated to "5" to match, since the divergence itself was already accounted for and
 accepted, just described with a now-stale number.
+
+### Addendum 8 — Edit Webhook field reorder and fluid modal width, no Rust touched
+
+Pure `static/` round: reorder one modal's field order, and stop the shared modal-width CSS from
+plateauing on wide monitors. Neither task touches `src/`, so `cargo check`/`clippy`/`test` were run
+to confirm nothing regressed, not because either was expected to move.
+
+**Task 1 — reorder.** Moved the Auth Mode `<select>` + hint `<p>` in `static/index.html`'s
+`#edit-webhook-modal` from the bottom of "remaining settings" to directly after Target Group,
+ahead of API Key/Signature Header/Signature Prefix/HMAC Template. Pure markup relocation —
+`openEditWebhookModal`/`submitEditWebhook`/`syncEditWebhookAuthFields` in `static/app.js` are all
+`getElementById`-driven, not order-dependent, so no JS logic changed. Did fix one doc comment that
+the move made false: `syncEditWebhookAuthFields()`'s comment used to justify *not* hiding fields by
+Auth Mode on the geometric argument that Auth Mode sat *below* the fields it governs (so hiding one
+would read as data loss appearing "for no reason"). After the move, Auth Mode sits *above* those
+fields — the same position the create form uses to justify hiding them — so the old geometric
+argument is gone. Rewrote the comment around the argument that still holds regardless of position:
+every field in the edit modal can carry a real saved value, unlike the create form where a hidden
+field is genuinely empty, so toggling Auth Mode must never make a saved API key or HMAC template
+blink in and out of the form. Deliberately did not restore mode-based field hiding — the task said
+"reorder," and changing what's visible is a separate, larger behavior change nobody asked for.
+
+**Task 2 — fluid width.** `.modal-card` and `.modal-card-form` (`static/style.css`) used
+`max-width: min(90vw, 480px)` / `min(92vw, 720px)`. A `min(vw, px)` cap stops growing the instant
+the `vw` term crosses the pixel value — every viewport past roughly 530px/783px rendered the
+*identical* card, so a 1440p and a 4K monitor drew the same box. Replaced both with `clamp(min,
+preferred-vw, max)`: `.modal-card` → `clamp(360px, 45vw, 760px)`, `.modal-card-form` → `clamp(420px,
+65vw, 1200px)`. `clamp()`'s middle term stays live all the way to its own `max`, so a wide monitor
+actually gets a wider card instead of hitting the same wall immediately. Kept a real (if much
+higher) ceiling rather than letting either grow unbounded to `100vw` — long unwrapped lines of form
+text get *harder* to scan past a point, so "fluid" was read as "keeps scaling well beyond the old
+cap," not "no cap at all." Both explanatory comments (which named the old 480px/720px/460px numbers
+outright) were rewritten to match. No id-specific modal width rules exist anywhere else in
+`style.css` — Execution Detail, Template Variables, and Edit Webhook all inherit purely from these
+two shared classes, so no other selectors needed touching.
+
+**Live verification.** Booted a throwaway server (`sqlite` + `INITIAL_MASTER_KEY`/
+`INITIAL_MASTER_SIGNING_SECRET`), created a group and a fully-configured `CANONICAL_V1` webhook via
+the API (real API key, HMAC template, custom sig header/prefix, long target URL) so the modal had
+non-empty content to render, then drove headless Chromium via the stdlib CDP client to log in
+through the dashboard's own login form (it signs the request in-browser, same as a real user),
+open the Edit Webhook modal, and read back both `getBoundingClientRect().width` and the DOM order
+of every `edit-webhook-*` field, at three viewport widths:
+
+- 1366×900 (standard): field order matched the required sequence exactly; modal width 887.9px
+  (= 65vw, mid-clamp, confirming the fluid middle term is live, not just the floor/ceiling).
+- 2560×1440 (wide): width 1200px (clamp ceiling reached — `65vw` would be 1664px, so the max
+  correctly caps it); noticeably wider than the old fixed 720px, still centered and readable.
+- 3440×1440 (ultra-wide): width still 1200px (ceiling, as designed — `65vw` here is 2236px);
+  confirms the cap is a deliberate readability ceiling, not an accidental low ceiling reappearing.
+
+Screenshotted at all three sizes; field order and layout both confirmed visually, not just via the
+measured numbers. (One process-level snag during setup: the first attempt's "click the Edit button"
+selector matched a same-labeled "Edit" button left over from the API Keys tab rather than the
+webhook row's own Edit button — caught immediately because the resulting screenshot showed the
+wrong modal, "Edit API Key" instead of "Edit Webhook"; fixed by locating the button through the
+webhook's own table row rather than by button text.)
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` 338 passed, 0 failed (unchanged — no Rust touched); `./scripts/test_e2e.sh` 705 checks
+passed, 0 failed (unchanged); `./scripts/verify_convergence.sh` 62 matching, 1 documented
+divergence, 0 unexplained, exit 0 (unchanged — this round never touched anything the convergence
+check tracks).

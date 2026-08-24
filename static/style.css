@@ -1608,12 +1608,18 @@ body {
     display: flex !important;
 }
 
-/* `min(90vw, 480px)`, not a bare fixed px value: on a narrow viewport the modal still fits with
-   room either side, and on a wide/ultra-wide one it grows past the old hard 460px ceiling instead
-   of sitting cramped in the middle of the screen regardless of how much space is actually there. */
+/* `clamp(min, preferred, max)`, not `min(vw, px)`: a `min()` cap stops growing the instant the
+   `vw` term crosses the pixel ceiling, so every viewport wider than roughly 530px (90vw = 480px)
+   rendered the *identical* 480px card — a phone and a 4K monitor drew the same box. `clamp()`
+   keeps the middle, viewport-relative term live all the way up to its own `max`, so a wide monitor
+   actually gets a wider card instead of hitting the same wall the old rule hit almost immediately.
+   The `max` here is still a real ceiling, not infinite growth to `100vw` — a short confirmation
+   prompt does not read better at 2000px than at 760px, it just gets harder to scan — but it is
+   roughly 1.6x the previous hard cap and, unlike that cap, is actually reachable by scaling rather
+   than being the *only* value wide viewports ever saw. */
 .modal-card {
     width: 100%;
-    max-width: min(90vw, 480px);
+    max-width: clamp(360px, 45vw, 760px);
     box-shadow: var(--shadow-lg);
     animation: fadeIn var(--transition-slow);
 }
@@ -1659,10 +1665,14 @@ body {
    overflowing the viewport on a short window. Wider than `.modal-card`'s own cap for the same
    reason it needs the extra height: these hold long target URLs, JSON payload templates, and
    (in the Execution Detail modal) a receiver's raw response body — content that reads as a wall of
-   wrapped fragments at 520px on anything wider than a phone. `min(92vw, 720px)` grows with the
-   viewport instead of leaving that space unused on a large screen. */
+   wrapped fragments at 520px on anything wider than a phone. Like `.modal-card`, this uses
+   `clamp()` rather than `min(vw, px)`: the old `min(92vw, 720px)` stopped growing the moment `92vw`
+   passed 720px — every viewport from a small laptop up through an ultra-wide monitor rendered the
+   same 720px card. The `clamp()` below keeps scaling with the viewport well past that point, so a
+   wide monitor actually gets to use the extra space for these longer, denser fields instead of
+   floating a fixed-size box in a sea of unused background. */
 .modal-card-form {
-    max-width: min(92vw, 720px);
+    max-width: clamp(420px, 65vw, 1200px);
     max-height: calc(100vh - 3rem);
     overflow-y: auto;
 }
