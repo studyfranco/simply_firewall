@@ -1232,6 +1232,27 @@ if [ "$WEBHOOK_RECEIVER_AVAILABLE" -eq 1 ]; then
         echo -e "$(ts)   ${RED}✗ FAIL${RESET} expected exactly 1 delivery after IP_ADD, got ${HITS:-0}" >&2
     fi
 
+    # The mock receiver capturing the hit above proves the HTTP call happened; it says nothing about
+    # whether the real background worker went on to record it in `webhook_executions`. Poll the real
+    # listing endpoint — against the live binary, not a Rust test process — so this is genuinely the
+    # whole path end to end: POST /api/ban -> real worker -> real HTTP dispatch -> a row visible
+    # through GET /api/webhooks/executions.
+    log "Polling GET /api/webhooks/executions for the row that dispatch must have recorded..."
+    EXEC_FOUND=0
+    for _ in $(seq 1 20); do
+        api_call GET "/api/webhooks/executions" "$MASTER_KEY"
+        if [ "$RESP_STATUS" == "200" ] && echo "$RESP_BODY" | jq -e --arg wid "$EVENT_FILTER_WEBHOOK_ID" \
+            'any(.[]; .webhook_id == $wid and .event_type == "IP_ADD" and .is_success == true and .status_code == 200)' \
+            >/dev/null 2>&1
+        then
+            EXEC_FOUND=1
+            break
+        fi
+        sleep 0.2
+    done
+    check_local "$EXEC_FOUND" "1" \
+        "the real dispatch above produced a matching webhook_executions row (event_type=IP_ADD, is_success=true, status_code=200)"
+
     log "Re-registering the same address (IP_UPDATE) — must NOT fire (not subscribed)..."
     api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.250","group_name":"event-filter-group","cause":"updated"}'
     check "200" "re-register the address (IP_UPDATE)"

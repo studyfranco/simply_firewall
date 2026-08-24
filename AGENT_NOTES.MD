@@ -8848,3 +8848,20 @@ the execution history within the timeout`); reverted, confirmed passing again.
 **Gate re-verification after the fix:** `cargo check`/`clippy -D warnings` clean; `cargo test`
 **319 passed** (unchanged — an existing test was extended, not a new one added), 0 failed;
 `./scripts/test_e2e.sh` **629 checks passed**, 0 failed.
+
+### Addendum 2 — the same gap in `scripts/test_e2e.sh`
+
+Asked to add the equivalent check there too. §13 ("Webhook Event Filtering") already drives the real
+path against the **actual compiled binary** (not a Rust test process) — a local Python mock receiver,
+a webhook scoped to `events: "IP_ADD"`, `POST /api/ban` to trigger it, and a hit-count check against
+the receiver's log. Added a poll loop immediately after the existing "IP_ADD was delivered" check:
+polls `GET /api/webhooks/executions` (as Master) for a row matching the webhook's id with
+`event_type=IP_ADD`, `is_success=true`, `status_code=200`, via `check_local` against a
+locally-computed found/not-found flag (the existing pattern for an assertion that isn't a single
+static expected value). New count: **630 checks** (up from 629).
+
+Mutation-tested against the real binary, not just reasoned about: rebuilt with the same
+`webhook_id = Uuid::new_v4()` defect from Addendum 1 planted in `dispatch_worker`, reran the full
+E2E suite, and the new check failed exactly as expected (`expected '1', got '0'`) with every other
+check still passing — confirming it fails for the right reason and not as a side effect of the
+mutation breaking something else. Reverted, rebuilt, reran clean at 630/630.
