@@ -501,6 +501,11 @@ class FirewallClient {
             searchId: 'webhook-group-search',
             valueId: 'webhook-group-id'
         });
+        this.editWebhookGroupCombobox = new SearchableSelect({
+            rootId: 'edit-webhook-group-combobox',
+            searchId: 'edit-webhook-group-search',
+            valueId: 'edit-webhook-group-id'
+        });
 
         this.init();
     }
@@ -1022,6 +1027,7 @@ class FirewallClient {
             this.groupFilterCombobox.setOptions(byName);
             this.rightsGroupCombobox.setOptions(byName);
             this.webhookGroupCombobox.setOptions(byId);
+            this.editWebhookGroupCombobox.setOptions(byId);
         } catch(e) {}
     }
 
@@ -1759,7 +1765,7 @@ class FirewallClient {
                 <td><span class="badge badge-scope">${escapeHtml(e.event_type)}</span></td>
                 <td>${this.executionStatusBadge(e)}</td>
                 <td class="text-sm">${e.duration_ms} ms</td>
-                <td class="text-sm">${escapeHtml(e.error_message || '-')}</td>
+                <td class="text-sm">${escapeHtml(e.response_body || '-')}</td>
             </tr>
         `;
         }).join('');
@@ -2171,6 +2177,27 @@ class FirewallClient {
             FirewallClient.AUTH_MODE_HINTS[mode] || '';
     }
 
+    /**
+     * The Edit Webhook modal's counterpart to `syncWebhookAuthFields()` — same field-visibility
+     * rule, applied to the edit form's own (edit-prefixed) elements. Nothing here is `required`:
+     * unlike the create form, every field in the edit modal has a fallback ("leave blank to keep
+     * the current value"), so hiding a field must never block submission of the rest.
+     */
+    syncEditWebhookAuthFields() {
+        const mode = document.getElementById('edit-webhook-auth-mode').value;
+        const needsSecret = mode === 'CANONICAL_V1' || mode === 'HMAC_ONLY';
+        const needsApiKey = mode === 'CANONICAL_V1' || mode === 'API_KEY_ONLY';
+        const needsTemplate = mode === 'CANONICAL_V1';
+
+        document.getElementById('edit-webhook-hmac-template-group').classList.toggle('hidden', !needsTemplate);
+        document.getElementById('edit-webhook-secret-group').classList.toggle('hidden', !needsSecret);
+        document.getElementById('edit-webhook-api-key-group').classList.toggle('hidden', !needsApiKey);
+        document.getElementById('edit-webhook-sig-transport-group').classList.toggle('hidden', !needsSecret);
+
+        document.getElementById('edit-webhook-auth-mode-hint').innerHTML =
+            FirewallClient.AUTH_MODE_HINTS[mode] || '';
+    }
+
     // ───────────────────────────────────────────────────────
     // Webhook custom headers — key/value editor
     // ───────────────────────────────────────────────────────
@@ -2416,10 +2443,11 @@ class FirewallClient {
     /**
      * Opens the Edit Webhook modal, pre-filled from the cached `GET /api/webhooks` row.
      *
-     * Auth mode, API-key presence, and the signature header/prefix are rendered read-only — `PUT
-     * /api/v1/webhooks/{id}` does not accept changes to any of them (see the modal's HTML comment
-     * for why), so showing them as editable inputs would let an operator "change" a value that
-     * silently reverts on save.
+     * Every stored field is editable here. `secret_token` and `api_key` are the exceptions to
+     * "pre-filled": both are write-only (no read endpoint ever returns them), so their inputs open
+     * blank with a "leave blank to keep the current value" placeholder rather than a stale or fake
+     * pre-fill — `submitEditWebhook()` omits either field from the request entirely when its input
+     * is empty, which is what makes blank mean "unchanged" rather than "clear it".
      */
     openEditWebhookModal(id) {
         const w = this.state.webhooks.find(w => w.id === id);
@@ -2431,25 +2459,21 @@ class FirewallClient {
         document.getElementById('edit-webhook-template').value = w.payload_template;
         document.getElementById('edit-webhook-is-active').checked = w.is_active;
 
-        const mode = w.auth_mode || 'HMAC_ONLY';
-        const badgeClasses = {
-            CANONICAL_V1: 'badge-canonical', HMAC_ONLY: 'badge-hmac-only',
-            API_KEY_ONLY: 'badge-api-key', NONE: 'badge-no-auth'
-        };
-        const modeBadge = document.getElementById('edit-webhook-auth-mode-badge');
-        modeBadge.textContent = mode;
-        modeBadge.className = `badge ${badgeClasses[mode] || 'badge-hmac-only'}`;
-        document.getElementById('edit-webhook-api-key-badge').classList.toggle('hidden', !w.has_api_key);
+        const group = this.state.groups.find(g => g.id === w.group_id);
+        document.getElementById('edit-webhook-group-search').value = group ? group.name : w.group_id;
+        document.getElementById('edit-webhook-group-id').value = w.group_id;
 
-        const needsTemplate = mode === 'CANONICAL_V1';
-        const needsSecret = mode === 'CANONICAL_V1' || mode === 'HMAC_ONLY';
-        document.getElementById('edit-webhook-hmac-template-group').classList.toggle('hidden', !needsTemplate);
+        const mode = w.auth_mode || 'HMAC_ONLY';
+        document.getElementById('edit-webhook-auth-mode').value = mode;
+        document.getElementById('edit-webhook-api-key-badge').classList.toggle('hidden', !w.has_api_key);
+        document.getElementById('edit-webhook-api-key').value = '';
+        document.getElementById('edit-webhook-api-key').disabled = false;
+        document.getElementById('edit-webhook-api-key-clear').checked = false;
         document.getElementById('edit-webhook-hmac-template').value = w.hmac_template || '';
-        document.getElementById('edit-webhook-secret-group').classList.toggle('hidden', !needsSecret);
         document.getElementById('edit-webhook-secret').value = '';
-        document.getElementById('edit-webhook-sig-transport-hint').textContent = needsSecret
-            ? `Signature sent in ${w.signature_header}, prefixed "${w.signature_prefix}". Not editable here.`
-            : '';
+        document.getElementById('edit-webhook-sig-header').value = w.signature_header || '';
+        document.getElementById('edit-webhook-sig-prefix').value = w.signature_prefix || '';
+        this.syncEditWebhookAuthFields();
 
         const events = w.events ? w.events.split(',').map(s => s.trim()) : ['IP_ADD', 'IP_UPDATE', 'IP_DELETE'];
         document.getElementById('edit-webhook-event-add').checked = events.includes('IP_ADD');
@@ -2482,9 +2506,17 @@ class FirewallClient {
         }
         const events = checkedEvents.length === Object.keys(eventKeys).length ? null : checkedEvents.join(',');
 
+        const groupId = document.getElementById('edit-webhook-group-id').value;
+        if (!groupId) {
+            this.showToast('Please select a valid target group from the list', 'error');
+            return;
+        }
+
         const payload = {
             name: document.getElementById('edit-webhook-name').value,
             target_url: document.getElementById('edit-webhook-url').value,
+            group_id: groupId,
+            auth_mode: document.getElementById('edit-webhook-auth-mode').value,
             payload_template: document.getElementById('edit-webhook-template').value,
             is_active: document.getElementById('edit-webhook-is-active').checked,
             events
@@ -2495,6 +2527,23 @@ class FirewallClient {
         }
         const newSecret = document.getElementById('edit-webhook-secret').value;
         if (newSecret) payload.secret_token = newSecret;
+
+        // `api_key` is write-only, so — like the secret above — a blank input means "leave it as
+        // is" and is left out of the request entirely, not sent as an empty string. Clearing an
+        // existing key is instead an explicit action (the checkbox), since an empty string here has
+        // its own meaning to the server: it wipes the stored key rather than leaving it untouched.
+        const newApiKey = document.getElementById('edit-webhook-api-key').value;
+        const clearApiKey = document.getElementById('edit-webhook-api-key-clear').checked;
+        if (clearApiKey) {
+            payload.api_key = '';
+        } else if (newApiKey) {
+            payload.api_key = newApiKey;
+        }
+
+        if (!document.getElementById('edit-webhook-sig-transport-group').classList.contains('hidden')) {
+            payload.signature_header = document.getElementById('edit-webhook-sig-header').value.trim();
+            payload.signature_prefix = document.getElementById('edit-webhook-sig-prefix').value;
+        }
 
         const headers = this.editHeaderMap();
         payload.headers_json = Object.keys(headers).length > 0 ? JSON.stringify(headers) : null;
@@ -2738,6 +2787,15 @@ class FirewallClient {
         });
         document.getElementById('edit-webhook-headers-add').addEventListener('click', () => this.addEditHeaderRow());
         document.getElementById('edit-webhook-test').addEventListener('click', () => this.testWebhook());
+        document.getElementById('edit-webhook-auth-mode').addEventListener('change', () => this.syncEditWebhookAuthFields());
+        // "Clear the configured API key" and typing a replacement are mutually exclusive actions;
+        // checking the box disables the text field so the two can't be set at once and leave it
+        // ambiguous which one submitEditWebhook() should honour.
+        document.getElementById('edit-webhook-api-key-clear').addEventListener('change', (e) => {
+            const input = document.getElementById('edit-webhook-api-key');
+            input.disabled = e.target.checked;
+            if (e.target.checked) input.value = '';
+        });
         document.addEventListener('keydown', (e) => {
             if (e.key !== 'Escape') return;
             if (!document.getElementById('edit-webhook-modal').classList.contains('hidden')) {

@@ -344,6 +344,24 @@ pub struct UpdateWebhookPayload {
     pub events: Option<String>,
     /// Enable or disable dispatching.
     pub is_active: Option<bool>,
+    /// New target IP group. Subject to the same `can_read` check `create_webhook` applies — a
+    /// non-master caller may only retarget a webhook onto a group it can already read. Not gated by
+    /// the privileged-webhook rule below: it changes which events trigger dispatch, not where a
+    /// credential is sent or what is signed.
+    pub group_id: Option<Uuid>,
+    /// New auth mode: `"CANONICAL_V1"`, `"BODY_ONLY"`, `"API_KEY_ONLY"`, or `"NONE"`. Changing into a
+    /// signing mode forces `secret_token` rotation, the same as repointing does — see
+    /// [`update_webhook`].
+    pub auth_mode: Option<String>,
+    /// New `X-API-Key` value. An empty (or whitespace-only) string clears it; a non-empty string
+    /// replaces it. On a webhook that is *already* privileged (a non-empty `api_key` stored today),
+    /// changing this is master-only — see [`update_webhook`]'s privileged-webhook gate.
+    pub api_key: Option<String>,
+    /// New header the signature is sent in. Empty (or whitespace-only) clears it back to the default
+    /// (`X-Signature-256`).
+    pub signature_header: Option<String>,
+    /// New prefix on the hex digest. `Some("")` sends a bare digest; omit to leave unchanged.
+    pub signature_prefix: Option<String>,
 }
 
 
@@ -363,11 +381,13 @@ pub struct UpdateWebhookResponse {
 }
 
 
-/// Handles `PUT /api/v1/webhooks/{id}` — edits a webhook in place.
+/// Handles `PUT /api/v1/webhooks/{id}` — edits a webhook in place. Every stored field is editable
+/// this way: name, target, group, auth mode, secret, api key, headers, payload template, event
+/// filter, signature header/prefix, and active state.
 ///
-/// **Repointing a webhook invalidates its secret.** If `target_url` or `hmac_template` changes, the
-/// `secret_token` is replaced — with the caller's own value if it supplied one, otherwise with a
-/// freshly generated secret returned once in this response.
+/// **Repointing a webhook invalidates its secret.** If `target_url`, `hmac_template`, or `auth_mode`
+/// changes into a signing mode, the `secret_token` is replaced — with the caller's own value if it
+/// supplied one, otherwise with a freshly generated secret returned once in this response.
 ///
 /// This is the anti-hijack property. `secret_token` is write-only: no endpoint returns it, so a
 /// caller who can edit a webhook cannot read the secret it currently signs with. Without forced
@@ -379,7 +399,18 @@ pub struct UpdateWebhookResponse {
 ///
 /// Changing `hmac_template` is treated identically: the template decides which bytes the signature
 /// covers, so a caller who can rewrite it (e.g. to a constant that ignores `{body}`) can make the
-/// existing secret vouch for content it never saw.
+/// existing secret vouch for content it never saw. Changing `auth_mode` into a signing mode is
+/// treated the same way for the mirror-image reason: a secret that was never chosen as (or was
+/// appropriate for) an HMAC key should not silently become one.
+///
+/// **A privileged webhook's identity fields are master-only to edit.** A webhook that already
+/// carries a non-empty `api_key` authenticates as a real caller on the receiving system — changing
+/// its `target_url`, `hmac_template`, `auth_mode`, or `api_key` is master-only, on top of the
+/// rotation above, for the same reason a repoint alone would not be safe: none of those changes are
+/// undone by rotating `secret_token`, since the `api_key` itself belongs to the remote system and is
+/// never rotated by this endpoint. Every other field on a privileged webhook — name, group, payload
+/// template, event filter, signature header/prefix, active state — stays editable by any
+/// `can_manage_webhooks` holder that owns it.
 pub async fn update_webhook(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
@@ -437,6 +468,32 @@ pub async fn update_webhook(
         ));
     }
 
+    // Same `can_read` check `create_webhook` applies to the group a webhook is created against —
+    // retargeting one onto a group the caller cannot read would be an equivalent way to reach data
+    // outside the caller's own scope, just via an edit instead of a fresh POST.
+    if let Some(group_id) = payload.group_id
+        && group_id != target.group_id
+        && !key.is_master
+    {
+        let perm = caller_group_permission(&state.db, key.id, group_id).await?;
+        if !perm.is_some_and(|p| p.can_read) {
+            return Err(AppError::Forbidden(
+                "Permission denied: you have no read access to the target group".to_owned(),
+            ));
+        }
+    }
+
+    // Rejected rather than silently defaulted — same reasoning as `create_webhook`.
+    let requested_mode = match &payload.auth_mode {
+        Some(raw) => Some(webhook_config::AuthMode::parse(raw).ok_or_else(|| {
+            AppError::InvalidInput(format!(
+                "Invalid auth_mode '{raw}': must be one of {}",
+                webhook_config::AuthMode::ALL.join(", ")
+            ))
+        })?),
+        None => None,
+    };
+
     // Compared against the *effective* current values so that setting a field to what it already
     // holds is not treated as a repoint — an idempotent PUT from a dashboard that submits every
     // field on every save must not churn the secret on each click.
@@ -449,36 +506,70 @@ pub async fn update_webhook(
         .filter(|t| !t.is_empty())
         .is_some_and(|t| t != effective_template);
 
-    let mode = webhook_config::AuthMode::from_stored(&target.auth_mode);
+    let current_mode = webhook_config::AuthMode::from_stored(&target.auth_mode);
+    let auth_mode_changed = requested_mode.is_some_and(|m| m != current_mode);
+    let effective_mode = requested_mode.unwrap_or(current_mode);
+
+    // Empty strings normalize to `None`, matching `create_webhook`'s own treatment — "field present
+    // but blank" and "field absent" mean the same thing everywhere downstream.
+    let requested_api_key = payload
+        .api_key
+        .as_deref()
+        .map(str::trim)
+        .map(|v| if v.is_empty() { None } else { Some(v.to_owned()) });
+    let api_key_changed = requested_api_key.is_some();
+    let effective_api_key = match &requested_api_key {
+        Some(new_value) => new_value.clone(),
+        None => target.api_key.clone(),
+    };
 
     // A *privileged* webhook carries a credential the receiver recognizes as an identity — an
     // `api_key`, which is how instance chaining works (`AGENT.MD` §4): its dispatches authenticate
-    // as a real API caller on the receiving system. Repointing one aims a working credential at a
-    // destination of the editor's choosing, which forced rotation alone does not undo, because the
-    // `api_key` is not rotated and cannot be (it belongs to the remote system, not this one).
+    // as a real API caller on the receiving system. Repointing one, or changing what it signs, aims
+    // a working credential at a destination of the editor's choosing; changing the auth mode or the
+    // `api_key` value itself achieves the same hijack by other means — forced secret rotation alone
+    // does not undo any of these, because the `api_key` is not rotated and cannot be (it belongs to
+    // the remote system, not this one).
     //
-    // So for these, changing the destination or what the signature attests to is master-only. Every
-    // other property — name, payload template, event filter, enabled/disabled — stays editable by
-    // any `can_manage_webhooks` holder, and non-privileged webhooks are unaffected.
-    if (url_changed || template_changed)
+    // So for these four fields, editing an *already-privileged* webhook is master-only. Every other
+    // property — name, payload template, event filter, group, enabled/disabled, signature header and
+    // prefix — stays editable by any `can_manage_webhooks` holder, and non-privileged webhooks are
+    // unaffected. (A non-master owner may still freely *create* a privileged webhook, or set an
+    // `api_key` on one that doesn't have one yet — this gate is about editing a credential that is
+    // already live, not about a non-master ever holding one.)
+    if (url_changed || template_changed || auth_mode_changed || api_key_changed)
         && target.api_key.as_deref().is_some_and(|k| !k.is_empty())
         && !key.is_master
     {
         tracing::warn!(
-            "Blocked webhook repointing: key {} attempted to alter target_url/hmac_template on \
-             privileged webhook '{}' (carries an api_key)",
+            "Blocked webhook edit: key {} attempted to alter target_url/hmac_template/auth_mode/\
+             api_key on privileged webhook '{}' (carries an api_key)",
             key.prefix,
             target.name
         );
         return Err(AppError::Forbidden(
             "This webhook sends an api_key credential; only a master key may change its \
-             target_url or hmac_template"
+             target_url, hmac_template, auth_mode, or api_key"
                 .to_owned(),
         ));
     }
+
+    // The same per-mode preconditions `create_webhook` enforces, checked against the *effective*
+    // post-update state so a transition into a mode this webhook cannot yet satisfy is refused up
+    // front rather than saved and left to fail silently on the next dispatch.
+    if effective_mode == webhook_config::AuthMode::ApiKeyOnly && effective_api_key.is_none() {
+        return Err(AppError::InvalidInput(
+            "auth_mode 'API_KEY_ONLY' requires a non-empty api_key".to_owned(),
+        ));
+    }
+
     // Only the signing modes have a secret worth protecting; forcing a rotation on API_KEY_ONLY or
-    // NONE would mint a secret that is never used and cannot be verified against anything.
-    let must_rotate = (url_changed || template_changed) && mode.requires_secret();
+    // NONE would mint a secret that is never used and cannot be verified against anything. A mode
+    // change into a signing mode rotates too, on the same anti-hijack logic as a repoint: a secret
+    // that was never meant to be used as an HMAC key (or was appropriate under a different mode)
+    // should not be inherited silently.
+    let must_rotate =
+        (url_changed || template_changed || auth_mode_changed) && effective_mode.requires_secret();
 
     let supplied_secret = payload.secret_token.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let mut generated_secret = None;
@@ -494,6 +585,17 @@ pub async fn update_webhook(
         }
         (false, None) => None,
     };
+
+    // Defensive final check: belt-and-braces given `must_rotate` should already cover every
+    // transition into a signing mode, but this keeps the invariant enforced on every path rather
+    // than resting entirely on that one computation staying correct as the function grows.
+    let final_secret_present = new_secret.is_some() || !target.secret_token.is_empty();
+    if effective_mode.requires_secret() && !final_secret_present {
+        return Err(AppError::InvalidInput(format!(
+            "auth_mode '{}' computes an HMAC and requires a non-empty secret_token",
+            effective_mode.as_str()
+        )));
+    }
 
     let mut active: webhook_config::ActiveModel = target.clone().into();
     if let Some(name) = payload.name {
@@ -520,12 +622,27 @@ pub async fn update_webhook(
     if let Some(secret) = new_secret {
         active.secret_token = Set(secret);
     }
+    if let Some(group_id) = payload.group_id {
+        active.group_id = Set(group_id);
+    }
+    if let Some(mode) = requested_mode {
+        active.auth_mode = Set(mode.as_str().to_owned());
+    }
+    if requested_api_key.is_some() {
+        active.api_key = Set(effective_api_key.clone());
+    }
+    if let Some(header) = &payload.signature_header {
+        active.signature_header = Set(Some(header.trim().to_owned()).filter(|h| !h.is_empty()));
+    }
+    if let Some(prefix) = payload.signature_prefix {
+        active.signature_prefix = Set(Some(prefix));
+    }
 
     let updated = active.update(&state.db).await?;
 
     let detail = if must_rotate {
         format!(
-            "Updated webhook '{}' (repointed — secret_token rotated)",
+            "Updated webhook '{}' (secret_token rotated)",
             updated.name
         )
     } else {

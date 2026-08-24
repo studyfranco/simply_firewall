@@ -8952,3 +8952,131 @@ delivery still landed on the pre-edit path). Reverted, rebuilt clean.
 test, reverted with no diff); `cargo test` unchanged at 321; `./scripts/test_e2e.sh` **661 checks
 passed** (up from 630: +31 — whitelist parity + edit-verification), 0 failed;
 `./scripts/verify_convergence.sh` 63 matching, exit 0.
+
+### Addendum 5 — response body saved on every dispatch, every webhook field made editable, whitelist parity re-verified live
+
+Three requests together: (1) save whatever a webhook's receiver says back on **every** dispatch
+attempt, not only failures — `webhook_executions.error_message` had been failure-only, and even
+then held a computed `"HTTP {status}"` string rather than the receiver's actual body; (2) make
+every `webhook_configs` column genuinely editable through `PUT /api/webhooks/{id}`, back and
+front, with tests — `group_id`, `auth_mode`, `api_key`, `signature_header`, and `signature_prefix`
+had been fixed at creation, a limitation Addendum 4 had confirmed as deliberate and correct at the
+time, which this addendum now supersedes; (3) confirm `/api/white` genuinely works, on request
+rather than on trust in Addendum 4's own §24c write-up.
+
+**Task 1 — response body, every outcome.** Migration `m20260824_110000` renames
+`webhook_executions.error_message` → `response_body` (a `Table::alter().rename_column`, not a new
+column — the old one was already "whatever the receiver said back", just too narrowly scoped; see
+the migration's own module header for why a rename was chosen over a second overlapping field).
+`dispatch::attempt_delivery` now reads and returns the response body whenever a response was
+received at all, success included — previously the body was read only on a non-2xx status.
+`dispatch_with_retries_config` and `send_test_dispatch_with_privacy` both now persist that body in
+preference to the computed `"HTTP {status}"`/error-summary reason, via a `detail = body.or(reason)`
+pattern at each of the four call sites (success, permanent failure, retry, exhausted-retry).
+`static/app.js`'s Executions tab reads `e.response_body` instead of `e.error_message`.
+
+Two new unit tests directly on `attempt_delivery` and `dispatch_with_retries_config`, against a raw
+TCP test server (`spawn_body_sequence_server`, a body-bearing sibling of the existing
+`spawn_status_sequence_server`) proving: a 200 with a JSON body returns that body, not `None`; a
+403 with a body persists the body, not the computed `"HTTP 403"` reason. **Mutation-tested both**:
+reverting the success-path body capture to `None`, and reverting the failure-path `detail` back to
+`Some(&reason)`, each made the matching new test fail with the exact expected diff (`None` vs
+`Some("...")`, or the computed reason string vs the real body) — reverted, clean again.
+
+**Task 2 — every field editable.** `UpdateWebhookPayload` gains `group_id`, `auth_mode`, `api_key`,
+`signature_header`, `signature_prefix`. `update_webhook` mirrors `create_webhook`'s own validation
+for each: the same `can_read`-on-target-group check (only when `group_id` is actually changing),
+the same `auth_mode` parse-or-400, the same `API_KEY_ONLY` needs-a-key precondition, checked against
+the *effective* post-update state rather than the raw payload so a transition that only becomes
+valid once combined with another field in the same request (e.g. `auth_mode: API_KEY_ONLY` +
+`api_key: "..."` together) is accepted.
+
+The security-relevant extension: the pre-existing "privileged webhook" gate — a webhook holding a
+non-empty `api_key` is master-only to repoint (§25's own long-standing rule, since its dispatches
+authenticate as a real caller on the receiving system and forced secret rotation doesn't undo that)
+— previously covered only `target_url`/`hmac_template`. Changing `auth_mode` or `api_key` on an
+already-privileged webhook is an equivalent hijack by other means (downgrading verification
+entirely, or swapping the credential outright) and is now gated the same way. `group_id` is
+deliberately **not** added to that gate — retargeting only changes which events trigger dispatch,
+never where a credential is sent or what is signed — so a non-master owner may still retarget a
+privileged webhook's group, subject only to the ordinary `can_read` check. `signature_header`/
+`signature_prefix` are likewise ungated: they affect how the signature is transported, not what is
+signed or where. `must_rotate` gains `auth_mode_changed` as a trigger, on the same logic as a
+repoint — a secret that was never chosen as (or appropriate for) an HMAC key must not be inherited
+silently into a new signing use — plus a defensive final check (`effective_mode.requires_secret() &&
+!final_secret_present` → 400) that would catch the same defect even if `must_rotate`'s own
+computation were ever wrong.
+
+Frontend: the Edit Webhook modal's "Auth Mode (fixed at creation)" read-only badge became a real
+`<select>`, wired through a new `syncEditWebhookAuthFields()` (the edit-modal counterpart to the
+create form's `syncWebhookAuthFields()`, minus the `required` attributes — every edit field has a
+"leave blank to keep the current value" fallback, so hiding one must never block the rest of the
+form from submitting). Added: a group combobox (reusing the same `SearchableSelect` the create form
+and Manage Access modal already use), an API-key input with an explicit "Clear the configured API
+key" checkbox (needed because the field is write-only — an empty *input* has to mean "leave
+unchanged", so clearing needs its own affirmative action, distinct from typing a replacement), and
+editable signature header/prefix inputs. `secret_token` and `api_key` alike open blank with a
+placeholder rather than pre-filled, matching their write-only nature server-side.
+
+**A real CSS bug found and fixed while UI-verifying this**: the auth-mode select and its
+description hint were first laid out with the create form's own `.compact-grid.auth-mode-row`
+(a `minmax(230px, 20rem) 1fr` two-column grid, falling back to one column only under a `700px`
+*viewport* media query). The modal card is capped at `max-width: 520px` regardless of viewport
+width, so inside the modal the two columns had nowhere to fit and the hint box rendered overlapping
+the field above it — caught by actually opening the modal in a headless browser and looking at the
+screenshot, not by reading the HTML. Fixed by stacking the two elements as ordinary sibling
+`.form-group`s instead, matching how every other field in this modal already lays out; confirmed
+visually correct after the fix.
+
+**Verified live end-to-end**, not just in Rust tests: booted a throwaway instance, seeded groups and
+a privileged webhook via signed `curl` calls, then drove the dashboard in headless Chromium
+(`cdp.py`, the stdlib-only CDP client from earlier this session — no `chromium-cli`/Playwright
+available here) through: opening the Edit modal on a `CANONICAL_V1`+`api_key` webhook and confirming
+every field pre-fills correctly (group name resolved from `group_id`, mode, sig header/prefix,
+`has_api_key` badge); switching mode to `NONE` and confirming the mode-dependent fields hide;
+retargeting the group and renaming the signature header in one save, then confirming via a fresh
+`GET /api/webhooks` that both actually changed server-side; and, logged in as a non-master owner of
+its own privileged webhook, attempting to change `auth_mode` and getting the `403` toast rendered
+inline with the modal staying open (not just a raw HTTP status checked programmatically).
+
+New backend tests (`tests/security_tests.rs`, mutation-tested individually — each mutation made its
+matching test fail for the stated reason, then reverted):
+- `attack_editing_a_privileged_webhooks_auth_mode_or_api_key_is_master_only` — the gate extension:
+  a non-master owner is refused on `auth_mode`/`api_key`, still allowed to rename, and a master can
+  do both.
+- `update_webhook_group_id_change_is_scoped_by_can_read_not_by_the_privileged_gate` — retargeting a
+  *privileged* webhook is refused onto an unreadable group and allowed onto a readable one, by the
+  same non-master owner the gate above just refused on other fields.
+- `attack_changing_auth_mode_into_a_signing_mode_forces_secret_rotation` — `NONE` → `CANONICAL_V1`
+  without a supplied secret still yields a generated one and `secret_rotated: true`.
+- `update_webhook_rejects_api_key_only_transition_without_a_key` — `400` without a key, `200` once
+  one is supplied in the same request.
+
+`scripts/test_e2e.sh` gained **§25a "Every Webhook Field Is Editable"** (new, between §25 and the
+existing §25b): all five fields edited individually against a live server, the `API_KEY_ONLY`
+transition's 400-then-200 sequence, and the extended privileged-webhook gate reusing §25's own
+"manager creates its own webhook, so it is the owner" pattern for a fresh privileged fixture (§25's
+original `PRIV_HOOK_ID` is deleted by the time this section runs). Mutation-tested by reverting the
+Rust gate extension and rerunning the full suite: exactly the two new `403`-expecting checks failed
+(got `200` instead), nothing else — reverted, clean again.
+
+**Task 3 — `/api/white` re-verified.** Re-ran the full `test_e2e.sh` rather than re-reading the
+code: §24c ("Whitelist Parity: Update, Soft Delete, Restore, Hard Delete", added by Addendum 4) logs
+two real `POST /api/white` calls against the live server and 15 passing checks covering create,
+re-registration-as-update, soft delete, trash visibility, restore, and hard delete — all against a
+`group_type: "whitelist"` group specifically, not inferred from the banlist path. Confirmed passing
+in this run with 0 failures in that section; `/api/white` is not a second-class citizen in the
+suite, it has its own dedicated lifecycle coverage since Addendum 4.
+
+**A tooling near-miss worth recording**: while drafting this addendum, a `Write` call was issued
+against `AGENT_NOTES.MD` with placeholder content instead of `Edit`, truncating the file to one
+line. Recovered immediately via `git checkout -- AGENT_NOTES.MD` — the working-tree copy was
+byte-identical to the committed `HEAD` version (confirmed by exact line-count and tail-content
+match against a `Read` taken moments before), so nothing was actually lost. Recorded here as a
+reminder that `Write` unconditionally replaces a file's entire content and must never be used for
+an addition to an existing document — `Edit` is the only tool that appends.
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` **328 passed** (up from 321: +3 `dispatch.rs` unit tests, +4 `security_tests.rs`
+cases), 0 failed; `./scripts/test_e2e.sh` **686 checks passed** (up from 661: +25, §25a), 0 failed;
+`./scripts/verify_convergence.sh` 63 matching, 0 unexplained divergences, exit 0.

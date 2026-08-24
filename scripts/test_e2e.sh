@@ -2331,6 +2331,99 @@ check "204" "delete the privileged webhook"
 api_call DELETE "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY"
 check "204" "delete the hijack-target webhook"
 
+log_section "25a. Every Webhook Field Is Editable"
+
+# `UpdateWebhookPayload` used to carry only name/target_url/hmac_template/secret_token/
+# headers_json/payload_template/events/is_active — group_id, auth_mode, api_key,
+# signature_header, and signature_prefix were fixed at creation. This section proves each of
+# those five is now genuinely settable through `PUT /api/webhooks/{id}`, and that the
+# privileged-webhook master-only gate (§25 above, previously scoped to target_url/hmac_template
+# only) now also covers auth_mode and api_key changes on an already-privileged webhook.
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"editfields-group-a"}'
+check "200" "#25a create the webhook's starting group"
+EDITFIELDS_GROUP_A=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"editfields-group-b"}'
+check "200" "#25a create a second group to retarget onto"
+EDITFIELDS_GROUP_B=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"editfields-hook\",\"target_url\":\"https://editfields.example.com/hook\",\"payload_template\":\"{}\",\"group_id\":\"$EDITFIELDS_GROUP_A\",\"auth_mode\":\"NONE\"}"
+check "200" "#25a create a non-privileged webhook with no auth"
+EDITFIELDS_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+# group_id: retargeting a non-privileged webhook onto another readable group is a plain edit.
+api_call PUT "/api/webhooks/$EDITFIELDS_HOOK_ID" "$MASTER_KEY" \
+    "{\"group_id\":\"$EDITFIELDS_GROUP_B\"}"
+check "200" "#25a group_id is editable"
+check_jq ".group_id" "$EDITFIELDS_GROUP_B" "#25a the webhook now reports the new group_id"
+
+# auth_mode: NONE -> HMAC_ONLY needs a secret; omitting one still works because the transition
+# itself forces a rotation, exactly like a repoint does.
+api_call PUT "/api/webhooks/$EDITFIELDS_HOOK_ID" "$MASTER_KEY" '{"auth_mode":"HMAC_ONLY"}'
+check "200" "#25a auth_mode is editable, and a transition into a signing mode is accepted without an explicit secret"
+check_jq ".auth_mode" "HMAC_ONLY" "#25a the webhook now reports the new auth_mode"
+check_true '.secret_rotated == true' "#25a transitioning into a signing mode rotates the secret, same as a repoint"
+
+# signature_header / signature_prefix: freely editable, not gated by anything.
+api_call PUT "/api/webhooks/$EDITFIELDS_HOOK_ID" "$MASTER_KEY" \
+    '{"signature_header":"X-Custom-Sig","signature_prefix":""}'
+check "200" "#25a signature_header and signature_prefix are editable"
+check_jq ".signature_header" "X-Custom-Sig" "#25a the webhook now reports the new signature_header"
+check_jq ".signature_prefix" "" "#25a an explicit empty signature_prefix (bare digest) is honoured, not treated as absent"
+
+# API_KEY_ONLY transition validation: refused without a key (mirrors create_webhook's own
+# precondition), accepted once one is supplied in the same request.
+api_call PUT "/api/webhooks/$EDITFIELDS_HOOK_ID" "$MASTER_KEY" '{"auth_mode":"API_KEY_ONLY"}'
+check "400" "#25a transitioning into API_KEY_ONLY without ever having (or now supplying) an api_key is refused"
+
+api_call PUT "/api/webhooks/$EDITFIELDS_HOOK_ID" "$MASTER_KEY" \
+    '{"auth_mode":"API_KEY_ONLY","api_key":"editfields-downstream-key"}'
+check "200" "#25a supplying api_key alongside the mode change satisfies the precondition"
+check_jq ".auth_mode" "API_KEY_ONLY" "#25a the webhook now reports API_KEY_ONLY"
+check_true '.has_api_key == true' "#25a has_api_key now reports true, without disclosing the key itself"
+
+api_call DELETE "/api/webhooks/$EDITFIELDS_HOOK_ID" "$MASTER_KEY"
+check "204" "#25a delete the editfields webhook"
+
+# The privileged-webhook gate, extended: a webhook that already carries a non-empty api_key is
+# master-only to edit on target_url/hmac_template/auth_mode/api_key alike — §25 above already
+# proved the first two; this proves the extension covers the latter two the same way, using the
+# same "manager creates its own webhook, so it is the owner" pattern §25 established.
+api_call POST "/api/keys/$WHM_KEY_ID/permissions" "$MASTER_KEY" \
+    "{\"group_id\":\"$EDITFIELDS_GROUP_A\",\"can_read\":true,\"can_write\":true,\"can_delete\":true}"
+check "200" "#25a grant the existing webhook manager access to the editfields group too"
+
+api_call POST "/api/webhooks" "$WHM_KEY" \
+    "{\"name\":\"editfields-privileged-hook\",\"target_url\":\"https://legitimate.example.com/hook\",\"secret_token\":\"s\",\"api_key\":\"downstream-credential\",\"payload_template\":\"{}\",\"group_id\":\"$EDITFIELDS_GROUP_A\",\"auth_mode\":\"CANONICAL_V1\"}"
+check "200" "#25a the manager creates its own privileged webhook"
+EDITFIELDS_PRIV_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call PUT "/api/webhooks/$EDITFIELDS_PRIV_HOOK_ID" "$WHM_KEY" '{"auth_mode":"NONE"}'
+check "403" "#25a a non-master cannot change auth_mode on a privileged webhook"
+
+api_call PUT "/api/webhooks/$EDITFIELDS_PRIV_HOOK_ID" "$WHM_KEY" '{"api_key":"attacker-supplied-key"}'
+check "403" "#25a a non-master cannot change api_key on a privileged webhook"
+
+# group_id is deliberately NOT part of that gate — it only changes which events trigger dispatch,
+# not where a credential is sent or what is signed — so the same non-master owner may still
+# retarget it, as long as it can read the destination group.
+api_call PUT "/api/webhooks/$EDITFIELDS_PRIV_HOOK_ID" "$WHM_KEY" \
+    "{\"group_id\":\"$HIJACK_GROUP_ID\"}"
+check "200" "#25a a non-master owner may retarget a privileged webhook's group when it can read the destination"
+
+api_call PUT "/api/webhooks/$EDITFIELDS_PRIV_HOOK_ID" "$WHM_KEY" \
+    '{"group_id":"00000000-0000-0000-0000-000000000000"}'
+check "403" "#25a ...but not onto a group it has no read access to"
+
+api_call PUT "/api/webhooks/$EDITFIELDS_PRIV_HOOK_ID" "$MASTER_KEY" '{"auth_mode":"NONE"}'
+check "200" "#25a a master may change auth_mode on a privileged webhook"
+check_jq ".auth_mode" "NONE" "#25a the privileged webhook now reports auth_mode NONE"
+
+api_call DELETE "/api/webhooks/$EDITFIELDS_PRIV_HOOK_ID" "$MASTER_KEY"
+check "204" "#25a delete the editfields privileged webhook"
+
 log_section "25b. An Edited Webhook's New Config Actually Takes Effect"
 
 # Every PUT check above (renames, repoints, template rewrites, RBAC refusals) verifies only the

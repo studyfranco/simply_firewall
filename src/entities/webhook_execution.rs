@@ -30,9 +30,13 @@ pub struct Model {
     /// Wall-clock duration of this one HTTP attempt, in milliseconds. Not cumulative across
     /// retries — each retry attempt is its own row.
     pub duration_ms: i32,
-    /// The failure reason, when there was one: `DispatchOutcome::Transient`/`Permanent`'s `reason`
-    /// string, or a response-body snippet. `None` on success.
-    pub error_message: Option<String>,
+    /// Whatever the receiver said back, truncated (see `dispatch::RESPONSE_SNIPPET_MAX_BYTES`) —
+    /// captured on **every** attempt that reached the network, success or failure alike, not only
+    /// failures. `None` only when no response was ever received at all (a network-level error,
+    /// timeout, or DNS failure), in which case the failure reason is stored here instead — there is
+    /// no body to have kept in that case. Renamed from `error_message` by
+    /// `m20260824_110000_webhook_execution_response_body`; see that migration's module header.
+    pub response_body: Option<String>,
     /// When this attempt was made.
     pub created_at: DateTime,
 }

@@ -399,8 +399,9 @@ enum DispatchOutcome {
 
 /// Sends one HTTP attempt and classifies the result into [`DispatchOutcome`].
 ///
-/// Reads the response body **only** on a non-2xx status — a successful delivery has no reason to pay
-/// for it, and a network-level error never produced a body to read.
+/// Reads the response body whenever a response was received at all — success included, not only
+/// failure, so whatever the receiver said back (a JSON acknowledgement, a tracking id) is available
+/// to persist. A network-level error never produced a body to read.
 async fn attempt_delivery(
     client: &Client,
     target_url: &str,
@@ -410,10 +411,11 @@ async fn attempt_delivery(
     match client.post(target_url).headers(headers).body(payload).send().await {
         Ok(resp) => {
             let status = resp.status();
-            if status.is_success() {
-                return (DispatchOutcome::Success { status: status.as_u16() }, None);
+            let is_success = status.is_success();
+            let body = resp.text().await.ok().filter(|b| !b.is_empty()).map(|b| snippet(&b));
+            if is_success {
+                return (DispatchOutcome::Success { status: status.as_u16() }, body);
             }
-            let body = resp.text().await.ok().map(|b| snippet(&b));
             let reason = format!("HTTP {status}");
             if status.is_server_error() {
                 (DispatchOutcome::Transient { status: Some(status.as_u16()), reason }, body)
@@ -470,7 +472,7 @@ async fn log_execution(
     status_code: Option<u16>,
     is_success: bool,
     duration_ms: i64,
-    error_message: Option<&str>,
+    response_body: Option<&str>,
 ) {
     let row = webhook_execution::ActiveModel {
         id: Set(Uuid::new_v4()),
@@ -481,7 +483,7 @@ async fn log_execution(
         // `duration_ms` is `i32` in the schema — a single HTTP attempt exceeding ~24 days is not a
         // real value to preserve exactly, so this saturates rather than panicking or wrapping.
         duration_ms: Set(duration_ms.try_into().unwrap_or(i32::MAX)),
-        error_message: Set(error_message.map(str::to_owned)),
+        response_body: Set(response_body.map(str::to_owned)),
         created_at: Set(chrono::Utc::now().naive_utc()),
     };
     if let Err(e) = row.insert(db).await {
@@ -520,8 +522,11 @@ async fn dispatch_with_retries_config(
 
         match outcome {
             DispatchOutcome::Success { status } => {
-                info!(webhook = %webhook_name, url = %target_url, status, attempt, "Webhook delivered");
-                log_execution(&db, webhook_id, &event_type, Some(status), true, duration_ms, None)
+                info!(
+                    webhook = %webhook_name, url = %target_url, status, attempt,
+                    body = %body.as_deref().unwrap_or(""), "Webhook delivered"
+                );
+                log_execution(&db, webhook_id, &event_type, Some(status), true, duration_ms, body.as_deref())
                     .await;
                 return;
             }
@@ -531,8 +536,11 @@ async fn dispatch_with_retries_config(
                     body = %body.as_deref().unwrap_or(""),
                     "Webhook delivery failed with a non-retryable error; not retrying"
                 );
-                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, Some(&reason))
-                    .await;
+                // Whatever the receiver actually said back, when it said anything — `reason` here is
+                // only ever the computed `"HTTP {status}"` string, which the body (when present) is
+                // strictly more informative than.
+                let detail = body.as_deref().or(Some(reason.as_str()));
+                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, detail).await;
                 return;
             }
             DispatchOutcome::Transient { status, reason } if attempt <= max_retries => {
@@ -546,8 +554,8 @@ async fn dispatch_with_retries_config(
                     backoff_ms, reason = %reason, body = %body.as_deref().unwrap_or(""),
                     "Webhook delivery failed with a transient error; retrying"
                 );
-                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, Some(&reason))
-                    .await;
+                let detail = body.as_deref().or(Some(reason.as_str()));
+                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, detail).await;
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 attempt += 1;
             }
@@ -558,8 +566,8 @@ async fn dispatch_with_retries_config(
                     "Webhook delivery failed with a transient error and exhausted its retries; \
                      giving up"
                 );
-                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, Some(&reason))
-                    .await;
+                let detail = body.as_deref().or(Some(reason.as_str()));
+                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, detail).await;
                 return;
             }
         }
@@ -686,12 +694,12 @@ async fn send_test_dispatch_with_privacy(
                 .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("<binary>").to_owned()))
                 .collect();
             let success = status.is_success();
-            let body = resp.text().await.ok().map(|b| snippet(&b));
+            let body = resp.text().await.ok().filter(|b| !b.is_empty()).map(|b| snippet(&b));
             let error = if success { None } else { Some(format!("receiver responded with HTTP {status}")) };
-            log_execution(
-                db, config.id, "TEST", Some(status.as_u16()), success, duration_ms, error.as_deref(),
-            )
-            .await;
+            // Whatever the receiver said back, on success or failure alike — not the computed
+            // `error` summary, which the body (when present) is strictly more informative than.
+            let detail = body.as_deref().or(error.as_deref());
+            log_execution(db, config.id, "TEST", Some(status.as_u16()), success, duration_ms, detail).await;
             WebhookTestResult {
                 success,
                 status: Some(status.as_u16()),
@@ -1164,6 +1172,39 @@ mod tests {
         PreparedDispatch { target_url, headers: HeaderMap::new(), payload: "{}".to_owned() }
     }
 
+    /// Like [`spawn_status_sequence_server`] but answers with a real body instead of
+    /// `Content-Length: 0` — the counterpart needed to prove a receiver's actual reply survives into
+    /// `webhook_executions.response_body`, not just the status code.
+    async fn spawn_body_sequence_server(responses: Vec<(u16, &'static str)>) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
+        let addr = listener.local_addr().expect("listener has a local address");
+
+        tokio::spawn(async move {
+            let mut n = 0usize;
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let (status, body) = *responses
+                    .get(n)
+                    .unwrap_or_else(|| responses.last().expect("at least one response configured"));
+                n += 1;
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let response = format!(
+                        "HTTP/1.1 {status} Status\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        addr
+    }
+
     /// A migrated in-memory database holding one group and one webhook, for tests that need
     /// `log_execution`'s `webhook_id` foreign key to resolve to a real row.
     async fn seed_test_webhook(db: &DatabaseConnection) -> Uuid {
@@ -1253,6 +1294,26 @@ mod tests {
         let (outcome, _) =
             attempt_delivery(&client, "http://127.0.0.1:1", HeaderMap::new(), String::new()).await;
         assert!(matches!(outcome, DispatchOutcome::Transient { status: None, .. }));
+    }
+
+    /// A receiver's actual reply must come back on **every** outcome that reached the network —
+    /// success included, not only failure. Before this, the body was read only on a non-2xx
+    /// response; a 200 with a JSON acknowledgement was discarded entirely.
+    #[tokio::test]
+    async fn attempt_delivery_captures_the_receivers_body_on_success_and_on_failure() {
+        let client = build_webhook_client().expect("client builds");
+
+        let addr = spawn_body_sequence_server(vec![(200, "{\"received\":true}")]).await;
+        let (outcome, body) =
+            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
+        assert!(matches!(outcome, DispatchOutcome::Success { status: 200 }));
+        assert_eq!(body.as_deref(), Some("{\"received\":true}"));
+
+        let addr = spawn_body_sequence_server(vec![(500, "downstream exploded")]).await;
+        let (outcome, body) =
+            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
+        assert!(matches!(outcome, DispatchOutcome::Transient { status: Some(500), .. }));
+        assert_eq!(body.as_deref(), Some("downstream exploded"));
     }
 
     /// A receiver that fails twice with `503` and then succeeds is retried exactly enough times to
@@ -1358,6 +1419,79 @@ mod tests {
             execution_count(&db, webhook_id).await,
             3,
             "every attempt is recorded, exhausted retries included"
+        );
+    }
+
+    /// A successful dispatch's `webhook_executions` row must hold the receiver's actual response
+    /// body — not `NULL`, and not a computed "HTTP 200" placeholder — proving the body survives the
+    /// full path from `attempt_delivery` through `log_execution`, not just `attempt_delivery`'s
+    /// return value in isolation.
+    #[tokio::test]
+    async fn a_successful_dispatch_persists_the_receivers_response_body() {
+        let addr = spawn_body_sequence_server(vec![(200, "{\"ack\":\"ok\"}")]).await;
+        let client = build_webhook_client().expect("client builds");
+        let db = migrated_memory_db().await;
+        let webhook_id = seed_test_webhook(&db).await;
+
+        dispatch_with_retries_config(
+            client,
+            dummy_prepared(format!("http://{addr}/")),
+            "test-webhook".to_owned(),
+            /* max_retries */ 5,
+            /* base_backoff_ms */ 1,
+            db.clone(),
+            webhook_id,
+            "IP_ADD".to_owned(),
+        )
+        .await;
+
+        let rows = webhook_execution::Entity::find()
+            .filter(webhook_execution::Column::WebhookId.eq(webhook_id))
+            .all(&db)
+            .await
+            .expect("querying execution rows succeeds");
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].is_success);
+        assert_eq!(
+            rows[0].response_body.as_deref(),
+            Some("{\"ack\":\"ok\"}"),
+            "a success must persist the receiver's actual body, not a computed placeholder or NULL"
+        );
+    }
+
+    /// A permanently-failed dispatch's `webhook_executions` row must hold the receiver's actual
+    /// reply when one was received, in preference to the computed "HTTP 403" reason string — the
+    /// body is strictly more informative whenever it is present.
+    #[tokio::test]
+    async fn a_failed_dispatch_prefers_the_receivers_actual_reply_over_the_computed_reason() {
+        let addr = spawn_body_sequence_server(vec![(403, "forbidden: bad signature")]).await;
+        let client = build_webhook_client().expect("client builds");
+        let db = migrated_memory_db().await;
+        let webhook_id = seed_test_webhook(&db).await;
+
+        dispatch_with_retries_config(
+            client,
+            dummy_prepared(format!("http://{addr}/")),
+            "test-webhook".to_owned(),
+            /* max_retries */ 5,
+            /* base_backoff_ms */ 1,
+            db.clone(),
+            webhook_id,
+            "IP_ADD".to_owned(),
+        )
+        .await;
+
+        let rows = webhook_execution::Entity::find()
+            .filter(webhook_execution::Column::WebhookId.eq(webhook_id))
+            .all(&db)
+            .await
+            .expect("querying execution rows succeeds");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].response_body.as_deref(),
+            Some("forbidden: bad signature"),
+            "a body-bearing failure must persist the receiver's actual reply, not the computed \
+             'HTTP 403' reason"
         );
     }
 

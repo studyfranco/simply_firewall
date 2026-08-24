@@ -270,7 +270,7 @@ failed twice before succeeding leaves three rows, not one. Added by `m20260824_0
 | `status_code` | `Integer` | Nullable | HTTP status received, if a response was received at all. `NULL` means a network-level failure (timeout, connection refused, DNS failure), not "unknown" |
 | `is_success` | `Boolean` | Not Null | Whether the receiver answered `2xx`. The column filtered on for status and for retention — `status_code` is diagnostic detail |
 | `duration_ms` | `Integer` | Not Null | Wall-clock duration of this one attempt. Not cumulative across a delivery's retries |
-| `error_message` | `Text` | Nullable | Failure reason or a response-body snippet. `NULL` on success |
+| `response_body` | `Text` | Nullable | Whatever the receiver said back, truncated (see `dispatch::RESPONSE_SNIPPET_MAX_BYTES`), captured on **every** attempt that reached the network — success or failure alike. `NULL` only when no response was ever received at all (a network-level error, timeout, DNS failure), in which case the failure reason is stored here instead. Renamed from `error_message` by `m20260824_110000` — see that migration's module header |
 | `created_at` | `DateTimeUtc` | Not Null, Indexed | When this attempt was made |
 
 **Why `webhook_id` is `CASCADE`, not `SET NULL` like `audit_logs.api_key_id`.** This table carries no

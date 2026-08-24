@@ -14,6 +14,7 @@ mod m20260811_000010_audit_attribution_not_null;
 mod m20260811_000011_index_ip_record_delta_columns;
 mod m20260811_000012_webhook_hmac_only_mode;
 mod m20260824_093000_add_webhook_executions;
+mod m20260824_110000_webhook_execution_response_body;
 
 /// The ordered set of all schema migrations for `simply_ip_vault`.
 pub struct Migrator;
@@ -35,6 +36,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260811_000011_index_ip_record_delta_columns::Migration),
             Box::new(m20260811_000012_webhook_hmac_only_mode::Migration),
             Box::new(m20260824_093000_add_webhook_executions::Migration),
+            Box::new(m20260824_110000_webhook_execution_response_body::Migration),
         ]
     }
 }

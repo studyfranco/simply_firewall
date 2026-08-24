@@ -5164,7 +5164,7 @@ async fn s4_webhook_executions_are_scoped_to_ownership_not_can_manage_keys() {
                 status_code: Set(Some(200)),
                 is_success: Set(true),
                 duration_ms: Set(5),
-                error_message: Set(None),
+                response_body: Set(None),
                 created_at: Set(chrono::Utc::now().naive_utc()),
             }
             .insert(&db)
@@ -5280,7 +5280,7 @@ async fn s4_webhook_executions_endpoint_filters_paginates_and_rejects_unknown_fi
                 status_code: Set(Some(if is_success { 200 } else { 500 })),
                 is_success: Set(is_success),
                 duration_ms: Set(5),
-                error_message: Set(None),
+                response_body: Set(None),
                 created_at: Set(chrono::Utc::now().naive_utc()),
             }
             .insert(&db)

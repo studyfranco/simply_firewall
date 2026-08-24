@@ -2380,6 +2380,327 @@ async fn attack_webhook_admin_cannot_reach_groups_it_has_no_access_to() {
     assert_eq!(status, StatusCode::OK, "a tenant may still manage webhooks on its own group");
 }
 
+/// Editing an already-privileged webhook's `auth_mode` or `api_key` is master-only, extending the
+/// same gate that already covers `target_url`/`hmac_template`. Changing either one achieves the same
+/// hijack a repoint would: an `auth_mode` change can downgrade the receiver's verification (e.g. to
+/// `NONE`, so no signature is checked at all), and an `api_key` change swaps out the credential the
+/// receiver trusts — neither is undone by the secret rotation a repoint alone triggers.
+#[tokio::test]
+async fn attack_editing_a_privileged_webhooks_auth_mode_or_api_key_is_master_only() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let master = insert_master_key(&db, "Owner").await;
+    let master_secret = test_signing_secret(&master);
+    let (owner_id, owner_key) = insert_key(&db, "Webhook Owner", false, false, true, false, None).await;
+    let owner_secret = test_signing_secret(&owner_key);
+    let group_id = insert_group(&db, "priv-group").await;
+    grant(&db, owner_id, group_id, true, true, true).await;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("X-API-Key", &owner_key)
+                .header("Content-Type", "application/json"),
+        ),
+        &owner_secret,
+        &json!({
+            "name": "Privileged Hook",
+            "target_url": "https://legitimate.example.com/hook",
+            "secret_token": "s",
+            "api_key": "downstream-credential",
+            "payload_template": "{}",
+            "group_id": group_id.to_string(),
+            "auth_mode": "CANONICAL_V1",
+        })
+        .to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+    let hook_id = created["id"].as_str().unwrap().to_owned();
+
+    let put = |key: String, secret: String, body: serde_json::Value| {
+        let (app, hook_id) = (app.clone(), hook_id.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/webhooks/{hook_id}"))
+                        .header("X-API-Key", &key)
+                        .header("Content-Type", "application/json"),
+                ),
+                &secret,
+                &body.to_string(),
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+            (status, parsed)
+        }
+    };
+
+    // The owner (non-master) may not weaken auth_mode on its own privileged webhook...
+    let (status, _) = put(owner_key.clone(), owner_secret.clone(), json!({ "auth_mode": "NONE" })).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a non-master cannot change auth_mode on a privileged webhook"
+    );
+
+    // ...nor swap out the api_key credential itself.
+    let (status, _) =
+        put(owner_key.clone(), owner_secret.clone(), json!({ "api_key": "attacker-supplied-key" })).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a non-master cannot change api_key on a privileged webhook"
+    );
+
+    // Non-identity fields remain freely editable by the owner.
+    let (status, _) =
+        put(owner_key.clone(), owner_secret.clone(), json!({ "name": "Renamed Privileged" })).await;
+    assert_eq!(status, StatusCode::OK, "a non-master may still rename a privileged webhook");
+
+    // A master may change either.
+    let (status, body) = put(master.clone(), master_secret.clone(), json!({ "auth_mode": "NONE" })).await;
+    assert_eq!(status, StatusCode::OK, "a master may change auth_mode on a privileged webhook");
+    assert_eq!(body["auth_mode"], "NONE");
+
+    let (status, body) =
+        put(master.clone(), master_secret.clone(), json!({ "api_key": "master-rotated-key" })).await;
+    assert_eq!(status, StatusCode::OK, "a master may change api_key on a privileged webhook");
+    assert_eq!(body["has_api_key"], true);
+}
+
+/// Retargeting a webhook onto a different group is scoped by the same `can_read` check
+/// `create_webhook` applies to the group a webhook is created against — and, unlike
+/// `target_url`/`hmac_template`/`auth_mode`/`api_key`, is **not** gated by the privileged-webhook
+/// rule: it changes which events trigger dispatch, not where a credential is sent or what is signed.
+#[tokio::test]
+async fn update_webhook_group_id_change_is_scoped_by_can_read_not_by_the_privileged_gate() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (owner_id, owner_key) = insert_key(&db, "Owner", false, false, true, false, None).await;
+    let owner_secret = test_signing_secret(&owner_key);
+    let origin_group = insert_group(&db, "origin-group").await;
+    let readable_group = insert_group(&db, "readable-group").await;
+    let unreadable_group = insert_group(&db, "unreadable-group").await;
+    grant(&db, owner_id, origin_group, true, true, true).await;
+    grant(&db, owner_id, readable_group, true, true, true).await;
+    // Deliberately no grant on unreadable_group.
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("X-API-Key", &owner_key)
+                .header("Content-Type", "application/json"),
+        ),
+        &owner_secret,
+        &json!({
+            "name": "Privileged Regroup Hook",
+            "target_url": "https://legitimate.example.com/hook",
+            "secret_token": "s",
+            "api_key": "downstream-credential",
+            "payload_template": "{}",
+            "group_id": origin_group.to_string(),
+            "auth_mode": "CANONICAL_V1",
+        })
+        .to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+    let hook_id = created["id"].as_str().unwrap().to_owned();
+
+    let put = |body: serde_json::Value| {
+        let (app, owner_key, owner_secret, hook_id) =
+            (app.clone(), owner_key.clone(), owner_secret.clone(), hook_id.clone());
+        async move {
+            let req = signed(
+                inject_connect_info(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(format!("/api/webhooks/{hook_id}"))
+                        .header("X-API-Key", &owner_key)
+                        .header("Content-Type", "application/json"),
+                ),
+                &owner_secret,
+                &body.to_string(),
+            );
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+            let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap_or(json!(null));
+            (status, parsed)
+        }
+    };
+
+    // Retargeting onto a group the owner cannot read is refused...
+    let (status, _) = put(json!({ "group_id": unreadable_group.to_string() })).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "retargeting onto an unreadable group must be refused");
+
+    // ...but onto one it can read succeeds, even though the webhook is privileged — group_id is not
+    // part of the privileged-webhook gate.
+    let (status, body) = put(json!({ "group_id": readable_group.to_string() })).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a non-master owner may retarget a privileged webhook's group when it can read the destination"
+    );
+    assert_eq!(body["group_id"], readable_group.to_string());
+}
+
+/// Changing `auth_mode` into a signing mode is treated the same as a repoint: the secret a webhook
+/// holds must never be inherited silently into a new signing use. A webhook created in `NONE` mode
+/// (so its `secret_token` is an empty string) transitioning into `CANONICAL_V1` without supplying a
+/// secret must get a freshly generated one, not ship with an empty signing key.
+#[tokio::test]
+async fn attack_changing_auth_mode_into_a_signing_mode_forces_secret_rotation() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let key = insert_master_key(&db, "Hook Admin").await;
+    let secret = test_signing_secret(&key);
+    let group_id = insert_group(&db, "mode-change-group").await;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        &json!({
+            "name": "Mode Change Hook",
+            "target_url": "https://legitimate.example.com/hook",
+            "payload_template": "{}",
+            "group_id": group_id.to_string(),
+            "auth_mode": "NONE",
+        })
+        .to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+    let hook_id = created["id"].as_str().unwrap().to_owned();
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/webhooks/{hook_id}"))
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        &json!({ "auth_mode": "CANONICAL_V1" }).to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        body["secret_rotated"], true,
+        "transitioning into a signing mode must rotate the secret"
+    );
+    assert!(
+        body["secret_token"].as_str().is_some_and(|s| s.len() == 64),
+        "a fresh secret is generated and returned"
+    );
+}
+
+/// Transitioning an existing webhook into `API_KEY_ONLY` without ever having (or now supplying) an
+/// `api_key` is refused up front — the same precondition `create_webhook` enforces, checked here
+/// against the *effective* post-update state rather than the payload alone.
+#[tokio::test]
+async fn update_webhook_rejects_api_key_only_transition_without_a_key() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let key = insert_master_key(&db, "Hook Admin").await;
+    let secret = test_signing_secret(&key);
+    let group_id = insert_group(&db, "api-key-transition-group").await;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        &json!({
+            "name": "No Key Hook",
+            "target_url": "https://legitimate.example.com/hook",
+            "secret_token": "s",
+            "payload_template": "{}",
+            "group_id": group_id.to_string(),
+            "auth_mode": "CANONICAL_V1",
+        })
+        .to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+    let hook_id = created["id"].as_str().unwrap().to_owned();
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/webhooks/{hook_id}"))
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        &json!({ "auth_mode": "API_KEY_ONLY" }).to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::BAD_REQUEST,
+        "no api_key exists to satisfy API_KEY_ONLY"
+    );
+
+    // Supplying one alongside the mode change succeeds.
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/api/webhooks/{hook_id}"))
+                .header("X-API-Key", &key)
+                .header("Content-Type", "application/json"),
+        ),
+        &secret,
+        &json!({ "auth_mode": "API_KEY_ONLY", "api_key": "remote-credential" }).to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "supplying api_key alongside the mode change satisfies the precondition"
+    );
+}
+
 // ─────────────────────────────────────────────────────────────
 // IP record soft delete, restore, hard delete, and 92-day purge
 // ─────────────────────────────────────────────────────────────
@@ -2812,7 +3133,7 @@ async fn webhook_execution_retention_purges_each_outcome_on_its_own_window() {
                 status_code: Set(Some(if is_success { 200 } else { 500 })),
                 is_success: Set(is_success),
                 duration_ms: Set(10),
-                error_message: Set(None),
+                response_body: Set(None),
                 created_at: Set(age_hours(hours_old)),
             }
             .insert(&db)
