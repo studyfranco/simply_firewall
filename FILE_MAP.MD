@@ -3,7 +3,7 @@
 An index of every file under `src/`, its size, and its exact purpose. Written for future agents: read
 this before searching the tree, and update it when you add, remove, or repurpose a file.
 
-**Revision:** `5a0a22c` (plus this session's uncommitted changes) · **Generated:** 2026-08-19, line counts refreshed 2026-08-21 · **Files indexed:** 44 · **Total:** ~13,900 lines. Line counts below are refreshed only for files this session touched (`config.rs`, `db.rs`, `dispatch.rs`, `lib.rs`, `webhooks.rs`); the rest are as of `2026-08-19` and have drifted somewhat since — treat other rows' line counts as approximate.
+**Revision:** `fbbe318` (plus this session's uncommitted changes) · **Generated:** 2026-08-19, line counts refreshed 2026-08-24 · **Files indexed:** 46 · **Total:** ~14,700 lines. Line counts below are refreshed only for files this session or the previous one touched (`config.rs`, `db.rs`, `dispatch.rs`, `lib.rs`, `main.rs`, `retention.rs`, `webhooks.rs`, `webhook_config.rs`, `webhook_execution.rs`, the new migration); the rest are as of `2026-08-19` and have drifted somewhat since — treat other rows' line counts as approximate.
 
 ---
 
@@ -22,8 +22,8 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | `middleware.rs` | 328 | Authentication middleware: key lookup by hash, signature verification, timestamp validation, replay rejection, and `bound_ips` CIDR enforcement — in that order, so an unauthenticated caller cannot probe key bindings via 401-vs-403. |
 | `replay.rs` | 440 | `ReplayGuard`: the single-use ledger for `CANONICAL_V1` signatures. Fails closed on a poisoned lock, and prunes only genuinely expired entries — never wholesale, which would let every live signature replay at once. |
 | `state.rs` | 208 | `AppState`: the database handle, the webhook dispatch channel, and the three security singletons (`MasterPin`, `ReplayGuard`, `SecretCipher`). Carries `for_tests` so integration tests can build state without environment reads. |
-| `dispatch.rs` | 1,260 | The outbound webhook dispatcher — the background worker pool that actually sends notifications, with rate limiting and the four authentication modes. Request construction (`prepare_dispatch`) is shared between the real dispatch path and `send_test_dispatch` (the live "Test Webhook" endpoint's backend), so a test exercises the exact bytes a real event would send. Delivery retries transient failures (network errors, `5xx`) with exponential backoff up to `config::webhook_max_retries`; a `4xx` fails on the first attempt (`attempt_delivery`'s classification, `dispatch_with_retries_config`). |
-| `retention.rs` | 134 | Background retention worker: permanently drops soft-deleted IP records once they age past the configured window. |
+| `dispatch.rs` | 1,465 | The outbound webhook dispatcher — the background worker pool that actually sends notifications, with rate limiting and the four authentication modes. Request construction (`prepare_dispatch`) is shared between the real dispatch path and `send_test_dispatch` (the live "Test Webhook" endpoint's backend), so a test exercises the exact bytes a real event would send. Delivery retries transient failures (network errors, `5xx`) with exponential backoff up to `config::webhook_max_retries`; a `4xx` fails on the first attempt (`attempt_delivery`'s classification, `dispatch_with_retries_config`). **Every HTTP attempt, including retried ones, is persisted as its own `webhook_executions` row** (`log_execution`) — the delivery history behind the dashboard's Executions tab. |
+| `retention.rs` | 266 | Two independent background retention workers, each its own task with its own shutdown channel: `run_retention_worker` permanently drops soft-deleted IP records once they age past the configured window, and `run_webhook_execution_retention_worker` purges `webhook_executions` rows — successes after 24h, failures after 7 days, independently configurable and independently disable-able. |
 
 ## `src/api/` — HTTP handlers
 
@@ -35,7 +35,7 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | `keys.rs` | 1,374 | API key endpoints: identity (`/auth/me`), creation, listing, lifecycle, rotation, and per-group grants. Implements the §6 cascade with pre-flight inventory and resolution map. The largest handler module. |
 | `records.rs` | 1,458 | IP record endpoints: ban/whitelist upsert, listing with delta (`since`) support, batch upsert/full-replace, soft delete, restore, and hard purge. |
 | `groups.rs` | 201 | IP Group endpoints: creation, listing, deletion, owner reassignment. |
-| `webhooks.rs` | 678 | Webhook config endpoints: creation, listing, update, deletion, owner reassignment, the four auth modes, and `POST /{id}/test` (`test_webhook`) — a live, synchronous dispatch for the dashboard's "Test Webhook" action, gated by the same `can_manage_webhooks` + ownership rule as update/delete. |
+| `webhooks.rs` | 759 | Webhook config endpoints: creation, listing, update, deletion, owner reassignment, the four auth modes, `POST /{id}/test` (`test_webhook`) — a live, synchronous dispatch for the dashboard's "Test Webhook" action, gated by the same `can_manage_webhooks` + ownership rule as update/delete — and `GET /executions` (`list_webhook_executions`), the delivery-history listing, gated the same way and then narrowed to `webhook_configs.owner_key_id = caller.id` for non-master. |
 | `audit.rs` | 58 | Audit log query endpoint. Master-only. |
 | `health.rs` | 121 | Unauthenticated liveness (`/health`, `/healthz`) and readiness (`/ready`, `/readyz`) probes. Liveness deliberately does not touch the database, so an outage cannot become a restart loop. |
 
@@ -49,6 +49,7 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | `ip_record.rs` | 76 | `ip_records`: banned/whitelisted addresses and subnets, with soft-delete columns. |
 | `ip_group.rs` | 87 | `ip_groups`: named collections of IP rules (`fail2ban`, `sshd`, …), each with an `owner_key_id`. |
 | `webhook_config.rs` | 247 | `webhook_configs`: downstream HTTP endpoints notified on IP events, including auth mode and templating. |
+| `webhook_execution.rs` | 60 | `webhook_executions`: one row per outbound HTTP attempt a webhook dispatch makes, including retries. `ON DELETE CASCADE` from `webhook_configs` — see the migration for why, unlike `audit_logs`, this table cannot use `SET NULL`. |
 | `audit_log.rs` | 66 | `audit_logs`: the mutating-operation audit trail. Attribution columns are `NOT NULL` by migration. |
 | `api_key_group_permission.rs` | 70 | `api_key_group_permissions` M:N junction: per-group read/write/delete/manage rights. The table R2's conjunction is evaluated against. |
 | `ip_record_group_membership.rs` | 54 | `ip_record_group_memberships` M:N junction associating records with groups. |
@@ -70,6 +71,7 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | `m20260811_000010_audit_attribution_not_null.rs` | 287 | Makes `api_key_name`, `api_key_prefix`, `client_ip` `NOT NULL` — structurally forbidding an unattributed audit row. No peer service has an equivalent. **Backfills the `UNRECORDED` sentinel before tightening nullability**, and carries the SQLite table-rebuild path (no `ALTER COLUMN` there). The `NOT NULL` strings coexist with `api_key_id`'s `ON DELETE SET NULL` because they are different columns — denormalized copies survive the cascade. **Reference implementation for the rebuild pattern**; see `AGENT.MD` § SeaORM Migration Standards. |
 | `m20260811_000011_index_ip_record_delta_columns.rs` | 72 | Indexes `ip_records.updated_at` so delta (`since`) queries do not table-scan. |
 | `m20260811_000012_webhook_hmac_only_mode.rs` | 105 | Renames the `BODY_ONLY` auth mode to `HMAC_ONLY` and makes the signature header configurable. |
+| `m20260824_093000_add_webhook_executions.rs` | 142 | Adds `webhook_executions` (one row per HTTP delivery attempt) with `webhook_id` `ON DELETE CASCADE` — deliberately not `SET NULL` like `audit_logs.api_key_id`, since this table has no denormalized name to fall back on and visibility is entirely join-derived through `webhook_id`. Indexes `webhook_id`, `created_at`, and a composite `(is_success, created_at)` for the retention sweep. |
 
 ---
 
@@ -81,9 +83,9 @@ which file owns which property saves adding a test to the wrong one.
 | File | Owns |
 | :--- | :--- |
 | `rbac_model_compliance.rs` | One test per `RBAC_MODEL.md` rule and section (`r1_`–`r7_`, `s3_`–`s7_`). Five are marked `ADVERSARIAL(§N)` and bypass the application layer with raw SQL. `scripts/verify_convergence.sh` fails if a rule loses its test |
-| `security_tests.rs` | Named attacks, each asserting the attack fails. HMAC forgery, replay, proxy spoofing, master promotion, the unauthenticated probes |
+| `security_tests.rs` | Named attacks, each asserting the attack fails. HMAC forgery, replay, proxy spoofing, master promotion, the unauthenticated probes. Also owns both retention sweeps' unit-level coverage (`purge_expired_ip_records`, `purge_expired_webhook_executions`) — not an attack, but the closest existing home for a pure-function DB test that needs no router |
 | `schema_integrity_tests.rs` | What the **engine** does — foreign-key cascades, orphan refusal, address canonicalisation against the UNIQUE constraint, and everything `m20260811_000010`'s table rebuild had to carry across. File-backed, opened through `db::connect`, because `PRAGMA foreign_keys` is per-connection |
-| `rbac_integration_tests.rs` | The features working, end to end through the router |
+| `rbac_integration_tests.rs` | The features working, end to end through the router. Includes `GET /api/webhooks/executions`'s ownership scoping (`can_manage_keys` grants nothing; two different owners each see only their own webhook's executions; Master sees both) and the `parent_key_id` chain a multi-key listing carries for the dashboard's Key Lineage view |
 | `source_hygiene.rs` | Properties of the source tree: no raw SQL and no hand-written DML in `src/`, outside two startup-only exemptions. Carries a meta-test proving the scanner can see a violation |
 | `concurrency_and_contracts.rs` | Races and interface contracts. Replay-ledger atomicity under real thread contention, concurrent-delete idempotency, a map of the response shape returned for every kind of malformed input across every extractor (`StrictJson`/`StrictPath`/`StrictQuery`, all in the `{"error": …}` envelope), and `deny_unknown_fields` refused across every domain payload (groups, ban, white, webhooks). Name shared with the peer's suite of the same purpose |
 | `frontend_syntax_test.rs` | `static/app.js` parses. Nothing else compiles or executes it |
@@ -99,11 +101,17 @@ failures were invisible because neither had a meta-test. This file has one.
 
 ## `static/` and `scripts/` — outside this map's `src/` scope, noted briefly
 
-This map indexes `src/`; the dashboard (`static/index.html`, `app.js`, `style.css`, ~5,300 lines)
+This map indexes `src/`; the dashboard (`static/index.html`, `app.js`, `style.css`, ~5,600 lines)
 and the E2E harness (`scripts/test_e2e.sh`, ~3,600+ lines / 629 checks) are large enough to deserve
-their own maps if they keep growing, but do not have one yet. Three things worth knowing without
+their own maps if they keep growing, but do not have one yet. Four things worth knowing without
 reading either in full:
 
+- **`PagedCache` (`app.js`) is the one generic paginator behind IP Records, Audit Logs, and now
+  Executions** — server-fetched 100 rows at a time, paginated locally 15 at a time, with background
+  prefetch. A new paginated tab needs only a `fetchChunk` function and the four
+  render/pagination-update boilerplate calls (`loadFirstChunk`/`currentPageItems`/`hasNextPage`/
+  `hasPrevPage`); it does not need a new pagination implementation. `executionsCache` is the
+  reference example to copy for the next one.
 - **The Webhooks tab's create form and its Edit modal each own a separate custom-headers editor.**
   `app.js`'s `renderHeaderRows`/`addHeaderRow`/`headerMap` back the always-visible create form
   (`webhookHeaders` state, `#webhook-headers-list`); `renderEditHeaderRows`/`addEditHeaderRow`/

@@ -16,16 +16,17 @@
 use std::time::Duration;
 use std::str::FromStr;
 use std::net::IpAddr;
-use crate::entities::{prelude::*, webhook_config::{self, AuthMode, DEFAULT_HMAC_TEMPLATE}};
+use crate::entities::{prelude::*, webhook_config::{self, AuthMode, DEFAULT_HMAC_TEMPLATE}, webhook_execution};
 use crate::state::WebhookEvent;
 use reqwest::{Client, header::{HeaderMap, HeaderName, HeaderValue}};
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde::Serialize;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 use hmac::{Hmac, Mac, KeyInit};
 use sha2::Sha256;
+use uuid::Uuid;
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INFLIGHT: usize = 64;
@@ -435,15 +436,57 @@ async fn attempt_delivery(
 /// configuration — split out purely so the retry *loop itself* (attempt counting, backoff growth,
 /// when it stops) is reachable with small, fast, deterministic values in a test, the same reason
 /// `config::clamp_pool_max` and friends are split from the functions that cache their inputs.
-async fn dispatch_with_retries(client: Client, prepared: PreparedDispatch, webhook_name: String) {
+async fn dispatch_with_retries(
+    client: Client,
+    prepared: PreparedDispatch,
+    webhook_name: String,
+    db: DatabaseConnection,
+    webhook_id: Uuid,
+    event_type: String,
+) {
     dispatch_with_retries_config(
         client,
         prepared,
         webhook_name,
         crate::config::webhook_max_retries(),
         crate::config::webhook_retry_backoff_ms(),
+        db,
+        webhook_id,
+        event_type,
     )
     .await
+}
+
+/// Persists one `webhook_executions` row for a single HTTP attempt — success, transient, or
+/// permanent alike, one row per attempt including retries, never a row for the delivery as a whole.
+///
+/// Never fatal to the dispatch it is recording: a database error here is logged and swallowed. The
+/// alternative — letting a failed *log write* affect a real delivery's outcome or retry behaviour —
+/// would make the observability feature a new way for dispatch to break, which is backwards.
+async fn log_execution(
+    db: &DatabaseConnection,
+    webhook_id: Uuid,
+    event_type: &str,
+    status_code: Option<u16>,
+    is_success: bool,
+    duration_ms: i64,
+    error_message: Option<&str>,
+) {
+    let row = webhook_execution::ActiveModel {
+        id: Set(Uuid::new_v4()),
+        webhook_id: Set(webhook_id),
+        event_type: Set(event_type.to_owned()),
+        status_code: Set(status_code.map(i32::from)),
+        is_success: Set(is_success),
+        // `duration_ms` is `i32` in the schema — a single HTTP attempt exceeding ~24 days is not a
+        // real value to preserve exactly, so this saturates rather than panicking or wrapping.
+        duration_ms: Set(duration_ms.try_into().unwrap_or(i32::MAX)),
+        error_message: Set(error_message.map(str::to_owned)),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    };
+    if let Err(e) = row.insert(db).await {
+        error!(webhook_id = %webhook_id, "Failed to record webhook execution history: {e}");
+    }
 }
 
 /// Logs at `info` on success, `warn` on a transient failure that will be retried, and `error` on the
@@ -451,23 +494,35 @@ async fn dispatch_with_retries(client: Client, prepared: PreparedDispatch, webho
 /// URL, HTTP status (when one was received), the error reason, the attempt count, and a response body
 /// snippet when one is available. An operator grepping logs for a broken integration should never
 /// need to reproduce the failure to learn what it was.
+///
+/// Every attempt — including ones that will be retried — is also persisted to `webhook_executions`
+/// via [`log_execution`], so the dashboard's Executions tab shows the same retry history these logs
+/// describe.
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_with_retries_config(
     client: Client,
     prepared: PreparedDispatch,
     webhook_name: String,
     max_retries: u32,
     base_backoff_ms: u64,
+    db: DatabaseConnection,
+    webhook_id: Uuid,
+    event_type: String,
 ) {
     let PreparedDispatch { target_url, headers, payload } = prepared;
 
     let mut attempt: u32 = 1;
     loop {
+        let started = std::time::Instant::now();
         let (outcome, body) =
             attempt_delivery(&client, &target_url, headers.clone(), payload.clone()).await;
+        let duration_ms = started.elapsed().as_millis() as i64;
 
         match outcome {
             DispatchOutcome::Success { status } => {
                 info!(webhook = %webhook_name, url = %target_url, status, attempt, "Webhook delivered");
+                log_execution(&db, webhook_id, &event_type, Some(status), true, duration_ms, None)
+                    .await;
                 return;
             }
             DispatchOutcome::Permanent { status, reason } => {
@@ -476,6 +531,8 @@ async fn dispatch_with_retries_config(
                     body = %body.as_deref().unwrap_or(""),
                     "Webhook delivery failed with a non-retryable error; not retrying"
                 );
+                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, Some(&reason))
+                    .await;
                 return;
             }
             DispatchOutcome::Transient { status, reason } if attempt <= max_retries => {
@@ -489,6 +546,8 @@ async fn dispatch_with_retries_config(
                     backoff_ms, reason = %reason, body = %body.as_deref().unwrap_or(""),
                     "Webhook delivery failed with a transient error; retrying"
                 );
+                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, Some(&reason))
+                    .await;
                 tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
                 attempt += 1;
             }
@@ -499,6 +558,8 @@ async fn dispatch_with_retries_config(
                     "Webhook delivery failed with a transient error and exhausted its retries; \
                      giving up"
                 );
+                log_execution(&db, webhook_id, &event_type, status, false, duration_ms, Some(&reason))
+                    .await;
                 return;
             }
         }
@@ -541,8 +602,18 @@ pub struct WebhookTestResult {
 /// clicks "Test Webhook" wants to know within seconds whether *this* attempt succeeded, not to wait
 /// out several minutes of exponential backoff against a receiver that might be down for a reason a
 /// human should investigate instead.
-pub async fn send_test_dispatch(config: &webhook_config::Model, event: &WebhookEvent) -> WebhookTestResult {
-    send_test_dispatch_with_privacy(config, event, allow_private_webhooks()).await
+///
+/// Logs a `webhook_executions` row (`event_type = "TEST"`) for the one HTTP attempt actually made —
+/// same as a real dispatch's retry loop, so a test dispatch shows up in the Executions tab exactly
+/// like the delivery it stands in for. No row is logged if the request never reached the network at
+/// all (a `prepare_dispatch` failure or an SSRF refusal): neither is an HTTP attempt, so neither has
+/// a status code or duration worth recording.
+pub async fn send_test_dispatch(
+    db: &DatabaseConnection,
+    config: &webhook_config::Model,
+    event: &WebhookEvent,
+) -> WebhookTestResult {
+    send_test_dispatch_with_privacy(db, config, event, allow_private_webhooks()).await
 }
 
 /// The testable core of [`send_test_dispatch`], taking the private-network allowance as a parameter
@@ -554,6 +625,7 @@ pub async fn send_test_dispatch(config: &webhook_config::Model, event: &WebhookE
 /// each other. Taking the value as an argument sidesteps that entirely rather than serializing tests
 /// against a lock.
 async fn send_test_dispatch_with_privacy(
+    db: &DatabaseConnection,
     config: &webhook_config::Model,
     event: &WebhookEvent,
     allow_private: bool,
@@ -601,7 +673,11 @@ async fn send_test_dispatch_with_privacy(
         }
     };
 
-    match client.post(&prepared.target_url).headers(prepared.headers).body(prepared.payload).send().await {
+    let started = std::time::Instant::now();
+    let outcome = client.post(&prepared.target_url).headers(prepared.headers).body(prepared.payload).send().await;
+    let duration_ms = started.elapsed().as_millis() as i64;
+
+    match outcome {
         Ok(resp) => {
             let status = resp.status();
             let headers = resp
@@ -611,23 +687,32 @@ async fn send_test_dispatch_with_privacy(
                 .collect();
             let success = status.is_success();
             let body = resp.text().await.ok().map(|b| snippet(&b));
+            let error = if success { None } else { Some(format!("receiver responded with HTTP {status}")) };
+            log_execution(
+                db, config.id, "TEST", Some(status.as_u16()), success, duration_ms, error.as_deref(),
+            )
+            .await;
             WebhookTestResult {
                 success,
                 status: Some(status.as_u16()),
                 headers: Some(headers),
                 body,
-                error: if success { None } else { Some(format!("receiver responded with HTTP {status}")) },
+                error,
                 blocked_by_ssrf_filter: false,
             }
         }
-        Err(e) => WebhookTestResult {
-            success: false,
-            status: None,
-            headers: None,
-            body: None,
-            error: Some(e.to_string()),
-            blocked_by_ssrf_filter: false,
-        },
+        Err(e) => {
+            let reason = e.to_string();
+            log_execution(db, config.id, "TEST", None, false, duration_ms, Some(&reason)).await;
+            WebhookTestResult {
+                success: false,
+                status: None,
+                headers: None,
+                body: None,
+                error: Some(reason),
+                blocked_by_ssrf_filter: false,
+            }
+        }
     }
 }
 
@@ -739,13 +824,17 @@ async fn dispatch_worker(
 
             let client = client.clone();
             let webhook_name = config.name.clone();
+            let webhook_id = config.id;
+            let event_type = event.action.clone();
+            let exec_db = db.clone();
 
             join_set.spawn(async move {
                 if !is_url_safe(&prepared.target_url, allow_private_webhooks()).await {
                     warn!(url = %prepared.target_url, webhook = %webhook_name, "Webhook blocked by SSRF protection");
                     return;
                 }
-                dispatch_with_retries(client, prepared, webhook_name).await;
+                dispatch_with_retries(client, prepared, webhook_name, exec_db, webhook_id, event_type)
+                    .await;
             });
         }
 
@@ -766,6 +855,7 @@ async fn dispatch_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::PaginatorTrait;
 
     #[test]
     fn default_template_reproduces_the_canonical_v1_string() {
@@ -1074,6 +1164,67 @@ mod tests {
         PreparedDispatch { target_url, headers: HeaderMap::new(), payload: "{}".to_owned() }
     }
 
+    /// A migrated in-memory database holding one group and one webhook, for tests that need
+    /// `log_execution`'s `webhook_id` foreign key to resolve to a real row.
+    async fn seed_test_webhook(db: &DatabaseConnection) -> Uuid {
+        use sea_orm::{ActiveModelTrait, Set};
+
+        let group_id = Uuid::new_v4();
+        crate::entities::ip_group::ActiveModel {
+            id: Set(group_id),
+            name: Set(format!("exec-log-test-{group_id}")),
+            group_type: Set("banlist".to_owned()),
+            owner_key_id: Set(None),
+            description: Set(None),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .expect("group inserts");
+
+        let webhook_id = Uuid::new_v4();
+        webhook_config::ActiveModel {
+            id: Set(webhook_id),
+            name: Set("exec-log-test-webhook".to_owned()),
+            target_url: Set("http://127.0.0.1:1/unused".to_owned()),
+            secret_token: Set(String::new()),
+            auth_mode: Set(AuthMode::NONE.to_owned()),
+            api_key: Set(None),
+            hmac_template: Set(None),
+            signature_header: Set(None),
+            signature_prefix: Set(None),
+            headers_json: Set(None),
+            payload_template: Set("{}".to_owned()),
+            group_id: Set(group_id),
+            is_active: Set(true),
+            events: Set(None),
+            owner_key_id: Set(None),
+            created_at: Set(chrono::Utc::now().naive_utc()),
+        }
+        .insert(db)
+        .await
+        .expect("webhook config inserts");
+
+        webhook_id
+    }
+
+    /// The count of `webhook_executions` rows recorded for `webhook_id`, for asserting that
+    /// [`log_execution`] actually wrote what the retry loop or test dispatch did.
+    async fn execution_count(db: &DatabaseConnection, webhook_id: Uuid) -> u64 {
+        webhook_execution::Entity::find()
+            .filter(webhook_execution::Column::WebhookId.eq(webhook_id))
+            .count(db)
+            .await
+            .expect("counting execution rows succeeds")
+    }
+
+    async fn migrated_memory_db() -> DatabaseConnection {
+        use sea_orm_migration::MigratorTrait;
+        let db = sea_orm::Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
+        crate::migration::Migrator::up(&db, None).await.expect("migrations apply");
+        db
+    }
+
     /// [`attempt_delivery`] sorts a `2xx` into `Success`, a `4xx` into `Permanent`, and a `5xx` into
     /// `Transient` — the exact split the retry engine's "retry 5xx, fail immediately on 4xx" contract
     /// depends on, checked here against real HTTP responses rather than assumed from the status code
@@ -1111,6 +1262,8 @@ mod tests {
     async fn transient_errors_are_retried_until_success() {
         let (addr, counter) = spawn_status_sequence_server(vec![503, 503, 200]).await;
         let client = build_webhook_client().expect("client builds");
+        let db = migrated_memory_db().await;
+        let webhook_id = seed_test_webhook(&db).await;
 
         dispatch_with_retries_config(
             client,
@@ -1118,6 +1271,9 @@ mod tests {
             "test-webhook".to_owned(),
             /* max_retries */ 5,
             /* base_backoff_ms */ 1,
+            db.clone(),
+            webhook_id,
+            "IP_ADD".to_owned(),
         )
         .await;
 
@@ -1125,6 +1281,11 @@ mod tests {
             counter.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "two failing attempts plus the one that succeeded"
+        );
+        assert_eq!(
+            execution_count(&db, webhook_id).await,
+            3,
+            "one webhook_executions row per HTTP attempt, including the two that were retried"
         );
     }
 
@@ -1135,6 +1296,8 @@ mod tests {
     async fn permanent_4xx_errors_are_not_retried() {
         let (addr, counter) = spawn_status_sequence_server(vec![403]).await;
         let client = build_webhook_client().expect("client builds");
+        let db = migrated_memory_db().await;
+        let webhook_id = seed_test_webhook(&db).await;
 
         dispatch_with_retries_config(
             client,
@@ -1142,6 +1305,9 @@ mod tests {
             "test-webhook".to_owned(),
             /* max_retries */ 5,
             /* base_backoff_ms */ 1,
+            db.clone(),
+            webhook_id,
+            "IP_ADD".to_owned(),
         )
         .await;
 
@@ -1150,6 +1316,16 @@ mod tests {
             1,
             "a 4xx response must not be retried at all"
         );
+
+        let rows = webhook_execution::Entity::find()
+            .filter(webhook_execution::Column::WebhookId.eq(webhook_id))
+            .all(&db)
+            .await
+            .expect("querying execution rows succeeds");
+        assert_eq!(rows.len(), 1, "exactly one recorded attempt");
+        assert_eq!(rows[0].status_code, Some(403));
+        assert!(!rows[0].is_success);
+        assert_eq!(rows[0].event_type, "IP_ADD");
     }
 
     /// A receiver that always answers `503` is retried exactly `max_retries` times beyond the
@@ -1158,6 +1334,8 @@ mod tests {
     async fn retries_are_exhausted_after_max_attempts() {
         let (addr, counter) = spawn_status_sequence_server(vec![503]).await;
         let client = build_webhook_client().expect("client builds");
+        let db = migrated_memory_db().await;
+        let webhook_id = seed_test_webhook(&db).await;
 
         dispatch_with_retries_config(
             client,
@@ -1165,6 +1343,9 @@ mod tests {
             "test-webhook".to_owned(),
             /* max_retries */ 2,
             /* base_backoff_ms */ 1,
+            db.clone(),
+            webhook_id,
+            "IP_ADD".to_owned(),
         )
         .await;
 
@@ -1172,6 +1353,11 @@ mod tests {
             counter.load(std::sync::atomic::Ordering::SeqCst),
             3,
             "the initial attempt plus exactly 2 retries, then giving up"
+        );
+        assert_eq!(
+            execution_count(&db, webhook_id).await,
+            3,
+            "every attempt is recorded, exhausted retries included"
         );
     }
 
@@ -1181,8 +1367,10 @@ mod tests {
     #[tokio::test]
     async fn send_test_dispatch_reports_success_against_a_healthy_receiver() {
         let (addr, _) = spawn_status_sequence_server(vec![200]).await;
+        let db = migrated_memory_db().await;
+        let webhook_id = seed_test_webhook(&db).await;
         let config = webhook_config::Model {
-            id: uuid::Uuid::new_v4(),
+            id: webhook_id,
             name: "test-target".to_owned(),
             target_url: format!("http://{addr}/hook"),
             secret_token: "shared-secret".to_owned(),
@@ -1211,11 +1399,21 @@ mod tests {
         // public `send_test_dispatch`: the env var is process-wide and this binary's tests run
         // concurrently, so a test needing it "true" and one needing it unset (see the SSRF test
         // below) would race on the same global. Passing the value directly sidesteps that.
-        let result = send_test_dispatch_with_privacy(&config, &event, true).await;
+        let result = send_test_dispatch_with_privacy(&db, &config, &event, true).await;
 
         assert!(result.success, "a 200 response must report success: {:?}", result.error);
         assert_eq!(result.status, Some(200));
         assert!(result.error.is_none());
+
+        let rows = webhook_execution::Entity::find()
+            .filter(webhook_execution::Column::WebhookId.eq(webhook_id))
+            .all(&db)
+            .await
+            .expect("querying execution rows succeeds");
+        assert_eq!(rows.len(), 1, "the live test dispatch is recorded as one execution");
+        assert_eq!(rows[0].event_type, "TEST");
+        assert_eq!(rows[0].status_code, Some(200));
+        assert!(rows[0].is_success);
     }
 
     /// The live test path runs through the **same** SSRF screen as a real dispatch — an
@@ -1223,8 +1421,10 @@ mod tests {
     /// service would otherwise refuse to contact.
     #[tokio::test]
     async fn send_test_dispatch_is_blocked_by_the_ssrf_filter_by_default() {
+        let db = migrated_memory_db().await;
+        let webhook_id = seed_test_webhook(&db).await;
         let config = webhook_config::Model {
-            id: uuid::Uuid::new_v4(),
+            id: webhook_id,
             name: "loopback-target".to_owned(),
             target_url: "http://127.0.0.1:1/hook".to_owned(),
             secret_token: String::new(),
@@ -1251,10 +1451,15 @@ mod tests {
 
         // `_with_privacy(..., false)` — the default, production posture — for the same
         // race-avoidance reason as the success test above.
-        let result = send_test_dispatch_with_privacy(&config, &event, false).await;
+        let result = send_test_dispatch_with_privacy(&db, &config, &event, false).await;
 
         assert!(!result.success);
         assert!(result.blocked_by_ssrf_filter, "a loopback target must be reported as SSRF-blocked");
         assert!(result.status.is_none(), "a blocked target must never have been dialed at all");
+        assert_eq!(
+            execution_count(&db, webhook_id).await,
+            0,
+            "a request the SSRF filter refused was never attempted, so it must not be logged as one"
+        );
     }
 }

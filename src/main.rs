@@ -328,6 +328,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         simply_ip_vault::retention::run_retention_worker(retention_db, retention_rx).await;
     });
 
+    // Separate retention sweep for webhook delivery history — its own table, its own schedule, its
+    // own shutdown channel, for the reasons `retention::run_webhook_execution_retention_worker`'s
+    // doc comment gives.
+    let (exec_retention_tx, exec_retention_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let exec_retention_db = db.clone();
+    let exec_retention_handle = tokio::spawn(async move {
+        simply_ip_vault::retention::run_webhook_execution_retention_worker(
+            exec_retention_db,
+            exec_retention_rx,
+        )
+        .await;
+    });
+
     let (state, tx, worker_handle) = setup_state(db)?;
 
     // Fix the Master's identity before anything can be served.
@@ -370,8 +383,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Stopping background workers...");
     drop(tx);
     drop(retention_tx);
+    drop(exec_retention_tx);
     let _ = worker_handle.await;
     let _ = retention_handle.await;
+    let _ = exec_retention_handle.await;
 
     tracing::info!("Graceful shutdown complete.");
     Ok(())

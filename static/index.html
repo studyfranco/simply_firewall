@@ -72,6 +72,7 @@
             <button class="tab-btn" data-tab="groups" id="groups-tab-btn" role="tab" aria-selected="false">IP Groups</button>
             <button class="tab-btn" data-tab="keys" id="keys-tab-btn" role="tab" aria-selected="false">API Keys &amp; Permissions</button>
             <button class="tab-btn" data-tab="webhooks" id="webhooks-tab-btn" role="tab" aria-selected="false">Webhooks</button>
+            <button class="tab-btn" data-tab="executions" id="executions-tab-btn" role="tab" aria-selected="false">Executions</button>
             <button class="tab-btn" data-tab="audit" id="audit-tab-btn" role="tab" aria-selected="false">Audit Logs</button>
         </nav>
       </div>
@@ -518,6 +519,44 @@
         </main>
 
         <!-- ═══════════════════════════════════════════════ -->
+        <!-- TAB: Webhook Executions                         -->
+        <!-- ═══════════════════════════════════════════════ -->
+        <main id="tab-executions" class="tab-panel">
+            <section class="card audit-section">
+                <h2>Webhook Execution History</h2>
+                <p class="subtitle">
+                    One row per outbound HTTP attempt, including retries. Master sees every webhook's
+                    history; any other key sees only its own webhooks'. Successful rows are kept for
+                    24 hours, failed rows for 7 days, then purged automatically.
+                </p>
+                <div class="table-container table-scroll">
+                    <table class="data-table">
+                        <thead>
+                            <tr>
+                                <th>Time</th>
+                                <th>Webhook</th>
+                                <th>Event</th>
+                                <th>Status</th>
+                                <th>Duration</th>
+                                <th>Detail</th>
+                            </tr>
+                        </thead>
+                        <tbody id="executions-table-body">
+                            <tr>
+                                <td colspan="6" class="text-center text-muted">Loading data...</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+                <div class="pagination">
+                    <button id="executions-btn-prev" class="btn btn-icon" disabled>&laquo; Prev</button>
+                    <span id="executions-page-indicator">Page 1</span>
+                    <button id="executions-btn-next" class="btn btn-icon">Next &raquo;</button>
+                </div>
+            </section>
+        </main>
+
+        <!-- ═══════════════════════════════════════════════ -->
         <!-- TAB: Audit Logs                                 -->
         <!-- ═══════════════════════════════════════════════ -->
         <main id="tab-audit" class="tab-panel">
@@ -739,6 +778,18 @@
                     <button type="button" id="edit-webhook-cancel" class="btn btn-cancel">Cancel</button>
                 </div>
             </form>
+        </div>
+    </div>
+
+    <!-- Key Lineage Modal -->
+    <div id="key-lineage-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="key-lineage-modal-title">
+        <div class="modal-card modal-card-form card">
+            <h3 id="key-lineage-modal-title">Key Lineage</h3>
+            <div id="key-lineage-body"></div>
+            <div class="form-actions mt-4">
+                <button type="button" id="key-lineage-close" class="btn btn-secondary">Close</button>
+            </div>
         </div>
     </div>
 

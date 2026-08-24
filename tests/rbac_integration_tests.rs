@@ -5054,6 +5054,130 @@ async fn s4_webhook_test_endpoint_follows_ownership_and_genuinely_dispatches() {
     unsafe { std::env::remove_var("ALLOW_PRIVATE_WEBHOOKS") };
 }
 
+/// **`GET /api/webhooks/executions` — Master sees every execution; a non-master key sees only its
+/// own webhooks', and `can_manage_keys` grants neither.**
+///
+/// This is the core RBAC contract Task 3 asks for, spelled out against two webhooks owned by two
+/// different keys so "sees its own" and "does not see the other's" are both actually exercised
+/// (a test with only one owned webhook could pass by accident if the scoping filter were missing
+/// entirely and the handler merely happened to return the right rows for that one caller).
+#[tokio::test]
+async fn s4_webhook_executions_are_scoped_to_ownership_not_can_manage_keys() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (owner_a_id, owner_a_key) = insert_key(&db, "Owner A", false, false, true, false).await;
+    let (owner_b_id, owner_b_key) = insert_key(&db, "Owner B", false, false, true, false).await;
+    // Holds `can_manage_keys` — the exact scope the brief says must NOT grant execution read
+    // access — and nothing else.
+    let (_parent_id, parent_only_key) = insert_key(&db, "Parent (manage_keys only)", false, true, false, false).await;
+    let (_stranger_id, stranger_key) = insert_key(&db, "No webhook rights", false, false, false, false).await;
+
+    let group_id = insert_group_row(&db, "executions-rbac-group").await;
+    grant_perm(&db, owner_a_id, group_id, true, true, true, false).await;
+    grant_perm(&db, owner_b_id, group_id, true, true, true, false).await;
+
+    let seed_webhook = |owner: Uuid| {
+        let db = db.clone();
+        async move {
+            let webhook_id = Uuid::new_v4();
+            simply_ip_vault::entities::webhook_config::ActiveModel {
+                id: Set(webhook_id),
+                name: Set(format!("hook-{webhook_id}")),
+                target_url: Set("https://example.com/hook".to_owned()),
+                secret_token: Set(String::new()),
+                auth_mode: Set("NONE".to_owned()),
+                api_key: Set(None),
+                hmac_template: Set(None),
+                signature_header: Set(None),
+                signature_prefix: Set(None),
+                headers_json: Set(None),
+                payload_template: Set("{}".to_owned()),
+                group_id: Set(group_id),
+                is_active: Set(true),
+                events: Set(None),
+                owner_key_id: Set(Some(owner)),
+                created_at: Set(chrono::Utc::now().naive_utc()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            webhook_id
+        }
+    };
+    let seed_execution = |webhook_id: Uuid| {
+        let db = db.clone();
+        async move {
+            simply_ip_vault::entities::webhook_execution::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                webhook_id: Set(webhook_id),
+                event_type: Set("IP_ADD".to_owned()),
+                status_code: Set(Some(200)),
+                is_success: Set(true),
+                duration_ms: Set(5),
+                error_message: Set(None),
+                created_at: Set(chrono::Utc::now().naive_utc()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+    };
+
+    let webhook_a = seed_webhook(owner_a_id).await;
+    let webhook_b = seed_webhook(owner_b_id).await;
+    seed_execution(webhook_a).await;
+    seed_execution(webhook_b).await;
+
+    let list = |key: &str, ts: i64| {
+        let app = app.clone();
+        let key = key.to_owned();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("GET")
+                .uri("/api/webhooks/executions")
+                .header("X-API-Key", &key)), ts, "");
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap_or(serde_json::Value::Null);
+            (status, body)
+        }
+    };
+
+    // `can_manage_keys` alone: refused outright, per the brief's explicit note.
+    let (status, _) = list(&parent_only_key, 1).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "can_manage_keys must not grant execution read access");
+
+    // No webhook rights at all: refused outright too.
+    let (status, _) = list(&stranger_key, 2).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    // Owner A sees only its own webhook's execution, never Owner B's.
+    let (status, body) = list(&owner_a_key, 3).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().expect("a JSON array");
+    assert_eq!(rows.len(), 1, "Owner A sees exactly its own webhook's execution: {body}");
+    assert_eq!(rows[0]["webhook_id"], webhook_a.to_string());
+
+    // Owner B, symmetrically, sees only its own.
+    let (status, body) = list(&owner_b_key, 4).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().expect("a JSON array");
+    assert_eq!(rows.len(), 1, "Owner B sees exactly its own webhook's execution: {body}");
+    assert_eq!(rows[0]["webhook_id"], webhook_b.to_string());
+
+    // Master sees both, across both owners.
+    let (status, body) = list(&master_key, 5).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().expect("a JSON array");
+    assert_eq!(rows.len(), 2, "Master sees every webhook's executions: {body}");
+}
+
 // ─────────────────────────────────────────────────────────────
 // RBAC_MODEL.md §4 — visibility scopes and oracle discipline
 // ─────────────────────────────────────────────────────────────
@@ -5170,6 +5294,108 @@ async fn s4_key_listing_shows_own_subtree_in_full_and_shared_keys_minimally() {
     .unwrap();
     assert_eq!(master_listing.len(), 5, "master sees every key: {master_listing:?}");
     assert!(master_listing.iter().all(|k| k["view"] == "full"));
+}
+
+/// **`GET /api/keys` carries the exact `parent_key_id` chain the dashboard's Key Lineage view
+/// reconstructs client-side** — multiple siblings under one parent, correctly distinguishable, and
+/// a grandchild one level further down.
+///
+/// The existing view-scoping test above already covers *one* parent/daughter pair; it does not
+/// prove that two daughters of the *same* parent come back individually attributable, which is
+/// exactly what the lineage view's `apiKeys.filter(k => k.parent_key_id === id)` (one level of
+/// children) depends on — a listing that accidentally coalesced or mis-attributed siblings would
+/// pass every existing RBAC test (visibility scoping is unaffected) while silently breaking the
+/// lineage UI.
+#[tokio::test]
+async fn s4_api_key_listing_carries_the_parent_child_chain_a_lineage_view_needs() {
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (parent_id, parent_key) = insert_key(&db, "Parent", false, true, false, false).await;
+
+    // Mints a key through the real API (server-generated credentials, exactly like a real client
+    // would get) and returns `(id, plaintext_key, signing_secret)` for signing that key's own
+    // subsequent requests.
+    let mint_child = |name: &'static str, creator_key: String, ts: i64| {
+        let app = app.clone();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .method("POST")
+                .uri("/api/keys")
+                .header("X-API-Key", &creator_key)
+                .header("Content-Type", "application/json")), ts, json!({ "name": name }).to_string());
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap();
+            let id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+            let plaintext = body["plaintext_key"].as_str().unwrap().to_owned();
+            let secret = body["signing_secret"].as_str().unwrap().to_owned();
+            (id, plaintext, secret)
+        }
+    };
+
+    let (child_a, child_a_plaintext, child_a_secret) = mint_child("Child A", parent_key.clone(), 1).await;
+    let (child_b, _, _) = mint_child("Child B", parent_key.clone(), 2).await;
+
+    // A grandchild needs `can_manage_keys` granted to Child A first — Master is the only one who
+    // may grant it (R4), so this goes through master rather than self-granting.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("PUT")
+        .uri(format!("/api/keys/{child_a}"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json")), 3, json!({
+            "can_manage_keys": true
+        }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = signed_later_with(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/keys")
+        .header("X-API-Key", &child_a_plaintext)
+        .header("Content-Type", "application/json")), &child_a_secret, 4, json!({ "name": "Grandchild" }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let grandchild_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    // Parent's own listing (its "own subtree", §4) must carry the whole chain.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/keys")
+        .header("X-API-Key", &parent_key)), 5, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    let listing: Vec<serde_json::Value> = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let by_id = |id: Uuid| listing.iter().find(|k| k["id"] == id.to_string()).unwrap();
+
+    // Both children individually attribute their parent correctly — not merged, not swapped.
+    assert_eq!(by_id(child_a)["parent_key_id"], parent_id.to_string());
+    assert_eq!(by_id(child_b)["parent_key_id"], parent_id.to_string());
+    assert_ne!(child_a, child_b, "sanity: two distinct children exist");
+
+    // "One level of children" from Parent's perspective is exactly {Child A, Child B} — the
+    // grandchild must not appear as a direct child of Parent, only of Child A.
+    let direct_children_of_parent: Vec<&serde_json::Value> = listing
+        .iter()
+        .filter(|k| k["parent_key_id"] == parent_id.to_string())
+        .collect();
+    assert_eq!(direct_children_of_parent.len(), 2, "exactly Child A and Child B: {listing:?}");
+
+    assert_eq!(
+        by_id(grandchild_id)["parent_key_id"], child_a.to_string(),
+        "the grandchild's immediate parent is Child A, not Parent"
+    );
 }
 
 /// **§4 — dispatch targets are visible to their creator and Master, and to nobody else.**

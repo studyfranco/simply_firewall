@@ -236,11 +236,20 @@ pub enum Relation {
         on_delete = "Cascade"
     )]
     IpGroup,
+    /// This webhook's dispatch attempts.
+    #[sea_orm(has_many = "super::webhook_execution::Entity")]
+    WebhookExecution,
 }
 
 impl Related<super::ip_group::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::IpGroup.def()
+    }
+}
+
+impl Related<super::webhook_execution::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::WebhookExecution.def()
     }
 }
 

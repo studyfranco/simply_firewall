@@ -13,6 +13,7 @@ erDiagram
     api_keys ||--o{ api_key_group_permissions : "1:N"
     ip_groups ||--o{ api_key_group_permissions : "1:N"
     ip_groups ||--o{ webhook_configs : "1:N"
+    webhook_configs ||--o{ webhook_executions : "1:N"
     ip_groups ||--o{ ip_record_group_memberships : "1:N"
     ip_records ||--o{ ip_record_group_memberships : "1:N"
     api_keys ||--o{ audit_logs : "1:N (optional)"
@@ -29,7 +30,7 @@ erDiagram
            ▲
            │ N:1
            │
-      [ip_groups] ───► (1:N) ───► [webhook_configs]
+      [ip_groups] ───► (1:N) ───► [webhook_configs] ───► (1:N) ───► [webhook_executions]
            │
            │ 1:N
            ▼
@@ -257,7 +258,53 @@ inferred. It is still accepted on input for compatibility and is never emitted.
 
 ---
 
-### 7. `audit_logs`
+### 7. `webhook_executions`
+One row per outbound HTTP attempt a webhook dispatch makes — including retries, so a delivery that
+failed twice before succeeding leaves three rows, not one. Added by `m20260824_093000`.
+
+| Field | Type | Attributes | Description |
+| :--- | :--- | :--- | :--- |
+| `id` | `UUID` | Primary Key, Auto-Gen | Unique execution row ID |
+| `webhook_id` | `UUID` | Not Null, FK -> `webhook_configs.id` (**CASCADE**) | The webhook this attempt was dispatched for |
+| `event_type` | `String` | Not Null | `IP_ADD`/`IP_UPDATE`/`IP_DELETE` (matching `webhook_configs.events`) or `TEST` for a live "Test Webhook" dispatch |
+| `status_code` | `Integer` | Nullable | HTTP status received, if a response was received at all. `NULL` means a network-level failure (timeout, connection refused, DNS failure), not "unknown" |
+| `is_success` | `Boolean` | Not Null | Whether the receiver answered `2xx`. The column filtered on for status and for retention — `status_code` is diagnostic detail |
+| `duration_ms` | `Integer` | Not Null | Wall-clock duration of this one attempt. Not cumulative across a delivery's retries |
+| `error_message` | `Text` | Nullable | Failure reason or a response-body snippet. `NULL` on success |
+| `created_at` | `DateTimeUtc` | Not Null, Indexed | When this attempt was made |
+
+**Why `webhook_id` is `CASCADE`, not `SET NULL` like `audit_logs.api_key_id`.** This table carries no
+denormalized webhook name — unlike `audit_logs`, which keeps `api_key_name`/`api_key_prefix` so a
+nulled row still says who acted — so a `SET NULL` row would be an orphan attributable to nothing.
+Worse, visibility here is derived entirely through `webhook_id -> webhook_configs.owner_key_id` (this
+table has no `owner_key_id` column of its own); a nulled `webhook_id` would make the row invisible to
+every owner while remaining silently readable to Master, the opposite of what §4 asks for. See the
+migration's module header for the full reasoning, including why this table is not part of
+`RBAC_MODEL.md` §6's pre-flight inventory (it is operational log data, governed the same way
+`audit_logs` already is — no `owner_key_id`, confers no rights, not itself creatable or reassignable).
+
+**Retention, not permanence.** Unlike every other table here, rows are deliberately short-lived:
+`retention::run_webhook_execution_retention_worker` purges successful rows (`is_success = true`)
+after 24 hours and failed rows after 7 days (168 hours), both configurable
+(`WEBHOOK_EXECUTION_RETENTION_SUCCESS_HOURS`/`WEBHOOK_EXECUTION_RETENTION_FAILURE_HOURS`). The
+asymmetry is deliberate: a successful delivery has nothing further to investigate once it is
+confirmed, while a failure is exactly the row an operator is most likely to still need a day or a
+week later.
+
+**Visibility (`GET /api/webhooks/executions`).** Same base gate as every other webhook endpoint —
+`is_master || can_manage_webhooks` — then, for a non-master caller, narrowed to ownership: only
+executions whose `webhook_id` resolves to a `webhook_configs` row it owns (`owner_key_id =
+caller.id`). `can_manage_keys` satisfies neither half — it grants authority over *keys*, not read
+access to any webhook's delivery history, owned or not. This is a narrower rule than the
+peer's own `can_view_execution` grant (`RBAC_MODEL.md` documents "Execution record" as
+`simply_hook_executor`'s creator-private entity, and that service adds a dedicated per-hook
+`can_view_execution` permission verb) — `simply_ip_vault` does not have an equivalent verb, and
+ownership is the only path to visibility here. Documented as a deliberate divergence, the same way
+Pillar 5's authentication-posture asymmetry is (`AGENT_NOTES.MD`, "Convergence Parity Check").
+
+---
+
+### 8. `audit_logs`
 Security audit trail tracking mutating operations across the application.
 
 | Field | Type | Attributes | Description |

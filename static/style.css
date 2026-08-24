@@ -937,6 +937,21 @@ body {
     border: 1px solid rgba(231, 76, 60, 0.35);
 }
 
+/* Webhook execution status, in the Executions tab. Same colour language as `.test-result-panel`
+   (`--success`/`--danger`) rather than `.badge-white`/`.badge-ban`, which already mean whitelist/
+   ban elsewhere and would be a false-friend reuse here. */
+.badge-exec-success {
+    background-color: rgba(28, 220, 154, 0.12);
+    color: var(--success);
+    border: 1px solid rgba(28, 220, 154, 0.25);
+}
+
+.badge-exec-failed {
+    background-color: rgba(231, 76, 60, 0.15);
+    color: var(--danger);
+    border: 1px solid rgba(231, 76, 60, 0.35);
+}
+
 .badge-conflict {
     background-color: rgba(243, 156, 18, 0.15);
     color: var(--warning);
@@ -1756,6 +1771,53 @@ body {
 
 .test-result-detail:empty {
     display: none;
+}
+
+/* Key Lineage modal: one `.lineage-entry` per key (ancestor, target, or child), indented inline by
+   depth (see `lineageEntry()`). `.lineage-current` marks the key the modal was opened for, so it
+   reads as a clear anchor between the ancestor chain above it and the children below. */
+.lineage-section-title {
+    font-size: 0.7rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--text-muted);
+    margin: 1rem 0 0.4rem;
+}
+
+.lineage-section-title:first-child {
+    margin-top: 0;
+}
+
+.lineage-entry {
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.lineage-entry:last-child {
+    border-bottom: none;
+}
+
+.lineage-entry-header {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    margin-bottom: 0.35rem;
+}
+
+.lineage-connector {
+    color: var(--text-muted);
+}
+
+.lineage-current {
+    background-color: rgba(28, 220, 154, 0.06);
+    border-left: 2px solid var(--accent);
+    padding-left: 0.6rem;
+    margin-left: -0.6rem;
+}
+
+.lineage-entry-scopes {
+    margin-bottom: 0.35rem;
 }
 
 /* ─── Batch Selection Actions ──────────────────────────────── */

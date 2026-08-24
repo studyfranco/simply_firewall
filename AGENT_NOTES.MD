@@ -8677,3 +8677,144 @@ All five clean:
 | `cargo test` | **316 passed** (up from 309: +6 `dispatch.rs` retry/test-dispatch tests, +1 `rbac_integration_tests.rs` webhook-test-endpoint ownership/dispatch test), 0 failed, across all 9 binaries |
 | `./scripts/test_e2e.sh` | **629 checks passed**, 0 failed (unchanged — no §-numbered check added this session; the new endpoint and UI were verified live in a browser instead, see above) |
 | `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+## Session — Webhook execution history, retention worker, and hierarchical API key UI (2026-08-24)
+
+**Scope:** new migration + entity (`webhook_executions`), `src/dispatch.rs`, `src/retention.rs`,
+`src/main.rs`, `src/api/webhooks.rs`, `src/lib.rs`, `SCHEMA.MD`, `AGENT.MD`, `FILE_MAP.MD`,
+`static/`, two test files. `RBAC_MODEL.md` untouched (read-only). No peer pull needed for the
+implementation itself, but `example/simply_hook_executor`'s current executions/key-hierarchy UI was
+read as the named reference for Tasks 3–5, and the mandatory pull ran first regardless (already up
+to date; the peer had picked up its own new commits — `33006b3` et al. — since last checked, none
+relevant to this session's work).
+
+### Task 1 — `webhook_executions` (migration `m20260824_093000`, entity `webhook_execution.rs`)
+
+One row per outbound HTTP attempt, including retries — not per logical delivery. `webhook_id` is
+`ON DELETE CASCADE`, a deliberate departure from `audit_logs.api_key_id`'s `SET NULL` precedent:
+this table has no denormalized webhook name to fall back on (a nulled row would be an unattributable
+orphan), and because visibility is entirely join-derived through `webhook_id` (no `owner_key_id`
+column of its own), a nulled row would also be invisible to its former owner while remaining
+readable by Master — the opposite of §4. Reasoned through against `RBAC_MODEL.md` §6 (pre-flight
+inventory) too: this table is operational log data, not a "resource" or "creator-private entity" in
+the RBAC sense (no `owner_key_id`, confers no rights, not independently creatable/reassignable), so
+it is governed the way `audit_logs` already is — outside pre-flight inventory, cascade-deleted with
+its parent the same way `webhook_configs` already cascade-deletes with its parent `ip_groups` row.
+Indexes: `webhook_id` (FK + RBAC scoping queries), `created_at` (retention sweep + newest-first
+ordering), composite `(is_success, created_at)` (the retention sweep filters on exactly that pair,
+with two different age thresholds).
+
+### Task 2 — dispatch logging and the retention worker
+
+`dispatch::log_execution` is called after every `attempt_delivery` inside the retry loop
+(`dispatch_with_retries_config`) and once from the live "Test Webhook" path
+(`send_test_dispatch_with_privacy`, `event_type = "TEST"`) — never for a request that was refused
+before it could be attempted (a `prepare_dispatch` failure or an SSRF block), since neither is an
+HTTP attempt and neither has a status code or duration worth recording. Logging failures are logged
+and swallowed, never allowed to affect delivery outcome or retry behaviour.
+
+`retention.rs` gained a second, fully independent worker (`run_webhook_execution_retention_worker`,
+its own task, its own shutdown channel in `main.rs`) alongside the existing IP-record one — chosen
+over folding it into the existing worker specifically so a slow sweep on one table can never delay
+the other's tick. Two thresholds, deliberately uncoupled: successes purge after 24h
+(`WEBHOOK_EXECUTION_RETENTION_SUCCESS_HOURS`), failures after 7 days/168h
+(`WEBHOOK_EXECUTION_RETENTION_FAILURE_HOURS`) — a failure is what an operator comes back to
+investigate; a confirmed success is not. Each disables independently at `0`.
+
+### Task 3 — `GET /api/webhooks/executions` and its RBAC
+
+Registered ahead of `/webhooks/{id}` in the route list purely for readability; verified live (not
+just reasoned about) that axum's router prefers the literal segment regardless of registration
+order — booted the real binary and sent a signed `GET /api/webhooks/executions`, got `200 []`, not
+the `400`/`405` a match against `/webhooks/{id}`'s handlers would have produced.
+
+Same base gate as every other webhook endpoint (`is_master || can_manage_webhooks`), then narrowed
+to ownership for non-master (`webhook_configs.owner_key_id = caller.id`, resolved as a first query
+for the caller's own webhook ids since this table carries no `owner_key_id` itself). Landed on
+requiring `can_manage_webhooks` as the base gate — matching `list_webhooks`/`update_webhook`/
+`delete_webhook`/`test_webhook` exactly — after initially drafting it as ownership-only with no base
+gate at all; revised for consistency with every other endpoint in the file rather than inventing a
+new access shape for just this one. Deliberately narrower than the peer: `RBAC_MODEL.md` documents
+`simply_hook_executor`'s own creator-private entity ("Execution record") as additionally readable via
+a per-hook `can_view_execution` grant; `simply_ip_vault` has no equivalent verb, so ownership is the
+only path to visibility here — documented as a deliberate divergence in `SCHEMA.MD`, the same way
+Pillar 5's authentication-posture asymmetry already is.
+
+### Task 4 — Executions tab
+
+Reused `PagedCache` as-is (the same generic paginator `auditCache`/`ipCache` already use) rather than
+writing new pagination logic — `executionsCache` needed only a `fetchChunk` function and the four
+standard render/pagination-update wiring calls. Status rendering: `is_success` → green badge with
+the status code; a failed response → red badge with the code; a network-level failure (`status_code`
+`NULL`) → red "Error" badge, new `.badge-exec-success`/`.badge-exec-failed` CSS rather than reusing
+`.badge-white`/`.badge-ban` (already mean whitelist/ban elsewhere — a false-friend reuse here).
+
+### Task 5 — Key Lineage modal
+
+Explored `example/simply_hook_executor`'s own key-hierarchy UI first, per the brief's instruction —
+finding is worth recording since it shapes what "mirror" means here: **the peer has no recursive
+tree either.** It is a flat table plus a side-drawer showing one ancestor chain (root-first, with a
+"_ghost" placeholder for an invisible parent) and **one level** of children, built client-side from
+the already-fetched flat key list via `parent_key_id`. Implemented the same structure —
+`openKeyLineageModal` — as a **modal**, not a side-drawer: `simply_ip_vault`'s dashboard has an
+established, heavily-used modal pattern (Edit Key, Edit Webhook, Manage Access) and no drawer
+component anywhere, so matching the peer's chrome literally would have introduced a second,
+inconsistent "detail panel" pattern into this codebase for a UI concept it already has a home for.
+Reused `renderKeyScopes` (the existing tier/permission-badge renderer) inside each lineage entry
+rather than inventing a second badge set, so the lineage view is structurally incapable of showing a
+permission the main Keys table renders differently.
+
+### Task 6 — tests and gates
+
+Four categories, each mutation-tested (planted the exact defect, confirmed the test fails, reverted,
+confirmed it passes again):
+
+- **Execution logging** — the existing dispatch retry-engine tests (`transient_errors_are_retried_until_success`,
+  `permanent_4xx_errors_are_not_retried`, `retries_are_exhausted_after_max_attempts`) were extended
+  with `webhook_executions` row-count/content assertions rather than duplicated into new tests, plus
+  two new assertions on the "Test Webhook" path (`send_test_dispatch_reports_success_...` now checks
+  one row was written; `..._is_blocked_by_the_ssrf_filter_by_default` now checks *zero* rows were,
+  proving a refused request is never logged as an attempt).
+- **Retention pruning** — `webhook_execution_retention_purges_each_outcome_on_its_own_window`
+  (`tests/security_tests.rs`, beside the existing IP-retention test it mirrors): four rows pin the
+  boundary between the two thresholds, including one deliberately old enough to fail the *success*
+  window but not the *failure* one — the row that would disappear if the two thresholds were
+  accidentally coupled to one shared minimum. Mutation-planted exactly that coupling; caught.
+- **Master vs. non-master ownership filtering** —
+  `s4_webhook_executions_are_scoped_to_ownership_not_can_manage_keys`
+  (`tests/rbac_integration_tests.rs`): two different owners, each with one webhook and one
+  execution, a `can_manage_keys`-only key (must get `403`), a no-rights key (`403`), each owner
+  sees exactly its own row, Master sees both. Mutation-planted removal of the ownership filter;
+  caught immediately (Owner A saw Owner B's row).
+- **API key hierarchy queries** —
+  `s4_api_key_listing_carries_the_parent_child_chain_a_lineage_view_needs`: two siblings under one
+  parent plus a grandchild, minted through the real `POST /api/keys` (server-generated credentials,
+  captured from the response and used to sign the grandchild's own creation request — not the
+  `test_signing_secret()` shortcut, which only works for keys seeded directly by test helpers).
+  Asserts each child individually attributes the correct `parent_key_id` and that "one level of
+  children" from the parent's perspective excludes the grandchild — the property distinct from
+  existing view-scoping tests, which check full-vs-minimal visibility but never assert multiple
+  siblings come back individually distinguishable.
+
+### Quality gates
+
+All five clean:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean, zero warnings (one `redundant_locals` catch fixed during development — an unnecessary `let group_id = group_id;` shadow in a test closure) |
+| `cargo test` | **319 passed** (up from 316: +1 `security_tests.rs` retention test, +2 `rbac_integration_tests.rs` execution-RBAC and key-lineage-chain tests), 0 failed, across all 9 binaries |
+| `./scripts/test_e2e.sh` | **629 checks passed**, 0 failed (unchanged — this session's new surface was verified via Rust integration tests and a live browser session instead of new shell-script checks) |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+### UI verification
+
+Booted the real binary against a throwaway file-backed SQLite database and drove a real headless
+Chromium session (the same hand-rolled, stdlib-only CDP client from the previous session, no
+`chromium-cli`/Playwright available in this sandbox): logged in, created a group and a webhook
+pointed at an unreachable address, fired `POST /webhooks/{id}/test`, switched to the new Executions
+tab and confirmed the resulting row rendered with the correct event/status/duration/error-detail
+columns and local-time formatting; separately minted two child keys and confirmed the Key Lineage
+modal correctly listed both as one level of children under the signed-in Master key, each with its
+own tier badge and permission badges. Screenshots captured and reviewed for both.

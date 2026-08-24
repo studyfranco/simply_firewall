@@ -477,6 +477,7 @@ class FirewallClient {
         // network round-trip per page.
         this.ipCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchIpsChunk(offset, limit) });
         this.auditCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchAuditLogsChunk(offset, limit) });
+        this.executionsCache = new PagedCache({ fetchChunk: (offset, limit) => this.fetchExecutionsChunk(offset, limit) });
 
         // Searchable group comboboxes — populated from this.state.groups by loadGroups() via
         // setOptions() on each. The IP-group filter is free-text (its value IS the substring
@@ -814,6 +815,7 @@ class FirewallClient {
         const groupsTab = document.getElementById('groups-tab-btn');
         const keysTab = document.getElementById('keys-tab-btn');
         const webhooksTab = document.getElementById('webhooks-tab-btn');
+        const executionsTab = document.getElementById('executions-tab-btn');
         const auditTab = document.getElementById('audit-tab-btn');
 
         // Manage IPs
@@ -833,6 +835,11 @@ class FirewallClient {
 
         // Webhooks tab
         webhooksTab.style.display = (p.is_master || p.can_manage_webhooks) ? 'inline-block' : 'none';
+
+        // Executions tab — same gate as the backend's `list_webhook_executions` (§ ownership is
+        // enforced server-side; this only hides a tab that would otherwise show nothing useful to
+        // a key that holds neither).
+        executionsTab.style.display = (p.is_master || p.can_manage_webhooks) ? 'inline-block' : 'none';
 
         // Audit Logs Tab — the backend restricts GET /audit-logs to master keys, so hide the tab
         // entirely rather than show it and let every request 403.
@@ -914,6 +921,7 @@ class FirewallClient {
         await this.loadGroups();
         if (this.state.profile.is_master || this.state.profile.can_manage_webhooks) {
             await this.loadWebhooks();
+            await this.loadExecutions();
         }
         if (this.state.profile.is_master) {
             await this.loadAuditLogs();
@@ -1035,6 +1043,21 @@ class FirewallClient {
             await this.auditCache.loadFirstChunk();
             this.renderAuditLogsTable();
             this.updateAuditPaginationUI();
+        } catch(e) {}
+    }
+
+    async fetchExecutionsChunk(offset, limit) {
+        const params = new URLSearchParams({ limit, offset });
+        return await this.apiFetch(`/webhooks/executions?${params.toString()}`);
+    }
+
+    async loadExecutions() {
+        const p = this.state.profile;
+        if (!p?.is_master && !p?.can_manage_webhooks) return;
+        try {
+            await this.executionsCache.loadFirstChunk();
+            this.renderExecutionsTable();
+            this.updateExecutionsPaginationUI();
         } catch(e) {}
     }
 
@@ -1292,6 +1315,7 @@ class FirewallClient {
                 ? '<span class="text-muted text-sm" title="This key is visible because it shares a group you manage. Its credentials are outside your scope.">Shared &mdash; view only</span>'
                 : `
                         <button class="btn btn-sm btn-secondary" onclick="window.app.openEditKeyModal('${k.id}')">Edit</button>
+                        <button class="btn btn-sm btn-secondary" onclick="window.app.openKeyLineageModal('${k.id}')" title="View this key's ancestors and children">Lineage</button>
                         <button class="btn btn-sm btn-secondary" onclick="window.app.regenerateKeySecret('${k.id}')" title="Replace BOTH the API key and its signing secret">Regenerate</button>
                         <button class="btn btn-sm btn-cancel" onclick="window.app.rotateSigningSecret('${k.id}')" title="Replace only the HMAC signing secret; the API key, name and permissions stay the same">Rotate Secret</button>
                         <button class="btn btn-sm btn-danger" onclick="window.app.deleteKey('${k.id}')">Delete</button>`;
@@ -1353,6 +1377,94 @@ class FirewallClient {
             return '<span class="text-muted text-sm">None</span>';
         }
         return `<div class="scope-badges">${badges.join('')}</div>`;
+    }
+
+    /**
+     * One entry in the Key Lineage modal: name, tier/scope badges (reusing `renderKeyScopes`, so
+     * this view can never show a permission the main table doesn't also show the same way), and
+     * bound IPs. `depth` indents by `1.25rem` per level — inline, not a CSS class, matching how
+     * deeply nested this one entry happens to be without needing a class per depth.
+     */
+    lineageEntry(k, { depth = 0, current = false, connector = false } = {}) {
+        if (k._ghost) {
+            return `<div class="lineage-entry" style="margin-left:${depth * 1.25}rem">
+                <div class="lineage-entry-header">
+                    ${connector ? '<span class="lineage-connector">&#8618;</span>' : ''}
+                    <span class="text-muted">${escapeHtml(k.name)}</span>
+                </div>
+            </div>`;
+        }
+        const boundIps = k.view === 'minimal'
+            ? 'hidden (outside your visibility)'
+            : (k.bound_ips || 'no restriction');
+        return `<div class="lineage-entry${current ? ' lineage-current' : ''}" style="margin-left:${depth * 1.25}rem">
+            <div class="lineage-entry-header">
+                ${connector ? '<span class="lineage-connector">&#8618;</span>' : ''}
+                <strong>${escapeHtml(k.name)}</strong>
+            </div>
+            <div class="lineage-entry-scopes">${this.renderKeyScopes(k)}</div>
+            <div class="text-muted text-sm font-mono">Bound IPs: ${escapeHtml(boundIps)}</div>
+        </div>`;
+    }
+
+    /**
+     * Opens the Key Lineage modal for `id` — its ancestor chain (root-first), the key itself, and
+     * one level of children. Built entirely from the already-fetched `GET /api/keys` response
+     * (`this.state.apiKeys`), the same data the main table renders from, so this view can never
+     * show anything the server did not already agree the caller may see.
+     *
+     * **One level of children only**, not a full recursive descendant tree — mirroring
+     * `simply_hook_executor`'s own lineage view. A full subtree is not guaranteed visible from the
+     * middle of it: `RBAC_MODEL.md` §4's "own subtree in full" is scoped to keys *the caller*
+     * created, not to every descendant of an arbitrary key the caller can merely see.
+     *
+     * **Ghost ancestors.** Walking `parent_key_id` upward can reach an id this caller's own listing
+     * did not include — a parent outside their visibility. That stops the walk with a single
+     * "(outside your visibility)" placeholder rather than silently truncating the chain with no
+     * explanation, or guessing at data the server never sent.
+     */
+    openKeyLineageModal(id) {
+        const byId = new Map(this.state.apiKeys.map(k => [k.id, k]));
+        const target = byId.get(id);
+        if (!target) return;
+
+        const ancestors = [];
+        let cursor = target;
+        while (cursor.parent_key_id) {
+            const parent = byId.get(cursor.parent_key_id);
+            if (!parent) {
+                ancestors.unshift({ id: cursor.parent_key_id, name: '(outside your visibility)', _ghost: true });
+                break;
+            }
+            ancestors.unshift(parent);
+            cursor = parent;
+        }
+
+        // One level, by direct `parent_key_id` match — see the doc comment above for why this
+        // deliberately does not recurse further.
+        const children = this.state.apiKeys.filter(k => k.parent_key_id === id);
+
+        const sections = [];
+        if (ancestors.length > 0) {
+            sections.push('<h4 class="lineage-section-title">Ancestors</h4>');
+            sections.push(ancestors.map((k, i) => this.lineageEntry(k, { depth: i, connector: i > 0 })).join(''));
+        }
+        sections.push('<h4 class="lineage-section-title">This key</h4>');
+        sections.push(this.lineageEntry(target, { depth: ancestors.length, current: true, connector: ancestors.length > 0 }));
+        if (children.length > 0) {
+            sections.push('<h4 class="lineage-section-title">Children</h4>');
+            sections.push(children.map(k => this.lineageEntry(k, { depth: ancestors.length + 1, connector: true })).join(''));
+        } else {
+            sections.push('<p class="text-muted text-sm mt-2">No child keys.</p>');
+        }
+
+        document.getElementById('key-lineage-body').innerHTML = sections.join('');
+        document.getElementById('key-lineage-modal-title').textContent = `Key Lineage — ${target.name}`;
+        document.getElementById('key-lineage-modal').classList.remove('hidden');
+    }
+
+    closeKeyLineageModal() {
+        document.getElementById('key-lineage-modal').classList.add('hidden');
     }
 
     updateRightsSelector() {
@@ -1616,6 +1728,51 @@ class FirewallClient {
         pr.disabled = !this.auditCache.hasPrevPage;
         nt.disabled = !this.auditCache.hasNextPage;
         ind.textContent = `Page ${this.auditCache.localPage + 1}`;
+    }
+
+    /** `<span class="badge ...">`: the HTTP status on success, the status on a rejected response,
+     * or "Error" for a network-level failure that never got a response at all (`status_code` is
+     * `null` in exactly that case — see `webhook_executions.status_code`'s own doc). */
+    executionStatusBadge(e) {
+        if (e.is_success) return `<span class="badge badge-exec-success">${e.status_code}</span>`;
+        if (e.status_code != null) return `<span class="badge badge-exec-failed">${e.status_code}</span>`;
+        return `<span class="badge badge-exec-failed">Error</span>`;
+    }
+
+    renderExecutionsTable() {
+        const tbody = document.getElementById('executions-table-body');
+        const rows = this.executionsCache.currentPageItems;
+        if (rows.length === 0) {
+            tbody.innerHTML = '<tr><td colspan="6" class="text-center text-muted">No webhook executions recorded.</td></tr>';
+            return;
+        }
+
+        tbody.innerHTML = rows.map(e => {
+            const webhook = this.state.webhooks.find(w => w.id === e.webhook_id);
+            const webhookDisplay = webhook
+                ? `<strong>${escapeHtml(webhook.name)}</strong><br><span class="text-muted text-sm font-mono">${escapeHtml(webhook.target_url)}</span>`
+                : `<span class="text-muted font-mono">${escapeHtml(e.webhook_id)}</span>`;
+            return `
+            <tr>
+                <td class="text-sm">${formatTimestamp(e.created_at)}</td>
+                <td>${webhookDisplay}</td>
+                <td><span class="badge badge-scope">${escapeHtml(e.event_type)}</span></td>
+                <td>${this.executionStatusBadge(e)}</td>
+                <td class="text-sm">${e.duration_ms} ms</td>
+                <td class="text-sm">${escapeHtml(e.error_message || '-')}</td>
+            </tr>
+        `;
+        }).join('');
+    }
+
+    updateExecutionsPaginationUI() {
+        const pr = document.getElementById('executions-btn-prev');
+        const nt = document.getElementById('executions-btn-next');
+        const ind = document.getElementById('executions-page-indicator');
+
+        pr.disabled = !this.executionsCache.hasPrevPage;
+        nt.disabled = !this.executionsCache.hasNextPage;
+        ind.textContent = `Page ${this.executionsCache.localPage + 1}`;
     }
 
     // ───────────────────────────────────────────────────────
@@ -2560,6 +2717,18 @@ class FirewallClient {
         document.getElementById('form-edit-key').addEventListener('submit', (e) => this.submitEditKey(e));
         document.getElementById('edit-key-cancel').addEventListener('click', () => this.closeEditKeyModal());
 
+        // Key Lineage modal: close on button / backdrop / Escape.
+        document.getElementById('key-lineage-close').addEventListener('click', () => this.closeKeyLineageModal());
+        document.getElementById('key-lineage-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'key-lineage-modal') this.closeKeyLineageModal();
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            if (!document.getElementById('key-lineage-modal').classList.contains('hidden')) {
+                this.closeKeyLineageModal();
+            }
+        });
+
         // Edit Webhook modal: submit, Cancel, backdrop click, Escape, headers editor, and the live
         // "Test Webhook" action — same close pattern as the Manage Access modal above.
         document.getElementById('form-edit-webhook').addEventListener('submit', (e) => this.submitEditWebhook(e));
@@ -2615,6 +2784,18 @@ class FirewallClient {
             await this.auditCache.nextPage();
             this.renderAuditLogsTable();
             this.updateAuditPaginationUI();
+        });
+
+        // Execution history pagination — same pattern again.
+        document.getElementById('executions-btn-prev').addEventListener('click', () => {
+            this.executionsCache.prevPage();
+            this.renderExecutionsTable();
+            this.updateExecutionsPaginationUI();
+        });
+        document.getElementById('executions-btn-next').addEventListener('click', async () => {
+            await this.executionsCache.nextPage();
+            this.renderExecutionsTable();
+            this.updateExecutionsPaginationUI();
         });
     }
 }

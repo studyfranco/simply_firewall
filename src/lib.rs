@@ -98,6 +98,10 @@ pub fn create_app(state: AppState) -> Router {
         .route("/groups/{id}/owner", put(api::reassign_group_owner))
         .route("/webhooks", post(api::create_webhook))
         .route("/webhooks", get(api::list_webhooks))
+        // Ahead of `/webhooks/{id}` in this list purely for readability — axum's router (matchit)
+        // already prefers a literal segment over a path parameter at the same position regardless
+        // of registration order, so `executions` can never be swallowed by `{id}`.
+        .route("/webhooks/executions", get(api::list_webhook_executions))
         .route("/webhooks/{id}", put(api::update_webhook))
         .route("/webhooks/{id}", delete(api::delete_webhook))
         .route("/webhooks/{id}/owner", put(api::reassign_webhook_owner))

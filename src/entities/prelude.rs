@@ -12,5 +12,7 @@ pub use super::ip_record::Entity as IpRecord;
 pub use super::ip_record_group_membership::Entity as IpRecordGroupMembership;
 /// The `webhook_configs` entity.
 pub use super::webhook_config::Entity as WebhookConfig;
+/// The `webhook_executions` entity.
+pub use super::webhook_execution::Entity as WebhookExecution;
 /// The `audit_logs` entity.
 pub use super::audit_log::Entity as AuditLog;

@@ -2756,6 +2756,111 @@ async fn purge_removes_only_records_past_the_92_day_retention_window() {
     assert!(raw_record(&db, recent).await.is_some(), "nothing was destroyed by the disabled sweep");
 }
 
+/// **Successful and failed `webhook_executions` rows are purged on independent windows** — 24h for
+/// successes, 7 days (168h) for failures — and each threshold disables independently at `0`,
+/// mirroring `purge_removes_only_records_past_the_92_day_retention_window`'s coverage of the same
+/// properties for IP records.
+///
+/// Four rows pin every boundary that matters: a success old enough to purge, a success just inside
+/// its window, a failure old enough to purge under the *failure* window but not the (much shorter)
+/// success one, and a failure well inside its own window. If the two outcomes shared one threshold,
+/// this test would catch it — the "old failure" row would either survive when it shouldn't (proving
+/// the windows are genuinely independent) or the "old success" row's purge would also destroy it.
+#[tokio::test]
+async fn webhook_execution_retention_purges_each_outcome_on_its_own_window() {
+    use simply_ip_vault::retention::{
+        purge_expired_webhook_executions, DEFAULT_EXECUTION_RETENTION_FAILURE_HOURS,
+        DEFAULT_EXECUTION_RETENTION_SUCCESS_HOURS,
+    };
+    use simply_ip_vault::entities::{webhook_config, webhook_execution};
+
+    let db = setup_test_db().await;
+    let group_id = insert_group(&db, "exec-retention-group").await;
+
+    let webhook_id = Uuid::new_v4();
+    webhook_config::ActiveModel {
+        id: Set(webhook_id),
+        name: Set("retention-test-hook".to_owned()),
+        target_url: Set("https://example.com/hook".to_owned()),
+        secret_token: Set(String::new()),
+        auth_mode: Set("NONE".to_owned()),
+        api_key: Set(None),
+        hmac_template: Set(None),
+        signature_header: Set(None),
+        signature_prefix: Set(None),
+        headers_json: Set(None),
+        payload_template: Set("{}".to_owned()),
+        group_id: Set(group_id),
+        is_active: Set(true),
+        events: Set(None),
+        owner_key_id: Set(None),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    let age_hours = |hours: i64| (chrono::Utc::now() - chrono::Duration::hours(hours)).naive_utc();
+    let insert_execution = |is_success: bool, hours_old: i64| {
+        let db = db.clone();
+        async move {
+            let id = Uuid::new_v4();
+            webhook_execution::ActiveModel {
+                id: Set(id),
+                webhook_id: Set(webhook_id),
+                event_type: Set("TEST".to_owned()),
+                status_code: Set(Some(if is_success { 200 } else { 500 })),
+                is_success: Set(is_success),
+                duration_ms: Set(10),
+                error_message: Set(None),
+                created_at: Set(age_hours(hours_old)),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            id
+        }
+    };
+
+    let old_success = insert_execution(true, DEFAULT_EXECUTION_RETENTION_SUCCESS_HOURS + 1).await;
+    let recent_success = insert_execution(true, DEFAULT_EXECUTION_RETENTION_SUCCESS_HOURS - 1).await;
+    // Older than the success window, but well inside the (much longer) failure window — must
+    // survive, proving the two thresholds are genuinely independent rather than one shared minimum.
+    let old_failure_recent_by_its_own_window =
+        insert_execution(false, DEFAULT_EXECUTION_RETENTION_SUCCESS_HOURS + 1).await;
+    let expired_failure = insert_execution(false, DEFAULT_EXECUTION_RETENTION_FAILURE_HOURS + 1).await;
+
+    let purged = purge_expired_webhook_executions(
+        &db,
+        DEFAULT_EXECUTION_RETENTION_SUCCESS_HOURS,
+        DEFAULT_EXECUTION_RETENTION_FAILURE_HOURS,
+    )
+    .await
+    .unwrap();
+    assert_eq!(purged, 2, "the one aged-out success and the one aged-out failure, nothing else");
+
+    let exists = |id: Uuid| {
+        let db = db.clone();
+        async move { webhook_execution::Entity::find_by_id(id).one(&db).await.unwrap().is_some() }
+    };
+    assert!(!exists(old_success).await, "a success past its 24h window is purged");
+    assert!(exists(recent_success).await, "a success inside its window is kept");
+    assert!(
+        exists(old_failure_recent_by_its_own_window).await,
+        "a failure past the *success* window but inside its own 7-day window must survive — the \
+         two outcomes do not share a threshold"
+    );
+    assert!(!exists(expired_failure).await, "a failure past its 7-day window is purged");
+
+    // Each threshold disables independently at 0, mirroring `purge_expired_ip_records`'s contract.
+    assert_eq!(purge_expired_webhook_executions(&db, 0, 0).await.unwrap(), 0);
+    assert!(exists(recent_success).await, "nothing was destroyed by the fully-disabled sweep");
+    assert!(
+        exists(old_failure_recent_by_its_own_window).await,
+        "nothing was destroyed by the fully-disabled sweep"
+    );
+}
+
 /// The master-only purge endpoint runs the same sweep and reports what it removed.
 #[tokio::test]
 async fn purge_endpoint_reports_the_number_of_records_removed() {

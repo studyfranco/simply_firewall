@@ -4,14 +4,14 @@
 //! never exposed by the shared-resource visibility rule (§4).
 
 use axum::{Extension, extract::{Json, State}, response::IntoResponse};
-use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
+use sea_orm::{ActiveModelTrait, ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entities::prelude::WebhookConfig;
-use crate::entities::{api_key, webhook_config};
+use crate::entities::{api_key, webhook_config, webhook_execution};
 use crate::error::AppError;
-use crate::extract::{StrictJson, StrictPath};
+use crate::extract::{StrictJson, StrictPath, StrictQuery};
 use crate::middleware::ClientIp;
 use crate::state::AppState;
 
@@ -653,7 +653,7 @@ pub async fn test_webhook(
         cause: Some("Manual test dispatch from the dashboard".to_owned()),
     };
 
-    let result = crate::dispatch::send_test_dispatch(&target, &event).await;
+    let result = crate::dispatch::send_test_dispatch(&state.db, &target, &event).await;
 
     create_audit_log(
         &state.db,
@@ -675,4 +675,85 @@ pub async fn test_webhook(
     .await?;
 
     Ok(Json(result))
+}
+
+
+/// Query parameters for `GET /api/v1/webhooks/executions`. `deny_unknown_fields` so a misspelled
+/// filter (`success` for `is_success`) is refused with `400` rather than silently ignored and
+/// answered as though no filter had been given — the same reasoning as `AuditLogQuery`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookExecutionQuery {
+    /// Narrow to one webhook's delivery history. Combined with the caller's own ownership scoping
+    /// below (`AND`, not `OR`) — asking for a webhook the caller does not own returns an empty page,
+    /// never another tenant's rows and never an error that would confirm the id exists.
+    pub webhook_id: Option<Uuid>,
+    /// Filter by exact event type (`IP_ADD`, `IP_UPDATE`, `IP_DELETE`, `TEST`).
+    pub event_type: Option<String>,
+    /// Filter to only successful (`true`) or only failed (`false`) attempts.
+    pub is_success: Option<bool>,
+    /// Pagination limit. Defaults to 50, matching `AuditLogQuery`.
+    pub limit: Option<u64>,
+    /// Pagination offset.
+    pub offset: Option<u64>,
+}
+
+
+/// Handles `GET /api/v1/webhooks/executions` — the delivery history behind the dashboard's
+/// Executions tab.
+///
+/// Same base gate as every other endpoint in this file — `is_master || can_manage_webhooks` — and
+/// then, for a non-master caller, narrowed further to **ownership**: only executions for webhooks
+/// it owns (`webhook_configs.owner_key_id = caller.id`), the same test `update_webhook`/
+/// `delete_webhook`/`test_webhook` already apply. `can_manage_keys` satisfies neither half — it
+/// authorises managing *keys*, not reading any webhook's delivery history, owned or not. This
+/// table carries no `owner_key_id` of its own; visibility is derived entirely by joining through
+/// `webhook_id`, which is why the ownership check below runs as a first query for the caller's own
+/// webhook ids rather than a column filter on this table directly.
+///
+/// Narrower than the peer's own model: `RBAC_MODEL.md` documents `simply_hook_executor`'s
+/// "Execution record" (its own creator-private entity, analogous to this table) as additionally
+/// readable via a dedicated `can_view_execution` grant on the parent Hook. `simply_ip_vault` has no
+/// equivalent verb; ownership is the only path to visibility here. See `SCHEMA.MD`'s
+/// `webhook_executions` section for this documented as a deliberate divergence.
+pub async fn list_webhook_executions(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    StrictQuery(query): StrictQuery<WebhookExecutionQuery>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_webhooks {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let mut q = webhook_execution::Entity::find()
+        .order_by_desc(webhook_execution::Column::CreatedAt);
+
+    if !key.is_master {
+        let owned_ids: Vec<Uuid> = WebhookConfig::find()
+            .filter(webhook_config::Column::OwnerKeyId.eq(key.id))
+            .select_only()
+            .column(webhook_config::Column::Id)
+            .into_tuple()
+            .all(&state.db)
+            .await?;
+        q = q.filter(webhook_execution::Column::WebhookId.is_in(owned_ids));
+    }
+
+    if let Some(webhook_id) = query.webhook_id {
+        q = q.filter(webhook_execution::Column::WebhookId.eq(webhook_id));
+    }
+    if let Some(event_type) = &query.event_type
+        && !event_type.is_empty()
+    {
+        q = q.filter(webhook_execution::Column::EventType.eq(event_type));
+    }
+    if let Some(is_success) = query.is_success {
+        q = q.filter(webhook_execution::Column::IsSuccess.eq(is_success));
+    }
+
+    let limit = query.limit.unwrap_or(50);
+    let offset = query.offset.unwrap_or(0);
+    let executions = q.limit(limit).offset(offset).all(&state.db).await?;
+
+    Ok(Json(executions))
 }

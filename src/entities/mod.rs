@@ -15,5 +15,7 @@ pub mod ip_record;
 pub mod ip_record_group_membership;
 /// The `webhook_configs` table: outbound webhook endpoints scoped to an IP group.
 pub mod webhook_config;
+/// The `webhook_executions` table: one row per outbound HTTP attempt a webhook dispatch makes.
+pub mod webhook_execution;
 /// The `audit_logs` table: the audit trail of mutating operations.
 pub mod audit_log;
