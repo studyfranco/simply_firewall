@@ -3711,7 +3711,8 @@ async fn sqlite_pragma_failures_never_stop_the_service() {
 /// This one uses a real file, which is the only place the setting can take effect, and asserts the
 /// two properties the production reasoning depends on:
 ///
-/// 1. `journal_mode` is genuinely `wal` and `busy_timeout` is genuinely 5000 after the call.
+/// 1. `journal_mode` is genuinely `wal` and `busy_timeout` is genuinely the configured value after
+///    the call.
 /// 2. **WAL survives reconnection.** It is recorded in the database file header rather than being
 ///    connection state, which is what makes applying it once at startup sufficient for every
 ///    connection the pool opens later — and for every subsequent run of the service. If that were
@@ -3750,7 +3751,11 @@ async fn wal_engages_on_a_file_backed_database_and_survives_reconnection() {
     );
 
     let timeout: i32 = pragma(&db, "PRAGMA busy_timeout;", "timeout").await;
-    assert_eq!(timeout, 5000, "the busy timeout must be the configured 5000ms");
+    assert_eq!(
+        timeout,
+        simply_ip_vault::db::SQLITE_BUSY_TIMEOUT_MS as i32,
+        "the busy timeout must be the configured value"
+    );
 
     // Migrations still run against the WAL database, so the setting is not merely reported but
     // actually usable for the writes the service performs at boot.
@@ -4736,7 +4741,7 @@ async fn test_webhook_queue_overflow_non_blocking() {
 /// What it demonstrates is that the queueing is *correct and bounded*: every task completes, none
 /// returns `SQLITE_BUSY` or a lock error, and the final row count is exactly the union of what the
 /// tasks wrote. A serialisation bug would show up here as a failed request or a missing row, and
-/// `busy_timeout=5000` is what keeps a queued writer waiting rather than erroring.
+/// `db::SQLITE_BUSY_TIMEOUT_MS` is what keeps a queued writer waiting rather than erroring.
 ///
 /// The tasks write **overlapping** address ranges deliberately. Disjoint sets would exercise only
 /// insertion; the overlap forces the same rows to be contended, which is where a lost update or a

@@ -44,9 +44,9 @@
 //! defaults (10/2) and their own hard ceiling
 //! (`config::SQLITE_FILE_MAX_CONNECTIONS_CEILING`, 10, which an operator can lower but not raise),
 //! distinct from the PostgreSQL/MySQL tier's 50/10 and unbounded ceiling. SQLite permits any number
-//! of concurrent readers under WAL and exactly one writer at a time — `busy_timeout` (still 5000ms,
-//! still applied per-connection at open time) is what makes a second writer queue instead of
-//! erroring, on one connection or ten alike.
+//! of concurrent readers under WAL and exactly one writer at a time — `busy_timeout` (10000ms as of
+//! the concurrent-write-load tuning pass, still applied per-connection at open time) is what makes
+//! a second writer queue instead of erroring, on one connection or ten alike.
 //!
 //! # Pool tuning is structural, not a guard clause
 //!
@@ -63,11 +63,12 @@
 //! | Pragma | Scope | Default already in force |
 //! | :--- | :--- | :--- |
 //! | `foreign_keys` | per-connection | **ON** (SQLx sets it) |
-//! | `busy_timeout` | per-connection | **5000 ms** (SQLx sets it) |
+//! | `busy_timeout` | per-connection | **10000 ms** (SQLx sets it) |
 //! | `journal_mode=WAL` | **persistent** (file header) | `delete` |
 //! | `synchronous=NORMAL` | per-connection | `FULL` (2) |
+//! | `temp_store=MEMORY` | per-connection | `0` (engine's choice, usually a disk file) |
 //!
-//! Three of the four are per-connection, which would matter enormously on a multi-connection pool —
+//! Four of the five are per-connection, which would matter enormously on a multi-connection pool —
 //! sampling `PRAGMA synchronous` across a five-connection pool after a single
 //! `PRAGMA synchronous=NORMAL` returns *both* `1` and `2`, because the statement lands on whichever
 //! connection served it. With one connection the distinction collapses: pool-wide and
@@ -96,10 +97,16 @@ use sea_orm_migration::MigratorTrait;
 
 /// How long SQLite waits on a locked database before returning `SQLITE_BUSY`, in milliseconds.
 ///
-/// Deliberately the same 5000 SQLx already applies by default: this constant exists to make the
-/// value explicit and assert it, not to change it. Lowering it would turn a transient lock into a
-/// `500` on a request that did nothing wrong.
-pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 5_000;
+/// Was 5000 (SQLx's own default) until production logs under concurrent write load showed
+/// `SQLITE_BUSY` surfacing as user-visible `500`s on simple single-row `INSERT`s — a writer that
+/// would have succeeded a few hundred milliseconds later was instead failing outright. Raised to
+/// 10000: still bounded (a genuinely stuck writer cannot hang a request forever), but wide enough
+/// that a writer queued behind WAL's single-writer-at-a-time rule waits it out instead of erroring.
+/// This does not fix contention — it changes what contention costs: a queued write now costs
+/// latency instead of a failed request. See also the write-batching in `api::records`/`api::support`
+/// that reduces *how many* separate write-lock acquisitions one logical request makes in the first
+/// place, which addresses the contention itself rather than just how long a caller tolerates it.
+pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 10_000;
 
 /// Connections in the in-memory SQLite tier's pool. **One**, unconditionally, and not a tuning
 /// knob — see the module header for why this is a data-integrity constraint rather than the
@@ -150,7 +157,15 @@ fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, Db
         // companion to WAL: it keeps full durability against process crashes and gives up only the
         // last transactions in a power loss, in exchange for not fsyncing on every commit.
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(std::time::Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS))))
+        .busy_timeout(std::time::Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS)))
+        // TEMP tables and indexes (the sort in `ORDER BY ... USE TEMP B-TREE`, a `GROUP BY`'s
+        // aggregation buffer) default to a disk-backed file. `MEMORY` keeps them in the process's
+        // own heap instead — a real win for the query shapes this service actually runs, all of
+        // which fit comfortably in memory (paginated listings, capped at `limit`), and one less
+        // place a slow disk can show up as request latency. No portable `SqliteConnectOptions`
+        // method exists for this pragma, hence the generic `.pragma()` escape hatch rather than a
+        // typed setter like the others above.
+        .pragma("temp_store", "MEMORY"))
 }
 
 /// Runs every pending migration on a dedicated pool that opens with exactly one connection, applies
@@ -420,13 +435,14 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
         Err(e) => tracing::warn!("Could not enable SQLite WAL mode: {e}. Continuing without it."),
     }
 
-    // The remaining three are set-and-log. Each is per-connection, so on a pool this reaches
+    // The remaining four are set-and-log. Each is per-connection, so on a pool this reaches
     // whichever connection serves it — which is precisely why `connect` sets them at open time and
     // why these calls are confirmation rather than mechanism.
     for (label, statement) in [
         ("foreign key enforcement", "PRAGMA foreign_keys=ON;".to_owned()),
         ("synchronous mode", "PRAGMA synchronous=NORMAL;".to_owned()),
         ("busy timeout", format!("PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS};")),
+        ("temp store", "PRAGMA temp_store=MEMORY;".to_owned()),
     ] {
         if let Err(e) =
             db.execute_raw(Statement::from_string(DatabaseBackend::Sqlite, statement)).await
@@ -436,7 +452,7 @@ pub async fn apply_sqlite_pragmas(db: &DatabaseConnection) -> Result<(), DbErr> 
     }
     tracing::info!(
         "SQLite session pragmas applied: foreign_keys=ON, synchronous=NORMAL, \
-         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms."
+         busy_timeout={SQLITE_BUSY_TIMEOUT_MS}ms, temp_store=MEMORY."
     );
 
     Ok(())
@@ -475,16 +491,16 @@ mod tests {
         }
     }
 
-    /// All four pragmas are in force on a pool built by [`connect`].
+    /// All five pragmas are in force on a pool built by [`connect`].
     ///
     /// Note what this does **not** claim. An earlier version of this test sampled twenty-five times
     /// and asserted the values were uniform, which sounds like a pool-wide guarantee and is not one:
     /// the pool holds a single connection, so every sample necessarily hits it and uniformity is
     /// tautological. The real pool-wide guarantee comes from
-    /// [`tests::the_sqlite_pool_holds_exactly_one_connection`]; this test's job is only that the four
+    /// [`tests::the_sqlite_pool_holds_exactly_one_connection`]; this test's job is only that the five
     /// settings actually took.
     #[tokio::test]
-    async fn connect_applies_all_four_pragmas() {
+    async fn connect_applies_all_five_pragmas() {
         let tmp = TempDb::new();
         let db = connect(&tmp.url()).await.expect("a file-backed sqlite pool opens");
 
@@ -495,6 +511,10 @@ mod tests {
             pragma::<i32>(&db, "PRAGMA busy_timeout;", "timeout").await,
             SQLITE_BUSY_TIMEOUT_MS as i32
         );
+        // `temp_store`: 0 = engine default (a disk file), 1 = FILE, 2 = MEMORY. `.pragma("temp_store",
+        // "MEMORY")` at connect time must actually have taken, not merely been accepted as a
+        // connection-string parameter and silently ignored.
+        assert_eq!(pragma::<i32>(&db, "PRAGMA temp_store;", "temp_store").await, 2, "MEMORY");
     }
 
     /// The in-memory SQLite tier holds exactly one connection, regardless of anything an operator

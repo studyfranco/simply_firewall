@@ -170,9 +170,9 @@ Stores banned or whitelisted IP addresses and CIDR subnets.
 | `cause` | `Text` | Nullable | Reason for adding the IP record |
 | `is_locked` | `Boolean` | Default: `false` | When `true`, the record cannot be modified or deleted through the API regardless of caller permissions. No endpoint currently sets this; it is a manual/administrative safeguard |
 | `created_at` | `DateTimeUtc` | Not Null | Initial insertion timestamp |
-| `updated_at` | `DateTimeUtc` | Not Null | Timestamp of the last field update (cause change or re-registration) |
+| `updated_at` | `DateTimeUtc` | Not Null, Indexed | Timestamp of the last field update (cause change or re-registration). Indexed twice over: `idx-ip_records-updated_at` (single-column, `m20260811_000011`, for the delta-sync `since` filter, which searches this column alone) and `idx_ip_records_deleted_updated` (composite with `is_deleted`, `m20260824_150000`, below) — not a duplicate, since `GET /api/ips`'s own listing query filters `is_deleted` *and* sorts by this column together, a shape the single-column index cannot serve without a separate sort step |
 | `last_seen_at` | `DateTimeUtc` | Not Null, Indexed | Timestamp of last re-registration or recorded activity |
-| `is_deleted` | `Boolean` | Not Null, Default: `false`, Indexed | Soft-delete flag. A `true` row is hidden from every read (including the `iplist` export) and from webhook dispatch, but survives for the retention window so a master key can inspect or restore it |
+| `is_deleted` | `Boolean` | Not Null, Default: `false`, Indexed | Soft-delete flag. A `true` row is hidden from every read (including the `iplist` export) and from webhook dispatch, but survives for the retention window so a master key can inspect or restore it. Also the leading column of `idx_ip_records_deleted_updated` (`(is_deleted, updated_at DESC)`, `m20260824_150000`) — `GET /api/ips`'s own query filters on this column and sorts on `updated_at` in the same request, and `EXPLAIN QUERY PLAN` confirmed this composite is what lets SQLite serve both from one index scan instead of filtering via the single-column `is_deleted` index and then falling back to `USE TEMP B-TREE FOR ORDER BY` |
 | `deleted_at` | `DateTimeUtc` | Nullable, Indexed | When the soft delete happened; `NULL` while live. This — not `updated_at` — is what the purge measures against, so restoring and re-deleting restarts the retention clock |
 | `deleted_by` | `Text` | Nullable | The `api_keys.id` (as text) of whoever soft-deleted the row. Deliberately **not** a foreign key: a FK would either block deleting that key or null the attribution out, and an attribution that disappears with its actor is not an attribution |
 
@@ -196,7 +196,13 @@ Associates an IP record with one or multiple IP groups.
 | `group_id` | `UUID` | FK -> `ip_groups.id` (CASCADE) | Associated Group ID |
 
 *Constraints & Indexes:*
-- Primary Key: Composite `(ip_record_id, group_id)`
+- Primary Key: Composite `(ip_record_id, group_id)` — serves a lookup keyed on `ip_record_id`
+  (or on both columns together) but not one keyed on `group_id` alone, since that is the
+  *trailing* column.
+- `idx_group_memberships_lookup`: Composite `(group_id, ip_record_id)`, added by `m20260824_150000`.
+  The other column order — every RBAC accessible-groups filter, and `GET /api/ips`'s own
+  `groups=`/`group_name=`/`group_id=` filters, look up memberships by `group_id` alone, which the
+  primary key above cannot serve; `EXPLAIN QUERY PLAN` showed a full table scan without this index.
 
 ---
 

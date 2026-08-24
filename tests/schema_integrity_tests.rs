@@ -1078,6 +1078,181 @@ async fn the_audit_rebuild_preserved_both_indexes() {
     );
 }
 
+/// **`GET /api/ips`'s join, filtered on `is_deleted`, sorted on `updated_at` — and a group-scoped
+/// membership lookup — must use an index for both the filter and the sort, and must never fall back
+/// to a full table scan.**
+///
+/// `has_index` (above) only proves an index *exists*; it says nothing about whether the query
+/// planner actually reaches for it, which is the property that was actually missing (production
+/// logs reported 20-42s on exactly this join under load) and the property `m20260824_150000`'s own
+/// module header verified empirically before writing the migration. `EXPLAIN QUERY PLAN`'s output
+/// is the only source of truth for that — `USE TEMP B-TREE FOR ORDER BY` and `SCAN <table>` are the
+/// two lines whose *absence* this test pins, so a future migration or query rewrite that
+/// reintroduces either regresses loudly here rather than silently in production.
+#[tokio::test]
+async fn list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    let plan_lines = |db: &DatabaseConnection, sql: &'static str| {
+        let db = db.clone();
+        async move {
+            db.query_all_raw(Statement::from_string(DatabaseBackend::Sqlite, sql))
+                .await
+                .expect("EXPLAIN QUERY PLAN runs")
+                .into_iter()
+                .map(|row| row.try_get::<String>("", "detail").unwrap_or_default())
+                .collect::<Vec<_>>()
+        }
+    };
+
+    // The exact join shape `list_ips` builds via `find_also_related` + `filter(IsDeleted)` +
+    // `order_by_desc(UpdatedAt)` — reproduced as raw SQL because `EXPLAIN QUERY PLAN` has no SeaORM
+    // query-builder equivalent to prefix onto a `Select`.
+    let join_plan = plan_lines(
+        &db,
+        "EXPLAIN QUERY PLAN \
+         SELECT * FROM ip_record_group_memberships \
+         LEFT JOIN ip_records ON ip_records.id = ip_record_group_memberships.ip_record_id \
+         WHERE ip_records.is_deleted = false \
+         ORDER BY ip_records.updated_at DESC \
+         LIMIT 50 OFFSET 0",
+    )
+    .await;
+    assert!(
+        join_plan.iter().any(|l| l.contains("idx_ip_records_deleted_updated")),
+        "the join must use the composite (is_deleted, updated_at) index: {join_plan:?}"
+    );
+    assert!(
+        !join_plan.iter().any(|l| l.contains("TEMP B-TREE")),
+        "the composite index must make a separate sort step unnecessary: {join_plan:?}"
+    );
+    assert!(
+        !join_plan.iter().any(|l| l.contains("SCAN ip_records")),
+        "ip_records must be reached by SEARCH (index), never a full SCAN: {join_plan:?}"
+    );
+
+    // The group-scoped lookup every RBAC accessible-groups filter (and `groups=`/`group_id=`)
+    // performs — `WHERE group_id = ?` alone, the shape the membership table's primary key
+    // (`ip_record_id, group_id` — the *other* column order) cannot serve.
+    let group_lookup_plan =
+        plan_lines(&db, "EXPLAIN QUERY PLAN SELECT * FROM ip_record_group_memberships WHERE group_id = '00000000-0000-0000-0000-000000000000'")
+            .await;
+    assert!(
+        group_lookup_plan.iter().any(|l| l.contains("idx_group_memberships_lookup")),
+        "the group_id lookup must use idx_group_memberships_lookup: {group_lookup_plan:?}"
+    );
+    assert!(
+        !group_lookup_plan.iter().any(|l| l.contains("SCAN")),
+        "a group_id lookup must never fall back to a full table scan: {group_lookup_plan:?}"
+    );
+}
+
+/// **`list_ips`'s query, at a size where a missing index is no longer a rounding error.**
+///
+/// The reported production symptom was 20-42 *seconds*, not milliseconds — which means the bound
+/// worth asserting is "unmistakably fast", not a specific fractional-millisecond figure. A literal
+/// sub-millisecond assertion would be dishonest here: this path runs through SeaORM's query
+/// builder, sqlx's async row mapping, and a pooled connection acquisition, all of which cost more
+/// than the index lookup itself does — asserting a number that tight would either be flaky on a
+/// loaded CI runner or, worse, coincidentally pass on `sqlite::memory:`'s page cache in a way that
+/// says nothing about the indexes actually being used (that property is `EXPLAIN QUERY PLAN`'s job,
+/// pinned by the test above — this one is about wall-clock time at realistic scale, the two
+/// properties are complementary, not substitutes for each other).
+///
+/// 50ms and 50,000 rows are not arbitrary — smaller values were tried first and rejected because
+/// they did not actually discriminate: at 5,000 rows this same query completed in well under 50ms
+/// *even with `idx_ip_records_deleted_updated` removed*, which would have made this a test that
+/// always passes regardless of whether the index exists — worse than no test, since it looks like
+/// coverage. Confirmed by mutation at the row count actually committed here: with the index
+/// removed, the same 50,000-row query took ~77ms (fails); restored, ~3ms (passes with room to
+/// spare) — a ~26x difference at a scale still small enough for this test to seed and run in under
+/// two seconds.
+#[tokio::test]
+async fn list_ips_query_completes_quickly_at_realistic_scale() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    const GROUPS: usize = 10;
+    const RECORDS_PER_GROUP: usize = 5_000;
+    const BULK_CHUNK: usize = 500; // sqlite's default bound on bound parameters per statement.
+
+    let mut group_ids = Vec::with_capacity(GROUPS);
+    for g in 0..GROUPS {
+        group_ids.push(seed_group(&db, &format!("bench-group-{g}"), None).await);
+    }
+
+    let now = Utc::now().naive_utc();
+    let mut record_models = Vec::with_capacity(GROUPS * RECORDS_PER_GROUP);
+    let mut membership_models = Vec::with_capacity(GROUPS * RECORDS_PER_GROUP);
+    for (g, &group_id) in group_ids.iter().enumerate() {
+        for i in 0..RECORDS_PER_GROUP {
+            let id = Uuid::new_v4();
+            // A spread of ages (not all identical) and roughly 10% soft-deleted — the mixed shape
+            // `WHERE is_deleted = false ORDER BY updated_at DESC` actually has to sort/filter
+            // through, rather than a pathological all-identical-value case an index could shortcut
+            // in a way real data never does.
+            let updated_at = now - chrono::Duration::seconds((g * RECORDS_PER_GROUP + i) as i64);
+            record_models.push(ip_record::ActiveModel {
+                id: Set(id),
+                target_address: Set(format!("10.{g}.{}.{}", i / 250, i % 250)),
+                cause: Set(Some("bench seed".to_owned())),
+                is_locked: Set(false),
+                created_at: Set(updated_at),
+                updated_at: Set(updated_at),
+                last_seen_at: Set(updated_at),
+                is_deleted: Set(i % 10 == 0),
+                deleted_at: Set(None),
+                deleted_by: Set(None),
+            });
+            membership_models.push(ip_record_group_membership::ActiveModel {
+                ip_record_id: Set(id),
+                group_id: Set(group_id),
+            });
+        }
+    }
+    for chunk in record_models.chunks(BULK_CHUNK) {
+        ip_record::Entity::insert_many(chunk.to_vec()).exec(&db).await.expect("bulk record insert");
+    }
+    for chunk in membership_models.chunks(BULK_CHUNK) {
+        ip_record_group_membership::Entity::insert_many(chunk.to_vec())
+            .exec(&db)
+            .await
+            .expect("bulk membership insert");
+    }
+
+    // The exact shape `list_ips` builds: `find_also_related` + `filter(IsDeleted)` +
+    // `order_by_desc(UpdatedAt)` + `limit`/`offset` — reproduced via the same SeaORM query builder
+    // `list_ips` itself calls, not hand-written SQL, so this exercises the real ORM/async path.
+    use sea_orm::{ColumnTrait, QueryFilter, QueryOrder, QuerySelect};
+
+    let started = std::time::Instant::now();
+    let page = ip_record_group_membership::Entity::find()
+        .find_also_related(ip_record::Entity)
+        .filter(ip_record::Column::IsDeleted.eq(false))
+        .order_by_desc(ip_record::Column::UpdatedAt)
+        .limit(50)
+        .offset(0)
+        .all(&db)
+        .await
+        .expect("the paginated query succeeds");
+    let elapsed = started.elapsed();
+    // Visible on a passing run too (`cargo test -- --nocapture`), not only in a failure message —
+    // the actual measured number is the point of a benchmark test, not just the pass/fail verdict.
+    println!(
+        "list_ips query: {elapsed:?} against {} seeded records (50-row page)",
+        GROUPS * RECORDS_PER_GROUP
+    );
+
+    assert_eq!(page.len(), 50, "a full page of results at this row count");
+    assert!(
+        elapsed < std::time::Duration::from_millis(50),
+        "list_ips's query took {elapsed:?} against {} seeded records — the composite index should \
+         make this fast regardless of row count, not merely tolerable",
+        GROUPS * RECORDS_PER_GROUP
+    );
+}
+
 /// Historical rows survive the constraint, and say so honestly.
 ///
 /// Migrations 1–9 are applied, a row with NULL attribution is written the way the old schema allowed,

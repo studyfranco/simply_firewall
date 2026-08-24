@@ -9238,3 +9238,150 @@ New Rust tests, all mutation-tested individually: `dispatch.rs` gained
 failed; `./scripts/test_e2e.sh` **704 checks passed** (up from 686: +18, §25c), 0 failed;
 `./scripts/verify_convergence.sh` 63 matching, 0 unexplained divergences, exit 0 (peer repo pulled
 fresh — picked up unrelated `simply_hook_executor` UI changes with no convergence impact).
+
+### Addendum 7 — write-lock contention, missing indexes, and `apiFetch` retrying into its own replay guard
+
+Four-part request driven by production logs: `list_ips`'s join taking 20-42s under load, simple
+`INSERT INTO audit_logs`/`ip_records` taking 1-2s, and the dashboard destroying sessions on network
+timeouts/5xx responses with retries that (the brief said) reuse stale signatures and get rejected as
+replays. Investigated every claim against the actual code before changing anything — two turned out
+to already be correct, two were real.
+
+**Task 1 — indexes, verified by `EXPLAIN QUERY PLAN` before writing any migration**, not assumed
+from the symptom. Booted a real migrated file-backed DB and ran the two query shapes directly:
+
+```text
+-- list_ips's join, before:
+SEARCH ip_records USING INDEX idx_ip_records_is_deleted (is_deleted=?)
+USE TEMP B-TREE FOR ORDER BY                              <-- the reported slowness
+
+-- a group-scoped membership lookup, before:
+SCAN ip_record_group_memberships                          <-- full table scan
+```
+
+Both real. `idx_ip_records_is_deleted` satisfies the `WHERE` but says nothing about order, so every
+matching row still gets sorted by hand; `ip_record_group_memberships`'s only index is its primary
+key `(ip_record_id, group_id)` — leading with the *wrong* column for a `group_id`-alone lookup, which
+is what every RBAC accessible-groups filter and `groups=`/`group_id=` does. Migration
+`m20260824_150000` adds `idx_ip_records_deleted_updated` (composite, `is_deleted`+`updated_at DESC`)
+and `idx_group_memberships_lookup` (composite, `group_id`+`ip_record_id`); re-running the same two
+`EXPLAIN QUERY PLAN`s afterward showed both problem lines gone.
+
+The other two indexes the brief asked for **already existed** — `idx-ip_records-updated_at`
+(`m20260811_000011`) and `idx-audit_logs-timestamp` (`m20230101_000001`), found by grepping every
+migration rather than trusting the column name. Added anyway, they would have been dead weight: a
+second index with identical lookup capability that a planner would never prefer over its twin,
+costing every future write for nothing. Not adding them was itself a finding, written into the new
+migration's own module header so the next person auditing "are we missing an index" doesn't
+re-propose the same two.
+
+New permanent regression test, `list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan`
+(`tests/schema_integrity_tests.rs`): pins both `EXPLAIN QUERY PLAN` outputs — the composite indexes
+present in the plan, `TEMP B-TREE`/`SCAN` absent. Mutation-tested by unregistering the migration:
+failed with the *exact* reported plan line (`USE TEMP B-TREE FOR ORDER BY`) reproduced verbatim.
+
+**Task 1/4 — a benchmark test that had to be caught lying to itself.** First draft seeded 5,000 rows
+and asserted the join completed under 50ms. It passed — including with the migration unregistered,
+which meant it was measuring nothing: SQLite's in-memory temp-b-tree sort over a few thousand rows is
+fast enough on its own that the missing index made no measurable difference at that scale. Rewritten
+at 50,000 rows (10 groups × 5,000), where mutation testing showed a real, discriminating gap: ~77ms
+without the index (fails the 50ms bound), ~3ms with it. The 50ms bound itself is deliberately not the
+literal "sub-millisecond" the brief asked for — the query runs through SeaORM's builder, sqlx's async
+row mapping, and pool acquisition, all of which cost more than the index lookup does, so a
+sub-millisecond assertion would either flake under CI load or coincidentally pass for reasons
+unrelated to indexing. 50ms is ~3 orders of magnitude under the reported 20-42*seconds* and, per the
+mutation test, still tight enough to fail loudly on a real regression.
+
+**Task 2 — PRAGMA tuning and the write-contention root cause.** `busy_timeout` 5000ms → 10000ms
+(the constant's own doc comment previously argued *for* keeping it at 5000; production evidence of
+`SQLITE_BUSY` surfacing as `500`s on writes that would have succeeded moments later is what changed
+that judgment — updated the comment rather than silently overriding it). Added `temp_store=MEMORY`
+via `SqliteConnectOptions::pragma()` (no typed setter exists for it, unlike the other four) and
+`PRAGMA temp_store=MEMORY` in `apply_sqlite_pragmas`'s confirmation pass; `connect_applies_all_five_pragmas`
+(renamed from `...four_pragmas`) asserts it read back as `2` (MEMORY).
+
+**"IMMEDIATE write transactions" and "async audit logging" turned out to be the same fix, not two.**
+Investigated whether SeaORM exposes `BEGIN IMMEDIATE` at all — it does, but not through the
+`IsolationLevel`/`AccessMode` API that looked like the obvious place (those are ANSI-SQL concepts
+with no SQLite-specific meaning and are visibly unused for at least some backends, `_isolation_level`/
+`_access_mode` in `sea-orm`'s own source). The actual mechanism, already used exactly once in this
+codebase (`api::records::batch_records`), is `TransactionTrait::begin_with_options` +
+`TransactionOptions { sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate), .. }` —
+missed on first read of the file, found only because `/api/ban`'s handler happened to be read in
+full for the audit-logging question below and its neighbor `batch_records` was right there with the
+pattern already spelled out in its own comment.
+
+For "async audit logging", read `create_audit_log`'s own doc comment first (it already argues, for
+the batch endpoint, that an audit row written outside its operation's transaction "would survive a
+rollback and claim an operation that never happened... a trail that lies is not a trail") and
+concluded literal fire-and-forget backgrounding would reopen exactly that problem for
+`handle_ip_upsert`/`delete_ip` — plus a new one, silent data loss if the process crashes between
+responding `200` and a spawned task's write actually landing. **Did not implement it as asked.**
+Instead traced what "audit_logs INSERT takes 1-2s" actually was: `handle_ip_upsert` did three
+separate, un-transacted writes against the pool (the record, the membership, the audit row), each
+its own implicit transaction and its own write-lock acquisition — three chances to queue behind
+another writer per logical request, not one slow statement. Combined all three (and the equivalent
+two-plus-one in `delete_ip`) into one `Immediate` transaction each, committed before the webhook
+event enqueues. This addresses the stated goal — the HTTP response is not delayed by the audit
+write specifically — by removing two of the three lock acquisitions entirely, without trading away
+the durability guarantee a background task would have cost. Documented the deviation prominently, in
+both `create_audit_log`'s doc comment and `AGENT.MD`, specifically so a future reader (or a future
+version of this same request) does not read the absence of a background task as an oversight.
+
+The existing `UniqueConstraintViolation` retry loop inside `handle_ip_upsert` (defends against two
+concurrent requests both inserting the same new address) is now effectively unreachable — an
+`Immediate` transaction holds the write lock for its whole duration, so a second writer queues rather
+than interleaving with the first — but was kept rather than deleted: nothing about its own
+correctness depended on the transaction wrapping being right, and removing defensive code the task
+did not ask about is exactly the kind of unrequested refactor to avoid.
+
+**Task 3 — `apiFetch`, and a premise that didn't survive reading the code.** The brief described
+"retried XHR requests" reusing stale signatures and 401ing as replays. `static/app.js` has no
+`XMLHttpRequest` anywhere and, before this pass, no retry logic of any kind — a network failure was
+toasted once and given up on. It also already scoped session destruction to genuine `401`s only;
+`res.status === 403` was already routed to `resyncCapabilities()`, never a logout, and the
+catch-all at the bottom never called `handleAuthFailure()` for anything but that one `401` branch.
+So the two headline symptoms ("destroys sessions on timeout", "retries replay stale signatures")
+were not reproducible from the code as it stood — the real gap was that nothing retried *at all*,
+which reads as "the request just failed" to a user, indistinguishable in the UI from "logged out"
+if the failed request happened to be `/auth/me` at boot.
+
+Rewrote `apiFetch` to recurse on itself (not loop with a captured timestamp) up to
+`API_FETCH_MAX_RETRIES` (2) times on: `fetch()` itself throwing (offline, DNS failure, an aborted
+connection — `NS_BINDING_ABORTED` and equivalents), any 5xx, or a `401` whose body does *not* match
+this server's own `{"error": "..."}` shape (every genuine `AppError::Unauthorized` is shaped exactly
+that way with no exception — `src/error.rs`; a `401` that isn't is far more likely a proxy/gateway
+artifact than a considered rejection, and is treated as transient rather than logged out). Each
+recursive call computes its own fresh `Math.floor(Date.now()/1000)` and calls `signRequest` fresh, so
+a retry never resends the prior attempt's headers verbatim.
+
+**A live headless-browser check caught a real bug in the fix itself before it shipped**: the first
+retry backoff was 400ms/800ms. `X-Timestamp` is whole seconds, so two attempts inside the same
+second sign an *identical* canonical string and produce an *identical* signature — a retry could
+collide with the anti-replay guard exactly the way the original (unreproducible) bug report
+described, just introduced by the retry logic meant to fix the *other* half of the brief. Caught by
+mocking `fetch()` to always reject and recording every attempt's `X-Timestamp`: 3 calls, only 2
+unique timestamps. Fixed by raising the base delay to 1100ms (comfortably over 1000ms even accounting
+for `setTimeout` firing late, which it does under load, never early) — re-ran the same check, 3
+calls, 3 unique timestamps. Also verified live: a genuine 401 still logs out; a mocked network
+failure and a mocked 503-then-200 both leave the session intact and show the "Server busy... retrying"
+toast (screenshotted mid-retry); a 401 with a non-JSON gateway-shaped body does not log out; a 403
+still surfaces the server's own "Permission denied: ..." text unchanged.
+
+No dedicated automated headless-browser suite exists in this repo (consistent with earlier
+addenda) — this round's verification was real (a live server, real HTTP responses, a real headless
+Chromium instance, screenshotted) but manual, not wired into `cargo test`/`test_e2e.sh` as a
+repeatable gate. `tests/frontend_syntax_test.rs`'s existing `oxc_parser` check does cover the
+rewritten `apiFetch` for syntax validity as part of every `cargo test` run, which is the one
+JS-level guarantee that *is* automated here.
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` **338 passed** (up from 336: +2 `schema_integrity_tests.rs` — the query-plan test and
+the benchmark), 0 failed; `./scripts/test_e2e.sh` **705 checks passed** (up from 704: +1, a new
+`temp_store=MEMORY` startup-log assertion; two existing assertions updated in place for
+`busy_timeout=10000ms`), 0 failed; `./scripts/verify_convergence.sh` **62 matching, 1 documented
+divergence, 0 unexplained**, exit 0 — the SQLite-pragma-count comparison flipped from an incidental
+`MATCH` to its already-anticipated `DIVERGES` state once a fifth pragma made the two services'
+`apply_sqlite_pragmas` bodies genuinely differ; the comparison's own `expected` wording ("applies 4
+pragmas") was updated to "5" to match, since the divergence itself was already accounted for and
+accepted, just described with a now-stale number.

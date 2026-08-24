@@ -632,11 +632,65 @@ class FirewallClient {
     }
 
     // ───────────────────────────────────────────────────────
-    // Fetch Wrapper (Global 401/403 interceptor)
+    // Fetch Wrapper (Global 401/403 interceptor, transient-failure retry)
     // ───────────────────────────────────────────────────────
-    async apiFetch(endpoint, options = {}) {
+
+    /** Attempts left, and the base backoff between them, for `apiFetch`'s transient-failure retry.
+     * `RETRY_BASE_DELAY_MS` grows linearly with attempt number (1100ms, 2200ms) rather than a fixed
+     * pause repeated — a burst of requests that all hit the same transient condition should not all
+     * retry in lockstep and immediately recreate the load that caused it.
+     *
+     * **1100, not some rounder, shorter number.** `X-Timestamp` is whole seconds
+     * (`Math.floor(Date.now() / 1000)`), so two attempts inside the same second sign the *identical*
+     * canonical string (method + path + timestamp + body, all unchanged on a retry) and therefore
+     * produce the *identical* `X-Signature-256` — which the anti-replay guard then rejects as a
+     * literal replay, turning "retry a transient failure" into "guarantee a 401 on attempt two". A
+     * delay of at least 1000ms, plus a margin against `setTimeout` firing a little late (which it
+     * does under load, never early), is what guarantees the retry's floored timestamp is a
+     * different integer than the attempt before it, no matter where in its own second that attempt
+     * landed. */
+    static API_FETCH_MAX_RETRIES = 2;
+    static API_FETCH_RETRY_BASE_DELAY_MS = 1100;
+
+    /**
+     * Three failure classes, handled differently — conflating them (specifically, treating *any*
+     * non-2xx or thrown error the same way) was the bug: a network drop or a 5xx would destroy the
+     * session exactly as if the credential itself had been rejected, logging out a user whose key
+     * was never actually invalid.
+     *
+     *   - **A genuine 401** — this server's own structured `{"error": "..."}` body (every 401
+     *     `AppError::Unauthorized` ever produces is shaped exactly that way, with no exception; see
+     *     `error.rs`) — means the credential itself was rejected: missing, malformed, wrong
+     *     signature, expired timestamp, a replay. Unrecoverable by definition, so the session is
+     *     destroyed. A 401 that does *not* carry that shape (empty body, an HTML error page, plain
+     *     text) did not come from this application's own considered rejection — far more likely a
+     *     misconfigured reverse proxy or gateway intercepting the request before it ever reached the
+     *     API — and is treated as transient instead, the same as a 5xx.
+     *   - **A transient failure** — `fetch()` itself rejecting (offline, DNS failure, a connection
+     *     aborted mid-flight — `NS_BINDING_ABORTED` and its Chromium/WebKit equivalents), or the
+     *     server answering with a 5xx (a gateway timeout, an overloaded database) — says nothing
+     *     about whether this key or signature is valid. Retried up to
+     *     [`API_FETCH_MAX_RETRIES`](#static-API_FETCH_MAX_RETRIES) times with a fresh
+     *     `X-Timestamp`/`X-Signature-256` on every attempt (this method recurses on itself rather
+     *     than looping with a captured timestamp, specifically so a retry cannot resend the *same*
+     *     signed headers — the anti-replay guard rejects an exact repeat outright, which would turn
+     *     "retry a transient failure" into "guarantee a 401 on the second attempt"). The session is
+     *     left untouched throughout; a soft toast says so rather than the page silently hanging.
+     *
+     *     Retrying a non-idempotent write (`POST /api/keys`, `POST /api/webhooks`) on a transient
+     *     failure carries a known, accepted risk: if the *original* attempt actually reached the
+     *     server and was processed, but the *response* was what got lost, a retry creates a second
+     *     resource. This service has no idempotency-key mechanism to close that gap, and building
+     *     one is out of scope here — noted so it isn't mistaken for an oversight.
+     *   - **Any other 4xx** (400/403/404/409/…) is neither of the above: the request reached the
+     *     server, was understood, and was refused for a reason retrying cannot fix. Surfaced once,
+     *     exactly as before.
+     */
+    async apiFetch(endpoint, options = {}, attempt = 0) {
         // The signature covers the path only, so strip any query string before signing while still
-        // requesting the full URL. Mutating fields all travel in the (signed) body.
+        // requesting the full URL. Mutating fields all travel in the (signed) body. Computed fresh
+        // on *every* call — including every retry, since a fresh timestamp is what a retry needs to
+        // avoid the anti-replay guard (see the class doc comment above).
         const method = (options.method || 'GET').toUpperCase();
         const rawBody = options.body ?? '';
         const timestamp = Math.floor(Date.now() / 1000).toString();
@@ -646,6 +700,7 @@ class FirewallClient {
             ...(options.headers || {})
         };
 
+        let res;
         try {
             if (this.apiKey && this.signingSecret) {
                 headers['X-API-Key'] = this.apiKey;
@@ -658,56 +713,82 @@ class FirewallClient {
                 );
             }
 
-            const res = await fetch(`${this.requestBase}${endpoint}`, { ...options, headers });
+            res = await fetch(`${this.requestBase}${endpoint}`, { ...options, headers });
+        } catch (networkError) {
+            // fetch() itself rejected: the request never got a response at all. Never a signal
+            // about the credential — never a logout, always eligible for retry.
+            return this._retryTransientFailureOrGiveUp(endpoint, options, attempt, networkError);
+        }
 
-            // 401 means the key itself is invalid/missing — the session is unrecoverable, so log
-            // out. 403 means the key IS valid but lacks permission for this one action; it must
-            // NOT log the user out or swallow the server's specific "Permission denied: ..."
-            // message behind a generic one — that message is exactly what the user needs to see,
-            // and falls through to the generic error handling below like any other 4xx.
-            if (res.status === 401) {
-                this.handleAuthFailure();
-                throw new Error("Session expired or invalid API key — please log in again.");
+        // Read the body as text first and only attempt to parse it when there's actually
+        // something to parse. Several endpoints (e.g. POST /api/keys/:id/groups) return a
+        // bare 200 with no body at all — exactly as "empty" as a real 204 as far as parsing
+        // is concerned — and `res.json()` throws "Unexpected end of JSON input" on either.
+        // A parse failure on a genuinely non-empty body (e.g. an upstream proxy's HTML error
+        // page, not actually JSON) falls back to the raw text rather than crashing.
+        const text = await res.text();
+        let data = {};
+        if (text && text.trim().length > 0) {
+            try {
+                data = JSON.parse(text);
+            } catch {
+                data = text;
             }
+        }
 
-            // A 403 is also a signal that this UI's picture of the key's rights is out of date: the
-            // gating below is built from a profile fetched at login, and scopes can be changed by
-            // Master, or revoked, at any point afterwards. Re-sync in the background so the offending
-            // control disappears instead of staying there to be clicked again.
-            //
-            // Deliberately not awaited and deliberately guarded: the caller's own error path should
-            // not wait on a refresh, and `/auth/me` failing must not recurse back into here.
-            if (res.status === 403) {
-                this.resyncCapabilities();
-            }
+        const looksLikeGenuineApiError = data && typeof data === 'object' && typeof data.error === 'string';
 
-            // Read the body as text first and only attempt to parse it when there's actually
-            // something to parse. Several endpoints (e.g. POST /api/keys/:id/groups) return a
-            // bare 200 with no body at all — exactly as "empty" as a real 204 as far as parsing
-            // is concerned — and `res.json()` throws "Unexpected end of JSON input" on either.
-            // A parse failure on a genuinely non-empty body (e.g. an upstream proxy's HTML error
-            // page, not actually JSON) falls back to the raw text rather than crashing.
-            const text = await res.text();
-            let data = {};
-            if (text && text.trim().length > 0) {
-                try {
-                    data = JSON.parse(text);
-                } catch {
-                    data = text;
-                }
-            }
+        // Genuine 401: the credential itself was rejected. Unrecoverable — log out.
+        if (res.status === 401 && looksLikeGenuineApiError) {
+            this.handleAuthFailure();
+            throw new Error("Session expired or invalid API key — please log in again.");
+        }
 
-            if (!res.ok) {
-                const errMsg = (data && typeof data === 'object' ? data.error : null) || (typeof data === 'string' ? data : null) || `HTTP ${res.status}`;
-                throw new Error(errMsg);
-            }
+        // A 401 that does not carry this server's own error shape, or any 5xx, is transient — a
+        // gateway/proxy artifact or a genuine server-side overload, neither of which says the
+        // credential is bad.
+        if (res.status >= 500 || (res.status === 401 && !looksLikeGenuineApiError)) {
+            const reason = looksLikeGenuineApiError ? data.error : `HTTP ${res.status}`;
+            return this._retryTransientFailureOrGiveUp(endpoint, options, attempt, new Error(reason));
+        }
 
-            return data;
+        // A 403 is a signal that this UI's picture of the key's rights is out of date: the gating
+        // elsewhere is built from a profile fetched at login, and scopes can be changed by Master,
+        // or revoked, at any point afterwards. Re-sync in the background so the offending control
+        // disappears instead of staying there to be clicked again.
+        //
+        // Deliberately not awaited and deliberately guarded: the caller's own error path should
+        // not wait on a refresh, and `/auth/me` failing must not recurse back into here. It must
+        // NOT log the user out or swallow the server's specific "Permission denied: ..." message
+        // behind a generic one — that message is exactly what the user needs to see, and falls
+        // through to the generic error handling below like any other 4xx.
+        if (res.status === 403) {
+            this.resyncCapabilities();
+        }
 
-        } catch (error) {
-            this.showToast(error.message, 'error');
+        if (!res.ok) {
+            const errMsg = (data && typeof data === 'object' ? data.error : null) || (typeof data === 'string' ? data : null) || `HTTP ${res.status}`;
+            const err = new Error(errMsg);
+            this.showToast(err.message, 'error');
+            throw err;
+        }
+
+        return data;
+    }
+
+    /** The retry half of `apiFetch`: soft-toasts and retries with backoff while attempts remain,
+     * otherwise toasts the final failure and re-throws — the session is never touched by either
+     * outcome. Split out so `apiFetch` itself reads as "one attempt", not "an attempt plus a retry
+     * loop tangled into the same function". */
+    async _retryTransientFailureOrGiveUp(endpoint, options, attempt, error) {
+        if (attempt >= FirewallClient.API_FETCH_MAX_RETRIES) {
+            this.showToast('Server busy or network error. Please try again.', 'error');
             throw error;
         }
+        this.showToast('Server busy or network error, retrying…', 'info');
+        const delay = FirewallClient.API_FETCH_RETRY_BASE_DELAY_MS * (attempt + 1);
+        await new Promise(r => setTimeout(r, delay));
+        return this.apiFetch(endpoint, options, attempt + 1);
     }
 
     // ───────────────────────────────────────────────────────

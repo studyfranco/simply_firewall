@@ -768,13 +768,14 @@ echo
 echo "${BOLD}Pillar 4 — Database resilience & retention${RESET}"
 # Both services now keep this in `src/db.rs`, so the *module* difference that used to explain the
 # divergence is gone. What remains is a real behavioural difference, stated plainly rather than left
-# as "wording": this service applies **four** pragmas (adding `foreign_keys=ON` and
-# `synchronous=NORMAL`) where the peer applies two. The shared half — WAL, the busy timeout, and the
+# as "wording": this service applies **five** pragmas (adding `foreign_keys=ON`,
+# `synchronous=NORMAL`, and `temp_store=MEMORY`, the last added during a concurrent-write-load
+# tuning pass) where the peer applies two. The shared half — WAL, the busy timeout, and the
 # never-fatal handling of both — is what this comparison is still watching.
 compare_fn "SQLite pragma initialization" \
     "src/db.rs" "apply_sqlite_pragmas" \
     "src/db.rs" "apply_sqlite_pragmas" \
-    "this service applies 4 pragmas (adds foreign_keys, synchronous); the peer applies 2"
+    "this service applies 5 pragmas (adds foreign_keys, synchronous, temp_store); the peer applies 2"
 # The pragmas must not be able to abort startup. A `?` inside would make a read-only mount fatal.
 if grep -A40 "pub async fn apply_sqlite_pragmas" "$PROJECT_ROOT/src/db.rs" | grep -qE '\?;\s*$'; then
     echo "  ${RED}✗ FATAL${RESET}   apply_sqlite_pragmas propagates an error — it must degrade, not abort"

@@ -156,9 +156,26 @@ pub(crate) fn format_key_reference(name: &str, id: Uuid) -> String {
 /// # Generic over the connection
 ///
 /// Takes any [`ConnectionTrait`](sea_orm::ConnectionTrait), so it can be called with a
-/// `DatabaseTransaction` as readily as with the pool. That matters for the batch endpoint: an audit
-/// row written outside the transaction it describes would survive a rollback and claim an operation
+/// `DatabaseTransaction` as readily as with the pool. That matters for the batch endpoint — and, as
+/// of the concurrent-write-load tuning pass, `handle_ip_upsert`/`delete_ip` too: an audit row
+/// written outside the transaction it describes would survive a rollback and claim an operation
 /// that never happened, which is worse than no row at all — a trail that lies is not a trail.
+///
+/// # Deliberately not backgrounded
+///
+/// Production logs once showed `INSERT INTO audit_logs` itself taking 1-2s under write contention,
+/// which reads like an argument for moving the write off the request's own critical path (a spawned
+/// task, a channel to a dedicated writer). That was rejected: a caller who receives `200 OK` before
+/// their audit row is confirmed durable has no way to know whether it ever will be — a crash between
+/// responding and the background write landing loses the record silently, and (worse, for the
+/// endpoints this row now shares a transaction with) a background write is definitionally outside
+/// whatever transaction the operation it describes runs in, reopening exactly the "trail that lies"
+/// problem above. The actual measured cause was three separate write-lock acquisitions per logical
+/// request (the record write, the membership write, and this one, each its own implicit
+/// transaction), not slow disk I/O on this statement specifically — see `handle_ip_upsert`'s and
+/// `delete_ip`'s own comments for the fix that follows from that: one `Immediate` transaction
+/// instead of three deferred ones, which cuts the lock-acquisition count without cutting the
+/// durability guarantee.
 pub(crate) async fn create_audit_log<C: sea_orm::ConnectionTrait>(
     db: &C,
     key: &api_key::Model,

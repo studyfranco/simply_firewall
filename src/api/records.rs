@@ -216,18 +216,43 @@ pub(crate) async fn handle_ip_upsert(
     let now = Utc::now().naive_utc();
     let record_id: Uuid;
 
+    // The record upsert, the membership insert, and the audit log write used to be three separate
+    // round trips against the pool — each its own implicit transaction, each its own write-lock
+    // acquisition. Under concurrent load that is three chances to queue behind another writer
+    // instead of one, which is what production logs described as 1-2s on a "simple" insert: not
+    // slow disk I/O on any single statement, but three serialized lock waits stacked into one
+    // request. Combined into one transaction here, the same logical operation takes the write lock
+    // once.
+    //
+    // `Immediate` rather than a plain `begin()` (SQLite's default `BEGIN DEFERRED`), mirroring
+    // `batch_records`' own reasoning: the loop below reads before it writes (a `SELECT` per
+    // attempt, ahead of that attempt's own `INSERT`/`UPDATE`), and a deferred transaction only
+    // takes its read snapshot at that first `SELECT` — a concurrent writer committing between this
+    // transaction's first read and its first write would leave the snapshot stale, and SQLite
+    // refuses to upgrade a stale snapshot to a write lock (`SQLITE_BUSY` immediately, without ever
+    // invoking the `busy_timeout` handler that retries ordinary contention). `Immediate` takes the
+    // write lock up front, before the first read, so there is no snapshot left to go stale.
+    let txn = state
+        .db
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await?;
+
     // find-then-insert races under true concurrency: two requests can both see no existing
     // record and both attempt to insert the same (unique) target_address. Rather than trying to
     // cram the is_locked check and "only overwrite cause if provided" semantics into a single
     // atomic ON CONFLICT DO UPDATE, retry as a normal update on the one specific, portably
     // detectable failure mode that means "a concurrent request just won this race": a unique
-    // constraint violation on the insert. At most one retry is possible — by the time it fires,
-    // the winning request's row is already committed (SeaORM/sqlx pool this DB to a single
-    // connection for SQLite, so operations are fully serialized).
+    // constraint violation on the insert. Effectively unreachable now that the whole operation
+    // holds an `Immediate` write lock from the start — a second writer queues for that lock rather
+    // than interleaving with this one — but kept as defensive handling rather than deleted, since
+    // nothing about this loop's own correctness depended on the transaction wrapping to be right.
     loop {
         let existing_record = ip_record::Entity::find()
             .filter(ip_record::Column::TargetAddress.eq(normalized_address.clone()))
-            .one(&state.db)
+            .one(&txn)
             .await?;
 
         if let Some(record) = existing_record {
@@ -254,7 +279,7 @@ pub(crate) async fn handle_ip_upsert(
             if let Some(c) = &payload.cause {
                 active_rec.cause = Set(Some(c.clone()));
             }
-            let updated = active_rec.update(&state.db).await?;
+            let updated = active_rec.update(&txn).await?;
             record_id = updated.id;
             if was_deleted {
                 tracing::info!(
@@ -278,7 +303,7 @@ pub(crate) async fn handle_ip_upsert(
             deleted_at: Set(None),
             deleted_by: Set(None),
         };
-        match ip_record::Entity::insert(model).exec(&state.db).await {
+        match ip_record::Entity::insert(model).exec(&txn).await {
             Ok(_) => {
                 record_id = new_id;
                 break;
@@ -307,7 +332,7 @@ pub(crate) async fn handle_ip_upsert(
                 .do_nothing()
                 .to_owned()
         )
-        .exec_without_returning(&state.db)
+        .exec_without_returning(&txn)
         .await?;
 
     // Deliberately keyed off the *membership* being new, not the underlying `ip_record` row: an
@@ -318,7 +343,7 @@ pub(crate) async fn handle_ip_upsert(
     let action = if mem_result > 0 { "IP_ADD" } else { "IP_UPDATE" };
 
     create_audit_log(
-        &state.db,
+        &txn,
         &key,
         client_ip,
         action,
@@ -326,6 +351,10 @@ pub(crate) async fn handle_ip_upsert(
         Some(resolved_group_name.clone()),
         Some(format!("Added IP to group. Whitelist: {}", is_whitelist))
     ).await?;
+
+    // Committed before the webhook event is enqueued below — a webhook must never fire (or, worse,
+    // a receiver act) for a record that a rolled-back transaction means was never actually banned.
+    txn.commit().await?;
 
     let event = WebhookEvent {
         action: action.to_owned(),
@@ -1019,9 +1048,22 @@ pub async fn delete_ip(
         }
     }
 
+    // The record lookup, the membership delete, and the audit log write combined into one
+    // `Immediate` transaction — same reasoning as `handle_ip_upsert`'s own: three separate writes
+    // against the pool were three separate write-lock acquisitions per logical delete, and
+    // `Immediate` takes that lock up front rather than risking a stale-snapshot `SQLITE_BUSY` on
+    // the upgrade from this transaction's own leading read.
+    let txn = state
+        .db
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await?;
+
     let record = ip_record::Entity::find()
         .filter(ip_record::Column::TargetAddress.eq(&target_address))
-        .one(&state.db)
+        .one(&txn)
         .await?
         .ok_or(AppError::NotFound)?;
 
@@ -1030,7 +1072,7 @@ pub async fn delete_ip(
     }
 
     let mem_result = ip_record_group_membership::Entity::delete_by_id((record.id, group.id))
-        .exec(&state.db)
+        .exec(&txn)
         .await?;
 
     if mem_result.rows_affected == 0 {
@@ -1038,7 +1080,7 @@ pub async fn delete_ip(
     }
 
     create_audit_log(
-        &state.db,
+        &txn,
         &key,
         client_ip.0,
         "IP_DELETE",
@@ -1046,6 +1088,10 @@ pub async fn delete_ip(
         Some(group.name.clone()),
         None
     ).await?;
+
+    // Committed before the webhook event is enqueued below — same reasoning as `handle_ip_upsert`:
+    // a webhook must never fire for a delete a rolled-back transaction means never happened.
+    txn.commit().await?;
 
     let event = WebhookEvent {
         action: "IP_DELETE".to_owned(),
