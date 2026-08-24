@@ -8900,3 +8900,55 @@ new assertion catches it, reverted):
 | `cargo test` | **321 passed** (up from 319: +1 `schema_integrity_tests.rs`, +1 `rbac_integration_tests.rs`), 0 failed |
 | `./scripts/test_e2e.sh` | **630 checks passed**, 0 failed (unchanged — this addendum's coverage is Rust-only) |
 | `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+### Addendum 4 — audited `scripts/test_e2e.sh` against a live-hook checklist, closed three gaps
+
+Asked to recap §31 (live `simply_hook_executor` integration) against an 8-point checklist: all four
+auth modes (API Key+Hmac / API Key only / HMAC only / no auth) creation+test+execution, execution
+history, editing a webhook's auth method/link/hmac/events, verifying an edit actually works, and
+ban/whitelist add/update/delete. Delegated the raw line-mapping to an Explore subagent (context was
+at 86%) and cross-referenced its findings against what the Web UI actually supports (known from
+having built it, not re-derived).
+
+**Confirmed solid, no changes needed:** all four auth modes really do run against the *live*
+executor (not a mock) with `.stdout` verified end to end, including a genuine
+`"auth_mode":"NONE"` vault webhook (§31 L3862–3887) — not just the `API_KEY_ONLY`-webhook-to-
+`NONE`-hook pairing, which is a different combination. `auth_mode` and `group_id` are correctly
+*not* editable anywhere (server-side `UpdateWebhookPayload` doesn't carry them, matching the Edit
+Webhook modal's deliberate read-only treatment from an earlier session) — their absence from every
+`PUT` check is not a gap, it's consistency with a real limitation.
+
+**Three real gaps, all closed:**
+
+- **§24c "Whitelist Parity"** (new, after §24): whitelist had never been re-registered, soft-deleted,
+  restored, or hard-deleted anywhere in the file — created once (§3) and left alone, while banlist
+  got the full lifecycle. Mirrors §24's existing banlist assertions against a whitelist record
+  instead, without re-proving the mechanism (group-type isn't a branch that code takes) — the point
+  is that a regression scoped specifically to `group_type == "whitelist"` would have passed every
+  existing check silently.
+- **§25b "An Edited Webhook's New Config Actually Takes Effect"** (new, after §25): every existing
+  `PUT /api/webhooks` check (renames, repoints, template rewrites, RBAC refusals) verified only the
+  PUT's own HTTP response. None re-fired a real event afterward to prove the edited config was what
+  a live dispatch actually used. New section: one webhook against the real local receiver, edited
+  once (repoint target_url **and** narrow `events` to `IP_DELETE` in the same PUT), then two real
+  triggers — an `IP_ADD` that must reach neither URL (events no longer subscribes to it) and an
+  `IP_DELETE` that must reach exactly the new URL — proving both halves of the edit together rather
+  than either in isolation.
+- Two real bugs found and fixed while building §25b, both in the new shell code itself, not the
+  service: (1) `check_jq ".webhook.target_url"` — wrong path; `UpdateWebhookResponse` flattens
+  `webhook: WebhookSummary` (`#[serde(flatten)]`) into the top level, so the field is `.target_url`,
+  not `.webhook.target_url`. (2) `count_receiver_hits_for_path()`'s first draft was
+  `grep -c ... || echo 0` — `grep -c` prints `"0"` on zero matches but still exits `1`, so the `||`
+  fallback fired *too*, printing a second `"0"` on the next line and corrupting the very count being
+  reported. Fixed by switching to `grep -o ... | wc -l`, which always exits `0`.
+
+**Mutation-tested §25b specifically**, since it's the novel property: commented out
+`update_webhook`'s `active.events = Set(Some(events));` line (an edit that's accepted and returns
+`200` but never persisted), rebuilt, reran the full suite — both the response-shape check and the
+live-retrigger check failed exactly as expected (`expected 'IP_DELETE', got 'IP_ADD'`; a stale
+delivery still landed on the pre-edit path). Reverted, rebuilt clean.
+
+**Gates:** `cargo check`/`clippy -D warnings` clean (Rust code was touched only for the mutation
+test, reverted with no diff); `cargo test` unchanged at 321; `./scripts/test_e2e.sh` **661 checks
+passed** (up from 630: +31 — whitelist parity + edit-verification), 0 failed;
+`./scripts/verify_convergence.sh` 63 matching, exit 0.

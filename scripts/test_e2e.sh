@@ -1984,6 +1984,66 @@ api_call GET "/api/ips?include_deleted=true&groups=softdelete-group" "$MASTER_KE
 check_true '[.[] | select(.target_address == "198.51.100.201")] | length == 0' \
     "a hard-deleted record is gone even from the trash view"
 
+log_section "24c. Whitelist Parity: Update, Soft Delete, Restore, Hard Delete"
+
+# §3/§24 above exhaustively cover a *banlist* record's full lifecycle — create, re-register,
+# permission-gated soft delete, trash visibility, restore, re-registration-after-delete, and hard
+# delete. This section is not a second pass at proving the mechanism (group-type is not a branch
+# any of that code takes); it exists because a whitelist record had never actually been pushed
+# through any of it — created once (§3) and never touched again. A regression scoped to
+# `group_type == "whitelist"` specifically — for example a filter that assumed "banlist" — would
+# have passed every check above without ever being exercised.
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"softdelete-whitelist-group","group_type":"whitelist"}'
+check "200" "create a whitelist group for the whitelist-parity checks"
+SOFTDEL_WHITE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/white" "$MASTER_KEY" '{"target_address":"203.0.113.201","group_name":"softdelete-whitelist-group","cause":"first registration"}'
+check "200" "whitelist an address"
+
+api_call GET "/api/ips?groups=softdelete-whitelist-group" "$MASTER_KEY"
+check "200" "list the whitelist group before any update"
+check_jq ".[0].cause" "first registration" "the initial cause is recorded"
+SOFTDEL_WHITE_RECORD_ID=$(echo "$RESP_BODY" | jq -r '.[0].id')
+
+# Update: re-registering the same address must update the existing row, not collide or duplicate —
+# the whitelist mirror of §3's banlist "re-registering an existing address updates it" check.
+api_call POST "/api/white" "$MASTER_KEY" '{"target_address":"203.0.113.201","group_name":"softdelete-whitelist-group","cause":"updated-cause"}'
+check "200" "re-registering the same whitelisted address succeeds"
+api_call GET "/api/ips?groups=softdelete-whitelist-group" "$MASTER_KEY"
+check_true "length == 1" "still exactly one record — the re-registration updated it, not duplicated it"
+check_jq ".[0].cause" "updated-cause" "the cause was updated by the re-registration"
+check_jq ".[0].id" "$SOFTDEL_WHITE_RECORD_ID" "same row, same id — a genuine update, not a delete+recreate"
+
+# Soft delete + trash visibility.
+api_call DELETE "/api/ips/$SOFTDEL_WHITE_RECORD_ID" "$MASTER_KEY"
+check "200" "soft-delete the whitelisted record"
+check_true '.deleted == "soft"' "the delete is soft"
+
+api_call GET "/api/ips?groups=softdelete-whitelist-group" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "203.0.113.201")] | length == 0' \
+    "the soft-deleted whitelist record is hidden from the default listing"
+
+api_call GET "/api/ips?include_deleted=true&groups=softdelete-whitelist-group" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "203.0.113.201" and .is_deleted == true)] | length == 1' \
+    "the trash view exposes the soft-deleted whitelist record, same as a banlist one"
+
+# Restore.
+api_call POST "/api/ips/$SOFTDEL_WHITE_RECORD_ID/restore" "$MASTER_KEY"
+check "200" "restore the soft-deleted whitelist record"
+check_true '.restored == true' "the restore is reported"
+api_call GET "/api/ips?groups=softdelete-whitelist-group" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "203.0.113.201")] | length == 1' \
+    "the restored whitelist record is visible again"
+
+# Hard delete really drops the row.
+api_call DELETE "/api/ips/$SOFTDEL_WHITE_RECORD_ID?hard=true" "$MASTER_KEY"
+check "200" "hard-delete the whitelist record"
+check_true '.deleted == "permanent"' "the hard delete is reported as permanent"
+api_call GET "/api/ips?include_deleted=true&groups=softdelete-whitelist-group" "$MASTER_KEY"
+check_true '[.[] | select(.target_address == "203.0.113.201")] | length == 0' \
+    "a hard-deleted whitelist record is gone even from the trash view"
+
 # ── SQLite concurrency pragmas ──────────────────────────────────────────────
 # Asserted from the startup log rather than by querying, because the pragma is applied once at
 # connection setup and this is the only place its actual effect is reported.
@@ -2270,6 +2330,78 @@ check "204" "delete the privileged webhook"
 
 api_call DELETE "/api/webhooks/$HIJACK_HOOK_ID" "$MASTER_KEY"
 check "204" "delete the hijack-target webhook"
+
+log_section "25b. An Edited Webhook's New Config Actually Takes Effect"
+
+# Every PUT check above (renames, repoints, template rewrites, RBAC refusals) verifies only the
+# PUT's own HTTP response — `secret_rotated`, a status code, an error body. None of them re-fires a
+# real event afterward to prove the *edited* config is what a live dispatch actually uses. A PUT
+# handler that accepted a new `target_url` or `events` list but silently kept dispatching against
+# the old one would pass every check above. This section closes that gap against the real local
+# receiver §13 started (still running, since nothing stops it until final cleanup) — one webhook,
+# edited twice, each edit proven by an actual delivery rather than by re-reading the PUT response.
+if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+    # `grep -o | wc -l` rather than `grep -c ... || echo 0`: `grep -c` exits 1 on zero matches
+    # while still printing "0", so the `||` fallback would ALSO fire and print a second "0" on the
+    # next line — corrupting the very "0" this is meant to report cleanly. `wc -l` always exits 0.
+    count_receiver_hits_for_path() {
+        grep -o "\"path\": \"$1\"" "$RECEIVER_LOG" 2>/dev/null | wc -l | tr -d ' '
+    }
+
+    api_call POST "/api/groups" "$MASTER_KEY" '{"name":"edit-verify-group"}'
+    check "200" "create the group backing the edit-verification webhook"
+    EDITVERIFY_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"edit-verify-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/before-edit\",\"payload_template\":\"{}\",\"group_id\":\"$EDITVERIFY_GROUP_ID\",\"auth_mode\":\"NONE\",\"events\":\"IP_ADD\"}"
+    check "200" "create a webhook targeting /before-edit, subscribed to IP_ADD only"
+    EDITVERIFY_HOOK_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+    log "Before any edit: banning a new address must reach /before-edit..."
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.150","group_name":"edit-verify-group","cause":"pre-edit"}'
+    check "200" "IP_ADD before editing the webhook"
+    BEFORE_HITS=0
+    for _ in $(seq 1 20); do
+        BEFORE_HITS=$(count_receiver_hits_for_path "/before-edit")
+        [ "${BEFORE_HITS:-0}" -ge 1 ] && break
+        sleep 0.2
+    done
+    check_local "$BEFORE_HITS" "1" "the pre-edit config delivered to /before-edit"
+
+    # The edit: repoint target_url AND narrow events to IP_DELETE only, in one PUT.
+    api_call PUT "/api/webhooks/$EDITVERIFY_HOOK_ID" "$MASTER_KEY" \
+        "{\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/after-edit\",\"events\":\"IP_DELETE\"}"
+    check "200" "edit the webhook: repoint target_url and change events to IP_DELETE only"
+    # UpdateWebhookResponse flattens `webhook: WebhookSummary` into the top level (`#[serde(flatten)]`),
+    # so these fields are read directly rather than under a `.webhook` key.
+    check_jq ".target_url" "http://127.0.0.1:$RECEIVER_PORT/after-edit" "the PUT response reports the new target_url"
+    check_jq ".events" "IP_DELETE" "the PUT response reports the new events filter"
+
+    log "After the edit: an IP_ADD on a fresh address must fire on NEITHER path — events no longer includes IP_ADD..."
+    api_call POST "/api/ban" "$MASTER_KEY" '{"target_address":"192.0.2.151","group_name":"edit-verify-group","cause":"post-edit, wrong event"}'
+    check "200" "IP_ADD after editing the webhook (the ban itself still succeeds; only dispatch is filtered)"
+    sleep 1
+    check_local "$(count_receiver_hits_for_path "/before-edit")" "1" \
+        "still exactly 1 — the old URL received nothing more after the repoint"
+    check_local "$(count_receiver_hits_for_path "/after-edit")" "0" \
+        "the new URL received nothing either — IP_ADD is no longer a subscribed event"
+
+    log "Deleting that same address (IP_DELETE) must now reach /after-edit — proving both edits together..."
+    api_call DELETE "/api/ips?target_address=192.0.2.151&group_name=edit-verify-group" "$MASTER_KEY"
+    check "204" "IP_DELETE after editing the webhook"
+    AFTER_HITS=0
+    for _ in $(seq 1 20); do
+        AFTER_HITS=$(count_receiver_hits_for_path "/after-edit")
+        [ "${AFTER_HITS:-0}" -ge 1 ] && break
+        sleep 0.2
+    done
+    check_local "$AFTER_HITS" "1" \
+        "the edited target_url received the IP_DELETE dispatch — the edit genuinely took effect, not just the API response"
+    check_local "$(count_receiver_hits_for_path "/before-edit")" "1" \
+        "the old URL still shows exactly the one pre-edit hit — delivery moved, it did not duplicate"
+else
+    warn "Edit-verification checks skipped (no local webhook receiver — see §13)."
+fi
 
 # ─────────────────────────────────────────────────────────────
 log_section "26. Convergence — Full-URI Signing, Anti-Replay & Fail-Closed Crypto"
