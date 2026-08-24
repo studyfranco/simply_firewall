@@ -8865,3 +8865,38 @@ Mutation-tested against the real binary, not just reasoned about: rebuilt with t
 E2E suite, and the new check failed exactly as expected (`expected '1', got '0'`) with every other
 check still passing — confirming it fails for the right reason and not as a side effect of the
 mutation breaking something else. Reverted, rebuilt, reran clean at 630/630.
+
+### Addendum 3 — three more gaps found on request ("find some missing tests")
+
+Went looking specifically for `webhook_executions` properties that were designed/claimed but never
+actually exercised by a test. Found three, all mutation-verified (planted the defect, confirmed the
+new assertion catches it, reverted):
+
+- **Cascade delete was never proven.** The migration's own module header argues at length for why
+  `webhook_id` is `ON DELETE CASCADE` rather than `SET NULL`, and nothing had ever deleted a webhook
+  and checked. Added `deleting_a_webhook_cascades_to_its_execution_history`
+  (`tests/schema_integrity_tests.rs`, beside the file's other FK-cascade tests) — direct webhook
+  deletion, plus the transitive case (deleting the *group* cascades through the webhook to its
+  executions too, one level further than the pre-existing group-cascade test checks). Mutation:
+  changed the migration's `ForeignKeyAction::Cascade` to `Restrict`; the delete itself failed with a
+  `FOREIGN KEY constraint failed` error, confirming the test would have caught either a wrong action
+  or a silently-orphaned row.
+- **The query parameters were accepted but never proven to filter anything.** RBAC scoping was
+  tested; `webhook_id`/`event_type`/`is_success`/`limit`/`offset` were not — a filter that silently
+  no-op'd would have passed every existing test, since the (unfiltered) rows it returned were still
+  ones the caller could legitimately see. Added
+  `s4_webhook_executions_endpoint_filters_paginates_and_rejects_unknown_fields`
+  (`tests/rbac_integration_tests.rs`): each filter individually, filters combined (AND, not OR),
+  three one-row pages via `limit`/`offset` covering all three seeded rows with none repeated, and an
+  unrecognized query parameter refused with `400`. Mutation: disabled the `event_type` filter branch;
+  caught immediately (3 rows back instead of 1).
+
+### Quality gates (Addendum 3)
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean (one more `redundant_locals` catch during development, same shape as Addendum 3's earlier one — an unnecessary `let group_id = group_id;` shadow in a test closure) |
+| `cargo test` | **321 passed** (up from 319: +1 `schema_integrity_tests.rs`, +1 `rbac_integration_tests.rs`), 0 failed |
+| `./scripts/test_e2e.sh` | **630 checks passed**, 0 failed (unchanged — this addendum's coverage is Rust-only) |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |

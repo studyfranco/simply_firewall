@@ -39,7 +39,7 @@ use uuid::Uuid;
 
 use simply_ip_vault::entities::{
     api_key, api_key_group_permission, audit_log, ip_group, ip_record,
-    ip_record_group_membership, webhook_config,
+    ip_record_group_membership, webhook_config, webhook_execution,
 };
 
 /// A temporary directory holding one database file, removed on drop.
@@ -220,6 +220,26 @@ async fn seed_webhook(db: &DatabaseConnection, name: &str, group: Uuid, owner: O
     .exec(db)
     .await
     .expect("the webhook inserts");
+    id
+}
+
+/// Writes one `webhook_executions` row for `webhook` — a single successful `IP_ADD` attempt, since
+/// only its existence and survival matter to the cascade tests that use this, not its content.
+async fn seed_execution(db: &DatabaseConnection, webhook: Uuid) -> Uuid {
+    let id = Uuid::new_v4();
+    webhook_execution::Entity::insert(webhook_execution::ActiveModel {
+        id: Set(id),
+        webhook_id: Set(webhook),
+        event_type: Set("IP_ADD".to_owned()),
+        status_code: Set(Some(200)),
+        is_success: Set(true),
+        duration_ms: Set(5),
+        error_message: Set(None),
+        created_at: Set(Utc::now().naive_utc()),
+    })
+    .exec(db)
+    .await
+    .expect("the execution row inserts");
     id
 }
 
@@ -460,6 +480,54 @@ async fn deleting_a_group_cascades_to_permissions_memberships_and_webhooks() {
             .unwrap(),
         1,
         "the surviving group keeps its webhook"
+    );
+}
+
+/// Deleting a webhook removes its delivery history — `fk-webhook_executions-webhook_id`,
+/// `ON DELETE CASCADE`.
+///
+/// The one FK in the schema that deliberately does **not** follow `audit_logs.api_key_id`'s
+/// `SET NULL` precedent (see the migration's own module header for the full reasoning): a nulled
+/// `webhook_id` would be an execution row attributable to nothing, since this table carries no
+/// denormalized webhook name the way `audit_logs` carries `api_key_name`/`api_key_prefix`. This test
+/// is the one place that reasoning is actually checked against the live engine rather than only
+/// argued about in a doc comment — exactly the standard this file's own header sets: "the only way
+/// to know which [FK action] is deployed is to delete a row and look."
+///
+/// Also exercises the transitive path one level up: deleting a *group* cascades to its webhooks
+/// (already covered above) and, transitively, to their executions too — proven here by seeding the
+/// doomed webhook's execution and then deleting the *group*, not the webhook directly.
+#[tokio::test]
+async fn deleting_a_webhook_cascades_to_its_execution_history() {
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    let group = seed_group(&db, "exec-cascade-group", None).await;
+    let doomed_webhook = seed_webhook(&db, "doomed_hook", group, None).await;
+    let surviving_webhook = seed_webhook(&db, "surviving_hook", group, None).await;
+    let doomed_execution = seed_execution(&db, doomed_webhook).await;
+    let surviving_execution = seed_execution(&db, surviving_webhook).await;
+
+    webhook_config::Entity::delete_by_id(doomed_webhook).exec(&db).await.expect("the webhook deletes");
+
+    assert!(
+        webhook_execution::Entity::find_by_id(doomed_execution).one(&db).await.unwrap().is_none(),
+        "an execution row belonging to a webhook that no longer exists must not survive it — with \
+         foreign_keys off it would, orphaned and unreachable by any owner"
+    );
+    assert!(
+        webhook_execution::Entity::find_by_id(surviving_execution).one(&db).await.unwrap().is_some(),
+        "an unrelated webhook's execution history is untouched: the cascade is scoped to the \
+         deleted webhook, not a table wipe"
+    );
+
+    // Transitive case: deleting the *group* cascades to `surviving_hook` (proven above) and, one
+    // level further, to that webhook's own execution history.
+    ip_group::Entity::delete_by_id(group).exec(&db).await.expect("the group deletes");
+    assert!(
+        webhook_execution::Entity::find_by_id(surviving_execution).one(&db).await.unwrap().is_none(),
+        "deleting a group must cascade through its webhooks to their execution history too, not \
+         stop one level short at the webhook_configs row"
     );
 }
 

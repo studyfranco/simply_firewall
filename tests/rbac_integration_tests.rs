@@ -5225,6 +5225,141 @@ async fn s4_webhook_executions_are_scoped_to_ownership_not_can_manage_keys() {
     assert_eq!(rows.len(), 2, "Master sees every webhook's executions: {body}");
 }
 
+/// **`GET /api/webhooks/executions`'s query contract**: `webhook_id`/`event_type`/`is_success`
+/// each narrow the result set (not merely accepted and ignored), `limit`/`offset` paginate, and an
+/// unrecognized parameter is refused with `400` rather than silently dropped.
+///
+/// The ownership/permission scoping has its own test above; this one is deliberately scoped to a
+/// single owner so every assertion is about the *query parameters themselves* — a filter that
+/// silently no-ops would still pass every RBAC test (the rows it returns are all ones the caller may
+/// see, just not narrowed further), which is exactly the failure mode this test exists to catch.
+#[tokio::test]
+async fn s4_webhook_executions_endpoint_filters_paginates_and_rejects_unknown_fields() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let group_id = insert_group_row(&db, "executions-query-contract-group").await;
+
+    let seed_webhook = || {
+        let db = db.clone();
+        async move {
+            let webhook_id = Uuid::new_v4();
+            simply_ip_vault::entities::webhook_config::ActiveModel {
+                id: Set(webhook_id),
+                name: Set(format!("hook-{webhook_id}")),
+                target_url: Set("https://example.com/hook".to_owned()),
+                secret_token: Set(String::new()),
+                auth_mode: Set("NONE".to_owned()),
+                api_key: Set(None),
+                hmac_template: Set(None),
+                signature_header: Set(None),
+                signature_prefix: Set(None),
+                headers_json: Set(None),
+                payload_template: Set("{}".to_owned()),
+                group_id: Set(group_id),
+                is_active: Set(true),
+                events: Set(None),
+                owner_key_id: Set(None),
+                created_at: Set(chrono::Utc::now().naive_utc()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+            webhook_id
+        }
+    };
+    let seed_execution = |webhook_id: Uuid, event_type: &'static str, is_success: bool| {
+        let db = db.clone();
+        async move {
+            simply_ip_vault::entities::webhook_execution::ActiveModel {
+                id: Set(Uuid::new_v4()),
+                webhook_id: Set(webhook_id),
+                event_type: Set(event_type.to_owned()),
+                status_code: Set(Some(if is_success { 200 } else { 500 })),
+                is_success: Set(is_success),
+                duration_ms: Set(5),
+                error_message: Set(None),
+                created_at: Set(chrono::Utc::now().naive_utc()),
+            }
+            .insert(&db)
+            .await
+            .unwrap();
+        }
+    };
+
+    let webhook = seed_webhook().await;
+    let other_webhook = seed_webhook().await; // never gets an execution — the webhook_id-filter control.
+    seed_execution(webhook, "IP_ADD", true).await;
+    seed_execution(webhook, "IP_ADD", false).await;
+    seed_execution(webhook, "TEST", true).await;
+
+    let query = |qs: String, ts: i64| {
+        let app = app.clone();
+        let master_key = master_key.clone();
+        async move {
+            let req = signed_later(inject_connect_info(Request::builder()
+                .uri(format!("/api/webhooks/executions{qs}"))
+                .header("X-API-Key", &master_key)), ts, "");
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body: serde_json::Value = serde_json::from_slice(
+                &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+            )
+            .unwrap_or(serde_json::Value::Null);
+            (status, body)
+        }
+    };
+
+    // No filter: all three rows for `webhook`, none for `other_webhook`.
+    let (status, body) = query("".to_owned(), 1).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 3, "no filter returns every row: {body}");
+
+    // `webhook_id` narrows to one webhook — proven by a second webhook with zero matching rows,
+    // not merely by re-checking the same one the ownership test already covers.
+    let (status, body) = query(format!("?webhook_id={other_webhook}"), 2).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_array().unwrap().len(), 0, "the other webhook has no executions: {body}");
+
+    // `event_type` narrows.
+    let (status, body) = query("?event_type=TEST".to_owned(), 3).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "exactly the one TEST-type row: {body}");
+    assert_eq!(rows[0]["event_type"], "TEST");
+
+    // `is_success` narrows.
+    let (status, body) = query("?is_success=false".to_owned(), 4).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "exactly the one failed row: {body}");
+    assert_eq!(rows[0]["is_success"], false);
+
+    // Filters combine with AND, not OR.
+    let (status, body) = query("?event_type=IP_ADD&is_success=true".to_owned(), 5).await;
+    assert_eq!(status, StatusCode::OK);
+    let rows = body.as_array().unwrap();
+    assert_eq!(rows.len(), 1, "only the row matching both filters: {body}");
+
+    // `limit`/`offset` paginate: three separate one-row pages across the three seeded rows, no
+    // row repeated and none skipped.
+    let mut paged_ids = std::collections::HashSet::new();
+    for offset in 0..3 {
+        let (status, body) = query(format!("?limit=1&offset={offset}"), 6 + offset).await;
+        assert_eq!(status, StatusCode::OK);
+        let rows = body.as_array().unwrap();
+        assert_eq!(rows.len(), 1, "limit=1 returns exactly one row at offset {offset}: {body}");
+        paged_ids.insert(rows[0]["id"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(paged_ids.len(), 3, "three pages of one row each covered all three rows with none repeated");
+
+    // An unrecognized query parameter is refused, not silently ignored.
+    let (status, body) = query("?not_a_real_filter=1".to_owned(), 9).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown query parameter must be a 400: {body}");
+}
+
 // ─────────────────────────────────────────────────────────────
 // RBAC_MODEL.md §4 — visibility scopes and oracle discipline
 // ─────────────────────────────────────────────────────────────
