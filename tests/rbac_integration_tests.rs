@@ -720,6 +720,16 @@ async fn test_multi_group_and_temporal_filtering() {
 
 /// AGENT.MD mandates verifying webhook payload delivery and HMAC `X-Signature-256` validity via
 /// a mock HTTP endpoint.
+///
+/// Also the one place in the suite that proves execution history end to end: not by calling
+/// `dispatch::log_execution` or the retry loop directly (`dispatch.rs`'s own unit tests already do
+/// that), and not by hand-inserting a `webhook_executions` row and checking a listing endpoint
+/// reads it back (`s4_webhook_executions_are_scoped_to_ownership_not_can_manage_keys` does that) —
+/// but by driving the *entire* real path: `POST /api/ban` enqueues a real event, the real
+/// `run_webhook_worker` dispatches it over a real HTTP call to the mock receiver above, and only
+/// then is `GET /api/webhooks/executions` asked whether it saw a row. Every other execution-history
+/// test could pass while the wiring between the worker and `log_execution` was silently broken
+/// (wrong `db`, wrong `webhook_id`, a dropped `.await`) — this is the one that would catch it.
 #[tokio::test]
 async fn test_webhook_hmac_signature_and_delivery() {
     use hmac::{Hmac, KeyInit, Mac};
@@ -829,6 +839,11 @@ async fn test_webhook_hmac_signature_and_delivery() {
         }).to_string());
     let res = app.clone().oneshot(req).await.unwrap();
     assert_eq!(res.status(), StatusCode::OK);
+    let created: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let webhook_id = created["id"].as_str().unwrap().to_owned();
 
     let req = signed(inject_connect_info(Request::builder()
         .method("POST")
@@ -865,6 +880,38 @@ async fn test_webhook_hmac_signature_and_delivery() {
     let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
     assert_eq!(signature, expected);
     assert!(body.contains("5.5.5.5"));
+
+    // The mock receiver capturing the request only proves the HTTP call happened — it says nothing
+    // about whether `dispatch_with_retries_config` went on to call `log_execution` afterward. Poll
+    // the real listing endpoint (not the table directly) so this also proves
+    // `GET /api/webhooks/executions` itself surfaces what the worker just wrote, end to end.
+    let mut execution_row = None;
+    for i in 0..40 {
+        // A distinct offset per poll, not `signed()`'s bare "now": two signed requests inside the
+        // same wall-clock second produce the identical signature, which the anti-replay guard
+        // correctly refuses as a replay — see `signed_later`'s own doc comment. `100 +` keeps this
+        // clear of the earlier `signed()` calls above in this same test.
+        let req = signed_later(inject_connect_info(Request::builder()
+            .uri("/api/webhooks/executions")
+            .header("X-API-Key", &plaintext)), 100 + i, "");
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(
+            &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+        )
+        .unwrap();
+        if let Some(row) = rows.into_iter().find(|r| r["webhook_id"] == webhook_id) {
+            execution_row = Some(row);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let row = execution_row.expect("the real dispatch that just delivered must appear in the execution history within the timeout");
+    assert_eq!(row["event_type"], "IP_ADD", "the ban that triggered this dispatch is an IP_ADD event");
+    assert_eq!(row["is_success"], true, "the mock receiver answered 200");
+    assert_eq!(row["status_code"], 200);
+    assert!(row["duration_ms"].as_i64().unwrap() >= 0);
 }
 
 /// A webhook scoped to `events: "IP_ADD"` must fire for a genuinely new address (`IP_ADD`) but

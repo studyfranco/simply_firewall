@@ -8818,3 +8818,33 @@ tab and confirmed the resulting row rendered with the correct event/status/durat
 columns and local-time formatting; separately minted two child keys and confirmed the Key Lineage
 modal correctly listed both as one level of children under the signed-in Master key, each with its
 own tier badge and permission badges. Screenshots captured and reviewed for both.
+
+### Addendum — the true end-to-end gap, found by the user asking
+
+Asked directly: "did you create a test who launch a hook and verify the history?" Checked, and the
+honest answer was no. Every execution-history test above proves a real thing, but none of them
+proves the *whole chain at once*: the retry-loop tests call `dispatch_with_retries_config` directly
+(bypassing the queue and the real worker), the "Test Webhook" tests call
+`send_test_dispatch_with_privacy` directly (bypassing the HTTP endpoint), the RBAC test inserts
+`webhook_executions` rows by hand rather than dispatching anything, and the retention test does the
+same. Grepped every test that spawns the real `run_webhook_worker` (six of them, across three
+files) and confirmed none asserted anything about `webhook_executions` at all.
+
+Fixed by extending `test_webhook_hmac_signature_and_delivery` (`rbac_integration_tests.rs`) — already
+the one test that drives the complete real path (`POST /api/webhooks` → `POST /api/ban` → real
+`run_webhook_worker` → real HTTP call to a mock receiver) — with a poll loop against the real
+`GET /api/webhooks/executions` endpoint after delivery is confirmed, asserting the row's
+`event_type`/`is_success`/`status_code`. Extending the existing test rather than writing a new one
+from scratch: duplicating ~140 lines of mock-receiver/key/group/webhook setup for a second test
+would have been pure risk (two places that could drift apart) for no additional coverage the
+existing one couldn't carry.
+
+Mutation-tested immediately: planted `let webhook_id = Uuid::new_v4();` in `dispatch_worker`'s
+spawned task in place of the real `config.id` (the exact class of bug — a wiring mistake between
+the worker and `log_execution` — this test exists to catch, and one none of the other tests could
+have). The new assertion failed as expected (`the real dispatch that just delivered must appear in
+the execution history within the timeout`); reverted, confirmed passing again.
+
+**Gate re-verification after the fix:** `cargo check`/`clippy -D warnings` clean; `cargo test`
+**319 passed** (unchanged — an existing test was extended, not a new one added), 0 failed;
+`./scripts/test_e2e.sh` **629 checks passed**, 0 failed.
