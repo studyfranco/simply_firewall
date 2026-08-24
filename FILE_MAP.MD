@@ -3,7 +3,7 @@
 An index of every file under `src/`, its size, and its exact purpose. Written for future agents: read
 this before searching the tree, and update it when you add, remove, or repurpose a file.
 
-**Revision:** `cd8b247` (plus this session's uncommitted changes) · **Generated:** 2026-08-19 · **Files indexed:** 44 · **Total:** 13,395 lines (`src/` unchanged this session — see the `static/`/`scripts/` note below for what did change)
+**Revision:** `5a0a22c` (plus this session's uncommitted changes) · **Generated:** 2026-08-19, line counts refreshed 2026-08-21 · **Files indexed:** 44 · **Total:** ~13,900 lines. Line counts below are refreshed only for files this session touched (`config.rs`, `db.rs`, `dispatch.rs`, `lib.rs`, `webhooks.rs`); the rest are as of `2026-08-19` and have drifted somewhat since — treat other rows' line counts as approximate.
 
 ---
 
@@ -13,16 +13,16 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | :--- | ---: | :--- |
 | `lib.rs` | 166 | Crate root. Assembles the axum router, declares module visibility, and exposes `create_app` / `setup_state` — the two entry points integration tests build against. |
 | `main.rs` | 494 | Process entry point and nothing else. The boot sequence in strict order: connect → pragmas → migrate → bootstrap Master → **verify the encryption key opens a real sealed secret** → pin Master → build state → start workers → bind → serve → graceful shutdown. The only writer of `is_master = true` in the service. `verify_encryption_key` refuses to start rather than deferring a `VAULT_ENCRYPTION_KEY` mismatch to the first authenticated request's `500`; carries its own `#[cfg(test)]` integration tests against a real in-memory database. |
-| `config.rs` | 1,508 | All environment reads, each `OnceLock`-cached and fail-soft with a warning, plus the client-IP resolution policy (trusted proxies, `X-Forwarded-For` handling). Also holds fatal validators for bootstrap credentials. |
+| `config.rs` | 1,792 | All environment reads, each `OnceLock`-cached and fail-soft with a warning, plus the client-IP resolution policy (trusted proxies, `X-Forwarded-For` handling). Also holds fatal validators for bootstrap credentials. Pool tuning is two-tiered: PostgreSQL/MySQL (`database_max_connections` &c., default 50/10) and file-backed SQLite (`sqlite_file_max_connections` &c., default 10/2, hard-ceilinged at 10) share the same four env var names with independent defaults. Webhook dispatch tuning (`webhook_workers` default 4, `webhook_dispatch_interval` default 50ms, `webhook_queue_capacity` default 4,096, `webhook_max_retries` default 3, `webhook_retry_backoff_ms` default 1,000) lives here too. |
 | `crypto.rs` | 928 | Two responsibilities: `CANONICAL_V1` request signing (HMAC-SHA256, constant-time verification, 300 s skew window) and signing-secret encryption at rest (XChaCha20-Poly1305 via `SecretCipher`). Also `check_key_canary` — a pure, boot-time check that a configured `SecretCipher` actually opens a given stored secret, called from `main.rs::verify_encryption_key`. |
-| `db.rs` | 537 | Connection pool construction, SQLite session pragmas (WAL, `synchronous=NORMAL`, `foreign_keys=ON`), migration runner, and a dialect-aware `has_index` used by migrations. SQLite is capped at one connection — DDL breaks above it. |
+| `db.rs` | 730 | Connection pool construction, SQLite session pragmas (WAL, `synchronous=NORMAL`, `foreign_keys=ON`), migration runner, and a dialect-aware `has_index` used by migrations. **Two-phase startup**: `run_migrations_isolated` runs every migration on a dedicated single-connection pool (every backend) that closes before `connect`'s application pool ever opens, so that pool can never witness DDL. SQLite is then two tiers: `sqlite::memory:` stays pinned to one connection unconditionally (`is_in_memory_sqlite` detects it); a file-backed URL is sized by `config::sqlite_file_max_connections`. |
 | `error.rs` | 107 | `AppError` and its `IntoResponse` mapping. The single definition of the `{"error": "…"}` envelope and of which internal failures are redacted before reaching a client. |
 | `extract.rs` | 208 | Strict request extractors (`StrictJson`, `OptionalStrictJson`, `StrictPath`, `StrictQuery`). Makes rejection a property of the *type* rather than of a handler, so no endpoint can accidentally emit axum's default plain-text rejection. `StrictPath`/`StrictQuery` pass through axum's own rejection status (`400` for a malformed segment, `500` only for a route/handler mismatch) rather than hardcoding one — converged with `simply_hook_executor`'s wrapper of the same name. Every handler in `src/api/` uses these, never the bare axum extractors. |
 | `master.rs` | 322 | Boot-time pinning of the Master key **identity** (`MasterPin`), and the per-request demotion that enforces it. Distinct from the database's uniqueness constraint, which governs *cardinality* — an attacker with DB write access does not need two Masters, only to promote itself. |
 | `middleware.rs` | 328 | Authentication middleware: key lookup by hash, signature verification, timestamp validation, replay rejection, and `bound_ips` CIDR enforcement — in that order, so an unauthenticated caller cannot probe key bindings via 401-vs-403. |
 | `replay.rs` | 440 | `ReplayGuard`: the single-use ledger for `CANONICAL_V1` signatures. Fails closed on a poisoned lock, and prunes only genuinely expired entries — never wholesale, which would let every live signature replay at once. |
 | `state.rs` | 208 | `AppState`: the database handle, the webhook dispatch channel, and the three security singletons (`MasterPin`, `ReplayGuard`, `SecretCipher`). Carries `for_tests` so integration tests can build state without environment reads. |
-| `dispatch.rs` | 616 | The outbound webhook dispatcher — the background worker pool that actually sends notifications, with rate limiting, retry, and the four authentication modes. |
+| `dispatch.rs` | 1,260 | The outbound webhook dispatcher — the background worker pool that actually sends notifications, with rate limiting and the four authentication modes. Request construction (`prepare_dispatch`) is shared between the real dispatch path and `send_test_dispatch` (the live "Test Webhook" endpoint's backend), so a test exercises the exact bytes a real event would send. Delivery retries transient failures (network errors, `5xx`) with exponential backoff up to `config::webhook_max_retries`; a `4xx` fails on the first attempt (`attempt_delivery`'s classification, `dispatch_with_retries_config`). |
 | `retention.rs` | 134 | Background retention worker: permanently drops soft-deleted IP records once they age past the configured window. |
 
 ## `src/api/` — HTTP handlers
@@ -35,7 +35,7 @@ this before searching the tree, and update it when you add, remove, or repurpose
 | `keys.rs` | 1,374 | API key endpoints: identity (`/auth/me`), creation, listing, lifecycle, rotation, and per-group grants. Implements the §6 cascade with pre-flight inventory and resolution map. The largest handler module. |
 | `records.rs` | 1,458 | IP record endpoints: ban/whitelist upsert, listing with delta (`since`) support, batch upsert/full-replace, soft delete, restore, and hard purge. |
 | `groups.rs` | 201 | IP Group endpoints: creation, listing, deletion, owner reassignment. |
-| `webhooks.rs` | 616 | Webhook config endpoints: creation, listing, update, deletion, owner reassignment, and the four auth modes. |
+| `webhooks.rs` | 678 | Webhook config endpoints: creation, listing, update, deletion, owner reassignment, the four auth modes, and `POST /{id}/test` (`test_webhook`) — a live, synchronous dispatch for the dashboard's "Test Webhook" action, gated by the same `can_manage_webhooks` + ownership rule as update/delete. |
 | `audit.rs` | 58 | Audit log query endpoint. Master-only. |
 | `health.rs` | 121 | Unauthenticated liveness (`/health`, `/healthz`) and readiness (`/ready`, `/readyz`) probes. Liveness deliberately does not touch the database, so an outage cannot become a restart loop. |
 
@@ -99,10 +99,18 @@ failures were invisible because neither had a meta-test. This file has one.
 
 ## `static/` and `scripts/` — outside this map's `src/` scope, noted briefly
 
-This map indexes `src/`; the dashboard (`static/index.html`, `app.js`, `style.css`, ~4,900 lines)
-and the E2E harness (`scripts/test_e2e.sh`, ~3,600 lines / 587 checks) are large enough to deserve
-their own maps if they keep growing, but do not have one yet. Two things worth knowing without
+This map indexes `src/`; the dashboard (`static/index.html`, `app.js`, `style.css`, ~5,300 lines)
+and the E2E harness (`scripts/test_e2e.sh`, ~3,600+ lines / 629 checks) are large enough to deserve
+their own maps if they keep growing, but do not have one yet. Three things worth knowing without
 reading either in full:
+
+- **The Webhooks tab's create form and its Edit modal each own a separate custom-headers editor.**
+  `app.js`'s `renderHeaderRows`/`addHeaderRow`/`headerMap` back the always-visible create form
+  (`webhookHeaders` state, `#webhook-headers-list`); `renderEditHeaderRows`/`addEditHeaderRow`/
+  `editHeaderMap` are their near-identical twin for the Edit Webhook modal (`editWebhookHeaders`
+  state, `#edit-webhook-headers-list`) — kept separate rather than parametrized because the create
+  form is always present in the DOM while the modal only overlays it, so a shared array would let
+  opening one for editing clobber whatever the create form had half-typed.
 
 - **A flex container blockifies every element child, not only the ones meant to occupy their own
   line.** `static/style.css`'s `.auth-mode-hint` is `display: flex; flex-direction: column` so its
@@ -138,7 +146,8 @@ Full standards live in `AGENT.MD` § *SeaORM Migration Standards*. The two that 
 
 - **`create_audit_log` takes its actor by value.** Do not make it `Option`; an unattributed write must stay unrepresentable.
 - **`master_marker` is engine-derived and must never become settable** on any entity, fixture, or test helper (`RBAC_MODEL.md` §5).
-- **SQLite runs at one pool connection.** Raising it breaks DDL, and it means concurrent requests serialize — HTTP-level tests cannot demonstrate handler races.
+- **Migrations run only through `db::run_migrations_isolated`, on a single-connection pool, closed before `db::connect`'s application pool ever opens.** A file-backed SQLite application pool may legitimately hold more than one connection now (`config::sqlite_file_max_connections`) — that is safe *because* migration isolation guarantees it never sees DDL, not because the pool is capped at one. `sqlite::memory:` is the one tier still pinned to exactly one connection unconditionally (a second in-memory connection is a second, empty database). Do not add a second `run_migrations` call against the wide application pool "for safety" — see `src/db.rs`'s module header for why that would reintroduce the race it exists to prevent.
+- **An explicit transaction that reads before it writes needs `SqliteTransactionMode::Immediate`, not a plain `.begin()`.** Now that a file-backed SQLite pool can hold more than one connection, a `BEGIN DEFERRED` transaction (the default) that does a `SELECT` before its first write can have its read snapshot go stale if another connection commits in between — and SQLite refuses the write-lock upgrade with `SQLITE_BUSY` *immediately*, without the `busy_timeout` handler ever retrying. `api::records::batch_records` hit exactly this while the pool was being widened; see `AGENT.MD`'s database section for the fix and when it applies.
 - **Guards live in `guards.rs`.** An inline permission check in a handler is drift, and it is what separates the converged peers from the diverging one.
 - **Every handler takes `StrictJson`/`StrictPath`/`StrictQuery`, never the bare axum extractor.** A single bare `Path<Uuid>` left in a new handler is one route where a malformed input answers `text/plain` instead of `{"error": …}` — `tests/concurrency_and_contracts.rs::malformed_input_is_refused_on_every_extractor` asserts this across the whole crate for exactly that reason.
 - **New request-payload structs need `#[serde(deny_unknown_fields)]`.** The one exception is a struct with a `#[serde(flatten)]` field — serde refuses to compile the two together; put the annotation on the flattened type instead (see `keys.rs`'s `Resolution`/`ResolutionEntry`).

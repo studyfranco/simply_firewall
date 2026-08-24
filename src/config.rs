@@ -121,7 +121,7 @@ where
     }
 }
 
-/// Parallel webhook dispatch workers. Env `WEBHOOK_WORKERS`, default 1.
+/// Parallel webhook dispatch workers. Env `WEBHOOK_WORKERS`, default 4.
 pub const WEBHOOK_WORKERS_ENV: &str = "WEBHOOK_WORKERS";
 
 /// Delay each worker waits between events, in milliseconds. Env `WEBHOOK_DISPATCH_INTERVAL_MS`.
@@ -130,40 +130,80 @@ pub const WEBHOOK_INTERVAL_ENV: &str = "WEBHOOK_DISPATCH_INTERVAL_MS";
 /// Depth of the in-memory webhook queue. Env `WEBHOOK_QUEUE_CAPACITY`.
 pub const WEBHOOK_QUEUE_ENV: &str = "WEBHOOK_QUEUE_CAPACITY";
 
+/// Maximum retry attempts for a transient webhook delivery failure. Env `WEBHOOK_MAX_RETRIES`.
+pub const WEBHOOK_MAX_RETRIES_ENV: &str = "WEBHOOK_MAX_RETRIES";
+
+/// Base backoff between retry attempts, in milliseconds, doubled on each subsequent attempt. Env
+/// `WEBHOOK_RETRY_BACKOFF_MS`.
+pub const WEBHOOK_RETRY_BACKOFF_ENV: &str = "WEBHOOK_RETRY_BACKOFF_MS";
+
 /// Number of worker tasks consuming the webhook channel. **Clamped to at least 1.**
 ///
 /// Zero would mean nothing drains the queue: every send would fill the buffer and then fail, and the
 /// service would look healthy while delivering nothing. A configuration that silently disables a
 /// subsystem should not be reachable by typing `0`.
+///
+/// Raised from the historical default of 1 to 4: a production deployment saw the queue saturate
+/// (`capacity=1024`, dropped notifications logged at `warn`) under an ordinary bulk-ban burst, and a
+/// single worker was the bottleneck — four lets the pool drain roughly four times as fast without
+/// changing anything about how a single event fans out to its configs.
 pub fn webhook_workers() -> usize {
     static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *VALUE.get_or_init(|| numeric_env::<usize>(WEBHOOK_WORKERS_ENV, 1).max(1))
+    *VALUE.get_or_init(|| numeric_env::<usize>(WEBHOOK_WORKERS_ENV, 4).max(1))
 }
 
 /// Pause a worker takes after finishing one event, in milliseconds. `0` disables throttling.
 ///
 /// This paces **events per worker**, not individual HTTP calls: one event may fan out to several
 /// webhook configs, and those still dispatch concurrently. The aggregate ceiling is therefore
-/// `webhook_workers() / interval` events per second — with the defaults, two per second.
+/// `webhook_workers() / interval` events per second — with the defaults (4 workers, 50ms), 80 per
+/// second.
 ///
-/// The default is deliberately non-zero. A bulk operation can enqueue thousands of events in a
-/// second, and an unthrottled worker turns that into a synchronised burst against every configured
-/// receiver at once — which reads, from the receiver's side, as a denial-of-service originating from
-/// us. Pacing costs latency on a notification that is already asynchronous.
+/// The default is deliberately non-zero — pacing still matters, an unthrottled worker turns a bulk
+/// operation into a synchronised burst against every configured receiver at once, which reads, from
+/// the receiver's side, as a denial-of-service originating from us. Lowered from the historical
+/// 500ms to 50ms: 500ms limited a single worker to two events per second, which is what let the
+/// queue in `webhook_workers`'s doc comment saturate in the first place; 50ms keeps the
+/// burst-flattening property (still one event at a time per worker, never an unthrottled flood)
+/// while draining an order of magnitude faster.
 pub fn webhook_dispatch_interval() -> std::time::Duration {
     static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    std::time::Duration::from_millis(*VALUE.get_or_init(|| numeric_env::<u64>(WEBHOOK_INTERVAL_ENV, 500)))
+    std::time::Duration::from_millis(*VALUE.get_or_init(|| numeric_env::<u64>(WEBHOOK_INTERVAL_ENV, 50)))
 }
 
 /// Capacity of the webhook channel. **Clamped to at least 1** — `mpsc::channel(0)` panics.
 ///
-/// Raised from the historical 100 because throttling makes a full queue far likelier: at the default
-/// pace a single worker drains two events per second, so a bulk operation fills 100 slots almost
-/// immediately. See `state::AppState::enqueue_webhook` for what happens when it does fill — briefly,
-/// the event is dropped with a warning rather than blocking the request that produced it.
+/// Raised from the historical 100, then again from 1,024: throttling makes a full queue likelier
+/// than an unthrottled channel would, and a production deployment still saturated the queue at 1,024
+/// under a bulk-ban burst even with pacing. 4,096 alongside the faster 4-worker/50ms pool above gives
+/// substantially more headroom before the drop path in `state::AppState::enqueue_webhook` — which
+/// remains the correct behaviour for whatever headroom does eventually run out: the event is dropped
+/// with a warning rather than blocking the request that produced it.
 pub fn webhook_queue_capacity() -> usize {
     static VALUE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *VALUE.get_or_init(|| numeric_env::<usize>(WEBHOOK_QUEUE_ENV, 1_024).max(1))
+    *VALUE.get_or_init(|| numeric_env::<usize>(WEBHOOK_QUEUE_ENV, 4_096).max(1))
+}
+
+/// Maximum number of retry attempts after an initial transient delivery failure. **Clamped to at
+/// most 10** — an unbounded value would let one stuck receiver hold a dispatch worker's attention
+/// indefinitely via exponential backoff, at the expense of every other event waiting behind it.
+///
+/// Only *transient* failures are retried at all — a connection timeout, a network error, or a `5xx`
+/// response. A `4xx` response is treated as a configuration or authorization problem the target will
+/// not resolve by being asked again, and fails on the first attempt. See
+/// `dispatch::classify_dispatch_outcome`.
+pub fn webhook_max_retries() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| numeric_env::<u32>(WEBHOOK_MAX_RETRIES_ENV, 3).min(10))
+}
+
+/// Base delay before the first retry, in milliseconds, doubled on each subsequent attempt
+/// (`backoff * 2^(attempt - 1)`, so with the default 1000ms: 1s, 2s, 4s, ...). **Clamped to at least
+/// 1ms** — `0` would turn "backoff" into an immediate, tight retry loop against a receiver that just
+/// said it was struggling.
+pub fn webhook_retry_backoff_ms() -> u64 {
+    static VALUE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| numeric_env::<u64>(WEBHOOK_RETRY_BACKOFF_ENV, 1_000).max(1))
 }
 
 /// Maximum request body size in mebibytes. Env `MAX_BODY_SIZE_MIB`, default 10.
@@ -203,17 +243,25 @@ pub fn max_body_bytes() -> usize {
 // Database pool tuning
 // ─────────────────────────────────────────────────────────────
 //
-// PostgreSQL/MySQL only. **None of these four apply to SQLite**: `src/db.rs::connect` builds the
-// SQLite pool from a hand-constructed `SqlitePoolOptions` that never reads `ConnectOptions` at all,
-// so a value set here has no path to reach it — not a value the SQLite branch reads and discards,
-// but one it is structurally incapable of seeing. `SQLITE_MAX_CONNECTIONS` (`src/db.rs`) is the
-// single source of truth there, for the single-writer reason documented in that module's header.
+// Two tiers read these same four environment variables with two different sets of defaults and
+// ceilings. `database_max_connections`/`database_min_connections` below are the PostgreSQL/MySQL
+// tier (default 50/10, no ceiling beyond what the operator asks for).
+// `sqlite_file_max_connections`/`sqlite_file_min_connections`, further down, are the file-backed
+// SQLite tier — same two variable names, its own defaults (10/2) and a hard ceiling
+// (`SQLITE_FILE_MAX_CONNECTIONS_CEILING`) that no requested value can exceed. **Neither tier ever
+// reaches `sqlite::memory:`**: `src/db.rs::connect` pins that one to exactly one connection,
+// unconditionally, because an in-memory database is a single, unshareable buffer — a second
+// connection to it is not a second reader, it is an empty database that never saw the migrations
+// the first one applied. See that module's header for the full in-memory-vs-file split, and for why
+// even the file tier's ceiling exists at all (SQLite's single-writer lock makes a wide pool mostly
+// theoretical benefit for writes, real benefit for concurrent reads, and real risk of lock-wait
+// pile-ups past a fairly low number of connections).
 //
-// Defaults are chosen for a deployment fielding the production symptom this was added for
-// (`sqlx::pool::acquire: acquired connection exceeded slow threshold`): 50 max / 10 min gives
-// headroom under a webhook-dispatch burst without the pool constantly growing and shrinking from
-// zero, and a 10s acquire timeout turns a starved pool into a clear, bounded `500` instead of a
-// request hanging for as long as the caller's own client timeout allows.
+// Defaults for the PostgreSQL/MySQL tier are chosen for a deployment fielding the production
+// symptom this was added for (`sqlx::pool::acquire: acquired connection exceeded slow threshold`):
+// 50 max / 10 min gives headroom under a webhook-dispatch burst without the pool constantly growing
+// and shrinking from zero, and a 10s acquire timeout turns a starved pool into a clear, bounded
+// `500` instead of a request hanging for as long as the caller's own client timeout allows.
 
 /// Maximum PostgreSQL/MySQL pool connections. Env `DATABASE_MAX_CONNECTIONS`, default 50.
 pub const DATABASE_MAX_CONNECTIONS_ENV: &str = "DATABASE_MAX_CONNECTIONS";
@@ -285,6 +333,46 @@ pub fn database_acquire_timeout() -> std::time::Duration {
     std::time::Duration::from_secs(*VALUE.get_or_init(|| {
         clamp_acquire_timeout_secs(numeric_env::<u64>(DATABASE_ACQUIRE_TIMEOUT_ENV, 10))
     }))
+}
+
+/// Hard ceiling on the file-backed SQLite tier's connection count, regardless of what
+/// `DATABASE_MAX_CONNECTIONS` requests.
+///
+/// Not a default — a *ceiling*. SQLite permits any number of concurrent readers under WAL, but
+/// exactly one writer at a time (`busy_timeout` governs how long the rest queue for it); past a
+/// fairly small number of connections, the marginal reader throughput a wider pool buys is real but
+/// small, while the chance of a burst of writers queuing behind the single write lock — and each
+/// holding a checked-out connection while it waits — grows with pool size. 10 is generous headroom
+/// for read parallelism without inviting that. Unlike the PostgreSQL/MySQL tier, an operator cannot
+/// raise this by setting `DATABASE_MAX_CONNECTIONS` higher; it can only lower it.
+const SQLITE_FILE_MAX_CONNECTIONS_CEILING: u32 = 10;
+
+/// Clamps a requested file-backed-SQLite pool ceiling to `[1, SQLITE_FILE_MAX_CONNECTIONS_CEILING]`.
+/// Split out for the same testability reason as [`clamp_pool_max`], which this composes with.
+fn clamp_sqlite_file_max(requested: u32) -> u32 {
+    clamp_pool_max(requested).min(SQLITE_FILE_MAX_CONNECTIONS_CEILING)
+}
+
+/// The file-backed SQLite tier's connection ceiling: `DATABASE_MAX_CONNECTIONS`, default 10,
+/// clamped to at least 1 and to at most [`SQLITE_FILE_MAX_CONNECTIONS_CEILING`] — see
+/// [`clamp_sqlite_file_max`].
+///
+/// **Never consulted for `sqlite::memory:`** — `src/db.rs::connect` pins that case to exactly one
+/// connection before this function is ever called, by branching on the storage type rather than by
+/// this function detecting it. See the module header for why an in-memory database cannot use more
+/// than one connection at all, safely or not: it is a single unshareable buffer, not a slower disk.
+pub fn sqlite_file_max_connections() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| clamp_sqlite_file_max(numeric_env::<u32>(DATABASE_MAX_CONNECTIONS_ENV, 10)))
+}
+
+/// The file-backed SQLite tier's warm-connection floor: `DATABASE_MIN_CONNECTIONS`, default 2,
+/// clamped to at most [`sqlite_file_max_connections`].
+pub fn sqlite_file_min_connections() -> u32 {
+    static VALUE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        clamp_pool_min(numeric_env::<u32>(DATABASE_MIN_CONNECTIONS_ENV, 2), sqlite_file_max_connections())
+    })
 }
 
 /// Environment variable overriding the generated bootstrap master key.
@@ -1657,6 +1745,26 @@ mod tests {
         assert_eq!(clamp_pool_min(10, 50), 10, "a min below max passes through unchanged");
         assert_eq!(clamp_pool_min(100, 50), 50, "a min above max is pulled down to it");
         assert_eq!(clamp_pool_min(50, 50), 50, "min == max is not treated as a violation");
+    }
+
+    /// The file-backed SQLite tier's ceiling composes [`clamp_pool_max`]'s floor of 1 with its own
+    /// hard ceiling of [`SQLITE_FILE_MAX_CONNECTIONS_CEILING`] — an operator can request less than
+    /// the PostgreSQL/MySQL tier's default, but never more than this tier allows.
+    #[test]
+    fn sqlite_file_max_is_clamped_to_one_and_ceilinged_at_ten() {
+        assert_eq!(clamp_sqlite_file_max(0), 1, "the same zero-floor as the shared pool clamp");
+        assert_eq!(clamp_sqlite_file_max(5), 5, "an ordinary value under the ceiling passes through");
+        assert_eq!(
+            clamp_sqlite_file_max(SQLITE_FILE_MAX_CONNECTIONS_CEILING),
+            SQLITE_FILE_MAX_CONNECTIONS_CEILING,
+            "exactly the ceiling is not itself a violation"
+        );
+        assert_eq!(
+            clamp_sqlite_file_max(1_000),
+            SQLITE_FILE_MAX_CONNECTIONS_CEILING,
+            "a request far above the PostgreSQL/MySQL tier's own default must still be capped for \
+             file-backed SQLite"
+        );
     }
 
     /// `DATABASE_ACQUIRE_TIMEOUT_SECS=0` is indistinguishable from "never wait" to sqlx, which

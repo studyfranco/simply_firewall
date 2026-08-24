@@ -4182,16 +4182,16 @@ async fn requesting_an_unreadable_group_is_indistinguishable_from_requesting_a_n
 ///
 /// Handlers used to `webhook_tx.send(event).await`. That is harmless while the dispatcher drains as
 /// fast as events arrive — and stopped being harmless when dispatch became throttled. At the default
-/// pace one worker handles two events per second, so a bulk operation fills the queue in well under a
-/// second and every subsequent `send().await` parks the Axum handler until a slot frees. A firewall
-/// API that stops answering because a *notification* queue backed up has its priorities inverted:
-/// the ban is the product, the webhook is a courtesy.
+/// pace four workers handle eighty events per second between them, so a large enough bulk operation
+/// can still fill the queue faster than that, and every subsequent `send().await` parks the Axum
+/// handler until a slot frees. A firewall API that stops answering because a *notification* queue
+/// backed up has its priorities inverted: the ban is the product, the webhook is a courtesy.
 ///
-/// # Why a tiny channel instead of 1 024 real events
+/// # Why a tiny channel instead of 4 096 real events
 ///
 /// The production capacity comes from `WEBHOOK_QUEUE_CAPACITY` through a `OnceLock`, so it is fixed
-/// for the process and cannot be varied per test. Generating 1 024 genuine events would also mean
-/// 1 024 signed HTTP round trips — minutes of runtime to demonstrate a property that is about the
+/// for the process and cannot be varied per test. Generating 4 096 genuine events would also mean
+/// 4 096 signed HTTP round trips — minutes of runtime to demonstrate a property that is about the
 /// channel, not about volume.
 ///
 /// So the state is built with a **deliberately tiny channel whose receiver is dropped immediately**.
@@ -4298,7 +4298,7 @@ async fn test_webhook_queue_overflow_non_blocking() {
 ///
 /// # What this actually demonstrates
 ///
-/// Not WAL reader/writer concurrency. `SQLITE_MAX_CONNECTIONS` is **1** — SQLite permits a single
+/// Not WAL reader/writer concurrency. `SQLITE_MEMORY_MAX_CONNECTIONS` is **1** — SQLite permits a single
 /// writer, and a DDL sequence spread across connections does not survive — so these transactions do
 /// not race inside SQLite at all: they queue on the pool and execute one at a time. That is the
 /// design, not a limitation being worked around.
@@ -4325,8 +4325,10 @@ async fn test_concurrent_batch_writes_under_wal() {
     let dir = std::env::temp_dir().join(format!("vault_conc_{}", Uuid::new_v4()));
     std::fs::create_dir_all(&dir).unwrap();
     let url = format!("sqlite://{}", dir.join("v.db").display());
+    simply_ip_vault::db::run_migrations_isolated(&url)
+        .await
+        .expect("migrations apply on the isolated pool");
     let db = simply_ip_vault::db::connect(&url).await.expect("file-backed pool opens");
-    simply_ip_vault::db::run_migrations(&db).await.expect("migrations apply");
 
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
     let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());

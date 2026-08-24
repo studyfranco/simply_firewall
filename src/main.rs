@@ -293,6 +293,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
+    // Two-phase: migrations run to completion, on their own single-connection pool, and that pool
+    // is closed — all before the application pool below is ever opened. See `src/db.rs`'s module
+    // header. This is what lets a file-backed SQLite database use more than one connection next: by
+    // construction, the pool opened below can never witness a DDL statement.
+    tracing::info!("Running database migrations on an isolated connection...");
+    simply_ip_vault::db::run_migrations_isolated(&db_url).await?;
+
     tracing::info!("Connecting to database...");
     // `db::connect` rather than `Database::connect`: for SQLite it builds the pool from
     // `SqliteConnectOptions` so the session pragmas apply to *every* connection as it opens.
@@ -300,14 +307,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // statement — measured, and the reason this indirection exists. See `src/db.rs`.
     let db: DatabaseConnection = simply_ip_vault::db::connect(&db_url).await?;
 
-    // Before migrations: the migration itself writes, and should already benefit from WAL and the
-    // busy timeout rather than being the one write that still takes an exclusive lock.
-    //
     // Never fatal — every failure inside is logged and swallowed. A concurrency pragma that could
     // not be applied is a performance regression; refusing to boot over it would be an outage.
     simply_ip_vault::db::apply_sqlite_pragmas(&db).await?;
-
-    simply_ip_vault::db::run_migrations(&db).await?;
 
     bootstrap_master_key(&db, &cipher).await?;
 

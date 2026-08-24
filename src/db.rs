@@ -8,27 +8,55 @@
 //! connection **pragmas** — they configure how the engine behaves, not what it is asked — and they
 //! are skipped entirely on any backend that is not SQLite.
 //!
-//! # Pool tuning is PostgreSQL/MySQL-only, and that split is structural
+//! # Two-phase startup: migrate on one connection, then open the real pool
+//!
+//! [`run_migrations_isolated`] is the **only** place this service ever runs DDL — confirmed by
+//! grepping every non-`src/migration/` source file for `ALTER TABLE`/`CREATE TABLE`/`SchemaManager`
+//! and finding nothing. It builds its own throwaway single-connection pool, applies every pending
+//! migration, and lets that pool close as it goes out of scope — all *before* `main` ever calls
+//! [`connect`] to open the pool the running service actually uses. That ordering is what makes the
+//! application pool's connection count a pure performance question rather than a correctness one:
+//! by the time it exists, there is no DDL left to run against it, on any backend, ever again.
+//!
+//! This is a narrower, more precise version of the rule the single-connection pinning below used to
+//! carry entirely on its own: it is not "SQLite must never have more than one connection", it is
+//! "a DDL sequence must never be spread across connections" — the [`connect`]-time application pool
+//! for a *file-backed* SQLite database is now allowed to grow past one specifically because it can
+//! no longer see a migration by construction, not because the original failure mode stopped
+//! mattering.
+//!
+//! # SQLite is two tiers, not one, and only one of them can ever grow
+//!
+//! **`sqlite::memory:`** stays pinned to exactly one connection, unconditionally, and that pinning
+//! is not the DDL-race rule above — it is a different, harder constraint. An in-memory SQLite
+//! database is one process-local buffer with no file behind it; a *second* connection to
+//! `sqlite::memory:` is not a second reader of the same data, it is a second, entirely empty
+//! database that never saw a single migration the first connection applied. Growing this tier would
+//! not merely reintroduce a race, it would make the service internally inconsistent about what data
+//! exists at all. [`config::sqlite_file_max_connections`] and its sibling are never consulted for
+//! this tier — [`connect`] detects it before either function is called, by inspecting the URL
+//! (`is_in_memory_sqlite`), not by asking either function to guess.
+//!
+//! **A file-backed SQLite database** (`sqlite://path/to/file...`) may now use more than one
+//! connection, tuned by the same `DATABASE_MAX_CONNECTIONS`/`DATABASE_MIN_CONNECTIONS` environment
+//! variables the PostgreSQL/MySQL tier reads, through
+//! [`config::sqlite_file_max_connections`]/[`config::sqlite_file_min_connections`] — their own
+//! defaults (10/2) and their own hard ceiling
+//! (`config::SQLITE_FILE_MAX_CONNECTIONS_CEILING`, 10, which an operator can lower but not raise),
+//! distinct from the PostgreSQL/MySQL tier's 50/10 and unbounded ceiling. SQLite permits any number
+//! of concurrent readers under WAL and exactly one writer at a time — `busy_timeout` (still 5000ms,
+//! still applied per-connection at open time) is what makes a second writer queue instead of
+//! erroring, on one connection or ten alike.
+//!
+//! # Pool tuning is structural, not a guard clause
 //!
 //! `config::database_max_connections`/`database_min_connections`/`database_idle_timeout`/
-//! `database_acquire_timeout` (`src/config.rs`) apply only on the [`Database::connect`] path this
-//! module's [`connect`] takes for every non-SQLite URL. The SQLite branch never constructs the
-//! `ConnectOptions` those four calls configure — it builds a separate `SqlitePoolOptions` by hand —
-//! so there is no code path by which an operator's pool-tuning environment variables could reach
-//! SQLite even by mistake. The single-writer invariant below does not rest on remembering to leave
-//! four settings alone; it rests on them having nowhere to apply.
-//!
-//! # The SQLite pool holds exactly one connection, and that is load-bearing
-//!
-//! SeaORM pins `max_connections = 1` for SQLite — measured, not assumed — because SQLite permits a
-//! single writer and a pooled DDL sequence does not survive being spread across connections.
-//! [`connect`] pins the same value explicitly, and a test asserts it.
-//!
-//! This is not a tuning preference. Building the pool with SQLx's default of ten connections made
-//! **migrations fail**: `m20260808_000009` drops `master_marker` and re-adds it as a generated
-//! column, and with more than one connection the `ADD` lands on a connection whose schema still has
-//! the old one — `duplicate column name: master_marker`, at any pool size ≥ 2, deterministically.
-//! One connection: nine migrations applied. Two: eight, then failure.
+//! `database_acquire_timeout` (the PostgreSQL/MySQL tier) apply only on the [`Database::connect`]
+//! path [`connect`] takes for every non-SQLite URL — that branch never constructs the
+//! `SqlitePoolOptions` the SQLite tiers use, and the SQLite branches never construct the
+//! `ConnectOptions` this tier configures. There is no code path by which a setting meant for one
+//! tier could reach either of the other two even by mistake; each tier's ceiling holds because the
+//! other tiers' code cannot see it, not because it remembers not to look.
 //!
 //! # Where a pragma actually takes effect
 //!
@@ -61,6 +89,9 @@ use sea_orm::{
     ConnectOptions, ConnectionTrait, Database, DatabaseBackend, DatabaseConnection, DbErr,
     SqlxSqliteConnector, Statement,
 };
+use sea_orm::sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
+};
 use sea_orm_migration::MigratorTrait;
 
 /// How long SQLite waits on a locked database before returning `SQLITE_BUSY`, in milliseconds.
@@ -70,61 +101,42 @@ use sea_orm_migration::MigratorTrait;
 /// `500` on a request that did nothing wrong.
 pub const SQLITE_BUSY_TIMEOUT_MS: u32 = 5_000;
 
-/// Connections in the SQLite pool. **One**, and not a tuning knob.
-///
-/// SQLite permits a single writer, and a DDL sequence spread across connections does not survive:
-/// `m20260808_000009` drops and re-adds `master_marker`, and at any pool size ≥ 2 the `ADD` reaches
-/// a connection whose schema still holds the old column. SeaORM's own `Database::connect` pins this
-/// to 1 for SQLite; building a pool by hand opts out of that default, so it is restored here
-/// explicitly and asserted by [`tests::the_sqlite_pool_holds_exactly_one_connection`].
-pub const SQLITE_MAX_CONNECTIONS: u32 = 1;
+/// Connections in the in-memory SQLite tier's pool. **One**, unconditionally, and not a tuning
+/// knob — see the module header for why this is a data-integrity constraint rather than the
+/// DDL-race concern the rest of this module is about.
+pub const SQLITE_MEMORY_MAX_CONNECTIONS: u32 = 1;
 
-/// Opens the database pool, applying SQLite session pragmas to **every** connection.
-///
-/// Non-SQLite backends take the plain [`Database::connect`] path unchanged — there is nothing here
-/// PostgreSQL or MySQL needs, and a `PRAGMA` would be a syntax error on both.
-///
-/// For SQLite the pool is built from `SqliteConnectOptions` rather than from a bare URL, because
-/// that is the only place three of the four settings can be made to hold pool-wide (see the module
-/// header). SQLx applies them as each connection opens, so a connection created an hour after
-/// startup gets the same configuration as the first one.
-///
-/// `create_if_missing` matches the `?mode=rwc` this service has always documented; it is set here
-/// so the behaviour no longer depends on callers remembering the query parameter.
-pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
-    let mut opt = ConnectOptions::new(db_url.to_owned());
-    opt.sqlx_logging_level(log::LevelFilter::Debug);
+/// Connections a dedicated migration pool ever opens, on any backend. Not exported as a tuning
+/// knob: [`run_migrations_isolated`] is the only caller, and the whole point is that it never
+/// varies.
+const MIGRATION_POOL_MAX_CONNECTIONS: u32 = 1;
 
-    // Backend detection by URL scheme, which is the only signal available before a pool exists.
-    // Everything downstream reads `get_database_backend()` instead; this is the one place that
-    // cannot.
-    if !db_url.starts_with("sqlite:") {
-        // PostgreSQL/MySQL pool tuning — `config::database_*`, all environment-configurable. Set
-        // here rather than left to SeaORM's own defaults (`max_connections: 10`, no floor, no
-        // acquire timeout) because those defaults are what produced the slow-pool-acquisition
-        // symptom this function exists to address: a burst of concurrent webhook dispatches
-        // fetching their config rows can outrun ten connections long before the database itself is
-        // the bottleneck, and with no `acquire_timeout` the caller waits however long its own HTTP
-        // client allows rather than failing fast and legibly.
-        //
-        // These four calls have **no effect on SQLite** — the branch below never constructs this
-        // `opt` at all, let alone reads these fields off it. See the module header and
-        // `config::database_max_connections`'s own doc for why that separation is deliberate
-        // rather than an oversight: SQLite's pool is pinned to `SQLITE_MAX_CONNECTIONS` (1),
-        // unconditionally, for the single-writer reason documented there.
-        opt.max_connections(crate::config::database_max_connections())
-            .min_connections(crate::config::database_min_connections())
-            .idle_timeout(crate::config::database_idle_timeout())
-            .acquire_timeout(crate::config::database_acquire_timeout());
-        return Database::connect(opt).await;
-    }
+/// Whether `db_url` addresses SQLite's in-process, non-durable in-memory database rather than a
+/// file on disk.
+///
+/// Pure and exhaustively testable by design: this is the one signal [`connect`] uses to choose
+/// between the two SQLite tiers described in the module header, and it has to be right before
+/// either tier's connection count is ever chosen. Recognises the plain form (`sqlite::memory:`,
+/// the only form this codebase's own tests use), the URL-authority form (`sqlite://:memory:`),
+/// and the `?mode=memory` query-parameter form SQLx itself also accepts.
+fn is_in_memory_sqlite(db_url: &str) -> bool {
+    let (path, query) = db_url.split_once('?').unwrap_or((db_url, ""));
+    path.ends_with(":memory:") || query.split('&').any(|param| param.eq_ignore_ascii_case("mode=memory"))
+}
 
-    use sea_orm::sqlx::sqlite::{
-        SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous,
-    };
+/// Builds the `SqliteConnectOptions` every SQLite pool in this module opens with, whether that
+/// pool ends up holding one connection or several.
+///
+/// Split out so [`run_migrations_isolated`]'s single-connection migration pool and [`connect`]'s
+/// tiered application pool cannot drift apart on the pragmas that matter — in particular
+/// `busy_timeout`, which is what lets the migration pool and a not-yet-closed application pool
+/// (or a concurrent process) queue for the write lock instead of erroring, and `journal_mode=WAL`,
+/// which the module header explains must be set at open time because a reopened connection replays
+/// its `SqliteConnectOptions` but not hand-issued `PRAGMA` statements.
+fn build_sqlite_connect_options(db_url: &str) -> Result<SqliteConnectOptions, DbErr> {
     use std::str::FromStr;
 
-    let connect_options = SqliteConnectOptions::from_str(db_url)
+    Ok(SqliteConnectOptions::from_str(db_url)
         .map_err(|e| DbErr::Conn(sea_orm::RuntimeErr::Internal(e.to_string())))?
         .create_if_missing(true)
         // Enforced rather than assumed. SQLx already defaults this to on — measured, not trusted —
@@ -138,14 +150,109 @@ pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
         // companion to WAL: it keeps full durability against process crashes and gives up only the
         // last transactions in a power loss, in exchange for not fsyncing on every commit.
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(std::time::Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS)));
+        .busy_timeout(std::time::Duration::from_millis(u64::from(SQLITE_BUSY_TIMEOUT_MS))))
+}
 
-    let pool = SqlitePoolOptions::new()
-        // Explicit, because the default is wrong here and silently so. SQLx defaults to ten;
-        // SeaORM's own `Database::connect` pins SQLite to one. Leaving it at ten breaks DDL
-        // migrations outright — see the module header — and the failure appears only against a
-        // file-backed database, which the unit suite does not use by default.
-        .max_connections(SQLITE_MAX_CONNECTIONS)
+/// Runs every pending migration on a dedicated pool that opens with exactly one connection, applies
+/// every migration, and is closed before returning — on every backend, not only SQLite.
+///
+/// This is the mechanism the module header calls "two-phase startup": callers are expected to run
+/// this to completion, on the database's own URL, *before* ever calling [`connect`]. Once this
+/// function returns, there is no pool left open that has seen any DDL, and the pool [`connect`]
+/// builds next therefore cannot race one — regardless of how many connections that pool goes on to
+/// hold.
+///
+/// PostgreSQL and MySQL gain nothing operationally from the single-connection restriction today —
+/// nothing in this codebase runs concurrent DDL against them — but it is applied uniformly rather
+/// than only where a failure has already been observed, so a future migration cannot depend on
+/// which backend happened to make a race visible.
+pub async fn run_migrations_isolated(db_url: &str) -> Result<(), DbErr> {
+    tracing::info!("Running database migrations on an isolated, single-connection pool...");
+
+    let db = if db_url.starts_with("sqlite:") {
+        let connect_options = build_sqlite_connect_options(db_url)?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(MIGRATION_POOL_MAX_CONNECTIONS)
+            .connect_with(connect_options)
+            .await
+            .map_err(|e| DbErr::Conn(sea_orm::RuntimeErr::Internal(e.to_string())))?;
+        SqlxSqliteConnector::from_sqlx_sqlite_pool(pool)
+    } else {
+        let mut opt = ConnectOptions::new(db_url.to_owned());
+        opt.sqlx_logging_level(log::LevelFilter::Debug).max_connections(MIGRATION_POOL_MAX_CONNECTIONS);
+        Database::connect(opt).await?
+    };
+
+    crate::migration::Migrator::up(&db, None).await?;
+
+    // Explicit rather than left to `drop`: a dropped `DatabaseConnection` closes its pool in the
+    // background, with no guarantee it has finished by the time this function returns. The whole
+    // point of this function is that the caller can rely on "no pool has seen DDL" the instant it
+    // gets a result back, so the close is awaited here rather than assumed.
+    db.close().await
+}
+
+/// Opens the application's database pool, applying SQLite session pragmas to **every** connection.
+///
+/// Non-SQLite backends take the plain [`Database::connect`] path, tuned by `config::database_*`
+/// (see the module header's "Pool tuning is structural" section).
+///
+/// SQLite is two tiers — see the module header. `sqlite::memory:` is pinned to
+/// [`SQLITE_MEMORY_MAX_CONNECTIONS`] (1) unconditionally; a file-backed URL is tuned by
+/// `config::sqlite_file_max_connections`/`sqlite_file_min_connections`, the same environment
+/// variables the PostgreSQL/MySQL tier reads but with that tier's own defaults and hard ceiling.
+///
+/// This function assumes migrations have already been applied via [`run_migrations_isolated`] —
+/// it does not run them, and for a file-backed SQLite database it must not: by the time it is
+/// called, the pool it is about to build may hold more than one connection, and it is
+/// [`run_migrations_isolated`]'s single-connection discipline, not anything here, that makes that
+/// safe.
+pub async fn connect(db_url: &str) -> Result<DatabaseConnection, DbErr> {
+    // Backend detection by URL scheme, which is the only signal available before a pool exists.
+    // Everything downstream reads `get_database_backend()` instead; this is the one place that
+    // cannot.
+    if !db_url.starts_with("sqlite:") {
+        let mut opt = ConnectOptions::new(db_url.to_owned());
+        opt.sqlx_logging_level(log::LevelFilter::Debug);
+        // PostgreSQL/MySQL pool tuning — `config::database_*`, all environment-configurable. Set
+        // here rather than left to SeaORM's own defaults (`max_connections: 10`, no floor, no
+        // acquire timeout) because those defaults are what produced the slow-pool-acquisition
+        // symptom this function exists to address: a burst of concurrent webhook dispatches
+        // fetching their config rows can outrun ten connections long before the database itself is
+        // the bottleneck, and with no `acquire_timeout` the caller waits however long its own HTTP
+        // client allows rather than failing fast and legibly.
+        //
+        // These four calls have **no effect on SQLite** — the branches below never construct this
+        // `opt` at all, let alone read these fields off it. See the module header for why that
+        // separation is deliberate rather than an oversight.
+        opt.max_connections(crate::config::database_max_connections())
+            .min_connections(crate::config::database_min_connections())
+            .idle_timeout(crate::config::database_idle_timeout())
+            .acquire_timeout(crate::config::database_acquire_timeout());
+        return Database::connect(opt).await;
+    }
+
+    let connect_options = build_sqlite_connect_options(db_url)?;
+
+    let mut pool_options = SqlitePoolOptions::new();
+    pool_options = if is_in_memory_sqlite(db_url) {
+        // See the module header: this is not the DDL-race rule below, it is that a second
+        // connection to `sqlite::memory:` is a second, empty database, not a second reader of the
+        // first one's data.
+        pool_options.max_connections(SQLITE_MEMORY_MAX_CONNECTIONS)
+    } else {
+        // File-backed: SQLite's own file-locking serializes writers regardless of pool size, and
+        // migrations are guaranteed complete before this function is ever called (see this
+        // function's own doc comment), so widening the pool here is a performance choice, not a
+        // correctness risk.
+        pool_options
+            .max_connections(crate::config::sqlite_file_max_connections())
+            .min_connections(crate::config::sqlite_file_min_connections())
+            .idle_timeout(crate::config::database_idle_timeout())
+            .acquire_timeout(crate::config::database_acquire_timeout())
+    };
+
+    let pool = pool_options
         .connect_with(connect_options)
         .await
         .map_err(|e| DbErr::Conn(sea_orm::RuntimeErr::Internal(e.to_string())))?;
@@ -253,11 +360,13 @@ fn index_catalog_query(backend: DatabaseBackend) -> Result<&'static str, DbErr> 
     })
 }
 
-/// Runs every pending migration.
+/// Runs every pending migration against an already-open connection.
 ///
-/// A thin wrapper, and worth having anyway: it puts migration execution beside connection setup so
-/// the startup order — connect, pragmas, migrate — reads as one sequence in one module rather than
-/// being reconstructed from `main.rs`.
+/// A thin wrapper, kept for the four existing call sites that already hold a `&DatabaseConnection`
+/// (three integration-test files and `main.rs`'s own encryption-key-canary test) and for tests that
+/// want migrations applied without going through [`connect`] at all. Production startup does not
+/// use this — it uses [`run_migrations_isolated`], which owns its own single-connection pool and
+/// closes it before returning, rather than running DDL on a connection the caller keeps.
 pub async fn run_migrations(db: &DatabaseConnection) -> Result<(), DbErr> {
     tracing::info!("Running database migrations...");
     crate::migration::Migrator::up(db, None).await
@@ -388,39 +497,74 @@ mod tests {
         );
     }
 
-    /// The SQLite pool holds exactly one connection — the invariant migrations depend on.
-    ///
-    /// Asserted against the live pool rather than against the constant, so that changing
-    /// `SQLITE_MAX_CONNECTIONS` alone cannot satisfy it. SQLite permits one writer, and SeaORM's own
-    /// `Database::connect` pins this to 1; hand-building a pool opts out of that default silently.
+    /// The in-memory SQLite tier holds exactly one connection, regardless of anything an operator
+    /// sets `DATABASE_MAX_CONNECTIONS` to — [`connect`] must not even consult that setting for this
+    /// tier, since a second connection to `sqlite::memory:` is a second, empty database.
     #[tokio::test]
-    async fn the_sqlite_pool_holds_exactly_one_connection() {
+    async fn the_in_memory_sqlite_pool_holds_exactly_one_connection() {
+        let db = connect("sqlite::memory:").await.expect("pool opens");
+        assert_eq!(
+            db.get_sqlite_connection_pool().options().get_max_connections(),
+            SQLITE_MEMORY_MAX_CONNECTIONS,
+            "sqlite::memory: must never be pooled past one connection: a second connection is a \
+             second, unrelated empty database, not a second reader"
+        );
+    }
+
+    /// A file-backed SQLite pool built by [`connect`] is sized by the file tier's configuration —
+    /// not pinned to one — which is the entire point of tiering the pool in the first place.
+    ///
+    /// Asserted against the live pool rather than the config function directly, so this also proves
+    /// [`connect`] actually plumbs the value through rather than merely computing and discarding it.
+    #[tokio::test]
+    async fn a_file_backed_sqlite_pool_is_sized_by_the_file_tier_config() {
         let tmp = TempDb::new();
         let db = connect(&tmp.url()).await.expect("pool opens");
         assert_eq!(
             db.get_sqlite_connection_pool().options().get_max_connections(),
-            1,
-            "SQLite must run a single-connection pool; more than one breaks DDL migrations"
+            crate::config::sqlite_file_max_connections(),
+            "a file-backed pool must be sized by the file tier's config function, not left pinned \
+             to one now that migrations are isolated from it"
         );
     }
 
-    /// Migrations complete against a **file-backed** pool built by [`connect`].
+    /// Two-phase startup does not reintroduce the historical `duplicate column name: master_marker`
+    /// failure, run through the *actual* production sequence: [`run_migrations_isolated`] against
+    /// the bare URL first, then [`connect`] for the (now potentially multi-connection) application
+    /// pool second.
     ///
-    /// This is a regression test for a real break introduced while writing this module, and it is
-    /// here because none of the existing suites could have caught it. Building the pool with SQLx's
-    /// default of ten connections made `Migrator::up` fail with `duplicate column name:
-    /// master_marker` — `m20260808_000009` drops the column on one connection and re-adds it on
-    /// another whose schema is still the old one. Deterministic at any pool size ≥ 2, and invisible
-    /// to every other test in the repository, all of which run on `sqlite::memory:` where there is
-    /// nothing to pool.
+    /// This is the regression test for a real break introduced while writing this module originally:
+    /// building the pool with SQLx's default of ten connections made `Migrator::up` fail with
+    /// exactly this error, because `m20260808_000009` drops `master_marker` and re-adds it as a
+    /// generated column, and at any pool size ≥ 2 the `ADD` can land on a connection whose schema is
+    /// still the old one. Isolating migrations to their own single-connection pool — closed before
+    /// the wide pool ever opens — is what lets the wide pool exist at all without reviving that
+    /// failure, and this test is what stands behind that claim rather than merely asserting it in
+    /// the module header.
     #[tokio::test]
-    async fn migrations_apply_cleanly_on_a_file_backed_pool() {
+    async fn two_phase_startup_survives_the_historical_master_marker_regression() {
         let tmp = TempDb::new();
-        let db = connect(&tmp.url()).await.expect("pool opens");
-        run_migrations(&db).await.expect("every migration applies on a pooled file database");
 
-        // Re-running is a no-op rather than an error: this is what a restart does.
-        run_migrations(&db).await.expect("migrations are idempotent across restarts");
+        run_migrations_isolated(&tmp.url())
+            .await
+            .expect("every migration applies on the isolated single-connection pool");
+
+        let db = connect(&tmp.url()).await.expect("the application pool opens after migrations");
+
+        // The schema the isolated phase created is visible from a pool that never ran it — proof
+        // the isolated pool's writes are durable (WAL + a clean close) rather than only locally
+        // consistent within the connection that made them.
+        assert!(
+            has_index(&db, "api_keys", "idx-api_keys-master_marker").await.unwrap(),
+            "the application pool must see the schema the isolated migration phase created"
+        );
+
+        // A second migration pass against the wide pool — which production deliberately does not
+        // do, per the module header — must still be harmless if it ever happened, because there is
+        // no pending DDL left for it to run.
+        run_migrations(&db)
+            .await
+            .expect("a redundant migration pass against the wide pool is a no-op, not a failure");
     }
 
     /// Every supported backend has a catalog query, and each speaks its own dialect.
@@ -466,8 +610,8 @@ mod tests {
     #[tokio::test]
     async fn has_index_reports_presence_and_absence() {
         let tmp = TempDb::new();
-        let db = connect(&tmp.url()).await.expect("pool opens");
-        run_migrations(&db).await.expect("migrations run");
+        run_migrations_isolated(&tmp.url()).await.expect("migrations run on the isolated pool");
+        let db = connect(&tmp.url()).await.expect("pool opens after migrations are complete");
 
         assert!(
             has_index(&db, "api_keys", "idx-api_keys-master_marker").await.unwrap(),
@@ -493,8 +637,8 @@ mod tests {
     #[tokio::test]
     async fn foreign_keys_are_enforced_not_just_enabled() {
         let tmp = TempDb::new();
-        let db = connect(&tmp.url()).await.expect("pool opens");
-        run_migrations(&db).await.expect("migrations run");
+        run_migrations_isolated(&tmp.url()).await.expect("migrations run on the isolated pool");
+        let db = connect(&tmp.url()).await.expect("pool opens after migrations are complete");
 
         let orphan = crate::entities::api_key_group_permission::ActiveModel {
             id: sea_orm::ActiveValue::Set(uuid::Uuid::new_v4()),
@@ -543,6 +687,28 @@ mod tests {
         let db = Database::connect("sqlite::memory:").await.expect("in-memory sqlite opens");
         assert_eq!(db.get_database_backend(), DatabaseBackend::Sqlite);
         assert!(apply_sqlite_pragmas(&db).await.is_ok());
+    }
+
+    /// `is_in_memory_sqlite` classifies every URL form this codebase or SQLx itself recognises as
+    /// in-memory, and does not false-positive on a file path that merely contains "memory".
+    #[test]
+    fn is_in_memory_sqlite_classifies_every_known_url_form() {
+        // In-memory: the plain form this codebase's own code and tests use exclusively.
+        assert!(is_in_memory_sqlite("sqlite::memory:"));
+        // In-memory: the URL-authority form.
+        assert!(is_in_memory_sqlite("sqlite://:memory:"));
+        // In-memory: SQLx's own query-parameter form, including alongside other parameters and in
+        // mixed case.
+        assert!(is_in_memory_sqlite("sqlite://file.db?mode=memory"));
+        assert!(is_in_memory_sqlite("sqlite://file.db?cache=shared&mode=memory"));
+        assert!(is_in_memory_sqlite("sqlite://file.db?MODE=Memory"));
+
+        // File-backed: an ordinary path.
+        assert!(!is_in_memory_sqlite("sqlite:///var/lib/vault/v.db"));
+        // File-backed: `?mode=rwc`, this service's documented default query parameter.
+        assert!(!is_in_memory_sqlite("sqlite:///var/lib/vault/v.db?mode=rwc"));
+        // File-backed: a path that merely contains "memory" as text must not trip the suffix check.
+        assert!(!is_in_memory_sqlite("sqlite:///var/lib/vault/in_memory_archive.db"));
     }
 
     /// WAL is persistent: a *new* connection to the same file inherits it. This is what makes the

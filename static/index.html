@@ -635,6 +635,113 @@
         </div>
     </div>
 
+    <!-- Edit Webhook Modal -->
+    <div id="edit-webhook-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="edit-webhook-modal-title">
+        <div class="modal-card modal-card-form card">
+            <h3 id="edit-webhook-modal-title">Edit Webhook</h3>
+            <form id="form-edit-webhook">
+                <input type="hidden" id="edit-webhook-id">
+                <div class="form-group">
+                    <label for="edit-webhook-name">Webhook Name <span>*</span></label>
+                    <input type="text" id="edit-webhook-name" required class="input-field">
+                </div>
+                <div class="form-group">
+                    <label for="edit-webhook-url">Target URL <span>*</span></label>
+                    <input type="url" id="edit-webhook-url" required class="input-field">
+                    <small class="field-hint" id="edit-webhook-url-hint">
+                        Repointing this webhook (changing the URL from what it currently is) forces its
+                        signing secret to rotate — see the secret field below.
+                    </small>
+                </div>
+
+                <!-- Auth mode, API key presence, signature header/prefix are read-only here: `PUT
+                     /api/v1/webhooks/{id}` does not accept changes to any of them (only `name`,
+                     `target_url`, `hmac_template`, `secret_token`, `headers_json`,
+                     `payload_template`, `events`, `is_active` are settable). They are still shown —
+                     "inspectable" does not require "editable" — so an operator can see exactly what a
+                     dispatch from this webhook will authenticate with without needing the API. -->
+                <div class="form-group">
+                    <label>Auth Mode <span class="text-muted text-sm">(fixed at creation)</span></label>
+                    <p><span id="edit-webhook-auth-mode-badge" class="badge"></span>
+                       <span id="edit-webhook-api-key-badge" class="badge badge-scope hidden">key configured</span></p>
+                    <small class="field-hint" id="edit-webhook-sig-transport-hint"></small>
+                </div>
+
+                <div class="form-group" id="edit-webhook-hmac-template-group">
+                    <label for="edit-webhook-hmac-template">HMAC Signature Template <span>*</span></label>
+                    <input type="text" id="edit-webhook-hmac-template" class="input-field font-mono"
+                           spellcheck="false" autocomplete="off">
+                    <small class="field-hint">
+                        Changing this also forces the signing secret to rotate — it decides what the
+                        signature attests to. <code>{body}</code> is mandatory.
+                    </small>
+                </div>
+
+                <div class="form-group" id="edit-webhook-secret-group">
+                    <label for="edit-webhook-secret">New Secret <span class="text-muted text-sm">(optional)</span></label>
+                    <input type="password" id="edit-webhook-secret" placeholder="Leave blank to keep the current secret"
+                           class="input-field" autocomplete="off">
+                    <small class="field-hint">
+                        Only used if you supply one, or if repointing the URL/template above forces a
+                        rotation — in which case a secret is generated for you and shown once if you
+                        leave this blank.
+                    </small>
+                </div>
+
+                <div class="form-group">
+                    <label id="edit-webhook-headers-label">Custom Headers</label>
+                    <div id="edit-webhook-headers-list" class="kv-editor" role="group"
+                         aria-labelledby="edit-webhook-headers-label"></div>
+                    <button type="button" id="edit-webhook-headers-add" class="btn btn-secondary btn-sm mt-2">+ Add Header</button>
+                </div>
+
+                <div class="form-group">
+                    <label for="edit-webhook-template">Payload Template <span>*</span></label>
+                    <textarea id="edit-webhook-template" required class="input-field font-mono" rows="3"></textarea>
+                </div>
+
+                <div class="form-group">
+                    <label>Trigger On Events <span>*</span></label>
+                    <div class="permissions-grid mt-2">
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="edit-webhook-event-add">
+                            <span class="checkmark"></span> IP Added
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="edit-webhook-event-update">
+                            <span class="checkmark"></span> IP Updated
+                        </label>
+                        <label class="checkbox-container">
+                            <input type="checkbox" id="edit-webhook-event-delete">
+                            <span class="checkmark"></span> IP Deleted
+                        </label>
+                    </div>
+                </div>
+
+                <div class="form-group">
+                    <label class="checkbox-container">
+                        <input type="checkbox" id="edit-webhook-is-active">
+                        <span class="checkmark"></span> Dispatching enabled
+                    </label>
+                </div>
+
+                <!-- Populated by testWebhook() from the live POST /api/webhooks/{id}/test result.
+                     Hidden until a test has actually been run, so the modal opens clean every time. -->
+                <div id="edit-webhook-test-result" class="test-result-panel hidden" role="status" aria-live="polite">
+                    <p id="edit-webhook-test-summary" class="test-result-summary"></p>
+                    <pre id="edit-webhook-test-detail" class="test-result-detail"></pre>
+                </div>
+
+                <div class="form-actions mt-4">
+                    <button type="submit" class="btn btn-primary">Save Changes</button>
+                    <button type="button" id="edit-webhook-test" class="btn btn-secondary">Test Webhook</button>
+                    <button type="button" id="edit-webhook-cancel" class="btn btn-cancel">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Secret Reveal Modal (used after key rotation) -->
     <div id="secret-reveal-modal" class="modal-overlay hidden">
         <div class="modal-card card">

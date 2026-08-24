@@ -8,7 +8,8 @@ use chrono::Utc;
 use ipnetwork::IpNetwork;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, TransactionTrait, sea_query::OnConflict, SqlErr,
+    QueryOrder, QuerySelect, SqliteTransactionMode, TransactionOptions, TransactionTrait,
+    sea_query::OnConflict, SqlErr,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -1070,8 +1071,8 @@ pub async fn delete_ip(
 /// a message that says what to do about it.
 ///
 /// It also bounds the transaction. Every record below is a `SELECT` plus an `INSERT`/`UPDATE` inside
-/// one `BEGIN`, and on SQLite — a single-writer engine — that transaction holds the write lock for its
-/// whole duration. An unbounded batch is a self-inflicted outage for every other caller.
+/// one `BEGIN IMMEDIATE`, and on SQLite — a single-writer engine — that transaction holds the write
+/// lock for its whole duration. An unbounded batch is a self-inflicted outage for every other caller.
 pub const MAX_BATCH_RECORDS: usize = 10_000;
 
 /// How a batch reconciles against what is already in the group.
@@ -1287,7 +1288,25 @@ pub async fn batch_records(
 
     // ── The transaction ─────────────────────────────────────────────────────
     let now = Utc::now().naive_utc();
-    let txn = state.db.begin().await?;
+    // `Immediate` rather than a plain `begin()` (SQLite's default `BEGIN DEFERRED`): this
+    // transaction reads before it writes (a `SELECT` per record, ahead of that record's own
+    // `INSERT`/`UPDATE`), and a deferred transaction only takes a read snapshot at that first
+    // `SELECT`. On a single-connection SQLite pool that distinction was invisible — nothing else
+    // could commit in between regardless — but a file-backed pool may now hold more than one
+    // connection, and a concurrent writer committing between this transaction's first read and its
+    // first write leaves the snapshot stale. SQLite refuses to upgrade a stale snapshot to a write
+    // lock and returns `SQLITE_BUSY` **immediately**, without invoking the `busy_timeout` handler —
+    // that handler retries ordinary lock contention, not this. `Immediate` sidesteps the whole
+    // failure mode by taking the write lock up front, before the first read, so there is no snapshot
+    // left to go stale; a concurrent writer is then ordinary lock contention, and `busy_timeout` does
+    // apply and does queue it. Ignored (harmlessly) on non-SQLite backends.
+    let txn = state
+        .db
+        .begin_with_options(TransactionOptions {
+            sqlite_transaction_mode: Some(SqliteTransactionMode::Immediate),
+            ..Default::default()
+        })
+        .await?;
     let mut summary = BatchRecordsResponse::default();
 
     for (address, input) in &normalized {

@@ -614,3 +614,65 @@ pub async fn delete_webhook(
 
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
+
+
+/// Handles `POST /api/v1/webhooks/{id}/test` — a live, synchronous, human-observed dispatch used by
+/// the dashboard's "Test Webhook" action, so an operator can see whether a configuration actually
+/// reaches its receiver before saving it.
+///
+/// Same authority as [`update_webhook`]/[`delete_webhook`]: `can_manage_webhooks` (or master), and
+/// ownership of the specific webhook (§4 creator-private; `404`, not `403`, for one the caller does
+/// not own, matching every other webhook endpoint's oracle discipline). Testing reveals whether a
+/// receiver accepts the *current* configuration — target, headers, auth mode, secret — so it needs
+/// exactly the authority that can already read and change all of those, no more and no less.
+///
+/// The event dispatched is synthetic and fixed — address `127.0.0.1/32`, action `TEST` — never a real
+/// record, and it bypasses the webhook's own `events` filter entirely: an explicit, human-triggered
+/// test must run regardless of what live traffic the webhook is subscribed to, or a webhook scoped to
+/// `IP_DELETE` only could never be tested at all.
+pub async fn test_webhook(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath(id): StrictPath<Uuid>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_webhooks {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let target = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && target.owner_key_id != Some(key.id) {
+        return Err(AppError::NotFound);
+    }
+
+    let event = crate::state::WebhookEvent {
+        action: "TEST".to_owned(),
+        address: "127.0.0.1/32".to_owned(),
+        is_whitelist: false,
+        group_id: Some(target.group_id),
+        cause: Some("Manual test dispatch from the dashboard".to_owned()),
+    };
+
+    let result = crate::dispatch::send_test_dispatch(&target, &event).await;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "WEBHOOK_TEST",
+        None,
+        None,
+        Some(format!(
+            "Tested webhook '{}': {}",
+            target.name,
+            if result.success {
+                "delivered".to_owned()
+            } else {
+                format!("failed — {}", result.error.as_deref().unwrap_or("unknown error"))
+            }
+        )),
+    )
+    .await?;
+
+    Ok(Json(result))
+}

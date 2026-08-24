@@ -464,7 +464,12 @@ class FirewallClient {
             // Custom webhook headers as [{name, value}], owned here rather than read back out of
             // the DOM — see renderHeaderRows(). Survives auth-mode switches by construction: the
             // editor sits outside every mode-dependent group, so nothing hides or clears it.
-            webhookHeaders: []
+            webhookHeaders: [],
+            // The Edit Webhook modal's own headers editor, kept separate from `webhookHeaders`
+            // above — the create form and the edit modal can both be present in the DOM at once
+            // (the form is always visible; the modal only overlays it), so one shared array would
+            // let opening the editor for an existing webhook clobber whatever the create form had.
+            editWebhookHeaders: []
         };
 
         // IP records and audit logs are both large, append-only lists — fetched from the server
@@ -1243,7 +1248,7 @@ class FirewallClient {
                 <td>${statusBadge}</td>
                 <td class="text-sm" title="${escapeHtml(ip.cause || '')}">${escapeHtml(ip.cause || '-')}</td>
                 <td title="${escapeHtml(ip.group_name || 'Global')}"><span class="badge badge-group">${escapeHtml(ip.group_name || 'Global')}</span></td>
-                <td class="text-sm">${new Date(ip.last_seen_at).toLocaleString()}</td>
+                <td class="text-sm">${formatTimestamp(ip.last_seen_at)}</td>
                 <td>
                     <div class="flex gap-2">
                         <button class="btn btn-sm btn-danger" onclick="window.app.deleteIp('${escapeHtml(ip.target_address)}', '${escapeHtml(ip.group_name)}')" ${ip.is_locked ? 'disabled' : ''}>Delete</button>
@@ -1436,6 +1441,7 @@ class FirewallClient {
                 <td><span class="badge ${badgeClass}">${escapeHtml(mode)}</span>${keyBadge}${templateBadge}</td>
                 <td>
                     <div class="flex gap-2">
+                        <button class="btn btn-sm btn-secondary" onclick="window.app.openEditWebhookModal('${w.id}')">Edit</button>
                         <button class="btn btn-sm btn-danger" onclick="window.app.deleteWebhook('${w.id}')">Delete</button>
                     </div>
                 </td>
@@ -1590,7 +1596,7 @@ class FirewallClient {
                 : '<span class="text-muted">System</span>';
             return `
             <tr>
-                <td class="text-sm">${new Date(log.timestamp).toLocaleString()}</td>
+                <td class="text-sm">${formatTimestamp(log.timestamp)}</td>
                 <td class="text-sm">${keyDisplay}</td>
                 <td class="font-mono text-sm">${escapeHtml(log.client_ip || '-')}</td>
                 <td><span class="badge badge-scope">${escapeHtml(log.action)}</span></td>
@@ -2184,6 +2190,221 @@ class FirewallClient {
     }
 
     // ───────────────────────────────────────────────────────
+    // Edit Webhook modal — headers editor
+    //
+    // A second copy of the create form's kv-editor (renderHeaderRows/addHeaderRow/headerMap)
+    // rather than a shared, parametrized one: the create form is always present in the DOM (it is
+    // not itself a modal) while this modal can overlay it, so the two need independent state and
+    // independent DOM targets regardless. Duplicating ~20 lines here was judged lower-risk than
+    // reworking the create form's already-working editor to take a target parameter.
+    // ───────────────────────────────────────────────────────
+
+    renderEditHeaderRows() {
+        const list = document.getElementById('edit-webhook-headers-list');
+        const rows = this.state.editWebhookHeaders;
+
+        if (rows.length === 0) {
+            list.innerHTML = '<p class="kv-empty">No custom headers.</p>';
+            return;
+        }
+
+        list.innerHTML = rows.map((row, i) => `
+            <div class="kv-row" data-index="${i}">
+                <input type="text" class="input-field font-mono kv-name" placeholder="Header-Name"
+                       value="${escapeHtml(row.name)}" autocomplete="off" aria-label="Header name">
+                <input type="text" class="input-field font-mono kv-value" placeholder="value"
+                       value="${escapeHtml(row.value)}" autocomplete="off" aria-label="Header value">
+                <button type="button" class="kv-remove" data-index="${i}" title="Remove this header"
+                        aria-label="Remove header">&times;</button>
+            </div>
+        `).join('');
+
+        list.querySelectorAll('.kv-row').forEach(rowEl => {
+            const i = Number(rowEl.dataset.index);
+            rowEl.querySelector('.kv-name').addEventListener('input', (ev) => {
+                this.state.editWebhookHeaders[i].name = ev.target.value;
+            });
+            rowEl.querySelector('.kv-value').addEventListener('input', (ev) => {
+                this.state.editWebhookHeaders[i].value = ev.target.value;
+            });
+        });
+        list.querySelectorAll('.kv-remove').forEach(btn => {
+            btn.addEventListener('click', () => {
+                this.state.editWebhookHeaders.splice(Number(btn.dataset.index), 1);
+                this.renderEditHeaderRows();
+            });
+        });
+    }
+
+    addEditHeaderRow(name = '', value = '') {
+        this.state.editWebhookHeaders.push({ name, value });
+        this.renderEditHeaderRows();
+        const inputs = document.querySelectorAll('#edit-webhook-headers-list .kv-name');
+        inputs[inputs.length - 1]?.focus();
+    }
+
+    editHeaderMap() {
+        const map = {};
+        for (const { name, value } of this.state.editWebhookHeaders) {
+            const key = name.trim();
+            if (key) map[key] = value;
+        }
+        return map;
+    }
+
+    // ───────────────────────────────────────────────────────
+    // Edit Webhook modal — open/close/save/test
+    // ───────────────────────────────────────────────────────
+
+    /**
+     * Opens the Edit Webhook modal, pre-filled from the cached `GET /api/webhooks` row.
+     *
+     * Auth mode, API-key presence, and the signature header/prefix are rendered read-only — `PUT
+     * /api/v1/webhooks/{id}` does not accept changes to any of them (see the modal's HTML comment
+     * for why), so showing them as editable inputs would let an operator "change" a value that
+     * silently reverts on save.
+     */
+    openEditWebhookModal(id) {
+        const w = this.state.webhooks.find(w => w.id === id);
+        if (!w) return;
+
+        document.getElementById('edit-webhook-id').value = w.id;
+        document.getElementById('edit-webhook-name').value = w.name;
+        document.getElementById('edit-webhook-url').value = w.target_url;
+        document.getElementById('edit-webhook-template').value = w.payload_template;
+        document.getElementById('edit-webhook-is-active').checked = w.is_active;
+
+        const mode = w.auth_mode || 'HMAC_ONLY';
+        const badgeClasses = {
+            CANONICAL_V1: 'badge-canonical', HMAC_ONLY: 'badge-hmac-only',
+            API_KEY_ONLY: 'badge-api-key', NONE: 'badge-no-auth'
+        };
+        const modeBadge = document.getElementById('edit-webhook-auth-mode-badge');
+        modeBadge.textContent = mode;
+        modeBadge.className = `badge ${badgeClasses[mode] || 'badge-hmac-only'}`;
+        document.getElementById('edit-webhook-api-key-badge').classList.toggle('hidden', !w.has_api_key);
+
+        const needsTemplate = mode === 'CANONICAL_V1';
+        const needsSecret = mode === 'CANONICAL_V1' || mode === 'HMAC_ONLY';
+        document.getElementById('edit-webhook-hmac-template-group').classList.toggle('hidden', !needsTemplate);
+        document.getElementById('edit-webhook-hmac-template').value = w.hmac_template || '';
+        document.getElementById('edit-webhook-secret-group').classList.toggle('hidden', !needsSecret);
+        document.getElementById('edit-webhook-secret').value = '';
+        document.getElementById('edit-webhook-sig-transport-hint').textContent = needsSecret
+            ? `Signature sent in ${w.signature_header}, prefixed "${w.signature_prefix}". Not editable here.`
+            : '';
+
+        const events = w.events ? w.events.split(',').map(s => s.trim()) : ['IP_ADD', 'IP_UPDATE', 'IP_DELETE'];
+        document.getElementById('edit-webhook-event-add').checked = events.includes('IP_ADD');
+        document.getElementById('edit-webhook-event-update').checked = events.includes('IP_UPDATE');
+        document.getElementById('edit-webhook-event-delete').checked = events.includes('IP_DELETE');
+
+        this.state.editWebhookHeaders = Object.entries(JSON.parse(w.headers_json || '{}'))
+            .map(([name, value]) => ({ name, value }));
+        this.renderEditHeaderRows();
+
+        document.getElementById('edit-webhook-test-result').classList.add('hidden');
+        document.getElementById('edit-webhook-modal').classList.remove('hidden');
+    }
+
+    closeEditWebhookModal() {
+        document.getElementById('edit-webhook-modal').classList.add('hidden');
+    }
+
+    async submitEditWebhook(e) {
+        e.preventDefault();
+        const id = document.getElementById('edit-webhook-id').value;
+
+        const eventKeys = { add: 'IP_ADD', update: 'IP_UPDATE', delete: 'IP_DELETE' };
+        const checkedEvents = Object.entries(eventKeys)
+            .filter(([k]) => document.getElementById(`edit-webhook-event-${k}`).checked)
+            .map(([, action]) => action);
+        if (checkedEvents.length === 0) {
+            this.showToast('Select at least one event for this webhook to trigger on', 'error');
+            return;
+        }
+        const events = checkedEvents.length === Object.keys(eventKeys).length ? null : checkedEvents.join(',');
+
+        const payload = {
+            name: document.getElementById('edit-webhook-name').value,
+            target_url: document.getElementById('edit-webhook-url').value,
+            payload_template: document.getElementById('edit-webhook-template').value,
+            is_active: document.getElementById('edit-webhook-is-active').checked,
+            events
+        };
+
+        if (!document.getElementById('edit-webhook-hmac-template-group').classList.contains('hidden')) {
+            payload.hmac_template = document.getElementById('edit-webhook-hmac-template').value;
+        }
+        const newSecret = document.getElementById('edit-webhook-secret').value;
+        if (newSecret) payload.secret_token = newSecret;
+
+        const headers = this.editHeaderMap();
+        payload.headers_json = Object.keys(headers).length > 0 ? JSON.stringify(headers) : null;
+
+        try {
+            const res = await this.apiFetch(`/webhooks/${id}`, { method: 'PUT', body: JSON.stringify(payload) });
+            this.closeEditWebhookModal();
+            this.loadWebhooks();
+            if (res.secret_rotated && res.secret_token) {
+                // Same one-time-reveal pattern as key rotation: the new secret is shown here and
+                // never again, matching update_webhook's own "no endpoint re-reads it" guarantee.
+                document.getElementById('signing-secret-key-name').textContent = res.name;
+                document.getElementById('signing-secret-value').textContent = res.secret_token;
+                document.getElementById('signing-secret-modal').classList.remove('hidden');
+                this.showToast('Webhook updated — secret rotated, copy it now', 'success');
+            } else {
+                this.showToast('Webhook updated', 'success');
+            }
+        } catch(e) {}
+    }
+
+    /**
+     * Fires a live `POST /api/webhooks/{id}/test` and renders the result inline in the modal —
+     * status, headers, a body snippet, or the failure reason — so an operator can see whether the
+     * *current on-disk* configuration actually reaches its receiver before deciding to save.
+     *
+     * Deliberately reads the webhook `id` rather than the form's in-progress edits: the test
+     * endpoint dispatches against what is already stored, not against unsaved changes sitting in
+     * the modal's inputs. Save first if the point is to test what you just typed.
+     */
+    async testWebhook() {
+        const id = document.getElementById('edit-webhook-id').value;
+        const panel = document.getElementById('edit-webhook-test-result');
+        const summary = document.getElementById('edit-webhook-test-summary');
+        const detail = document.getElementById('edit-webhook-test-detail');
+        const button = document.getElementById('edit-webhook-test');
+
+        button.disabled = true;
+        button.textContent = 'Testing…';
+        panel.classList.remove('hidden');
+        panel.classList.remove('test-result-success', 'test-result-fail');
+        summary.textContent = 'Dispatching a test event…';
+        detail.textContent = '';
+
+        try {
+            const res = await this.apiFetch(`/webhooks/${id}/test`, { method: 'POST' });
+            panel.classList.add(res.success ? 'test-result-success' : 'test-result-fail');
+            summary.textContent = res.success
+                ? `Success — HTTP ${res.status}`
+                : `Failed${res.status ? ` — HTTP ${res.status}` : ''}${res.blocked_by_ssrf_filter ? ' (blocked by SSRF protection)' : ''}`;
+
+            const parts = [];
+            if (res.error) parts.push(`Error: ${res.error}`);
+            if (res.headers) parts.push(`Response headers:\n${Object.entries(res.headers).map(([k, v]) => `  ${k}: ${v}`).join('\n')}`);
+            if (res.body) parts.push(`Response body:\n${res.body}`);
+            detail.textContent = parts.join('\n\n');
+        } catch (e) {
+            panel.classList.add('test-result-fail');
+            summary.textContent = 'Test request failed';
+            detail.textContent = e.message || String(e);
+        } finally {
+            button.disabled = false;
+            button.textContent = 'Test Webhook';
+        }
+    }
+
+    // ───────────────────────────────────────────────────────
     // Event Binding
     // ───────────────────────────────────────────────────────
     bindEvents() {
@@ -2339,6 +2560,22 @@ class FirewallClient {
         document.getElementById('form-edit-key').addEventListener('submit', (e) => this.submitEditKey(e));
         document.getElementById('edit-key-cancel').addEventListener('click', () => this.closeEditKeyModal());
 
+        // Edit Webhook modal: submit, Cancel, backdrop click, Escape, headers editor, and the live
+        // "Test Webhook" action — same close pattern as the Manage Access modal above.
+        document.getElementById('form-edit-webhook').addEventListener('submit', (e) => this.submitEditWebhook(e));
+        document.getElementById('edit-webhook-cancel').addEventListener('click', () => this.closeEditWebhookModal());
+        document.getElementById('edit-webhook-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'edit-webhook-modal') this.closeEditWebhookModal();
+        });
+        document.getElementById('edit-webhook-headers-add').addEventListener('click', () => this.addEditHeaderRow());
+        document.getElementById('edit-webhook-test').addEventListener('click', () => this.testWebhook());
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            if (!document.getElementById('edit-webhook-modal').classList.contains('hidden')) {
+                this.closeEditWebhookModal();
+            }
+        });
+
         // Secret reveal modal (used after key rotation)
         document.getElementById('secret-reveal-close').addEventListener('click', () => {
             document.getElementById('secret-reveal-modal').classList.add('hidden');
@@ -2392,6 +2629,23 @@ function escapeHtml(unsafe) {
          .replace(/>/g, "&gt;")
          .replace(/"/g, "&quot;")
          .replace(/'/g, "&#039;");
+}
+
+// The API's `created_at`/`timestamp` columns are `chrono::NaiveDateTime` — a UTC instant
+// serialized with NO timezone designator, e.g. "2026-08-21T14:12:25.215206". Per the
+// ECMAScript Date Time String spec, `new Date(...)` on a date-time string with no trailing
+// 'Z' or '+HH:MM' offset is parsed as LOCAL time, not UTC. Left alone, that turns an
+// already-UTC value into one silently misread as local before `toLocaleString()` even runs —
+// every displayed time is off by exactly the viewer's UTC offset. Appending 'Z' only when no
+// timezone marker is already present is what makes the browser treat it as the UTC instant it
+// actually is, so `toLocaleString()` converts it to the viewer's real local time correctly —
+// matching how `simply_hook_executor`'s dashboard formats the same shape of timestamp.
+function formatTimestamp(raw) {
+    if (!raw) return '—';
+    const hasTimezone = /[zZ]|[+-]\d{2}:?\d{2}$/.test(raw);
+    const date = new Date(hasTimezone ? raw : `${raw}Z`);
+    if (Number.isNaN(date.getTime())) return escapeHtml(raw);
+    return date.toLocaleString();
 }
 
 // Bootstrap

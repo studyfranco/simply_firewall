@@ -488,18 +488,32 @@ caller.
 Connection construction, session pragmas, and migration execution live in `src/db.rs` — mirroring
 `simply_hook_executor`'s module of the same name — rather than inside `state.rs`.
 
-### The SQLite pool holds exactly one connection
+### Migrations run on an isolated pool, before the application pool ever opens
 
-Not a tuning choice. SQLite permits a single writer, and a DDL sequence spread across connections
+`db::run_migrations_isolated` owns a dedicated pool pinned to exactly one connection, on every
+backend, applies every pending migration, and closes it before returning. `main.rs` calls this
+**before** `db::connect` builds the pool the running service actually uses, so that pool can never
+witness a DDL statement — there is none left pending by the time it opens.
+
+This exists because SQLite permits a single writer, and a DDL sequence spread across connections
 does not survive: `m20260808_000009` drops `master_marker` and re-adds it as a generated column, and
 at any pool size ≥ 2 the `ADD` reaches a connection whose schema still holds the old one —
-`duplicate column name: master_marker`, deterministically. One connection: nine migrations applied.
-Two: eight, then failure.
+`duplicate column name: master_marker`, deterministically. Isolating migrations to their own
+single-connection pool, closed before the wider pool opens, closes that failure mode by
+construction rather than by capping the application pool at one connection forever.
 
-SeaORM's `Database::connect` pins `max_connections = 1` for SQLite. Building a pool by hand opts out
-of that default **silently**, which is exactly how this was broken while `db.rs` was being written.
-`SQLITE_MAX_CONNECTIONS` restores it, and a test asserts it against the live pool rather than against
-the constant.
+### SQLite is two tiers
+
+`sqlite::memory:` is pinned to `db::SQLITE_MEMORY_MAX_CONNECTIONS` (1), unconditionally — a second
+connection to an in-memory database is a second, unrelated empty database, not a second reader of
+the first one's data, so this is not the DDL-race rule above and does not relax once migrations are
+isolated.
+
+A file-backed SQLite URL may use more than one connection: `config::sqlite_file_max_connections`/
+`sqlite_file_min_connections` read the same `DATABASE_MAX_CONNECTIONS`/`DATABASE_MIN_CONNECTIONS`
+environment variables the PostgreSQL/MySQL tier does, with their own defaults (10/2) and their own
+hard ceiling (10). `journal_mode=WAL` plus `busy_timeout=5000` (below) is what makes that safe for
+concurrent readers without a writer erroring instead of queueing.
 
 ### Session pragmas
 

@@ -1719,6 +1719,45 @@ body {
     gap: 0.75rem;
 }
 
+/* Live "Test Webhook" result, rendered inline in the Edit Webhook modal. Colour is the only signal
+   that changes between success and failure — the text itself already says which — so it stays
+   subtle: a left border and a faint tint, the same treatment `.toast-success`/`.toast-error` use. */
+.test-result-panel {
+    margin-top: 1rem;
+    padding: 0.75rem 1rem;
+    border-radius: var(--radius);
+    background-color: var(--bg-input);
+    border-left: 3px solid var(--border);
+}
+
+.test-result-panel.test-result-success {
+    border-left-color: var(--success);
+}
+
+.test-result-panel.test-result-fail {
+    border-left-color: var(--danger);
+}
+
+.test-result-summary {
+    font-weight: 600;
+    margin: 0;
+}
+
+.test-result-detail {
+    margin: 0.5rem 0 0;
+    font-family: var(--font-mono);
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    white-space: pre-wrap;
+    word-break: break-word;
+    max-height: 220px;
+    overflow-y: auto;
+}
+
+.test-result-detail:empty {
+    display: none;
+}
+
 /* ─── Batch Selection Actions ──────────────────────────────── */
 
 .batch-actions {

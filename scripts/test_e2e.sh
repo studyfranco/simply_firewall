@@ -3096,14 +3096,19 @@ kill "$GOOD_PID" 2>/dev/null; wait "$GOOD_PID" 2>/dev/null
 
 log_section "29b. Database pool tuning environment variables"
 
-# These four are read unconditionally in `db::connect`, but only ever *applied* on the
-# PostgreSQL/MySQL path — the SQLite branch never constructs the `ConnectOptions` they configure.
-# This suite has no live Postgres/MySQL to boot against, so what it can and does prove on SQLite is
-# the boundary around that: the variables are accepted without affecting startup (valid values), a
-# garbled one fails soft with a warning rather than aborting boot (matching `numeric_env`'s
-# documented "all fail soft" contract — real unit coverage of the parsing/clamping logic itself
-# lives in `src/config.rs`'s own test module, which can exercise multiple values in one process; an
-# env-driven `OnceLock` cannot).
+# `DATABASE_MAX_CONNECTIONS`/`DATABASE_MIN_CONNECTIONS` now feed **two** tiers, not one: the
+# PostgreSQL/MySQL tier (`config::database_max_connections`, unreachable from this harness — it has
+# no live Postgres/MySQL to boot against) and, since the two-phase/tiered SQLite work, the
+# file-backed SQLite tier (`config::sqlite_file_max_connections`), which this harness boots against
+# on every run. `DATABASE_IDLE_TIMEOUT_SECS`/`DATABASE_ACQUIRE_TIMEOUT_SECS` remain PostgreSQL/MySQL-
+# only — the file-backed SQLite tier reuses `config::database_idle_timeout`/`database_acquire_timeout`
+# directly rather than having its own, so those two are read but not re-derived here. What this
+# section proves on SQLite: the variables are accepted without affecting startup (valid values), and
+# a garbled `DATABASE_MAX_CONNECTIONS` fails soft with a warning rather than aborting boot — visibly,
+# now, because the file-backed tier actually reads it (matching `numeric_env`'s documented "all fail
+# soft" contract — real unit coverage of the parsing/clamping logic itself lives in `src/config.rs`'s
+# own test module, which can exercise multiple values in one process; an env-driven `OnceLock`
+# cannot).
 POOLENV_PORT=$((VAULT_PORT + 65))
 POOLENV_DB="$WORK_DIR/poolenv.db"
 POOLENV_LOG="$WORK_DIR/poolenv_server.log"
@@ -3143,15 +3148,19 @@ done
 check_local "$GARBLED_READY" "1" "#29b a malformed DATABASE_MAX_CONNECTIONS does not abort startup on SQLite"
 kill "$GARBLED_PID" 2>/dev/null; wait "$GARBLED_PID" 2>/dev/null
 
-# Not merely tolerated — never read at all. `db::connect` only calls
-# `config::database_max_connections` (where `numeric_env`'s "not a valid number" warning would
-# fire) on the non-SQLite branch, and this harness only ever boots against SQLite, so the correct,
-# strongest thing observable here is silence: no warning, because there was nothing to parse. The
-# parse-and-clamp behaviour itself — including this exact warning — is unit-tested directly in
-# `src/config.rs`, which can drive the same `numeric_env` call with several inputs in one process;
-# an env-driven `OnceLock` cached once per boot cannot be re-exercised that way from outside.
+# Tolerated, and now *visibly* so. Before the tiered SQLite pool this was silence: `db::connect`
+# called `config::database_max_connections` (where `numeric_env`'s "not a valid number" warning
+# fires) only on the non-SQLite branch, and this harness only ever boots against SQLite, so nothing
+# ever read the value at all. That is no longer true — this harness's file-backed database now goes
+# through `config::sqlite_file_max_connections`, which calls the very same `numeric_env` parser on
+# the very same `DATABASE_MAX_CONNECTIONS`, so a garbled value is read, warned about, and clamped to
+# a floor of 1 exactly the way the PostgreSQL/MySQL tier always has been. The warning is the proof
+# the file-backed tier is genuinely consulting the environment rather than merely accepting the
+# ceiling's default. The parse-and-clamp behaviour itself is unit-tested directly in `src/config.rs`,
+# which can drive `numeric_env`/`clamp_sqlite_file_max` with several inputs in one process; an
+# env-driven `OnceLock` cached once per boot cannot be re-exercised that way from outside.
 check_local "$([ -s "$POOLENV_LOG" ] && grep -qi "not a valid number" "$POOLENV_LOG" && echo warned || echo silent)" \
-    "silent" "#29b on SQLite the value is never read at all, not merely read-and-ignored"
+    "warned" "#29b on SQLite the file-backed tier reads the value and warns rather than ignoring it"
 
 
 log_section "30. Edge cases: intra-batch duplicates and IPv6 canonicalisation"

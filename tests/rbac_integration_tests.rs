@@ -4957,6 +4957,103 @@ async fn s3_webhook_lifecycle_follows_its_owner_not_its_group() {
     assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NO_CONTENT);
 }
 
+/// **`POST /api/webhooks/{id}/test` carries the same ownership rule as every other webhook
+/// endpoint, and a successful test genuinely reaches a real receiver.**
+///
+/// Ownership half mirrors [`s3_webhook_lifecycle_follows_its_owner_not_its_group`] exactly — a group
+/// peer with `can_manage_webhooks` gets `404`, not `403`, the same oracle-discipline reason as
+/// delete/update. The dispatch half is the new behaviour: the owner's test request must actually
+/// reach a live loopback receiver (with `ALLOW_PRIVATE_WEBHOOKS` opted in, the same escape hatch
+/// `test_webhook_hmac_signature_and_delivery` uses) and report success, and it must do so without
+/// requiring any live traffic — nothing is ever posted to `/api/ban` or `/api/white` in this test, so
+/// a passing result proves the endpoint dispatches on its own rather than merely being reachable.
+#[tokio::test]
+async fn s4_webhook_test_endpoint_follows_ownership_and_genuinely_dispatches() {
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+
+    let receiver = axum::Router::new().route(
+        "/hook",
+        axum::routing::post(|| async { StatusCode::OK }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let receiver_addr = listener.local_addr().unwrap();
+    let _receiver = tokio::spawn(async move {
+        axum::serve(listener, receiver).await.unwrap();
+    });
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
+
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (owner_id, owner_key) = insert_key(&db, "Webhook owner", false, false, true, false).await;
+    let (peer_id, peer_key) = insert_key(&db, "Group peer", false, false, true, false).await;
+    let (_stranger_id, stranger_key) = insert_key(&db, "No manage rights", false, false, false, false).await;
+
+    let group_id = insert_group_row(&db, "test-endpoint-group").await;
+    grant_perm(&db, owner_id, group_id, true, true, true, false).await;
+    grant_perm(&db, peer_id, group_id, true, true, true, false).await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &owner_key)
+        .header("Content-Type", "application/json")), json!({
+            "name": "test-endpoint-hook",
+            "target_url": format!("http://{receiver_addr}/hook"),
+            "auth_mode": "NONE",
+            "payload_template": "{}",
+            "group_id": group_id.to_string()
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let webhook_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    // A key with no `can_manage_webhooks` at all: refused outright, `403` — it never had standing to
+    // ask about any webhook, owned or not.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{webhook_id}/test"))
+        .header("X-API-Key", &stranger_key)), 1, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    // A group peer with `can_manage_webhooks` but no ownership: `404`, matching delete/update — this
+    // webhook is not in the set that peer's `GET /api/webhooks` would ever list.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{webhook_id}/test"))
+        .header("X-API-Key", &peer_key)), 2, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    // The owner may test its own webhook, and the live receiver actually answers.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{webhook_id}/test"))
+        .header("X-API-Key", &owner_key)), 3, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let result: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(result["success"], true, "the live receiver answered 200: {result}");
+    assert_eq!(result["status"], 200);
+
+    // A master may test any webhook, ownership notwithstanding.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{webhook_id}/test"))
+        .header("X-API-Key", &master_key)), 4, "");
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    unsafe { std::env::remove_var("ALLOW_PRIVATE_WEBHOOKS") };
+}
+
 // ─────────────────────────────────────────────────────────────
 // RBAC_MODEL.md §4 — visibility scopes and oracle discipline
 // ─────────────────────────────────────────────────────────────
@@ -6315,8 +6412,10 @@ async fn perf_fixture() -> (axum::Router, DatabaseConnection, String, std::path:
     std::fs::create_dir_all(&dir).unwrap();
     let url = format!("sqlite://{}", dir.join("v.db").display());
 
+    simply_ip_vault::db::run_migrations_isolated(&url)
+        .await
+        .expect("migrations apply on the isolated pool");
     let db = simply_ip_vault::db::connect(&url).await.expect("file-backed pool opens");
-    simply_ip_vault::db::run_migrations(&db).await.expect("migrations apply");
 
     let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
     let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
@@ -6380,7 +6479,7 @@ async fn the_benchmark_pool_really_has_wal_and_synchronous_normal() {
 /// by an order of magnitude — and nothing narrower should be read into it.
 ///
 /// The **concurrency assertion is the real content**, and it is worth being precise about what it
-/// shows. `SQLITE_MAX_CONNECTIONS` is 1, so a probe issued *during* the batch does not demonstrate
+/// shows. `SQLITE_MEMORY_MAX_CONNECTIONS` is 1, so a probe issued *during* the batch does not demonstrate
 /// WAL reader/writer separation — it would queue on the pool regardless. What it does demonstrate is
 /// the property an operator actually cares about: the batch holds the connection for a bounded time
 /// and the service answers normally on either side of it, rather than the transaction wedging the

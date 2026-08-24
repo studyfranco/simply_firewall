@@ -20,6 +20,7 @@ use crate::entities::{prelude::*, webhook_config::{self, AuthMode, DEFAULT_HMAC_
 use crate::state::WebhookEvent;
 use reqwest::{Client, header::{HeaderMap, HeaderName, HeaderValue}};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use serde::Serialize;
 use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
@@ -28,6 +29,11 @@ use sha2::Sha256;
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_INFLIGHT: usize = 64;
+
+/// Longest response-body snippet kept for logging or the "Test Webhook" UI result. A receiver's
+/// error page can run to megabytes; the point of the snippet is to name what went wrong, not to
+/// mirror the response, so anything past this is a truncation signal, not lost diagnostic value.
+const RESPONSE_SNIPPET_MAX_BYTES: usize = 500;
 
 /// Whether a single resolved address is one this instance must never be induced to talk to.
 ///
@@ -205,6 +211,426 @@ pub fn resolve_hmac_template(
     out
 }
 
+/// Builds the HTTP client every outbound webhook call — dispatch or live test — is made through.
+///
+/// One function so the two paths cannot drift on the properties that matter: the timeout, and
+/// **redirects refused rather than followed**. `is_url_safe` screens the *configured* target; a
+/// receiver answering `302 Location: http://169.254.169.254/latest/meta-data/` would otherwise be
+/// followed by `reqwest`'s default policy without re-screening, handing the signed payload and any
+/// `X-API-Key` to whatever the redirect points at. A 3xx response is surfaced as a failed delivery
+/// instead.
+fn build_webhook_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(WEBHOOK_TIMEOUT)
+        .user_agent("SimplyFirewall/2.0")
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+}
+
+/// Whether `ALLOW_PRIVATE_WEBHOOKS=true` is set — the documented development escape hatch that lets
+/// [`is_url_safe`] pass every target unscreened. Read fresh on every call rather than cached: unlike
+/// the security-relevant startup variables in `config.rs`, this one is explicitly meant to be safe to
+/// flip on a running dev instance, and caching it would make that lie.
+fn allow_private_webhooks() -> bool {
+    std::env::var("ALLOW_PRIVATE_WEBHOOKS").unwrap_or_else(|_| "false".to_owned()) == "true"
+}
+
+/// The three pieces of an outbound webhook call: where it goes, what headers it carries (including
+/// any signature), and the body. Everything about *how* a `webhook_config` row and a [`WebhookEvent`]
+/// become an HTTP request lives in [`prepare_dispatch`]; this is just its output.
+struct PreparedDispatch {
+    target_url: String,
+    headers: HeaderMap,
+    payload: String,
+}
+
+/// Resolves a `webhook_config` row and an event into a ready-to-send HTTP request: payload template
+/// substitution, custom headers, and whichever authentication scheme [`AuthMode`] selects (API key
+/// header, HMAC signature, both, or neither).
+///
+/// Shared by [`dispatch_worker`]'s real dispatch loop and [`send_test_dispatch`]'s live "Test
+/// Webhook" endpoint, so a test exercises the **exact** bytes and headers a real delivery would use —
+/// not a hand-approximated stand-in that could pass while the real path is broken.
+///
+/// Returns `Err` with a human-readable reason for a config that cannot be turned into a request at
+/// all (an unusable header name/value, an HMAC key that cannot be constructed, an unparseable target
+/// URL for `CANONICAL_V1`'s path derivation). None of these depend on the network, so they are
+/// distinguished from a delivery failure — there is no request to have failed yet.
+fn prepare_dispatch(
+    config: &webhook_config::Model,
+    event: &WebhookEvent,
+) -> Result<PreparedDispatch, String> {
+    let mut payload = config.payload_template.clone();
+    payload = payload.replace("$target_address", &event.address);
+    payload = payload.replace("$ip", &event.address);
+    payload = payload.replace("$cause", event.cause.as_deref().unwrap_or("Unknown"));
+    payload = payload.replace(
+        "$group_name",
+        &event.group_id.map(|g| g.to_string()).unwrap_or_default(),
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert("Content-Type", HeaderValue::from_static("application/json"));
+
+    if let Some(hjson) = &config.headers_json
+        && let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(hjson)
+    {
+        for (k, v) in map {
+            if let (Ok(h_name), Ok(h_val)) = (HeaderName::from_str(&k), HeaderValue::from_str(&v)) {
+                headers.insert(h_name, h_val);
+            }
+        }
+    }
+
+    let mode = AuthMode::from_stored(&config.auth_mode);
+
+    // NULL means "this service's standard", resolved here rather than backfilled into every row —
+    // see `m20260811_000012`. An empty `signature_prefix` is a *meaningful* value (a receiver
+    // wanting a bare hex digest), which is why only NULL falls back.
+    let signature_header = config
+        .signature_header
+        .as_deref()
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .unwrap_or(webhook_config::DEFAULT_SIGNATURE_HEADER)
+        .to_owned();
+    let signature_prefix = config
+        .signature_prefix
+        .clone()
+        .unwrap_or_else(|| webhook_config::DEFAULT_SIGNATURE_PREFIX.to_owned());
+
+    // Sent by the two modes that identify the caller by key. Inserted before the signature so it is
+    // covered by nothing and can never be confused for one; a blank column means "no such header"
+    // rather than an empty one, which some receivers treat as a real (and failing) credential.
+    if mode.sends_api_key()
+        && let Some(api_key) = config.api_key.as_deref().filter(|k| !k.is_empty())
+    {
+        let hv = HeaderValue::from_str(api_key)
+            .map_err(|e| format!("webhook api_key is not a valid header value: {e}"))?;
+        headers.insert("X-API-Key", hv);
+    }
+
+    let signature = match mode {
+        // Signature and nothing else: HMAC over the body alone. `sends_api_key()` excludes this
+        // mode, so the key header above was skipped even if `api_key` is populated — that is the
+        // defining property of HMAC_ONLY, not an oversight. A receiver that chose signature-only
+        // authentication must not be handed a reusable bearer secret it never asked for.
+        AuthMode::HmacOnly => {
+            let mut mac = Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes())
+                .map_err(|e| format!("failed to create HMAC key: {e}"))?;
+            mac.update(payload.as_bytes());
+            Some(format!("{}{}", signature_prefix, hex::encode(mac.finalize().into_bytes())))
+        }
+        // CANONICAL_V1: sign the resolved hmac_template and send the timestamp alongside, so the
+        // receiver can run its own anti-replay check. Prefixed `sha256=`, exactly like HMAC_ONLY
+        // above and exactly like what the inbound API middleware now requires — that is the whole
+        // point of this mode: with the default template the header is byte-identical to one
+        // `crypto::compute_signature` would produce, so a dispatch authenticates directly against
+        // another instance's /api/* route (and against `simply_hook_executor`, which has always
+        // required the prefix).
+        AuthMode::CanonicalV1 => {
+            let timestamp = chrono::Utc::now().timestamp().to_string();
+            // The path is taken from the target URL; a URL that failed to parse cannot be
+            // dispatched at all, so failing here loses nothing (`is_url_safe` would reject it
+            // moments later regardless).
+            let path = reqwest::Url::parse(&config.target_url)
+                .map_err(|e| format!("unparseable webhook target URL: {e}"))?
+                .path()
+                .to_owned();
+            let template = config.hmac_template.as_deref().unwrap_or(DEFAULT_HMAC_TEMPLATE);
+            let message = resolve_hmac_template(template, "POST", &path, &timestamp, &payload);
+
+            let mut mac = Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes())
+                .map_err(|e| format!("failed to create canonical webhook HMAC key: {e}"))?;
+            mac.update(message.as_bytes());
+
+            if let Ok(hv) = HeaderValue::from_str(&timestamp) {
+                headers.insert("X-Timestamp", hv);
+            }
+            Some(format!("{}{}", signature_prefix, hex::encode(mac.finalize().into_bytes())))
+        }
+        // No signature to compute: the key header above (API_KEY_ONLY) or nothing at all (NONE) is
+        // the whole credential.
+        AuthMode::ApiKeyOnly | AuthMode::None => None,
+    };
+
+    if let Some(sig_val) = signature {
+        // The header name is caller-configurable, so it is parsed rather than assumed: an unusable
+        // name must fail the whole prepare step, not send the signature under a name the receiver
+        // will not read.
+        let name = HeaderName::from_bytes(signature_header.as_bytes())
+            .map_err(|_| format!("signature header '{signature_header}' is not a valid HTTP header name"))?;
+        let hv = HeaderValue::from_str(&sig_val)
+            .map_err(|e| format!("computed signature is not a valid header value: {e}"))?;
+        headers.insert(name, hv);
+    }
+
+    Ok(PreparedDispatch { target_url: config.target_url.clone(), headers, payload })
+}
+
+/// Truncates a response body to [`RESPONSE_SNIPPET_MAX_BYTES`] for logging or the "Test Webhook" UI,
+/// noting truncation rather than silently cutting the string mid-thought.
+///
+/// Truncates on a `char` boundary rather than a byte count directly — `reqwest::Response::text`
+/// already validated the body as UTF-8, and slicing mid-codepoint would panic.
+fn snippet(body: &str) -> String {
+    match body.char_indices().nth(RESPONSE_SNIPPET_MAX_BYTES) {
+        None => body.to_owned(),
+        Some((cut, _)) => format!("{}… ({} bytes total)", &body[..cut], body.len()),
+    }
+}
+
+/// Whether a delivery attempt should be retried, and why it succeeded or failed when it should not
+/// be.
+enum DispatchOutcome {
+    /// `2xx`. Nothing more to do.
+    Success { status: u16 },
+    /// A network-level failure (timeout, connection refused, DNS failure, TLS error — anything that
+    /// never produced an HTTP response) or a `5xx` response. The receiver, or the network path to
+    /// it, may recover, so this is worth retrying.
+    Transient { status: Option<u16>, reason: String },
+    /// A `4xx` response (or any other non-`5xx`, non-`2xx`/`3xx` status this service does not
+    /// otherwise treat as success). The request reached the receiver and the receiver rejected it
+    /// outright — a bad signature, a missing permission, a URL the receiver does not serve. Retrying
+    /// the identical request will not change that answer, so this fails on the first attempt.
+    Permanent { status: Option<u16>, reason: String },
+}
+
+/// Sends one HTTP attempt and classifies the result into [`DispatchOutcome`].
+///
+/// Reads the response body **only** on a non-2xx status — a successful delivery has no reason to pay
+/// for it, and a network-level error never produced a body to read.
+async fn attempt_delivery(
+    client: &Client,
+    target_url: &str,
+    headers: HeaderMap,
+    payload: String,
+) -> (DispatchOutcome, Option<String>) {
+    match client.post(target_url).headers(headers).body(payload).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            if status.is_success() {
+                return (DispatchOutcome::Success { status: status.as_u16() }, None);
+            }
+            let body = resp.text().await.ok().map(|b| snippet(&b));
+            let reason = format!("HTTP {status}");
+            if status.is_server_error() {
+                (DispatchOutcome::Transient { status: Some(status.as_u16()), reason }, body)
+            } else {
+                (DispatchOutcome::Permanent { status: Some(status.as_u16()), reason }, body)
+            }
+        }
+        // Every network-level failure — timeout, connection refused, DNS resolution failure, TLS
+        // handshake failure — is transient: none of them says anything about whether the *request*
+        // was acceptable, only that this attempt could not complete one. `reqwest::Error` carries no
+        // status in this branch by construction (a status implies a response was received).
+        Err(e) => (DispatchOutcome::Transient { status: None, reason: e.to_string() }, None),
+    }
+}
+
+/// Delivers one webhook, retrying transient failures with exponential backoff up to
+/// `config::webhook_max_retries` times before giving up.
+///
+/// A thin wrapper around [`dispatch_with_retries_config`] that supplies the live, `OnceLock`-cached
+/// configuration — split out purely so the retry *loop itself* (attempt counting, backoff growth,
+/// when it stops) is reachable with small, fast, deterministic values in a test, the same reason
+/// `config::clamp_pool_max` and friends are split from the functions that cache their inputs.
+async fn dispatch_with_retries(client: Client, prepared: PreparedDispatch, webhook_name: String) {
+    dispatch_with_retries_config(
+        client,
+        prepared,
+        webhook_name,
+        crate::config::webhook_max_retries(),
+        crate::config::webhook_retry_backoff_ms(),
+    )
+    .await
+}
+
+/// Logs at `info` on success, `warn` on a transient failure that will be retried, and `error` on the
+/// final failure — transient-and-exhausted or permanent-on-the-first-attempt alike — with the target
+/// URL, HTTP status (when one was received), the error reason, the attempt count, and a response body
+/// snippet when one is available. An operator grepping logs for a broken integration should never
+/// need to reproduce the failure to learn what it was.
+async fn dispatch_with_retries_config(
+    client: Client,
+    prepared: PreparedDispatch,
+    webhook_name: String,
+    max_retries: u32,
+    base_backoff_ms: u64,
+) {
+    let PreparedDispatch { target_url, headers, payload } = prepared;
+
+    let mut attempt: u32 = 1;
+    loop {
+        let (outcome, body) =
+            attempt_delivery(&client, &target_url, headers.clone(), payload.clone()).await;
+
+        match outcome {
+            DispatchOutcome::Success { status } => {
+                info!(webhook = %webhook_name, url = %target_url, status, attempt, "Webhook delivered");
+                return;
+            }
+            DispatchOutcome::Permanent { status, reason } => {
+                error!(
+                    webhook = %webhook_name, url = %target_url, status, attempt, reason = %reason,
+                    body = %body.as_deref().unwrap_or(""),
+                    "Webhook delivery failed with a non-retryable error; not retrying"
+                );
+                return;
+            }
+            DispatchOutcome::Transient { status, reason } if attempt <= max_retries => {
+                // `attempt` is 1-based, so the first retry (attempt 1 -> 2) waits one base interval,
+                // the second waits two, and so on — genuine exponential growth rather than a fixed
+                // pause repeated `max_retries` times. Shifting is capped well short of overflow;
+                // `webhook_max_retries` is itself clamped to at most 10, so this never approaches it.
+                let backoff_ms = base_backoff_ms.saturating_mul(1u64 << (attempt - 1).min(20));
+                warn!(
+                    webhook = %webhook_name, url = %target_url, status, attempt, max_retries,
+                    backoff_ms, reason = %reason, body = %body.as_deref().unwrap_or(""),
+                    "Webhook delivery failed with a transient error; retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+                attempt += 1;
+            }
+            DispatchOutcome::Transient { status, reason } => {
+                error!(
+                    webhook = %webhook_name, url = %target_url, status, attempt, max_retries,
+                    reason = %reason, body = %body.as_deref().unwrap_or(""),
+                    "Webhook delivery failed with a transient error and exhausted its retries; \
+                     giving up"
+                );
+                return;
+            }
+        }
+    }
+}
+
+/// The result of one live "Test Webhook" dispatch — the response `POST /api/webhooks/{id}/test`
+/// returns for the dashboard's test modal to render before the caller decides whether to save.
+#[derive(Serialize)]
+pub struct WebhookTestResult {
+    /// Whether the receiver answered with a `2xx` status.
+    pub success: bool,
+    /// The HTTP status code received, when a response was received at all.
+    pub status: Option<u16>,
+    /// Response headers, when a response was received. Keys are lower-cased header names; a header
+    /// sent multiple times is joined with `", "`, matching how a browser's `fetch` would report it.
+    pub headers: Option<std::collections::HashMap<String, String>>,
+    /// A truncated response body, when one was available and short enough to be worth showing (see
+    /// [`RESPONSE_SNIPPET_MAX_BYTES`]).
+    pub body: Option<String>,
+    /// A human-readable failure reason — a network error, a non-2xx status, an SSRF refusal, or a
+    /// configuration problem (e.g. an unusable header value) caught before any request was sent.
+    /// `None` exactly when `success` is `true`.
+    pub error: Option<String>,
+    /// Whether the failure was this instance's own SSRF filter refusing the target, rather than
+    /// anything the receiver did or didn't do — worth distinguishing in the UI, since the fix is
+    /// "point this webhook somewhere reachable", not "check the receiver's logs".
+    pub blocked_by_ssrf_filter: bool,
+}
+
+/// Dispatches a single, explicit test event to `config`'s target — the live "Test Webhook" action in
+/// the dashboard's webhook editor.
+///
+/// Runs the **exact same** request-construction path as a real dispatch ([`prepare_dispatch`]) and
+/// the **exact same** SSRF screen ([`is_url_safe`]) — a test that skipped either would validate a
+/// request the receiver would never actually get, or would turn "Test Webhook" into an SSRF probe an
+/// authorized-but-untrusted caller could aim at the deployment's internal network.
+///
+/// Deliberately **not** retried: this is a synchronous, human-observed check, and an operator who
+/// clicks "Test Webhook" wants to know within seconds whether *this* attempt succeeded, not to wait
+/// out several minutes of exponential backoff against a receiver that might be down for a reason a
+/// human should investigate instead.
+pub async fn send_test_dispatch(config: &webhook_config::Model, event: &WebhookEvent) -> WebhookTestResult {
+    send_test_dispatch_with_privacy(config, event, allow_private_webhooks()).await
+}
+
+/// The testable core of [`send_test_dispatch`], taking the private-network allowance as a parameter
+/// instead of reading `ALLOW_PRIVATE_WEBHOOKS` internally.
+///
+/// Split out for the same reason `dispatch_with_retries_config` is: `std::env::set_var` is
+/// process-wide and `#[tokio::test]` functions run concurrently, so two tests that each need a
+/// *different* value of this setting cannot both mutate the real environment variable without racing
+/// each other. Taking the value as an argument sidesteps that entirely rather than serializing tests
+/// against a lock.
+async fn send_test_dispatch_with_privacy(
+    config: &webhook_config::Model,
+    event: &WebhookEvent,
+    allow_private: bool,
+) -> WebhookTestResult {
+    let prepared = match prepare_dispatch(config, event) {
+        Ok(p) => p,
+        Err(reason) => {
+            return WebhookTestResult {
+                success: false,
+                status: None,
+                headers: None,
+                body: None,
+                error: Some(reason),
+                blocked_by_ssrf_filter: false,
+            };
+        }
+    };
+
+    if !is_url_safe(&prepared.target_url, allow_private).await {
+        warn!(url = %prepared.target_url, webhook = %config.name, "Test dispatch blocked by SSRF protection");
+        return WebhookTestResult {
+            success: false,
+            status: None,
+            headers: None,
+            body: None,
+            error: Some(
+                "target_url resolves to an address this service refuses to contact (SSRF protection)"
+                    .to_owned(),
+            ),
+            blocked_by_ssrf_filter: true,
+        };
+    }
+
+    let client = match build_webhook_client() {
+        Ok(c) => c,
+        Err(e) => {
+            return WebhookTestResult {
+                success: false,
+                status: None,
+                headers: None,
+                body: None,
+                error: Some(format!("failed to build HTTP client: {e}")),
+                blocked_by_ssrf_filter: false,
+            };
+        }
+    };
+
+    match client.post(&prepared.target_url).headers(prepared.headers).body(prepared.payload).send().await {
+        Ok(resp) => {
+            let status = resp.status();
+            let headers = resp
+                .headers()
+                .iter()
+                .map(|(k, v)| (k.as_str().to_owned(), v.to_str().unwrap_or("<binary>").to_owned()))
+                .collect();
+            let success = status.is_success();
+            let body = resp.text().await.ok().map(|b| snippet(&b));
+            WebhookTestResult {
+                success,
+                status: Some(status.as_u16()),
+                headers: Some(headers),
+                body,
+                error: if success { None } else { Some(format!("receiver responded with HTTP {status}")) },
+                blocked_by_ssrf_filter: false,
+            }
+        }
+        Err(e) => WebhookTestResult {
+            success: false,
+            status: None,
+            headers: None,
+            body: None,
+            error: Some(e.to_string()),
+            blocked_by_ssrf_filter: false,
+        },
+    }
+}
+
 /// Runs the background webhook worker, processing events and dispatching HTTP requests
 pub async fn run_webhook_worker(db: DatabaseConnection, rx: Receiver<WebhookEvent>) {
     let workers = crate::config::webhook_workers();
@@ -247,18 +673,7 @@ async fn dispatch_worker(
     rx: std::sync::Arc<tokio::sync::Mutex<Receiver<WebhookEvent>>>,
     interval: Duration,
 ) {
-    let client = match Client::builder()
-        .timeout(WEBHOOK_TIMEOUT)
-        .user_agent("SimplyFirewall/2.0")
-        // Redirects are refused, not followed. `is_url_safe` screens the *configured* target, and
-        // `reqwest`'s default policy would follow up to 10 hops afterwards without re-screening any
-        // of them — so a webhook pointed at an attacker-controlled public URL that answers `302
-        // Location: http://169.254.169.254/latest/meta-data/` would bypass the SSRF filter outright,
-        // and the signed payload plus `X-API-Key` would be delivered to the redirect target.
-        // A receiver that answers 3xx is now surfaced as a failed delivery instead.
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-    {
+    let client = match build_webhook_client() {
         Ok(c) => c,
         Err(e) => {
             error!("Failed to build webhook HTTP client, worker will not start: {}", e);
@@ -267,7 +682,6 @@ async fn dispatch_worker(
     };
 
     let mut join_set = JoinSet::new();
-    let allow_private_webhooks = std::env::var("ALLOW_PRIVATE_WEBHOOKS").unwrap_or_else(|_| "false".to_owned()) == "true";
 
     info!(worker = id, "Webhook worker started.");
 
@@ -315,164 +729,26 @@ async fn dispatch_worker(
                 let _ = join_set.join_next().await;
             }
 
-            let client = client.clone();
-            
-            let mut payload = config.payload_template.clone();
-            payload = payload.replace("$target_address", &event.address);
-            payload = payload.replace("$ip", &event.address);
-            payload = payload.replace("$cause", event.cause.as_deref().unwrap_or("Unknown"));
-            payload = payload.replace("$group_name", &gid.to_string()); 
-
-            let mut headers = HeaderMap::new();
-            headers.insert("Content-Type", HeaderValue::from_static("application/json"));
-            
-            if let Some(hjson) = &config.headers_json
-                && let Ok(map) = serde_json::from_str::<std::collections::HashMap<String, String>>(hjson)
-            {
-                for (k, v) in map {
-                    if let (Ok(h_name), Ok(h_val)) = (HeaderName::from_str(&k), HeaderValue::from_str(&v)) {
-                        headers.insert(h_name, h_val);
-                    }
+            let prepared = match prepare_dispatch(&config, &event) {
+                Ok(p) => p,
+                Err(reason) => {
+                    error!(webhook = %config.name, reason = %reason, "Webhook dispatch could not be prepared; skipping");
+                    continue;
                 }
-            }
-            
-            let mode = AuthMode::from_stored(&config.auth_mode);
-
-            // NULL means "this service's standard", resolved here rather than backfilled into every
-            // row — see `m20260811_000012`. An empty `signature_prefix` is a *meaningful* value (a
-            // receiver wanting a bare hex digest), which is why only NULL falls back.
-            let signature_header = config
-                .signature_header
-                .as_deref()
-                .map(str::trim)
-                .filter(|h| !h.is_empty())
-                .unwrap_or(webhook_config::DEFAULT_SIGNATURE_HEADER)
-                .to_owned();
-            let signature_prefix = config
-                .signature_prefix
-                .clone()
-                .unwrap_or_else(|| webhook_config::DEFAULT_SIGNATURE_PREFIX.to_owned());
-
-            // Sent by the two modes that identify the caller by key. Inserted before the signature
-            // so it is covered by nothing and can never be confused for one; a blank column means
-            // "no such header" rather than an empty one, which some receivers treat as a real
-            // (and failing) credential.
-            if mode.sends_api_key()
-                && let Some(api_key) = config.api_key.as_deref().filter(|k| !k.is_empty())
-            {
-                match HeaderValue::from_str(api_key) {
-                    Ok(hv) => {
-                        headers.insert("X-API-Key", hv);
-                    }
-                    Err(e) => {
-                        error!(webhook = %config.name, "Webhook api_key is not a valid header value: {}", e);
-                        continue;
-                    }
-                }
-            }
-
-            let signature = match mode {
-                // Signature and nothing else: HMAC over the body alone. `sends_api_key()` excludes
-                // this mode, so the key header above was skipped even if `api_key` is populated —
-                // that is the defining property of HMAC_ONLY, not an oversight. A receiver that
-                // chose signature-only authentication must not be handed a reusable bearer secret
-                // it never asked for.
-                AuthMode::HmacOnly => {
-                    let mut mac = match Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes()) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            tracing::error!("Failed to create HMAC key: {}", e);
-                            continue;
-                        }
-                    };
-                    mac.update(payload.as_bytes());
-                    Some(format!("{}{}", signature_prefix, hex::encode(mac.finalize().into_bytes())))
-                }
-                // CANONICAL_V1: sign the resolved hmac_template and send the timestamp alongside,
-                // so the receiver can run its own anti-replay check. Prefixed `sha256=`, exactly
-                // like HMAC_ONLY above and exactly like what the inbound API middleware now
-                // requires — that is the whole point of this mode: with the default template the
-                // header is byte-identical to one `crypto::compute_signature` would produce, so a
-                // dispatch authenticates directly against another instance's /api/* route (and
-                // against `simply_hook_executor`, which has always required the prefix).
-                AuthMode::CanonicalV1 => {
-                    let timestamp = chrono::Utc::now().timestamp().to_string();
-                    // The path is taken from the target URL; a URL that failed to parse cannot be
-                    // dispatched at all, so skipping here loses nothing (is_url_safe would reject
-                    // it moments later regardless).
-                    let path = match reqwest::Url::parse(&config.target_url) {
-                        Ok(url) => url.path().to_owned(),
-                        Err(e) => {
-                            error!(url = %config.target_url, "Unparseable webhook target URL: {}", e);
-                            continue;
-                        }
-                    };
-                    let template = config.hmac_template.as_deref().unwrap_or(DEFAULT_HMAC_TEMPLATE);
-                    let message = resolve_hmac_template(template, "POST", &path, &timestamp, &payload);
-
-                    let mut mac = match Hmac::<Sha256>::new_from_slice(config.secret_token.as_bytes()) {
-                        Ok(m) => m,
-                        Err(e) => {
-                            error!("Failed to create canonical webhook HMAC key: {}", e);
-                            continue;
-                        }
-                    };
-                    mac.update(message.as_bytes());
-
-                    if let Ok(hv) = HeaderValue::from_str(&timestamp) {
-                        headers.insert("X-Timestamp", hv);
-                    }
-                    Some(format!("{}{}", signature_prefix, hex::encode(mac.finalize().into_bytes())))
-                }
-                // No signature to compute: the key header above (API_KEY_ONLY) or nothing at all
-                // (NONE) is the whole credential.
-                AuthMode::ApiKeyOnly | AuthMode::None => None,
             };
 
-            if let Some(sig_val) = signature {
-                // The header name is caller-configurable, so it is parsed rather than assumed: an
-                // unusable name must skip the dispatch, not panic the worker or send the signature
-                // under a name the receiver will not read.
-                match (
-                    HeaderName::from_bytes(signature_header.as_bytes()),
-                    HeaderValue::from_str(&sig_val),
-                ) {
-                    (Ok(name), Ok(hv)) => {
-                        headers.insert(name, hv);
-                    }
-                    _ => {
-                        error!(
-                            webhook = %config.name,
-                            header = %signature_header,
-                            "Webhook signature header is not a valid HTTP header name; skipping \
-                             dispatch rather than sending an unsigned payload"
-                        );
-                        continue;
-                    }
-                }
-            }
-
-            let target_url = config.target_url.clone();
+            let client = client.clone();
+            let webhook_name = config.name.clone();
 
             join_set.spawn(async move {
-                if !is_url_safe(&target_url, allow_private_webhooks).await {
-                    warn!(url = %target_url, "Webhook blocked by SSRF protection");
+                if !is_url_safe(&prepared.target_url, allow_private_webhooks()).await {
+                    warn!(url = %prepared.target_url, webhook = %webhook_name, "Webhook blocked by SSRF protection");
                     return;
                 }
-                
-                match client.post(&target_url).headers(headers).body(payload).send().await {
-                    Ok(resp) => {
-                        if !resp.status().is_success() {
-                            error!(url = %target_url, status = %resp.status(), "Webhook failed");
-                        } else {
-                            info!(url = %target_url, "Webhook delivered");
-                        }
-                    }
-                    Err(e) => error!(url = %target_url, "Webhook error: {}", e),
-                }
+                dispatch_with_retries(client, prepared, webhook_name).await;
             });
         }
-        
+
         while let Some(Ok(_)) = join_set.try_join_next() {}
 
         // Paces this worker's *events*. One event may still fan out to several configs
@@ -625,7 +901,7 @@ mod tests {
     /// begins, and the `join_set.spawn` that performs the actual `client.post(...).send().await`
     /// captures `client`/`headers`/`payload`/`target_url` by value — never `db`. That is a static
     /// read of the code; this test is the dynamic proof; on SQLite's single-connection pool
-    /// (`db::SQLITE_MAX_CONNECTIONS = 1`), if the dispatcher held its connection across the HTTP
+    /// (`db::SQLITE_MEMORY_MAX_CONNECTIONS = 1`), if the dispatcher held its connection across the HTTP
     /// call, a concurrent, unrelated query against the same pool would have nowhere to go and would
     /// block for as long as the slow receiver takes to answer. It does not.
     #[tokio::test]
@@ -745,5 +1021,240 @@ mod tests {
 
         drop(tx);
         let _ = tokio::time::timeout(Duration::from_secs(5), worker).await;
+    }
+
+    /// A tiny raw-socket HTTP server that answers each accepted connection with the next status
+    /// code from `statuses` (repeating the last one once exhausted) and always closes the
+    /// connection. Every retry attempt therefore opens a fresh connection, which is what makes the
+    /// returned counter's final value exactly the number of attempts a caller made — the property
+    /// [`permanent_4xx_errors_are_not_retried`] and [`retries_are_exhausted_after_max_attempts`]
+    /// both assert against directly, rather than inferring attempt count from timing.
+    async fn spawn_status_sequence_server(
+        statuses: Vec<u16>,
+    ) -> (std::net::SocketAddr, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("loopback listener binds");
+        let addr = listener.local_addr().expect("listener has a local address");
+        let counter = Arc::new(AtomicUsize::new(0));
+        let counter_accept = counter.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                let n = counter_accept.fetch_add(1, Ordering::SeqCst);
+                let status = *statuses.get(n).unwrap_or_else(|| {
+                    statuses.last().expect("at least one status configured")
+                });
+                let reason = match status {
+                    200 => "OK",
+                    403 => "Forbidden",
+                    404 => "Not Found",
+                    500 => "Internal Server Error",
+                    503 => "Service Unavailable",
+                    _ => "Status",
+                };
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let response =
+                        format!("HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    let _ = socket.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (addr, counter)
+    }
+
+    fn dummy_prepared(target_url: String) -> PreparedDispatch {
+        PreparedDispatch { target_url, headers: HeaderMap::new(), payload: "{}".to_owned() }
+    }
+
+    /// [`attempt_delivery`] sorts a `2xx` into `Success`, a `4xx` into `Permanent`, and a `5xx` into
+    /// `Transient` — the exact split the retry engine's "retry 5xx, fail immediately on 4xx" contract
+    /// depends on, checked here against real HTTP responses rather than assumed from the status code
+    /// alone.
+    #[tokio::test]
+    async fn attempt_delivery_classifies_2xx_4xx_and_5xx_correctly() {
+        let client = build_webhook_client().expect("client builds");
+
+        let (addr, _) = spawn_status_sequence_server(vec![200]).await;
+        let (outcome, _) =
+            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
+        assert!(matches!(outcome, DispatchOutcome::Success { status: 200 }));
+
+        let (addr, _) = spawn_status_sequence_server(vec![403]).await;
+        let (outcome, _) =
+            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
+        assert!(matches!(outcome, DispatchOutcome::Permanent { status: Some(403), .. }));
+
+        let (addr, _) = spawn_status_sequence_server(vec![503]).await;
+        let (outcome, _) =
+            attempt_delivery(&client, &format!("http://{addr}/"), HeaderMap::new(), String::new()).await;
+        assert!(matches!(outcome, DispatchOutcome::Transient { status: Some(503), .. }));
+
+        // No response at all — nothing is listening on this port — is transient too: a network-level
+        // failure says nothing about whether the request itself was acceptable.
+        let (outcome, _) =
+            attempt_delivery(&client, "http://127.0.0.1:1", HeaderMap::new(), String::new()).await;
+        assert!(matches!(outcome, DispatchOutcome::Transient { status: None, .. }));
+    }
+
+    /// A receiver that fails twice with `503` and then succeeds is retried exactly enough times to
+    /// reach the success — proving the loop advances past a transient failure rather than either
+    /// giving up early or retrying past a success it already got.
+    #[tokio::test]
+    async fn transient_errors_are_retried_until_success() {
+        let (addr, counter) = spawn_status_sequence_server(vec![503, 503, 200]).await;
+        let client = build_webhook_client().expect("client builds");
+
+        dispatch_with_retries_config(
+            client,
+            dummy_prepared(format!("http://{addr}/")),
+            "test-webhook".to_owned(),
+            /* max_retries */ 5,
+            /* base_backoff_ms */ 1,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "two failing attempts plus the one that succeeded"
+        );
+    }
+
+    /// A `403` must fail on the very first attempt — the defining "do NOT retry" case from the
+    /// brief. `max_retries` is set high enough (5) that a passing count of 1 can only mean the
+    /// classification, not an exhausted budget, stopped the loop.
+    #[tokio::test]
+    async fn permanent_4xx_errors_are_not_retried() {
+        let (addr, counter) = spawn_status_sequence_server(vec![403]).await;
+        let client = build_webhook_client().expect("client builds");
+
+        dispatch_with_retries_config(
+            client,
+            dummy_prepared(format!("http://{addr}/")),
+            "test-webhook".to_owned(),
+            /* max_retries */ 5,
+            /* base_backoff_ms */ 1,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a 4xx response must not be retried at all"
+        );
+    }
+
+    /// A receiver that always answers `503` is retried exactly `max_retries` times beyond the
+    /// initial attempt, then given up on — not retried forever, and not given up on early.
+    #[tokio::test]
+    async fn retries_are_exhausted_after_max_attempts() {
+        let (addr, counter) = spawn_status_sequence_server(vec![503]).await;
+        let client = build_webhook_client().expect("client builds");
+
+        dispatch_with_retries_config(
+            client,
+            dummy_prepared(format!("http://{addr}/")),
+            "test-webhook".to_owned(),
+            /* max_retries */ 2,
+            /* base_backoff_ms */ 1,
+        )
+        .await;
+
+        assert_eq!(
+            counter.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the initial attempt plus exactly 2 retries, then giving up"
+        );
+    }
+
+    /// [`send_test_dispatch`] runs the live "Test Webhook" path end-to-end against a real receiver,
+    /// exercising [`prepare_dispatch`] (auth-mode signing, payload templating) and the HTTP call
+    /// together — proving the test endpoint dispatches the *exact* request a real event would.
+    #[tokio::test]
+    async fn send_test_dispatch_reports_success_against_a_healthy_receiver() {
+        let (addr, _) = spawn_status_sequence_server(vec![200]).await;
+        let config = webhook_config::Model {
+            id: uuid::Uuid::new_v4(),
+            name: "test-target".to_owned(),
+            target_url: format!("http://{addr}/hook"),
+            secret_token: "shared-secret".to_owned(),
+            auth_mode: AuthMode::HmacOnly.as_str().to_owned(),
+            api_key: None,
+            hmac_template: None,
+            signature_header: None,
+            signature_prefix: None,
+            headers_json: None,
+            payload_template: "{\"event\":\"test\"}".to_owned(),
+            group_id: uuid::Uuid::new_v4(),
+            is_active: true,
+            events: None,
+            owner_key_id: None,
+            created_at: chrono::Utc::now().naive_utc(),
+        };
+        let event = WebhookEvent {
+            action: "TEST".to_owned(),
+            address: "127.0.0.1/32".to_owned(),
+            is_whitelist: false,
+            group_id: Some(config.group_id),
+            cause: Some("unit test".to_owned()),
+        };
+
+        // `_with_privacy(..., true)` rather than setting `ALLOW_PRIVATE_WEBHOOKS` and calling the
+        // public `send_test_dispatch`: the env var is process-wide and this binary's tests run
+        // concurrently, so a test needing it "true" and one needing it unset (see the SSRF test
+        // below) would race on the same global. Passing the value directly sidesteps that.
+        let result = send_test_dispatch_with_privacy(&config, &event, true).await;
+
+        assert!(result.success, "a 200 response must report success: {:?}", result.error);
+        assert_eq!(result.status, Some(200));
+        assert!(result.error.is_none());
+    }
+
+    /// The live test path runs through the **same** SSRF screen as a real dispatch — an
+    /// authorized-but-untrusted caller must not be able to use "Test Webhook" to probe addresses the
+    /// service would otherwise refuse to contact.
+    #[tokio::test]
+    async fn send_test_dispatch_is_blocked_by_the_ssrf_filter_by_default() {
+        let config = webhook_config::Model {
+            id: uuid::Uuid::new_v4(),
+            name: "loopback-target".to_owned(),
+            target_url: "http://127.0.0.1:1/hook".to_owned(),
+            secret_token: String::new(),
+            auth_mode: AuthMode::NONE.to_owned(),
+            api_key: None,
+            hmac_template: None,
+            signature_header: None,
+            signature_prefix: None,
+            headers_json: None,
+            payload_template: "{}".to_owned(),
+            group_id: uuid::Uuid::new_v4(),
+            is_active: true,
+            events: None,
+            owner_key_id: None,
+            created_at: chrono::Utc::now().naive_utc(),
+        };
+        let event = WebhookEvent {
+            action: "TEST".to_owned(),
+            address: "127.0.0.1/32".to_owned(),
+            is_whitelist: false,
+            group_id: Some(config.group_id),
+            cause: None,
+        };
+
+        // `_with_privacy(..., false)` — the default, production posture — for the same
+        // race-avoidance reason as the success test above.
+        let result = send_test_dispatch_with_privacy(&config, &event, false).await;
+
+        assert!(!result.success);
+        assert!(result.blocked_by_ssrf_filter, "a loopback target must be reported as SSRF-blocked");
+        assert!(result.status.is_none(), "a blocked target must never have been dialed at all");
     }
 }

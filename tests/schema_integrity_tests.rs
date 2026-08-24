@@ -67,13 +67,42 @@ impl Drop for TempDb {
     }
 }
 
-/// A migrated, file-backed database opened the way production opens it.
+/// A migrated, file-backed database opened the way production opens it: migrations first, on their
+/// own isolated single-connection pool, then the (now potentially multi-connection) application
+/// pool — see `db::run_migrations_isolated`'s doc comment. Running migrations directly against
+/// `db::connect`'s pool here would reintroduce the exact `duplicate column name: master_marker`
+/// race that isolation exists to prevent, now that a file-backed pool is no longer pinned to one
+/// connection.
 async fn fresh_db(tmp: &TempDb) -> DatabaseConnection {
-    let db = simply_ip_vault::db::connect(&tmp.url())
+    simply_ip_vault::db::run_migrations_isolated(&tmp.url())
         .await
-        .expect("a file-backed sqlite pool opens");
-    simply_ip_vault::db::run_migrations(&db).await.expect("every migration applies");
-    db
+        .expect("every migration applies on the isolated pool");
+    simply_ip_vault::db::connect(&tmp.url()).await.expect("a file-backed sqlite pool opens")
+}
+
+/// A single-connection, file-backed pool for tests that drive `Migrator::up` to a partial version
+/// themselves and need every call — including the DDL-heavy migration 9, which drops and re-adds
+/// `master_marker` — to land on the one connection they go on to use.
+///
+/// Deliberately **not** `db::connect`: that pool may now hold more than one connection for a
+/// file-backed database, on the assumption (documented on `connect`) that migrations are already
+/// complete before it opens. These tests apply DDL after opening it, so that assumption does not
+/// hold here — using `db::connect` would reintroduce the exact `duplicate column name:
+/// master_marker` race the isolated-migration pool exists to prevent.
+async fn partial_migration_db(tmp: &TempDb) -> DatabaseConnection {
+    use sea_orm::sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+    use std::str::FromStr;
+
+    let options = SqliteConnectOptions::from_str(&tmp.url())
+        .expect("the url parses")
+        .create_if_missing(true)
+        .foreign_keys(true);
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .expect("the pool opens");
+    sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(pool)
 }
 
 /// Seeds a non-master key. `parent` threads the `parent_key_id` chain when a test needs one.
@@ -989,7 +1018,7 @@ async fn rows_written_before_the_constraint_are_backfilled_not_dropped() {
     use sea_orm_migration::MigratorTrait;
 
     let tmp = TempDb::new();
-    let db = simply_ip_vault::db::connect(&tmp.url()).await.expect("pool opens");
+    let db = partial_migration_db(&tmp).await;
 
     // Everything up to and including m20260808_000009, but not m20260811_000010.
     simply_ip_vault::migration::Migrator::up(&db, Some(9)).await.expect("nine migrations apply");
@@ -1039,7 +1068,7 @@ async fn the_audit_rebuild_did_not_transpose_columns() {
     use sea_orm_migration::MigratorTrait;
 
     let tmp = TempDb::new();
-    let db = simply_ip_vault::db::connect(&tmp.url()).await.expect("pool opens");
+    let db = partial_migration_db(&tmp).await;
     simply_ip_vault::migration::Migrator::up(&db, Some(9)).await.expect("nine migrations apply");
 
     let key = seed_key(&db, "before", None).await;

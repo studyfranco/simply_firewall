@@ -8423,3 +8423,257 @@ All five clean:
 
 Peer provenance: `example/simply_hook_executor` pulled to `99b0bd1` before any analysis, per
 `AGENT.MD`'s mandatory-pull rule.
+
+## Session — Two-phase migrations and tiered file-backed SQLite pooling (2026-08-21)
+
+**Scope:** `src/db.rs`, `src/config.rs`, `src/main.rs`, `src/api/records.rs`, `AGENT.MD`,
+`SCHEMA.MD`, `scripts/test_e2e.sh`, four test files. No `RBAC_MODEL.md` change. No peer pull needed
+(no `simply_hook_executor` behaviour is touched this round). Brief: relax SQLite's long-standing
+`max_connections = 1` pinning for file-backed databases without reviving the DDL race that pinning
+was built to prevent.
+
+### Task 1 — isolated migration phase
+
+`db::run_migrations_isolated(db_url: &str)` is new: it opens a throwaway pool pinned to exactly one
+connection — on every backend, not only SQLite — runs every pending migration, and calls
+`DatabaseConnection::close().await` explicitly before returning, rather than trusting `Drop` to have
+finished closing it by the time the caller proceeds. `main.rs` now calls this **before**
+`db::connect(&db_url)`, so the pool `connect` goes on to build can never observe a DDL statement —
+migrations are provably complete before it exists. `db::run_migrations(&DatabaseConnection)` is
+unchanged and kept: four existing call sites already hold an open connection and don't need to
+change, and some tests still want it directly.
+
+A private `build_sqlite_connect_options` was split out of the old `connect` so the isolated pool and
+the tiered application pool cannot drift on the pragmas that matter (`busy_timeout` and
+`journal_mode=WAL` in particular — see the module header in `src/db.rs` for why `WAL` has to be set
+at open time rather than left to `apply_sqlite_pragmas`).
+
+### Task 2 — tiered application pool
+
+`db::is_in_memory_sqlite(url)` — pure, exhaustively unit-tested — is the one signal `connect` uses to
+choose a tier:
+
+- **`sqlite::memory:`** (or `sqlite://:memory:`, or `?mode=memory`): pinned to
+  `db::SQLITE_MEMORY_MAX_CONNECTIONS` (1), unconditionally. Not the DDL-race rule below — a second
+  connection to an in-memory database is a second, unrelated, empty database, not a second reader, so
+  this tier does not relax just because migrations are isolated now.
+- **File-backed SQLite**: sized by two new `config.rs` functions, `sqlite_file_max_connections`/
+  `sqlite_file_min_connections`, reading the *same* `DATABASE_MAX_CONNECTIONS`/
+  `DATABASE_MIN_CONNECTIONS` the PostgreSQL/MySQL tier reads, but with independent defaults (10/2)
+  and a hard ceiling (`SQLITE_FILE_MAX_CONNECTIONS_CEILING = 10`) a future PostgreSQL-tier default
+  change can't accidentally widen. `idle_timeout`/`acquire_timeout` are *not* duplicated for this
+  tier — it reuses `config::database_idle_timeout`/`database_acquire_timeout` directly, since nothing
+  about those two needs a SQLite-specific default.
+- **PostgreSQL/MySQL**: unchanged from the previous session.
+
+### A regression the widened pool immediately produced, and its fix
+
+Widening the file-backed pool past one connection is what the historical `duplicate column name:
+master_marker` failure needed all along — and, empirically, two existing `db.rs` unit tests
+(`has_index_reports_presence_and_absence`, `foreign_keys_are_enforced_not_just_enabled`) reproduced
+it immediately: both called `connect()` then `run_migrations(&db)` directly against the now-wide
+pool, exactly the pattern the isolated phase exists to replace. Fixed by switching both, and every
+other test file that built a fresh file-backed database (`tests/schema_integrity_tests.rs`'s
+`fresh_db` helper — 19 call sites through one function — plus one call site each in
+`tests/security_tests.rs` and `tests/rbac_integration_tests.rs`), to
+`run_migrations_isolated(&url)` before `connect(&url)`. Two tests in `schema_integrity_tests.rs`
+that deliberately apply a *partial* migration count (`Migrator::up(&db, Some(9))`, to plant a
+pre-constraint row) can't use `run_migrations_isolated` (which always runs to `None`/latest), so they
+gained a small local `partial_migration_db` helper that hand-builds a single-connection pool instead
+of going through `connect` — the same reasoning, applied directly, for a case the isolated-phase
+function doesn't cover.
+
+A second, more interesting regression survived that fix and only showed up under `cargo test`'s real
+concurrent load: `tests/security_tests.rs::test_concurrent_batch_writes_under_wal` (8 concurrent
+`POST /api/records/batch` requests, 60 records each, deliberately overlapping ranges) started failing
+**deterministically**, every run, with HTTP 500 and a logged `Query Error: ... database is locked`
+(`SQLITE_BUSY`) — and failing in under 10ms, nowhere near the 5000ms `busy_timeout`. Root cause,
+confirmed by reading `src/api/records.rs`'s `batch_records`: it opens one explicit transaction with
+`state.db.begin()` (plain `BEGIN`, SQLite's default `DEFERRED` mode) and does a `SELECT` before each
+record's `INSERT`/`UPDATE`. A deferred transaction only takes its read snapshot at that first
+`SELECT`; on a single-connection pool no other connection could ever commit in between, so this was
+invisible for as long as the pool was pinned to one. On a genuinely multi-connection pool, a second
+task's transaction can commit between this transaction's first read and its first write — and SQLite
+refuses to upgrade a now-stale snapshot to a write lock, returning `SQLITE_BUSY` immediately without
+ever invoking the busy-handler `busy_timeout` configures (retrying would not help — the snapshot is
+stale regardless of how long it waits).
+
+Fixed at the one call site that has this shape (grepped: it is the *only* explicit `.begin()`/
+`.transaction()` call anywhere in `src/`) by switching to
+`state.db.begin_with_options(TransactionOptions { sqlite_transaction_mode:
+Some(SqliteTransactionMode::Immediate), ..Default::default() })` — both types exported by SeaORM
+2.0's `TransactionTrait`/`database::connection` and silently ignored on non-SQLite backends.
+`Immediate` takes the write lock at `BEGIN`, before any `SELECT`, so there is no snapshot left to go
+stale; a concurrent writer is then ordinary lock contention, which `busy_timeout` does retry. Verified
+by the natural before/after: the unmodified code failed 5/5 runs including under `--test-threads=1`
+(ruling out cross-test CPU contention as the cause), the fixed code passed 5/5. Documented in
+`AGENT.MD` as a standing rule for any future explicit read-then-write transaction, since this is now
+the only place in the codebase the distinction matters and the next one to add such a transaction
+won't have this session's context.
+
+### Task 3 — documentation and tests
+
+`src/db.rs`'s module header was rewritten around the two-phase/tiered design (superseding the old
+"the SQLite pool holds exactly one connection" section). `AGENT.MD`'s database bullet list and
+`SCHEMA.MD`'s connection-setup section were updated to match, including the new read-then-write
+transaction rule. Stale prose references to the renamed `SQLITE_MAX_CONNECTIONS` constant (now
+`SQLITE_MEMORY_MAX_CONNECTIONS`, since it is specifically the in-memory tier's constant now) were
+swept in doc comments across `src/dispatch.rs` and three test files — not functional changes, just
+keeping a since-renamed identifier from dangling in prose.
+
+New tests: `is_in_memory_sqlite_classifies_every_known_url_form` (pure-function, every URL form this
+codebase or SQLx recognises, plus a deliberate false-positive check on a path merely containing
+"memory"), `the_in_memory_sqlite_pool_holds_exactly_one_connection` and
+`a_file_backed_sqlite_pool_is_sized_by_the_file_tier_config` (split from the old single
+one-connection assertion, since the two tiers now genuinely differ),
+`two_phase_startup_survives_the_historical_master_marker_regression` (runs the actual production
+sequence — isolated migrate, then connect — and re-proves the historical failure doesn't recur, then
+also proves a redundant `run_migrations` call against the wide pool afterward is a harmless no-op),
+and `sqlite_file_max_is_clamped_to_one_and_ceilinged_at_ten` in `config.rs` (mirrors the existing
+`clamp_pool_max`/`clamp_pool_min` test pattern). `scripts/test_e2e.sh` §29b was updated: its
+"malformed `DATABASE_MAX_CONNECTIONS` produces silence on SQLite" assertion is now **false** by
+design (the file-backed tier genuinely reads that variable) and was flipped to assert the warning
+fires — this is what caught the change in a full E2E run before it could quietly rot the harness's
+own claim.
+
+### Quality gates
+
+All five clean:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean, zero warnings |
+| `cargo test` | **309 passed** (up from 306: +2 net in `db.rs`, +1 `config.rs` clamp test), 0 failed, across all 9 binaries |
+| `./scripts/test_e2e.sh` | **629 checks passed**, 0 failed (§29b's assertion flipped from `silent` to `warned`, count unchanged) |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |
+
+No peer pull was needed this session (`example/simply_hook_executor` untouched by this work), but
+`git pull` was still run against it first per `AGENT.MD`'s mandatory rule — already up to date.
+
+## Session — Resilient webhook retries, live "Test Webhook", local-timezone timestamps (2026-08-21)
+
+**Scope:** `src/config.rs`, `src/dispatch.rs`, `src/api/webhooks.rs`, `src/lib.rs`,
+`static/app.js`, `static/index.html`, `static/style.css`, plus one test fix each in
+`tests/security_tests.rs` and `tests/rbac_integration_tests.rs`. No `RBAC_MODEL.md` change. No peer
+pull needed (`example/simply_hook_executor` untouched), confirmed already up to date first per
+`AGENT.MD`'s mandatory rule. Triggered by a production report: database pool timeouts (addressed the
+prior session), webhook queue saturation (`capacity=1024`, dropped notifications), silent webhook
+failures, and a request for dashboard webhook inspection/editing/testing and correct local-timezone
+timestamps.
+
+Tasks 1–2 (isolated migration phase, tiered SQLite pool) were **already fully implemented** by the
+prior session (`perf(db): implement two-phase migrations and file-based WAL sqlite pool scaling`,
+uncommitted at the time this session started) — verified against this session's brief line by line
+and found to already satisfy it exactly, so no further `db.rs` changes were made.
+
+### Task 3 — webhook tuning defaults
+
+`config.rs`: `WEBHOOK_WORKERS` default 1→4, `WEBHOOK_DISPATCH_INTERVAL_MS` default 500→50 (aggregate
+ceiling: 2/s → 80/s), `WEBHOOK_QUEUE_CAPACITY` default 1,024→4,096. Two new settings:
+`WEBHOOK_MAX_RETRIES` (default 3, clamped to at most 10 — an unbounded value would let one stuck
+receiver hold a worker via exponential backoff indefinitely) and `WEBHOOK_RETRY_BACKOFF_MS` (default
+1,000ms, clamped to at least 1 — `0` would make "backoff" an immediate tight loop against a receiver
+that just said it was struggling).
+
+### Task 4 — retry engine and structured logging
+
+`dispatch.rs`'s per-config dispatch logic (previously inline in `dispatch_worker`'s for-loop) was
+split into `prepare_dispatch` (payload templating, headers, auth-mode signing — pure request
+construction) and `attempt_delivery` (one HTTP attempt, classified into `Success`/`Transient`/
+`Permanent`). Classification: `2xx` → success; network-level failure or `5xx` → `Transient` (retried);
+`4xx` → `Permanent` (fails on the first attempt, per the brief's explicit "do NOT retry
+400/401/403/404" instruction). `dispatch_with_retries_config` retries `Transient` failures with
+exponential backoff (`backoff_ms * 2^(attempt-1)`) up to `max_retries`, logging `info` on success,
+`warn` per retried attempt, `error` on the final failure — target URL, status (if any), reason,
+attempt count, and a response-body snippet (≤500 bytes, only fetched on non-2xx) on every failure log.
+`dispatch_with_retries` is a thin wrapper supplying the live config; the `_config` variant takes
+`max_retries`/`base_backoff_ms` as parameters specifically so the retry *loop* is unit-testable with
+fast values, the same reasoning `config::clamp_pool_max` was split out for.
+
+**A found-and-fixed real bug while writing the tests for this:** the four HTTP-level dispatch tests
+(`attempt_delivery_classifies_2xx_4xx_and_5xx_correctly`,
+`transient_errors_are_retried_until_success`, `permanent_4xx_errors_are_not_retried`,
+`retries_are_exhausted_after_max_attempts`) needed a tiny raw-socket test HTTP server
+(`spawn_status_sequence_server`, answers a configured sequence of status codes, always closes the
+connection so each retry is a genuinely fresh attempt the request counter can count). Mutation-tested
+by flipping `status.is_server_error()` to `true` unconditionally: both
+`attempt_delivery_classifies_2xx_4xx_and_5xx_correctly` and `permanent_4xx_errors_are_not_retried`
+failed as expected (a `403` was retried 6 times before the test's own timeout-shaped assertion caught
+it), confirmed passing again after reverting.
+
+### Task 5 — `POST /api/webhooks/{id}/test` and the dashboard's Edit/Test UI
+
+New endpoint, gated identically to `update_webhook`/`delete_webhook`: `is_master || can_manage_webhooks`
+plus ownership (`404`, not `403`, for a webhook the caller does not own — the same §4 oracle-discipline
+reason as every other webhook route). Dispatches a synthetic event (`action: "TEST"`,
+`address: "127.0.0.1/32"`, matching the brief's example) that deliberately **bypasses** the webhook's
+own `events` filter — an explicit human-triggered test must run regardless of what live traffic a
+webhook is scoped to.
+
+`send_test_dispatch` (`dispatch.rs`) reuses `prepare_dispatch` and runs through the **same** SSRF
+screen (`is_url_safe`) as a real dispatch — deliberately not retried (a human wants an answer in
+seconds, not several minutes of backoff) and deliberately not skippable (an authorized-but-untrusted
+caller must not be able to turn "Test Webhook" into an internal-network probe). Split into a public
+`send_test_dispatch` and a testable `send_test_dispatch_with_privacy(..., allow_private: bool)` for
+the same env-var-race reason as the retry engine's `_config` split — see below.
+
+**Frontend** (`static/`): the Webhooks tab previously had no edit affordance at all — only
+create-and-delete. Added an Edit Webhook modal (mirroring the existing Edit API Key modal's
+open/close/backdrop/Escape pattern) pre-filled from the cached `GET /api/webhooks` row. Auth mode,
+API-key presence, and signature header/prefix are rendered **read-only**: `PUT /api/v1/webhooks/{id}`
+does not accept changes to any of them (only `name`/`target_url`/`hmac_template`/`secret_token`/
+`headers_json`/`payload_template`/`events`/`is_active` are settable), and extending that mutation
+surface — auth-mode changes have real security invariants (a mode switch changing what needs a
+secret, whether an api_key is required, etc.) — was judged outside this session's scope; flagged here
+as a candidate follow-up rather than silently added or silently left unmentioned. The modal's own
+headers editor (`editWebhookHeaders` state) is a deliberate near-duplicate of the create form's,
+not a shared/parametrized one — see `FILE_MAP.MD`'s new `static/` note for why. "Test Webhook" calls
+the new endpoint and renders status/headers/body/error inline in a `.test-result-panel` (new CSS,
+reusing the existing `--success`/`--danger` tokens).
+
+### Task 6 — local-timezone timestamps
+
+Found the actual bug behind the brief's request while checking whether one existed: both timestamp
+render sites (`renderIpTable`, `renderAuditLogsTable`) already called `.toLocaleString()`, but on a
+raw string straight from the API — and `created_at`/`timestamp` are `chrono::NaiveDateTime`, which
+serializes with **no timezone designator** (confirmed against a live E2E run:
+`"created_at": "2026-08-21T14:12:25.215206495"`). Per the ECMAScript Date Time String spec, `new
+Date(...)` on a date-time string with no trailing `Z`/offset is parsed as **local** time, not UTC — so
+an already-UTC value was silently misread as local before `.toLocaleString()` even ran, putting every
+displayed timestamp off by exactly the viewer's UTC offset. Added a shared `formatTimestamp(raw)`
+(appends `Z` only when no timezone marker is already present, then formats) and pointed both render
+sites at it. Verified with a headless-Chromium session (no `chromium-cli`/Playwright available in
+this environment — drove a hand-rolled, stdlib-only Python CDP client instead, `/tmp/.../cdp.py`)
+with `Emulation.setTimezoneOverride` forcing `America/New_York`: the fix converted a raw UTC
+timestamp to the correct EDT wall-clock time (`8/23/2026, 8:26:01 PM` for a `00:26:01 UTC` instant);
+confirmed the unfixed code would have shown the bare UTC digits relabeled as local instead, 4 hours
+off.
+
+### UI verification
+
+Per `AGENT.MD`'s "start the dev server and use the feature in a browser" rule: booted the real binary
+(`INITIAL_MASTER_KEY`/`INITIAL_MASTER_SIGNING_SECRET`, the same deterministic values
+`scripts/test_e2e.sh` uses) against a throwaway file-backed SQLite database, and drove a real headless
+Chromium against it end to end — logged in through the dashboard's own login form (exercising the
+real client-side HMAC signing path), created a group and a webhook through the live UI/API, opened
+the new Edit Webhook modal from its row's **Edit** button and confirmed every field was correctly
+pre-filled (name, URL, auth-mode badge), clicked **Test Webhook** against a target with nothing
+listening and confirmed the failure rendered inline (`test-result-fail` styling, the genuine
+connection-refused error text), and screenshotted the Audit Logs tab showing converted local
+timestamps. No `chromium-cli` or Playwright was available in this sandbox, so the browser was driven
+via a small hand-rolled Chrome DevTools Protocol client written against only the Python standard
+library (raw WebSocket framing over a socket) — flagged here as a candidate for
+`/run-skill-generator` if this project is driven from a browser again.
+
+### Quality gates
+
+All five clean:
+
+| Gate | Result |
+| :--- | :--- |
+| `cargo check --all-targets` | Clean |
+| `cargo clippy --all-targets -- -D warnings` | Clean, zero warnings |
+| `cargo test` | **316 passed** (up from 309: +6 `dispatch.rs` retry/test-dispatch tests, +1 `rbac_integration_tests.rs` webhook-test-endpoint ownership/dispatch test), 0 failed, across all 9 binaries |
+| `./scripts/test_e2e.sh` | **629 checks passed**, 0 failed (unchanged — no §-numbered check added this session; the new endpoint and UI were verified live in a browser instead, see above) |
+| `./scripts/verify_convergence.sh` | **63 matching**, 0 unexplained divergences, exit 0 |

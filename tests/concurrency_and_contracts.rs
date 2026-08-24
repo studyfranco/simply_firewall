@@ -187,7 +187,7 @@ async fn send(app: &axum::Router, request: Request<Body>) -> (StatusCode, String
 /// deliberate check-then-insert window in the guard — lock released between the lookup and the
 /// insert, widened with a 50 ms sleep — leaves this test passing, on a multi-threaded runtime, every
 /// time. The reason is structural: `auth_middleware` performs a database lookup *before* reaching the
-/// replay guard, and `SQLITE_MAX_CONNECTIONS` is 1, so the two requests serialise on the pool long
+/// replay guard, and `SQLITE_MEMORY_MAX_CONNECTIONS` is 1, so the two requests serialise on the pool long
 /// before they ever contend for the ledger. The guard is simply never raced in this configuration.
 ///
 /// That is worth knowing rather than papering over — it means the SQLite deployment gets replay

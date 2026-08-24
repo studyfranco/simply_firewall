@@ -101,6 +101,7 @@ pub fn create_app(state: AppState) -> Router {
         .route("/webhooks/{id}", put(api::update_webhook))
         .route("/webhooks/{id}", delete(api::delete_webhook))
         .route("/webhooks/{id}/owner", put(api::reassign_webhook_owner))
+        .route("/webhooks/{id}/test", post(api::test_webhook))
         .route("/audit-logs", get(api::list_audit_logs))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
