@@ -670,6 +670,160 @@ pub async fn update_webhook(
 }
 
 
+/// Payload for `POST /api/v1/webhooks/{id}/clone`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CloneWebhookPayload {
+    /// Name for the new, cloned webhook.
+    pub name: String,
+}
+
+
+/// Response from [`clone_webhook`]. Carries a freshly generated `secret_token` **only** when the
+/// clone's auth mode requires one — the same "shown once, never echoed again" shape
+/// [`UpdateWebhookResponse`] uses for a forced rotation, since a clone's secret is deliberately never
+/// copied from its source (see [`clone_webhook`]'s doc comment).
+#[derive(Serialize)]
+pub struct CloneWebhookResponse {
+    /// The newly created webhook, in the same public-safe shape as the listing.
+    #[serde(flatten)]
+    pub webhook: WebhookSummary,
+    /// The freshly generated signing secret, present only when the effective auth mode required one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secret_token: Option<String>,
+}
+
+
+/// Handles `POST /api/v1/webhooks/{id}/clone` — duplicates an existing webhook's configuration under
+/// a new name, so an operator can stand up a variant (a different target group, a different event
+/// subset) without re-typing every field by hand.
+///
+/// # Authorization
+///
+/// Same base gate as every other endpoint in this file (`is_master || can_manage_webhooks`), then:
+///
+/// - **Ownership of the source webhook** — the same §4 test [`update_webhook`]/[`delete_webhook`]
+///   apply: master or the webhook's own `owner_key_id`, `404` (not `403`) otherwise, matching this
+///   file's oracle discipline. A webhook outside the caller's scope must be indistinguishable from
+///   one that does not exist.
+/// - **Read access to the source webhook's target group** — the same check [`create_webhook`]
+///   applies to a brand-new webhook. Cloning must not become a second way to reach a group's
+///   configuration without ever having held `can_read` on it.
+/// - **Master-only when the source webhook is privileged** (carries a non-empty `api_key`). A
+///   privileged webhook's `api_key` authenticates as a real caller on the receiving system — the same
+///   credential-duplication concern [`update_webhook`]'s privileged-webhook gate exists for, one step
+///   earlier: cloning one hands the same credential to a *second*, independently-editable dispatch
+///   target, which is a broader exposure than editing the original in place. Checked even against the
+///   source webhook's own non-master owner — owning a privileged webhook is not the same authority as
+///   being trusted to fan its credential out to a new target.
+///
+/// # What is duplicated
+///
+/// Every configuration property: `target_url`, `group_id`, `auth_mode`, `signature_header`,
+/// `signature_prefix`, `hmac_template`, `payload_template`, `headers_json`, `events`, `is_active`, and
+/// `api_key`. `owner_key_id` is **not** copied — the clone is owned by the *caller*
+/// ([`resource_owner`], the same rule every other creation endpoint follows), not by the source
+/// webhook's owner, since the caller is the one asking for a new dispatch target to exist.
+///
+/// `secret_token` is deliberately **never** copied. Two webhooks sharing one HMAC secret means a
+/// receiver able to verify one dispatch can verify the other, and a compromise of either target's
+/// secret exposes both — the opposite of what cloning into a separate, independently editable webhook
+/// is for. A fresh secret is generated whenever the effective `auth_mode` requires one (the same
+/// [`webhook_config::AuthMode::requires_secret`] test [`create_webhook`] applies) and returned exactly
+/// once in this response.
+pub async fn clone_webhook(
+    State(state): State<AppState>,
+    Extension(key): Extension<api_key::Model>,
+    Extension(client_ip): Extension<ClientIp>,
+    StrictPath(id): StrictPath<Uuid>,
+    StrictJson(payload): StrictJson<CloneWebhookPayload>,
+) -> Result<impl IntoResponse, AppError> {
+    if !key.is_master && !key.can_manage_webhooks {
+        return Err(AppError::Forbidden("Permission denied".to_owned()));
+    }
+
+    let source = WebhookConfig::find_by_id(id).one(&state.db).await?.ok_or(AppError::NotFound)?;
+    if !key.is_master && source.owner_key_id != Some(key.id) {
+        return Err(AppError::NotFound);
+    }
+
+    if !key.is_master {
+        let perm = caller_group_permission(&state.db, key.id, source.group_id).await?;
+        if !perm.is_some_and(|p| p.can_read) {
+            return Err(AppError::Forbidden(
+                "Permission denied: you have no read access to the target group".to_owned(),
+            ));
+        }
+    }
+
+    if source.api_key.as_deref().is_some_and(|k| !k.is_empty()) && !key.is_master {
+        tracing::warn!(
+            "Blocked webhook clone: key {} attempted to clone privileged webhook '{}' (carries an \
+             api_key)",
+            key.prefix,
+            source.name
+        );
+        return Err(AppError::Forbidden(
+            "This webhook sends an api_key credential; only a master key may clone it".to_owned(),
+        ));
+    }
+
+    let auth_mode = webhook_config::AuthMode::from_stored(&source.auth_mode);
+    // Never inherited from the source — see this handler's own doc comment. Generated fresh exactly
+    // like `create_webhook` would for a brand-new webhook in this mode.
+    let generated_secret = auth_mode.requires_secret().then(crate::crypto::generate_signing_secret);
+    let secret_token = generated_secret.clone().unwrap_or_default();
+
+    let new_id = Uuid::new_v4();
+    let now = chrono::Utc::now().naive_utc();
+    let cloned = webhook_config::Model {
+        id: new_id,
+        name: payload.name.clone(),
+        target_url: source.target_url.clone(),
+        secret_token,
+        auth_mode: auth_mode.as_str().to_owned(),
+        api_key: source.api_key.clone(),
+        hmac_template: source.hmac_template.clone(),
+        signature_header: source.signature_header.clone(),
+        signature_prefix: source.signature_prefix.clone(),
+        headers_json: source.headers_json.clone(),
+        payload_template: source.payload_template.clone(),
+        group_id: source.group_id,
+        // §4 makes a webhook creator-private, owned by whoever asked for it to exist — the caller
+        // here, not the source webhook's own owner (`resource_owner` is `None` for a master, matching
+        // every other creation endpoint).
+        owner_key_id: resource_owner(&key),
+        is_active: source.is_active,
+        events: source.events.clone(),
+        created_at: now,
+    };
+    let active: webhook_config::ActiveModel = cloned.clone().into();
+    webhook_config::Entity::insert(active).exec(&state.db).await?;
+
+    create_audit_log(
+        &state.db,
+        &key,
+        client_ip.0,
+        "WEBHOOK_CLONE",
+        None,
+        None,
+        Some(format!(
+            "Cloned '{}' ({}) as '{}' ({new_id})",
+            source.name, source.id, payload.name
+        )),
+    )
+    .await?;
+
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(CloneWebhookResponse {
+            webhook: WebhookSummary::from(cloned),
+            secret_token: generated_secret,
+        }),
+    ))
+}
+
+
 /// Handles GET /api/v1/webhooks
 pub async fn list_webhooks(
     State(state): State<AppState>,

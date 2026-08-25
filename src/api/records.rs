@@ -1172,6 +1172,13 @@ pub struct BatchRecordsPayload {
     pub mode: BatchMode,
     /// The records. Duplicates (after canonicalisation) are refused.
     pub records: Vec<BatchRecordInput>,
+    /// Suppresses webhook dispatch for every record this batch touches. `false`/omitted (the
+    /// default) dispatches exactly as `POST /api/ban`/`/white`/`DELETE /api/ips` would, one event per
+    /// record outcome. Meant for bulk imports and large synchronisation runs, where a multi-thousand-
+    /// record batch would otherwise enqueue a multi-thousand-event burst — the record writes and
+    /// audit trail are identical either way; only the notification side effect is gated.
+    #[serde(default)]
+    pub skip_webhooks: Option<bool>,
 }
 
 /// What a batch did, counted by outcome.
@@ -1229,6 +1236,20 @@ pub struct BatchRecordsResponse {
 /// - **Bypass address validation.** Banlist targets go through [`guard_bannable_address`], the same
 ///   guard `handle_ip_upsert` uses, so a batch cannot insert `127.0.0.1` into a banlist that the
 ///   single-record path refuses.
+///
+/// # Webhook dispatch
+///
+/// Every record outcome (a new address linked into the group, an existing one updated, or one
+/// `full_replace` swept into a soft delete) enqueues the same [`WebhookEvent`] shape
+/// `handle_ip_upsert`/`delete_ip` raise for their single-record equivalents — classified `IP_ADD`
+/// when the group membership itself is new and `IP_UPDATE` otherwise, matching those handlers'
+/// existing "keyed off the membership, not the underlying row" rule, and `IP_DELETE` for the
+/// `full_replace` sweep. `payload.skip_webhooks` (`false`/omitted by default) suppresses all of it —
+/// the record writes and the audit row are identical either way, only the notification side effect
+/// is gated. Events are buffered during the transaction and only handed to
+/// [`AppState::enqueue_webhook`] after it commits, for the same reason `handle_ip_upsert`/`delete_ip`
+/// enqueue after their own commit: a webhook must never fire for a write a rolled-back transaction
+/// means never happened.
 pub async fn batch_records(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
@@ -1356,6 +1377,11 @@ pub async fn batch_records(
         })
         .await?;
     let mut summary = BatchRecordsResponse::default();
+    let skip_webhooks = payload.skip_webhooks.unwrap_or(false);
+    // Buffered rather than enqueued as each record is processed: an event raised mid-transaction
+    // could still be rolled back by a later record's error, and a webhook that already fired cannot
+    // be un-fired. Handed to `state.enqueue_webhook` only once `txn.commit()` below has succeeded.
+    let mut webhook_events: Vec<WebhookEvent> = Vec::new();
 
     for (address, input) in &normalized {
         let existing = ip_record::Entity::find()
@@ -1444,6 +1470,22 @@ pub async fn batch_records(
         .exec_without_returning(&txn)
         .await?;
         summary.linked += linked;
+
+        if !skip_webhooks {
+            // Same classification `handle_ip_upsert` uses: a new membership is an `IP_ADD` even when
+            // the underlying `ip_record` row already existed under a different group, since that is
+            // what changed from this group's own perspective; anything else touched in this pass is
+            // an `IP_UPDATE`.
+            let action = if linked > 0 { "IP_ADD" } else { "IP_UPDATE" };
+            webhook_events.push(WebhookEvent {
+                action: action.to_owned(),
+                address: address.clone(),
+                is_whitelist: group.group_type == "whitelist",
+                group_id: Some(group.id),
+                group_name: Some(group.name.clone()),
+                cause: input.cause.clone(),
+            });
+        }
     }
 
     // ── full_replace: soft-delete what the batch omitted ────────────────────
@@ -1473,6 +1515,7 @@ pub async fn batch_records(
                 if seen.contains(&record.target_address) {
                     continue;
                 }
+                let swept_address = record.target_address.clone();
                 let mut active: ip_record::ActiveModel = record.into();
                 active.is_deleted = Set(true);
                 active.deleted_at = Set(Some(now));
@@ -1480,6 +1523,17 @@ pub async fn batch_records(
                 active.updated_at = Set(now);
                 active.update(&txn).await?;
                 summary.soft_deleted += 1;
+
+                if !skip_webhooks {
+                    webhook_events.push(WebhookEvent {
+                        action: "IP_DELETE".to_owned(),
+                        address: swept_address,
+                        is_whitelist: group.group_type == "whitelist",
+                        group_id: Some(group.id),
+                        group_name: Some(group.name.clone()),
+                        cause: Some("Removed via batch full_replace synchronisation".to_owned()),
+                    });
+                }
             }
         }
     }
@@ -1512,12 +1566,19 @@ pub async fn batch_records(
 
     txn.commit().await?;
 
+    // Committed before any event is enqueued, same as `handle_ip_upsert`/`delete_ip`: a webhook must
+    // never fire for a batch whose transaction rolled back.
+    for event in webhook_events {
+        state.enqueue_webhook(event);
+    }
+
     tracing::info!(
         group = %group.name,
         created = summary.created,
         updated = summary.updated,
         soft_deleted = summary.soft_deleted,
         locked_skipped = summary.locked_skipped,
+        skip_webhooks,
         "Batch record synchronisation committed"
     );
 

@@ -945,6 +945,32 @@
         </div>
     </div>
 
+    <!-- Clone Webhook Modal: prompts for a new name, then POSTs /webhooks/{id}/clone. A lightweight
+         single-field modal rather than a copy of the Edit Webhook form — every other property is
+         duplicated server-side sight unseen; the operator adjusts target group/events afterward in
+         the Edit Webhook modal this one chains into. -->
+    <div id="clone-webhook-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
+         aria-labelledby="clone-webhook-modal-title">
+        <div class="modal-card card">
+            <h3 id="clone-webhook-modal-title">Clone Webhook</h3>
+            <p class="subtitle">
+                Duplicates this webhook's configuration under a new name. Adjust its target group or
+                triggering events afterward.
+            </p>
+            <form id="form-clone-webhook">
+                <input type="hidden" id="clone-webhook-source-id">
+                <div class="form-group">
+                    <label for="clone-webhook-name">New Webhook Name <span>*</span></label>
+                    <input type="text" id="clone-webhook-name" required class="input-field">
+                </div>
+                <div class="form-actions mt-4">
+                    <button type="submit" class="btn btn-primary">Clone</button>
+                    <button type="button" id="clone-webhook-cancel" class="btn btn-cancel">Cancel</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
     <!-- Key Lineage Modal -->
     <div id="key-lineage-modal" class="modal-overlay hidden" role="dialog" aria-modal="true"
          aria-labelledby="key-lineage-modal-title">

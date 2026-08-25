@@ -473,7 +473,13 @@ class FirewallClient {
             // Whether the Edit Webhook modal's API-key input has been interacted with since it was
             // last opened — see `submitEditWebhook()`'s own comment for why this replaces the old
             // "Clear the configured API key" checkbox.
-            editApiKeyTouched: false
+            editApiKeyTouched: false,
+            // Set by `submitCloneWebhook()` when the clone generated a fresh secret, so the
+            // signing-secret reveal modal's own "Done" handler knows to open the Edit Webhook modal
+            // for the new webhook once the secret has been copied, rather than stacking both modals
+            // at once. `null` the rest of the time, including after key-rotation's own use of the
+            // same reveal modal.
+            pendingCloneEditId: null
         };
 
         // IP records and audit logs are both large, append-only lists — fetched from the server
@@ -1679,6 +1685,7 @@ class FirewallClient {
                 <td>
                     <div class="flex gap-2">
                         <button class="btn btn-sm btn-secondary" onclick="window.app.openEditWebhookModal('${w.id}')">Edit</button>
+                        <button class="btn btn-sm btn-secondary" onclick="window.app.openCloneWebhookModal('${w.id}')" title="Duplicate this webhook's configuration under a new name">Clone</button>
                         <button class="btn btn-sm btn-danger" onclick="window.app.deleteWebhook('${w.id}')">Delete</button>
                     </div>
                 </td>
@@ -2555,6 +2562,62 @@ class FirewallClient {
     }
 
     // ───────────────────────────────────────────────────────
+    // Clone Webhook modal — a single-field prompt, not a form
+    // ───────────────────────────────────────────────────────
+
+    openCloneWebhookModal(id) {
+        const w = this.state.webhooks.find(w => w.id === id);
+        if (!w) return;
+        document.getElementById('clone-webhook-source-id').value = id;
+        const nameInput = document.getElementById('clone-webhook-name');
+        nameInput.value = `${w.name} (Copy)`;
+        document.getElementById('clone-webhook-modal').classList.remove('hidden');
+        nameInput.focus();
+        nameInput.select();
+    }
+
+    closeCloneWebhookModal() {
+        document.getElementById('clone-webhook-modal').classList.add('hidden');
+    }
+
+    /**
+     * POSTs `/webhooks/{id}/clone`, then hands the operator straight into the Edit Webhook modal for
+     * the new webhook so it can be re-targeted or re-scoped immediately.
+     *
+     * If the clone generated a fresh signing secret (any signing auth mode), the one-time secret
+     * reveal modal is shown *first* and the Edit Webhook modal opens only once that is dismissed —
+     * `pendingCloneEditId` carries the handoff. Stacking both modals at once would either bury the
+     * secret behind the edit form or make the edit form unreachable behind the secret; showing them
+     * in sequence loses neither.
+     */
+    async submitCloneWebhook(e) {
+        e.preventDefault();
+        const sourceId = document.getElementById('clone-webhook-source-id').value;
+        const name = document.getElementById('clone-webhook-name').value.trim();
+        if (!name) return;
+
+        try {
+            const res = await this.apiFetch(`/webhooks/${sourceId}/clone`, {
+                method: 'POST',
+                body: JSON.stringify({ name })
+            });
+            this.closeCloneWebhookModal();
+            await this.loadWebhooks();
+
+            if (res.secret_token) {
+                this.state.pendingCloneEditId = res.id;
+                document.getElementById('signing-secret-key-name').textContent = res.name;
+                document.getElementById('signing-secret-value').textContent = res.secret_token;
+                document.getElementById('signing-secret-modal').classList.remove('hidden');
+                this.showToast('Webhook cloned — copy the generated secret now', 'success');
+            } else {
+                this.showToast('Webhook cloned', 'success');
+                this.openEditWebhookModal(res.id);
+            }
+        } catch(e) {}
+    }
+
+    // ───────────────────────────────────────────────────────
     // Edit Webhook modal — headers editor
     //
     // A second copy of the create form's kv-editor (renderHeaderRows/addHeaderRow/headerMap)
@@ -2998,14 +3061,36 @@ class FirewallClient {
             }
         });
 
+        // Clone Webhook modal: submit, Cancel, backdrop click, Escape.
+        document.getElementById('form-clone-webhook').addEventListener('submit', (e) => this.submitCloneWebhook(e));
+        document.getElementById('clone-webhook-cancel').addEventListener('click', () => this.closeCloneWebhookModal());
+        document.getElementById('clone-webhook-modal').addEventListener('click', (e) => {
+            if (e.target.id === 'clone-webhook-modal') this.closeCloneWebhookModal();
+        });
+        document.addEventListener('keydown', (e) => {
+            if (e.key !== 'Escape') return;
+            if (!document.getElementById('clone-webhook-modal').classList.contains('hidden')) {
+                this.closeCloneWebhookModal();
+            }
+        });
+
         // Secret reveal modal (used after key rotation)
         document.getElementById('secret-reveal-close').addEventListener('click', () => {
             document.getElementById('secret-reveal-modal').classList.add('hidden');
         });
 
-        // Signing-secret reveal modal (used after POST /api/keys/{id}/rotate-secret)
+        // Signing-secret reveal modal (used after POST /api/keys/{id}/rotate-secret, PUT
+        // /api/webhooks/{id} on repoint/rotation, and POST /api/webhooks/{id}/clone). Cloning is the
+        // one caller that needs a follow-up: if `pendingCloneEditId` is set, the operator dismissing
+        // this modal is the cue to open the Edit Webhook modal for the newly cloned webhook next,
+        // rather than showing both modals stacked at once.
         document.getElementById('signing-secret-close').addEventListener('click', () => {
             document.getElementById('signing-secret-modal').classList.add('hidden');
+            if (this.state.pendingCloneEditId) {
+                const id = this.state.pendingCloneEditId;
+                this.state.pendingCloneEditId = null;
+                this.openEditWebhookModal(id);
+            }
         });
         document.getElementById('signing-secret-copy').addEventListener('click', async () => {
             const value = document.getElementById('signing-secret-value').textContent;

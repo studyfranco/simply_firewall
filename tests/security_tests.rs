@@ -2479,6 +2479,110 @@ async fn attack_editing_a_privileged_webhooks_auth_mode_or_api_key_is_master_onl
     assert_eq!(body["has_api_key"], true);
 }
 
+/// **Cloning a privileged webhook (one carrying a non-empty `api_key`) is master-only**, even for the
+/// webhook's own non-master owner. Cloning duplicates every configuration property, including
+/// `api_key` — so an unrestricted clone would be an easy way to fan a receiver-trusted credential out
+/// to a *second*, independently-editable dispatch target, which is a strictly larger exposure than
+/// `PUT`-editing the original in place (the concern
+/// [`attack_editing_a_privileged_webhooks_auth_mode_or_api_key_is_master_only`] already covers).
+#[tokio::test]
+async fn attack_cloning_a_privileged_webhook_is_master_only() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let master = insert_master_key(&db, "Owner").await;
+    let master_secret = test_signing_secret(&master);
+    let (owner_id, owner_key) = insert_key(&db, "Webhook Owner", false, false, true, false, None).await;
+    let owner_secret = test_signing_secret(&owner_key);
+    let group_id = insert_group(&db, "priv-clone-group").await;
+    grant(&db, owner_id, group_id, true, true, true).await;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri("/api/webhooks")
+                .header("X-API-Key", &owner_key)
+                .header("Content-Type", "application/json"),
+        ),
+        &owner_secret,
+        &json!({
+            "name": "Privileged Hook",
+            "target_url": "https://legitimate.example.com/hook",
+            "secret_token": "s",
+            "api_key": "downstream-credential",
+            "payload_template": "{}",
+            "group_id": group_id.to_string(),
+            "auth_mode": "CANONICAL_V1",
+        })
+        .to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let created: serde_json::Value = serde_json::from_slice(&created).unwrap();
+    let hook_id = created["id"].as_str().unwrap().to_owned();
+
+    // The webhook's own non-master owner may not clone it — owning a privileged webhook is not the
+    // same authority as being trusted to fan its credential out to a new target.
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/webhooks/{hook_id}/clone"))
+                .header("X-API-Key", &owner_key)
+                .header("Content-Type", "application/json"),
+        ),
+        &owner_secret,
+        &json!({ "name": "owner-attempted-clone" }).to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::FORBIDDEN,
+        "a non-master cannot clone a privileged webhook, even one it owns"
+    );
+
+    // No row was created by the refused attempt.
+    let count = simply_ip_vault::entities::webhook_config::Entity::find().all(&db).await.unwrap().len();
+    assert_eq!(count, 1, "the refused clone must not have inserted anything");
+
+    // A master may clone it.
+    let req = signed_later(
+        inject_connect_info(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/webhooks/{hook_id}/clone"))
+                .header("X-API-Key", &master)
+                .header("Content-Type", "application/json"),
+        ),
+        &master_secret,
+        1,
+        &json!({ "name": "master-cloned" }).to_string(),
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "a master may clone a privileged webhook");
+    let cloned: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(cloned["name"], "master-cloned");
+
+    let cloned_id = Uuid::parse_str(cloned["id"].as_str().unwrap()).unwrap();
+    let cloned_row = simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(cloned_id)
+        .one(&db)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        cloned_row.api_key.as_deref(),
+        Some("downstream-credential"),
+        "a master's clone does duplicate api_key — the gate is about who may clone, not whether the \
+         field is copied once permitted"
+    );
+}
+
 /// Retargeting a webhook onto a different group is scoped by the same `can_read` check
 /// `create_webhook` applies to the group a webhook is created against — and, unlike
 /// `target_url`/`hmac_template`/`auth_mode`/`api_key`, is **not** gated by the privileged-webhook

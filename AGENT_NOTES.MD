@@ -9448,3 +9448,119 @@ webhook's own table row rather than by button text.)
 passed, 0 failed (unchanged); `./scripts/verify_convergence.sh` 62 matching, 1 documented
 divergence, 0 unexplained, exit 0 (unchanged — this round never touched anything the convergence
 check tracks).
+
+### Addendum 9 — webhook cloning API/UI, and batch webhook dispatch did not exist before this round
+
+Two features: `POST /api/webhooks/{id}/clone` plus a matching UI action, and an optional
+`skip_webhooks` flag on `POST /api/records/batch`. The second one's premise did not survive reading
+the code — recorded below, same discipline as Addendum 7's `apiFetch` finding.
+
+**Task 1 — `POST /api/webhooks/{id}/clone` (`src/api/webhooks.rs`).** Returns `201 Created` with the
+new webhook's `WebhookSummary` (`CloneWebhookResponse`, flattened, matching `UpdateWebhookResponse`'s
+own shape) plus a freshly generated `secret_token` when the auth mode needs one. Gates, in order:
+`is_master || can_manage_webhooks`; ownership of the *source* webhook (master or `owner_key_id ==
+caller.id`, `404` not `403` — the same §4 oracle discipline `update_webhook`/`delete_webhook` already
+apply); `can_read` on the source's target group (the same check `create_webhook` applies to a
+brand-new webhook); and, if the source is privileged (a non-empty `api_key`), master-only — checked
+even against the source's own non-master owner, because cloning fans a receiver-trusted credential
+out to a *second*, independently-editable dispatch target, a strictly larger exposure than
+`PUT`-editing the original in place (which `update_webhook`'s existing privileged gate already
+covers). Every configuration property is duplicated — `target_url`, `group_id`, `auth_mode`,
+`signature_header`/`signature_prefix`, `hmac_template`, `payload_template`, `headers_json`, `events`,
+`is_active`, `api_key` — **except** `owner_key_id` (set to the *caller* via `resource_owner`, the
+same rule every other creation endpoint follows, not copied from the source) and `secret_token`
+(never copied — two webhooks sharing one HMAC secret means a receiver that verifies one dispatch can
+verify the other; a fresh one is generated via `crypto::generate_signing_secret` whenever
+`auth_mode.requires_secret()`, exactly as `create_webhook` would for a brand-new webhook in that
+mode). Built the new row as an owned `webhook_config::Model` first and converted it to an
+`ActiveModel` via `.into()` (the same conversion `update_webhook` already uses from `target.clone()`)
+rather than re-querying the row after insert — one fewer round trip, and the response is guaranteed
+to describe exactly what was written since it's the same value.
+
+**Task 2 — Web UI.** A "Clone" button beside Edit/Delete on every webhook row opens a small
+dedicated `#clone-webhook-modal` (a single required `New Webhook Name` field, pre-filled `<source
+name> (Copy)`, focused and selected on open) — not a copy of the Edit Webhook form, since every other
+property is duplicated server-side sight unseen and the operator's next move is almost always to
+retarget the clone, not re-verify its fields. Submitting POSTs the clone, refreshes the table, and —
+when the response carries a `secret_token` — shows the existing one-time signing-secret reveal modal
+(`#signing-secret-modal`, already used by key-secret rotation and webhook-repoint rotation) before
+chaining into the Edit Webhook modal for the new webhook, so an operator can immediately fix its
+target group or event subset. The chain, not a simultaneous double-modal: showing both `.modal-
+overlay`s at once (same shared z-index) would either bury the one-time secret behind the edit form
+or make the edit form unreachable behind the secret, and there is no correct stacking order for a
+value that must not be lost. Implemented as `state.pendingCloneEditId`, set by `submitCloneWebhook()`
+and consumed by the *existing* `signing-secret-close` handler's click — the one behavioral change to
+code shared with key/webhook-secret rotation is that dismissing the reveal modal now also opens the
+Edit Webhook modal, but only when this field is set, which it never is for either of those two other
+callers. When no secret is generated (a clone in `API_KEY_ONLY`/`NONE` mode), the Edit Webhook modal
+opens immediately instead. Verified live in a headless browser end to end: clicked Clone on a
+`CANONICAL_V1` source, confirmed the prompt's pre-filled name, submitted, confirmed the secret-reveal
+modal showed the *new* webhook's name and a real 64-hex-char generated secret, clicked Done, confirmed
+the Edit Webhook modal opened pre-populated with the clone's duplicated fields (target URL, group,
+auth mode, events), and confirmed the table listed both webhooks afterward. (Noticed but did not
+touch: the reused reveal modal's static copy — "The API key, its name, and all permissions are
+unchanged — only the HMAC signing secret was replaced" — is already slightly inaccurate for its
+*existing* second caller, webhook-secret rotation via `PUT /api/webhooks/{id}`, since nothing there
+is an "API key" either. Extending it to a third caller doesn't make that worse, and rewriting shared
+copy neither this task nor the pre-existing rotation flow asked for was out of scope for this round;
+left as a rough edge worth a future pass.)
+
+**Task 3 — `skip_webhooks` on `POST /api/records/batch` (`src/api/records.rs`), and a premise that
+didn't survive reading the code.** The brief described suppressing the batch endpoint's *existing*
+webhook dispatch for bulk imports. `batch_records` had no webhook dispatch of any kind — confirmed by
+grepping the file for `enqueue_webhook`/`WebhookEvent`, both absent — a deliberate omission from the
+endpoint's original design (Session 51) that had gone unrevisited since. So there was nothing to
+"suppress" in the false-branch sense the brief assumed; a flag that only ever no-ops is not a
+feature. Read the brief's actual intent as "batch should dispatch like every other mutation path,
+and large synchronisation runs need a way to opt out of the resulting event flood" — which is exactly
+why a suppression flag is worth having at all — and implemented **both halves together**: real
+per-record webhook dispatch, classified the same way `handle_ip_upsert` already classifies its own
+single-record case (`IP_ADD` when the group *membership* is new, `IP_UPDATE` otherwise — not keyed on
+whether the underlying `ip_record` row itself was new, matching that handler's own "keyed off the
+membership" rule exactly), plus `IP_DELETE` for `full_replace`'s sweep of omitted records; and
+`skip_webhooks: Option<bool>` (default `false`/omitted) gating all of it. Events are buffered in a
+`Vec<WebhookEvent>` during the transaction and handed to `state.enqueue_webhook` only after
+`txn.commit()` succeeds — same reasoning as `handle_ip_upsert`/`delete_ip`'s own post-commit
+enqueue: a webhook must never fire for a batch a rolled-back transaction means never happened. This
+is a strictly additive change to `batch_records`'s existing behaviour (no dispatch → dispatch unless
+opted out) rather than a divergence from a previously-tested contract, so none of the six Session-51
+batch tests needed touching.
+
+**Mutation-tested both new authorization-shaped pieces before trusting the tests**: disabled the
+privileged-clone gate (`if false && …`) and re-ran `attack_cloning_a_privileged_webhook_is_master_only`
+— failed with `left: 201, right: 403` as expected, confirming the test actually exercises the gate
+rather than passing by construction; reverted, byte-diffed against a pre-mutation backup, re-ran
+clean. Same for `skip_webhooks`: hardcoded `let skip_webhooks = false;` ignoring the payload field,
+re-ran `batch_skip_webhooks_true_suppresses_dispatch` — failed on the "receiver never reached"
+assertion as expected; reverted, byte-diffed, re-ran clean.
+
+**Tests added:**
+
+| File | Test | Covers |
+| :--- | :--- | :--- |
+| `rbac_integration_tests.rs` | `clone_webhook_duplicates_configuration_under_a_fresh_secret_and_owner` | Every optional field (custom headers, non-default `hmac_template`, `signature_header`/`prefix`, restricted `events`, `is_active: false`) survives the clone; `owner_key_id` is the caller's; the stored secret differs from the source's |
+| `rbac_integration_tests.rs` | `clone_webhook_requires_ownership_or_master` | A group peer with `can_manage_webhooks` but no ownership gets `404`; a nonexistent id gets `404`; the owner and a master both succeed (`201`) |
+| `security_tests.rs` | `attack_cloning_a_privileged_webhook_is_master_only` | The webhook's own non-master owner is refused (`403`, no row inserted); a master succeeds and the clone does carry the duplicated `api_key` — the gate is about *who* may clone, not whether the field is copied once permitted |
+| `rbac_integration_tests.rs` | `batch_skip_webhooks_true_suppresses_dispatch` | Record and audit trail written regardless; the receiver is never reached (`await_dispatch` exhausts its full window) *and* `webhook_executions` has zero rows for the batch's webhook — ruling out "dispatched to the wrong place" as well as "never dispatched" |
+| `rbac_integration_tests.rs` | `batch_skip_webhooks_false_or_omitted_dispatches_normally` | Omitting the field dispatches (the documented default), the delivered body names the batch-created address, and it is classified `IP_ADD` |
+
+**E2E (`scripts/test_e2e.sh`):** two new sections, run unconditionally after §31 (not gated on the
+live `simply_hook_executor` checkout that section itself may skip). **§32 — Webhook Cloning**: create
+a `CANONICAL_V1` source with custom `events`/`is_active: false`, clone it, assert `201` and that
+every duplicated field round-trips over real HTTP (not just through the Rust test harness's direct
+router calls), assert the generated secret differs from the source's, delete the source and confirm
+the clone survives, assert a nonexistent id and a non-owner both get `404`. **§33 — Batch Webhook
+Suppression**: gated on `WEBHOOK_RECEIVER_AVAILABLE` (the same local capture receiver §13 sets up) —
+`skip_webhooks: true` writes the record but the receiver log stays empty after a 1s grace period;
+omitting the field dispatches within the existing 40×0.25s poll window and the captured body names
+the batch-created address. Degrades to a record-only check when the receiver is unavailable, matching
+the file's existing soft-dependency pattern for that condition. +33 checks (705 → 738).
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` **348 passed** (up from 338: +5 new, +3 clone, +2 batch-suppression), 0 failed;
+`./scripts/test_e2e.sh` **738 checks passed** (up from 705: +33), 0 failed; peers pulled fresh
+(`simply_hook_executor` already up to date at `d6070d3`; `simply_ip_exporter` fast-forwarded
+`6ed9fb3` → `8d4eba8`; `simply_ip_sync` already up to date at `e1b7cf9`) — none of the three pulls
+change anything the vault↔hook_executor comparison tracks;
+`./scripts/verify_convergence.sh` **62 matching, 1 documented divergence (the SQLite pragma count,
+unchanged from prior rounds), 0 unexplained**, exit 0.

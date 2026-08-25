@@ -4303,6 +4303,154 @@ else
     warn "simply_hook_executor unavailable — skipping §31 entirely."
 fi
 
+
+log_section "32. Webhook Cloning (POST /api/webhooks/{id}/clone)"
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"clone-e2e-group","group_type":"banlist"}'
+check "200" "#32 create the clone-source group"
+CLONE_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"clone-source-hook\",\"target_url\":\"https://example.invalid/clone-source\",\"secret_token\":\"clone-source-secret\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$CLONE_GROUP_ID\",\"auth_mode\":\"CANONICAL_V1\",\"events\":\"IP_ADD,IP_DELETE\",\"is_active\":false}"
+check "200" "#32 create the source webhook"
+CLONE_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/webhooks/$CLONE_SOURCE_ID/clone" "$MASTER_KEY" '{"name":"cloned-hook"}'
+check "201" "#32 clone the webhook — 201 Created"
+check_jq ".name" "cloned-hook" "#32 the clone carries the requested name"
+check_jq ".target_url" "https://example.invalid/clone-source" "#32 target_url is duplicated"
+check_jq ".auth_mode" "CANONICAL_V1" "#32 auth_mode is duplicated"
+check_jq ".events" "IP_ADD,IP_DELETE" "#32 events is duplicated"
+check_true '.is_active == false' "#32 is_active is duplicated, not reset to the default"
+check_true '(.secret_token | length) > 0' "#32 a fresh signing secret is generated and returned once"
+CLONE_GENERATED_SECRET=$(echo "$RESP_BODY" | jq -r '.secret_token')
+if [ "$CLONE_GENERATED_SECRET" != "clone-source-secret" ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} #32 the generated secret differs from the source's, never copied" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} #32 the clone must mint a fresh secret, not reuse the source's" >&2
+fi
+CLONE_TARGET_ID=$(echo "$RESP_BODY" | jq -r '.id')
+if [ "$CLONE_TARGET_ID" != "$CLONE_SOURCE_ID" ] && [ -n "$CLONE_TARGET_ID" ] && [ "$CLONE_TARGET_ID" != "null" ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} #32 the clone is a new row with a fresh id, not the source" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} #32 clone id ('$CLONE_TARGET_ID') must be new and distinct from the source" >&2
+fi
+
+# The clone is a fully independent row: deleting the source must not affect it.
+api_call DELETE "/api/webhooks/$CLONE_SOURCE_ID" "$MASTER_KEY"
+check "204" "#32 delete the source webhook"
+api_call GET "/api/webhooks" "$MASTER_KEY"
+check_true "[.[] | select(.id == \"$CLONE_TARGET_ID\")] | length == 1" \
+    "#32 the clone survives its source's deletion"
+
+api_call DELETE "/api/webhooks/$CLONE_TARGET_ID" "$MASTER_KEY"
+check "204" "#32 clean up the cloned webhook"
+api_call DELETE "/api/groups/$CLONE_GROUP_ID" "$MASTER_KEY"
+check "204" "#32 clean up the clone-source group"
+
+# Cloning a nonexistent webhook is a 404, matching every other webhook endpoint's oracle discipline —
+# indistinguishable from cloning one the caller cannot see.
+api_call POST "/api/webhooks/00000000-0000-0000-0000-000000000000/clone" "$MASTER_KEY" '{"name":"nope"}'
+check "404" "#32 cloning a nonexistent webhook id answers 404"
+
+# A key holding can_manage_webhooks but no relationship to the webhook at all — neither owner nor
+# even sharing its group — must not be able to clone it either.
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"clone-peer-group","group_type":"banlist"}'
+check "200" "#32 create a second group for the non-owner clone check"
+CLONE_PEER_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+api_call POST "/api/webhooks" "$MASTER_KEY" \
+    "{\"name\":\"clone-peer-source-hook\",\"target_url\":\"https://example.invalid/peer-source\",\"payload_template\":\"{}\",\"group_id\":\"$CLONE_PEER_GROUP_ID\",\"auth_mode\":\"NONE\",\"events\":\"IP_ADD\"}"
+check "200" "#32 create a second webhook, owned by master"
+CLONE_PEER_SOURCE_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/keys" "$MASTER_KEY" \
+    '{"name":"clone-peer","can_manage_webhooks":true,"bound_ips":"0.0.0.0/0,::/0"}'
+check "200" "#32 create a peer key holding can_manage_webhooks"
+CLONE_PEER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+register_key_secret "$CLONE_PEER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+CLONE_PEER_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/webhooks/$CLONE_PEER_SOURCE_ID/clone" "$CLONE_PEER_KEY" '{"name":"peer-attempted-clone"}'
+check "404" "#32 a non-owner with can_manage_webhooks cannot clone another tenant's webhook"
+
+api_call DELETE "/api/keys/$CLONE_PEER_KEY_ID" "$MASTER_KEY"
+check "204" "#32 clean up the peer key"
+api_call DELETE "/api/webhooks/$CLONE_PEER_SOURCE_ID" "$MASTER_KEY"
+check "204" "#32 clean up the second source webhook"
+api_call DELETE "/api/groups/$CLONE_PEER_GROUP_ID" "$MASTER_KEY"
+check "204" "#32 clean up the second group"
+
+
+log_section "33. Batch Webhook Suppression (POST /api/records/batch skip_webhooks)"
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"batch-skip-e2e-group","group_type":"banlist"}'
+check "200" "#33 create the batch-skip group"
+BATCH_SKIP_GROUP_ID=$(echo "$RESP_BODY" | jq -r '.id')
+
+if [ "${WEBHOOK_RECEIVER_AVAILABLE:-0}" -eq 1 ]; then
+    api_call POST "/api/webhooks" "$MASTER_KEY" \
+        "{\"name\":\"batch-skip-hook\",\"target_url\":\"http://127.0.0.1:$RECEIVER_PORT/batch-skip\",\"payload_template\":\"{\\\"ip\\\":\\\"\$target_address\\\"}\",\"group_id\":\"$BATCH_SKIP_GROUP_ID\",\"auth_mode\":\"NONE\",\"events\":\"IP_ADD\"}"
+    check "200" "#33 create a webhook on the batch-skip group"
+
+    # skip_webhooks: true — the record is written, but the receiver must never be reached.
+    : > "$RECEIVER_LOG"
+    api_call POST "/api/records/batch" "$MASTER_KEY" \
+        "{\"group_name\":\"batch-skip-e2e-group\",\"skip_webhooks\":true,\"records\":[{\"target_address\":\"203.0.113.90\"}]}"
+    check "200" "#33 batch with skip_webhooks: true succeeds"
+    check_true '.created == 1' "#33 and the record is written regardless of skip_webhooks"
+
+    # Give the (should-be-empty) dispatch queue every chance to have fired if it were going to.
+    sleep 1
+    if [ ! -s "$RECEIVER_LOG" ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} #33 skip_webhooks: true suppressed dispatch — the receiver was never reached" >&2
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} #33 skip_webhooks: true must not dispatch, but the receiver was hit" >&2
+    fi
+
+    # skip_webhooks omitted — the documented default is "dispatch normally", not "suppress".
+    : > "$RECEIVER_LOG"
+    api_call POST "/api/records/batch" "$MASTER_KEY" \
+        "{\"group_name\":\"batch-skip-e2e-group\",\"records\":[{\"target_address\":\"203.0.113.91\"}]}"
+    check "200" "#33 batch with skip_webhooks omitted succeeds"
+    check_true '.created == 1' "#33 and the record is written"
+
+    for _ in $(seq 1 40); do
+        [ -s "$RECEIVER_LOG" ] && break
+        sleep 0.25
+    done
+    if [ -s "$RECEIVER_LOG" ]; then
+        PASS_COUNT=$((PASS_COUNT + 1))
+        echo -e "$(ts)   ${GREEN}✓ PASS${RESET} #33 skip_webhooks omitted dispatches normally — the receiver was reached" >&2
+        HIT=$(head -n 1 "$RECEIVER_LOG")
+        HOOK_BODY=$(echo "$HIT" | jq -r '.body // empty')
+        if [[ "$HOOK_BODY" == *"203.0.113.91"* ]]; then
+            PASS_COUNT=$((PASS_COUNT + 1))
+            echo -e "$(ts)   ${GREEN}✓ PASS${RESET} #33 the dispatched payload names the batch-created address" >&2
+        else
+            FAIL_COUNT=$((FAIL_COUNT + 1))
+            echo -e "$(ts)   ${RED}✗ FAIL${RESET} #33 dispatched body does not mention the batch-created address (got: $HOOK_BODY)" >&2
+        fi
+    else
+        FAIL_COUNT=$((FAIL_COUNT + 1))
+        echo -e "$(ts)   ${RED}✗ FAIL${RESET} #33 skip_webhooks omitted did not dispatch within the timeout" >&2
+    fi
+
+    api_call DELETE "/api/groups/$BATCH_SKIP_GROUP_ID" "$MASTER_KEY"
+    check "204" "#33 clean up the batch-skip group"
+else
+    warn "Local webhook receiver unavailable — §33 checks only the record-level effect of skip_webhooks."
+    api_call POST "/api/records/batch" "$MASTER_KEY" \
+        "{\"group_name\":\"batch-skip-e2e-group\",\"skip_webhooks\":true,\"records\":[{\"target_address\":\"203.0.113.90\"}]}"
+    check "200" "#33 batch with skip_webhooks: true still succeeds without a receiver"
+    check_true '.created == 1' "#33 and the record is written regardless of skip_webhooks"
+fi
+
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2
 

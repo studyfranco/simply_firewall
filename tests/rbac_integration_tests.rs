@@ -5925,6 +5925,166 @@ async fn s4_webhook_listing_is_creator_private() {
     assert_eq!(master_sees, vec!["alice-hook", "bob-hook"], "the master sees both");
 }
 
+/// **`POST /api/webhooks/{id}/clone` duplicates every configuration property, assigns the caller as
+/// owner, and mints a fresh signing secret rather than copying the source's.**
+///
+/// Exercises a `CANONICAL_V1` webhook carrying every optional field this endpoint is asked to
+/// duplicate — custom headers, a non-default `hmac_template`, `signature_header`/`signature_prefix`,
+/// a restricted `events` subset, `is_active: false` — so a field silently dropped by the clone would
+/// show up as a mismatch here rather than passing by accident on an all-defaults fixture.
+#[tokio::test]
+async fn clone_webhook_duplicates_configuration_under_a_fresh_secret_and_owner() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (owner_id, owner_key) = insert_key(&db, "Webhook owner", false, false, true, false).await;
+    let group_id = insert_group_row(&db, "clone-source-group").await;
+    grant_perm(&db, owner_id, group_id, true, true, true, false).await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &owner_key)
+        .header("Content-Type", "application/json")), json!({
+            "name": "source-hook",
+            "target_url": "https://example.com/hook",
+            "secret_token": "source-secret",
+            "payload_template": "{\"ip\":\"$target_address\"}",
+            "group_id": group_id.to_string(),
+            "auth_mode": "CANONICAL_V1",
+            "hmac_template": "{method}\\n/fixed/path\\n{timestamp}\\n{body}",
+            "signature_header": "X-Hub-Signature-256",
+            "signature_prefix": "",
+            "headers_json": "{\"X-Custom\":\"yes\"}",
+            "events": "IP_ADD,IP_DELETE",
+            "is_active": false,
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let source_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{source_id}/clone"))
+        .header("X-API-Key", &owner_key)
+        .header("Content-Type", "application/json")), 1, json!({
+            "name": "cloned-hook",
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::CREATED, "clone returns 201 Created");
+    let cloned_body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let cloned_id = Uuid::parse_str(cloned_body["id"].as_str().unwrap()).unwrap();
+    assert_ne!(cloned_id, source_id, "the clone is a new row, not the same one");
+    assert_eq!(cloned_body["name"], "cloned-hook");
+    assert_eq!(cloned_body["target_url"], "https://example.com/hook");
+    assert_eq!(cloned_body["auth_mode"], "CANONICAL_V1");
+    assert_eq!(cloned_body["hmac_template"], "{method}\\n/fixed/path\\n{timestamp}\\n{body}");
+    assert_eq!(cloned_body["signature_header"], "X-Hub-Signature-256");
+    assert_eq!(cloned_body["signature_prefix"], "");
+    assert_eq!(cloned_body["headers_json"], "{\"X-Custom\":\"yes\"}");
+    assert_eq!(cloned_body["events"], "IP_ADD,IP_DELETE");
+    assert_eq!(cloned_body["is_active"], false, "is_active is duplicated, not reset to the default");
+    assert_eq!(cloned_body["group_id"], group_id.to_string());
+
+    let generated_secret =
+        cloned_body["secret_token"].as_str().expect("CANONICAL_V1 requires a secret, so one is generated");
+    assert!(!generated_secret.is_empty());
+
+    // The row itself: owned by the caller, not by the source's owner (trivially the same key here,
+    // but the field must be populated by `resource_owner(&caller)` rather than copied), and its
+    // stored secret must differ from the source's — never copied, per the handler's own doc comment.
+    let source_row = simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(source_id)
+        .one(&db).await.unwrap().unwrap();
+    let cloned_row = simply_ip_vault::entities::prelude::WebhookConfig::find_by_id(cloned_id)
+        .one(&db).await.unwrap().unwrap();
+    assert_eq!(cloned_row.owner_key_id, Some(owner_id));
+    assert_ne!(
+        cloned_row.secret_token, source_row.secret_token,
+        "cloning must mint a fresh secret, never reuse the source's"
+    );
+    assert_eq!(cloned_row.api_key, None, "neither webhook here ever set api_key");
+}
+
+/// **Cloning follows the same §4 ownership rule as every other webhook endpoint: a group peer with
+/// `can_manage_webhooks` gets `404`, not `403`, and the owner (or master) may proceed.**
+#[tokio::test]
+async fn clone_webhook_requires_ownership_or_master() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let (_master_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (owner_id, owner_key) = insert_key(&db, "Webhook owner", false, false, true, false).await;
+    let (peer_id, peer_key) = insert_key(&db, "Group peer", false, false, true, false).await;
+
+    let group_id = insert_group_row(&db, "clone-ownership-group").await;
+    grant_perm(&db, owner_id, group_id, true, true, true, false).await;
+    grant_perm(&db, peer_id, group_id, true, true, true, false).await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &owner_key)
+        .header("Content-Type", "application/json")), json!({
+            "name": "owned-for-cloning",
+            "target_url": "https://example.com/hook",
+            "secret_token": "s3cr3t",
+            "payload_template": "{}",
+            "group_id": group_id.to_string()
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    let webhook_id = Uuid::parse_str(body["id"].as_str().unwrap()).unwrap();
+
+    // Sharing the group (and holding `can_manage_webhooks`) is not owning the webhook.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{webhook_id}/clone"))
+        .header("X-API-Key", &peer_key)
+        .header("Content-Type", "application/json")), 1, json!({ "name": "hijack-clone" }).to_string());
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::NOT_FOUND,
+        "a non-owner must not learn the webhook exists, let alone clone it"
+    );
+
+    // A random id that was never a webhook at all answers identically.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{}/clone", Uuid::new_v4()))
+        .header("X-API-Key", &owner_key)
+        .header("Content-Type", "application/json")), 2, json!({ "name": "nope" }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::NOT_FOUND);
+
+    // The owner may clone its own webhook.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{webhook_id}/clone"))
+        .header("X-API-Key", &owner_key)
+        .header("Content-Type", "application/json")), 3, json!({ "name": "owner-clone" }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::CREATED);
+
+    // So may a master, ownership notwithstanding.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri(format!("/api/webhooks/{webhook_id}/clone"))
+        .header("X-API-Key", &master_key)
+        .header("Content-Type", "application/json")), 4, json!({ "name": "master-clone" }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::CREATED);
+}
+
 /// **§4 oracle discipline — an out-of-scope id answers exactly as a nonexistent one.**
 ///
 /// "Any key, resource, or dispatch target outside the caller's visibility scope must return the
@@ -7084,6 +7244,124 @@ async fn batch_enforces_address_validation_and_rejects_duplicates() {
         "two spellings of one address canonicalise to a duplicate and are refused rather than \
          resolved by payload order"
     );
+}
+
+/// **`skip_webhooks: true` on `POST /api/records/batch` suppresses dispatch entirely** — the record
+/// itself and the audit trail are written exactly as they would be otherwise; only the notification
+/// side effect is gated. Waits out the full `await_dispatch` window to confirm the *absence* of a
+/// call, and additionally checks `webhook_executions` directly — a receiver simply not being hit
+/// could mean "never dispatched" or "dispatched to the wrong place", and only the row count rules the
+/// second one out.
+#[tokio::test]
+async fn batch_skip_webhooks_true_suppresses_dispatch() {
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
+
+    let (base_url, captured) = spawn_capturing_receiver().await;
+    let (app, db, plaintext, group_id) = setup_webhook_fixture("batch-skip-group").await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")), json!({
+            "name": "batch-skip-hook",
+            "target_url": format!("{base_url}/hook"),
+            "auth_mode": "NONE",
+            "payload_template": "{}",
+            "group_id": group_id.to_string(),
+        }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/records/batch")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")), 1, json!({
+            "group_name": "batch-skip-group",
+            "skip_webhooks": true,
+            "records": [{ "target_address": "198.51.100.20" }],
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let summary: serde_json::Value = serde_json::from_slice(
+        &axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap(),
+    )
+    .unwrap();
+    assert_eq!(summary["created"], 1, "the record itself is written regardless of skip_webhooks");
+    assert_eq!(
+        raw_record_by_address(&db, "198.51.100.20").await.map(|r| r.target_address),
+        Some("198.51.100.20".to_owned())
+    );
+
+    assert!(
+        await_dispatch(&captured).await.is_none(),
+        "skip_webhooks: true must not enqueue any event, so the receiver is never reached"
+    );
+    assert_eq!(
+        simply_ip_vault::entities::webhook_execution::Entity::find().all(&db).await.unwrap().len(),
+        0,
+        "no execution row at all — not merely a receiver that missed the call"
+    );
+
+    unsafe { std::env::remove_var("ALLOW_PRIVATE_WEBHOOKS") };
+}
+
+/// **`skip_webhooks: false`, or the field omitted entirely, dispatches exactly as `POST /api/ban`
+/// would** — one `IP_ADD` event for a batch that links a brand-new record into the group, reaching a
+/// live receiver and recording a `webhook_executions` row.
+#[tokio::test]
+async fn batch_skip_webhooks_false_or_omitted_dispatches_normally() {
+    let _env_guard = ENV_MUTATION_LOCK.lock().await;
+    unsafe { std::env::set_var("ALLOW_PRIVATE_WEBHOOKS", "true") };
+
+    let (base_url, captured) = spawn_capturing_receiver().await;
+    let (app, db, plaintext, group_id) = setup_webhook_fixture("batch-dispatch-group").await;
+
+    let req = signed(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/webhooks")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")), json!({
+            "name": "batch-dispatch-hook",
+            "target_url": format!("{base_url}/hook"),
+            "auth_mode": "NONE",
+            "payload_template": "{\"ip\":\"$target_address\",\"action\":\"$action\"}",
+            "group_id": group_id.to_string(),
+        }).to_string());
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+
+    // `skip_webhooks` is omitted entirely — the documented default is "dispatch normally", not
+    // "suppress".
+    let req = signed_later(inject_connect_info(Request::builder()
+        .method("POST")
+        .uri("/api/records/batch")
+        .header("X-API-Key", &plaintext)
+        .header("Content-Type", "application/json")), 1, json!({
+            "group_name": "batch-dispatch-group",
+            "records": [{ "target_address": "198.51.100.30" }],
+        }).to_string());
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let hit = await_dispatch(&captured)
+        .await
+        .expect("a batch-created record must dispatch when skip_webhooks is omitted");
+    let delivered_body = hit.body.expect("body");
+    assert!(delivered_body.contains("198.51.100.30"));
+    assert!(
+        delivered_body.contains("IP_ADD"),
+        "a brand-new record/membership is classified IP_ADD, matching handle_ip_upsert's own rule: \
+         got {delivered_body}"
+    );
+
+    assert_eq!(
+        simply_ip_vault::entities::webhook_execution::Entity::find().all(&db).await.unwrap().len(),
+        1,
+        "one dispatch attempt recorded"
+    );
+
+    unsafe { std::env::remove_var("ALLOW_PRIVATE_WEBHOOKS") };
 }
 
 
