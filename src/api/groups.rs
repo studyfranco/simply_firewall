@@ -98,26 +98,39 @@ pub async fn create_ip_group(
 }
 
 
-/// Handles GET /api/v1/groups
+/// Handles GET /api/v1/groups and GET /api/v1/ip_groups
+///
+/// Master keys see all active IP groups. Non-master and daughter keys see only the IP groups
+/// where they hold at least `can_read` (or `can_write` / `can_delete` / `can_manage`) permissions.
+/// If a key has access to zero groups, returns 200 OK with an empty list `[]`.
 pub async fn list_ip_groups(
     State(state): State<AppState>,
     Extension(key): Extension<api_key::Model>,
 ) -> Result<impl IntoResponse, AppError> {
-    
     let mut query = IpGroup::find();
     if !key.is_master {
         let accessible_groups: Vec<Uuid> = api_key_group_permission::Entity::find()
             .filter(
                 Condition::all()
                     .add(api_key_group_permission::Column::ApiKeyId.eq(key.id))
-                    .add(api_key_group_permission::Column::CanRead.eq(true))
+                    .add(
+                        Condition::any()
+                            .add(api_key_group_permission::Column::CanRead.eq(true))
+                            .add(api_key_group_permission::Column::CanWrite.eq(true))
+                            .add(api_key_group_permission::Column::CanDelete.eq(true))
+                            .add(api_key_group_permission::Column::CanManage.eq(true)),
+                    ),
             )
             .all(&state.db)
             .await?
             .into_iter()
             .map(|p| p.group_id)
             .collect();
-        
+
+        if accessible_groups.is_empty() {
+            return Ok(Json(vec![]));
+        }
+
         query = query.filter(ip_group::Column::Id.is_in(accessible_groups));
     }
 

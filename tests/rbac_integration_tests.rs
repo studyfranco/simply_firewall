@@ -7987,3 +7987,199 @@ async fn test_sync_since_older_than_retention_period() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ─────────────────────────────────────────────────────────────
+// Task 1 & 2 — GET /api/groups RBAC: read-scoped filtering for
+// non-master and daughter keys
+// ─────────────────────────────────────────────────────────────
+
+/// A non-master key with `can_read` on Group A and **no access** to Group B calls
+/// `GET /api/groups`. The response must be `200 OK` and contain only Group A — Group B is
+/// invisible, not an error.
+///
+/// This is the canonical `simply_ip_exporter` use-case: a scoped API key should discover
+/// exactly the groups it is entitled to read, without any `403 Forbidden` interrupting it.
+#[tokio::test]
+async fn test_non_master_group_listing_read_scoped() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let group_a_id = insert_group_row(&db, "group-alpha").await;
+    let _group_b_id = insert_group_row(&db, "group-beta").await;
+
+    // Non-master, no global scopes — only `can_read` on Group A.
+    let (key_id, key) = insert_key(&db, "exporter-key", false, false, false, false).await;
+    grant_perm(&db, key_id, group_a_id, true, false, false, false).await;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .uri("/api/groups")
+                .header("X-API-Key", &key),
+        ),
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "non-master with can_read must receive 200 OK");
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let groups: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = groups.as_array().expect("response must be an array");
+
+    assert_eq!(arr.len(), 1, "only one group should be returned, not both");
+    assert_eq!(
+        arr[0]["name"].as_str().unwrap(),
+        "group-alpha",
+        "the returned group must be the one the key can read"
+    );
+}
+
+/// A daughter key (created with a `parent_key_id`) with `can_read` on Group A calls
+/// `GET /api/groups`. The response must be `200 OK` with only Group A — parentage
+/// confers no elevated authority (RBAC_MODEL.md R3) and the filter is by permission row, not
+/// lineage.
+#[tokio::test]
+async fn test_daughter_key_group_listing_is_filtered_to_readable_groups() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let group_a_id = insert_group_row(&db, "group-alpha-daughter").await;
+    let _group_b_id = insert_group_row(&db, "group-beta-daughter").await;
+
+    // "Parent" key — has can_manage_keys but does not make the daughter privileged (R3).
+    let (parent_id, _parent_key) = insert_key(&db, "parent-key", false, true, false, false).await;
+
+    // Daughter key: a non-master key whose parent_key_id is set.
+    let daughter_id = Uuid::new_v4();
+    let daughter_plaintext = simply_ip_vault::api::generate_random_key();
+    let daughter_hash = simply_ip_vault::api::hash_key(&daughter_plaintext);
+    simply_ip_vault::entities::api_key::ActiveModel {
+        id: Set(daughter_id),
+        key_hash: Set(daughter_hash),
+        signing_secret: Set(Some(stored_signing_secret(&daughter_plaintext))),
+        name: Set("daughter-key".to_owned()),
+        bound_ips: Set(None),
+        is_master: Set(false),
+        can_manage_keys: Set(false),
+        can_manage_webhooks: Set(false),
+        can_create_groups: Set(false),
+        parent_key_id: Set(Some(parent_id)),
+        prefix: Set("daught12".to_owned()),
+        created_at: Set(chrono::Utc::now().naive_utc()),
+        updated_at: Set(chrono::Utc::now().naive_utc()),
+    }
+    .insert(&db)
+    .await
+    .unwrap();
+
+    // Grant only Group A to the daughter key.
+    grant_perm(&db, daughter_id, group_a_id, true, false, false, false).await;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .uri("/api/groups")
+                .header("X-API-Key", &daughter_plaintext),
+        ),
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK, "daughter key with can_read must receive 200 OK");
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let groups: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = groups.as_array().expect("response must be an array");
+
+    assert_eq!(arr.len(), 1, "daughter key must see only Group A, not the parent's full scope");
+    assert_eq!(arr[0]["name"].as_str().unwrap(), "group-alpha-daughter");
+}
+
+/// A non-master key with **no group permission rows** calls `GET /api/groups`. The response
+/// must be `200 OK` with an empty array `[]` — never `403 Forbidden`. This is the baseline that
+/// the `simply_ip_exporter` service must never regress to a 403 on, even before groups are
+/// assigned to the key.
+#[tokio::test]
+async fn test_key_with_zero_assigned_groups_returns_empty_list() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    // Two groups exist in the system, but the key holds no rows.
+    let _group_a_id = insert_group_row(&db, "group-alpha-zero").await;
+    let _group_b_id = insert_group_row(&db, "group-beta-zero").await;
+
+    let (_key_id, key) = insert_key(&db, "zero-access-key", false, false, false, false).await;
+
+    let req = signed(
+        inject_connect_info(
+            Request::builder()
+                .uri("/api/groups")
+                .header("X-API-Key", &key),
+        ),
+        "",
+    );
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        res.status(),
+        StatusCode::OK,
+        "a key with no groups must receive 200 OK, not 403"
+    );
+
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let groups: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let arr = groups.as_array().expect("response body must be a JSON array");
+    assert!(arr.is_empty(), "a key with no group rows must receive an empty list []");
+}
+
+/// `GET /api/ip_groups` is a route alias for `GET /api/groups`. Both routes must produce
+/// byte-identical responses for the same authenticated caller, ensuring the companion exporter
+/// (`simply_ip_exporter`) and any client hitting the canonical path see the same data.
+#[tokio::test]
+async fn test_ip_groups_alias_returns_same_result_as_groups() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let app = create_app(AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new()));
+
+    let group_a_id = insert_group_row(&db, "group-alias-alpha").await;
+    let _group_b_id = insert_group_row(&db, "group-alias-beta").await;
+
+    let (key_id, key) = insert_key(&db, "alias-test-key", false, false, false, false).await;
+    grant_perm(&db, key_id, group_a_id, true, false, false, false).await;
+
+    let req_canonical = signed(
+        inject_connect_info(
+            Request::builder()
+                .uri("/api/groups")
+                .header("X-API-Key", &key),
+        ),
+        "",
+    );
+    let req_alias = signed_later(
+        inject_connect_info(
+            Request::builder()
+                .uri("/api/ip_groups")
+                .header("X-API-Key", &key),
+        ),
+        1,
+        "",
+    );
+
+    let res_canonical = app.clone().oneshot(req_canonical).await.unwrap();
+    let res_alias = app.clone().oneshot(req_alias).await.unwrap();
+
+    assert_eq!(res_canonical.status(), StatusCode::OK);
+    assert_eq!(res_alias.status(), StatusCode::OK, "/api/ip_groups must return 200 OK");
+
+    let body_canonical = axum::body::to_bytes(res_canonical.into_body(), usize::MAX).await.unwrap();
+    let body_alias = axum::body::to_bytes(res_alias.into_body(), usize::MAX).await.unwrap();
+
+    let canonical: serde_json::Value = serde_json::from_slice(&body_canonical).unwrap();
+    let alias: serde_json::Value = serde_json::from_slice(&body_alias).unwrap();
+
+    assert_eq!(
+        canonical, alias,
+        "/api/ip_groups and /api/groups must return identical JSON for the same key"
+    );
+}

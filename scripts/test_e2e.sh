@@ -4451,6 +4451,95 @@ else
     check_true '.created == 1' "#33 and the record is written regardless of skip_webhooks"
 fi
 
+# ── 34. Non-master / daughter key group listing (simply_ip_exporter workflow) ──
+#
+# Exercises the behaviour `simply_ip_exporter` depends on: a scoped API key calling
+# GET /api/groups (or the /api/ip_groups alias) must receive 200 OK with exactly the groups
+# it holds at least can_read on, no 403 Forbidden even when the group list is empty.
+#
+# Three sub-scenarios:
+#   34a. Non-master key with can_read on one group: sees only that group.
+#   34b. Daughter key (parent_key_id set) with can_read on same group: sees only that group.
+#   34c. Non-master key with zero group permissions: sees empty list [], not 403.
+#   34d. GET /api/ip_groups returns identical JSON to GET /api/groups for the same key.
+
+log_section "34. Non-master / daughter key group listing (simply_ip_exporter workflow)"
+
+# Set up two groups for this section.
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"exporter-group-visible"}'
+check "200" "#34 create the visible group"
+EXPORTER_VISIBLE_GID=$(echo "$RESP_BODY" | jq -r '.id')
+
+api_call POST "/api/groups" "$MASTER_KEY" '{"name":"exporter-group-hidden"}'
+check "200" "#34 create a second group that the exporter key must NOT see"
+
+# ── 34a. Non-master key filtered to its readable group ────────────────────────
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"exporter-nonmaster-key"}'
+check "200" "#34a create the non-master exporter key"
+EXPORTER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+EXPORTER_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$EXPORTER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+# Grant only the visible group.
+api_call POST "/api/keys/$EXPORTER_KEY_ID/permissions" "$MASTER_KEY" \
+    "{\"group_id\":\"$EXPORTER_VISIBLE_GID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "200" "#34a grant can_read on the visible group to the non-master key"
+
+api_call GET "/api/groups" "$EXPORTER_KEY"
+check "200" "#34a non-master key receives 200 OK on GET /api/groups"
+check_true "length == 1" "#34a response contains exactly one group (not two)"
+check_jq ".[0].name" "exporter-group-visible" "#34a the returned group is the one the key can read"
+
+# ── 34b. Daughter key (parent_key_id set) — same expectation ─────────────────
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"exporter-daughter-key"}'
+check "200" "#34b create a daughter key"
+DAUGHTER_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+DAUGHTER_KEY_ID=$(echo "$RESP_BODY" | jq -r '.id')
+register_key_secret "$DAUGHTER_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+# Grant only the visible group to the daughter key too.
+api_call POST "/api/keys/$DAUGHTER_KEY_ID/permissions" "$MASTER_KEY" \
+    "{\"group_id\":\"$EXPORTER_VISIBLE_GID\",\"can_read\":true,\"can_write\":false,\"can_delete\":false}"
+check "200" "#34b grant can_read on the visible group to the daughter key"
+
+api_call GET "/api/groups" "$DAUGHTER_KEY"
+check "200" "#34b daughter key receives 200 OK on GET /api/groups"
+check_true "length == 1" "#34b daughter key sees only its own readable group, not both"
+check_jq ".[0].name" "exporter-group-visible" "#34b the returned group is correct"
+
+# ── 34c. Key with zero permissions: empty list, never 403 ────────────────────
+
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"exporter-zero-key"}'
+check "200" "#34c create a key with no group grants"
+ZERO_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+register_key_secret "$ZERO_KEY" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+
+api_call GET "/api/groups" "$ZERO_KEY"
+check "200" "#34c key with zero group permissions receives 200 OK, not 403"
+check_true "length == 0" "#34c response is an empty list []"
+
+# ── 34d. GET /api/ip_groups alias returns identical JSON ─────────────────────
+
+api_call GET "/api/groups" "$EXPORTER_KEY"
+check "200" "#34d GET /api/groups baseline for alias comparison"
+GROUPS_CANONICAL="$RESP_BODY"
+
+api_call GET "/api/ip_groups" "$EXPORTER_KEY"
+check "200" "#34d GET /api/ip_groups returns 200 OK"
+GROUPS_ALIAS="$RESP_BODY"
+
+CANONICAL_NAMES=$(echo "$GROUPS_CANONICAL" | jq -c '[.[].name] | sort')
+ALIAS_NAMES=$(echo "$GROUPS_ALIAS" | jq -c '[.[].name] | sort')
+if [ "$CANONICAL_NAMES" = "$ALIAS_NAMES" ]; then
+    PASS_COUNT=$((PASS_COUNT + 1))
+    echo -e "$(ts)   ${GREEN}✓ PASS${RESET} #34d /api/ip_groups and /api/groups return identical group names" >&2
+else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    echo -e "$(ts)   ${RED}✗ FAIL${RESET} #34d /api/ip_groups returned different names: canonical=$CANONICAL_NAMES alias=$ALIAS_NAMES" >&2
+fi
+
 log_section "Summary"
 echo -e "$(ts) ${GREEN}Passed: $PASS_COUNT${RESET}   ${RED}Failed: $FAIL_COUNT${RESET}" >&2
 

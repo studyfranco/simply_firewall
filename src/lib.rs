@@ -92,10 +92,14 @@ pub fn create_app(state: AppState) -> Router {
         .route("/groups", post(api::create_ip_group))
         .route("/groups", get(api::list_ip_groups))
         .route("/groups/{id}", delete(api::delete_ip_group))
+        .route("/ip_groups", post(api::create_ip_group))
+        .route("/ip_groups", get(api::list_ip_groups))
+        .route("/ip_groups/{id}", delete(api::delete_ip_group))
         // Ownership reassignment, master-only (RBAC_MODEL.md §3). Separate routes rather than a
         // field on the update payloads: `ip_groups` has no update endpoint at all, and folding a
         // master-only field into a delegable one invites a guard that checks the wrong thing.
         .route("/groups/{id}/owner", put(api::reassign_group_owner))
+        .route("/ip_groups/{id}/owner", put(api::reassign_group_owner))
         .route("/webhooks", post(api::create_webhook))
         .route("/webhooks", get(api::list_webhooks))
         // Ahead of `/webhooks/{id}` in this list purely for readability — axum's router (matchit)
