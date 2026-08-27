@@ -9626,3 +9626,55 @@ and whose daughter still sees only its own single group.
 fresh by the gate (`simply_hook_executor` `d6070d3`, `simply_ip_exporter` `c2da8f2`, `simply_ip_sync`
 `e1b7cf9`); `./scripts/verify_convergence.sh` **62 matching, 1 documented divergence, 0 unexplained**,
 exit 0. `RBAC_MODEL.md` untouched.
+
+### Addendum 11 — `API_REFERENCE.md`, and why it was verified against a running server
+
+New root document (1,171 lines), no code changed. Catalogs **33 handler-backed endpoints across 40
+route registrations** plus the static fallback — the gap between those two numbers is aliases, which
+are marked inline rather than given their own entries.
+
+**Built from the router, not from memory.** The route list came from `src/lib.rs`'s assembly and each
+handler was read in `src/api/` for its guards, DTOs and response shape. Completeness is then
+*mechanically* checked rather than eyeballed: a script parses every
+`.route("path", method(api::handler))` out of `lib.rs` and asserts both the resolved path and the
+handler name appear in the document — 40/40 routes, 33/33 handlers, 0 missing. That check is cheap to
+re-run when a route is added, and is the thing that makes "no endpoints omitted" a claim rather than
+a hope.
+
+**Then verified live, which is where the value was.** Reading a handler tells you what it intends;
+only a running instance tells you what it answers. Booted a throwaway server and exercised the
+documented contract end to end. Everything held — probe bodies, `MeResponse`, `deny_unknown_fields`
+→ `400`, missing signature → `401`, duplicate group → `409`, the `404` oracle, both per-mode webhook
+preconditions → `400`, `hmac_template` without `{body}` → `400`, `older_than_days: 0` → `400`,
+`is_master` in a key payload → `400`, banning loopback → `400`, master rotation → `403`, clone →
+`201`, `format=iplist` → `{"ip_list":[…]}`, and the `/api/ip_groups` alias.
+
+**The one thing that "failed" was the harness, and it confirmed the document.** The first pass showed
+`POST /api/groups` returning `401` on a duplicate name instead of `409`. Cause: my shell helper
+incremented its timestamp counter inside a `$( )` command substitution, so the increment happened in
+a subshell and both calls signed the *same* method+path+timestamp+body — a byte-identical signature,
+which the replay guard correctly refuses. That is precisely the gotcha §1 of the new document
+records ("repeating a call unchanged within the same wall-clock second is indistinguishable from a
+replay"). Re-run with genuinely distinct timestamps, the duplicate returns `409` as documented. The
+replay behaviour was then asserted directly and in isolation: same signature twice → `200`, then
+`401`. Worth recording because the failure mode is one every integrator will hit, and the document
+now warns about it in the authentication section rather than leaving it to be discovered.
+
+**Two things the audit surfaced that are easy to get wrong and are called out explicitly:**
+
+- **`ApiKeySummary`'s `"minimal"` view omits fields rather than setting them false.** A client that
+  reads a missing `can_manage_keys` as "unprivileged" is asserting the absence of scopes it was never
+  shown. The document says to branch on `view`, not on field presence — the same trap `AGENT.MD`'s UI
+  section already flags for the dashboard.
+- **`POST /api/webhooks/{id}/test` returns `200` for a *failed* delivery.** The request succeeded;
+  the body describes the delivery. Documented inline, since a client checking only the HTTP status
+  would report every failed test as a success.
+
+Scope note: `AGENT.MD` was deliberately left untouched. Its "Document & Context Hierarchy" section
+lists the agent-facing documents, and adding an integrator-facing reference to a mandatory-read file
+was not asked for and is a judgement for whoever maintains that hierarchy.
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` **347 passed**, 0 failed; `./scripts/test_e2e.sh` **756 checks passed**, 0 failed;
+`./scripts/verify_convergence.sh` **62 matching, 1 documented divergence, 0 unexplained**, exit 0.
+All unchanged from the previous round, as expected for a documentation-only commit.

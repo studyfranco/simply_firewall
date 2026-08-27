@@ -143,6 +143,11 @@ reading either in full:
 5. `src/master.rs` — why Master identity and Master cardinality are separate properties.
 6. The handler module for whatever you are changing.
 
+`API_REFERENCE.md` (repository root) catalogs every HTTP endpoint — path, aliases, RBAC guard, query
+parameters, request DTO, and response schema — derived from `src/lib.rs`'s router and the handlers
+under `src/api/`. It is the fastest way to see the whole surface at once, and the right file to
+update in the same commit as any route change.
+
 ## Migration conventions
 
 Full standards live in `AGENT.MD` § *SeaORM Migration Standards*. The two that cause damage if missed:
