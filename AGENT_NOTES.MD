@@ -9564,3 +9564,65 @@ the file's existing soft-dependency pattern for that condition. +33 checks (705 
 change anything the vault↔hook_executor comparison tracks;
 `./scripts/verify_convergence.sh` **62 matching, 1 documented divergence (the SQLite pragma count,
 unchanged from prior rounds), 0 unexplained**, exit 0.
+
+### Addendum 10 — group listing for non-master keys: the reported 403 was never in this handler
+
+Shipped in `c5f9ef7` (`src/api/groups.rs`, `src/lib.rs`, `tests/rbac_integration_tests.rs`,
+`scripts/test_e2e.sh`). That commit did **not** update this file or `FILE_MAP.MD`, which `AGENT.MD`
+requires; this addendum is the retrofit, written after re-verifying the shipped behaviour rather than
+from the commit message. The verification turned up two corrections to the round's own premise, which
+is why it is worth a record at all.
+
+**The brief's premise did not match the code, in two ways.** It stated that `GET /api/groups`
+"strictly enforces master or admin-level gates, preventing non-master keys from discovering groups",
+and asked for the fix in `src/api/groups.rs` / **`src/auth.rs`**. There is no `src/auth.rs` in this
+crate — authorization lives in `api/guards.rs` and `middleware.rs` (see `FILE_MAP.MD`). More
+substantively, `list_ip_groups` **never had an `is_master` or `can_manage_keys` gate**: the
+pre-change body already branched on `is_master` and otherwise filtered to the caller's `can_read`
+rows. So the headline symptom — a `403` from this handler — was not reproducible from any revision of
+it. Same shape as Addendum 7's `apiFetch` finding and Addendum 9's `batch_records` finding: the
+reported symptom was real to the reporter, and its stated cause was not in the named code.
+
+**What the round actually changed, and what each part is worth.** Re-derived empirically this pass,
+because "shipped" and "load-bearing" are different claims:
+
+| Change | Verified effect |
+| :--- | :--- |
+| `can_read` → `can_read OR can_write OR can_delete OR can_manage` | **Real fix, one narrow case.** The least-privilege guard (`keys.rs:1196`) only forces `can_read` for `can_write`/`can_delete`, so a **`can_manage`-only row (`can_read: false`) is reachable through the grant API** — confirmed by reading that guard. Such a key administers a group's permission rows (R2) but previously could not *list* the group it administers. `can_write`/`can_delete` in the disjunction are inert by construction, kept because R1 states the rule per verb and a verb list that omits one is how the next verb added to the table gets forgotten |
+| Early `return Ok(Json(vec![]))` on an empty accessible set | **Defensive, not a bug fix.** Deleted the early return and re-ran `test_key_with_zero_assigned_groups_returns_empty_list`: it still **passed**. SeaORM's `is_in(vec![])` already yields an empty result set rather than emitting `IN ()` and erroring, so the zero-group path returned `200 []` before the change too. Kept — it states the intent locally instead of resting on a SeaORM behaviour nothing else in this repo pins — but it did not unblock anything |
+| `/api/ip_groups` alias (GET/POST/DELETE, plus `/{id}/owner`) | **The likeliest actual unblocker.** The path did not exist, so it fell through the `/api` nest to a `404`. Registered inside `api_routes`, *before* `.layer(auth_middleware)`, so the alias inherits full authentication — verified by reading the router assembly, since an alias mounted outside that layer would be an unauthenticated group listing |
+
+**Security review of the widening.** It discloses nothing new. A non-master still sees only groups it
+holds a permission row on — strictly a subset of what `GET /api/ips` already exposes the *contents*
+of. The one genuinely new case, a `can_manage`-only holder, is already entitled under §4's
+shared-resource rule to see keys holding rows on a group it manages ("id, name, and that key's rights
+on that resource alone"); learning the group's own name is strictly less than that, and is a
+precondition for administering it at all. The master path is untouched and still branches on
+`is_master` *before* consulting `api_key_group_permissions` — the invariant recorded earlier in this
+file (a group whose last manager revoked itself has no rows at all and must stay listable to Master).
+A key with zero rows gets `200 []`, which discloses nothing about whether groups exist, satisfying §4
+oracle discipline better than a `403` would.
+
+**Mutation-tested the four inherited tests before trusting them** — they were written by an earlier
+session, so "they pass" was not evidence they were load-bearing. Dropping the read-scoping filter
+entirely (every key sees every group — a tenancy leak) failed both
+`test_non_master_group_listing_read_scoped` and
+`test_daughter_key_group_listing_is_filtered_to_readable_groups` with `left: 2, right: 1`. Reinstating
+the exact reported bug (`403` on the zero-group path) failed
+`test_key_with_zero_assigned_groups_returns_empty_list` with `left: 403, right: 200`. Reverted from a
+byte-diffed backup after each, re-ran clean.
+
+**Task 2's audit (daughter-key resolution) came out clean and is worth stating as a negative result.**
+Group access is resolved *only* through `api_key_group_permissions` rows keyed on the presenting
+`api_key_id`; `parent_key_id` is never consulted on this path. So a daughter key sees exactly its own
+grants and inherits nothing from its parent — which is R3 ("parentage confers no authority") holding
+by construction rather than by a check that could be forgotten. Pinned by
+`test_daughter_key_group_listing_is_filtered_to_readable_groups`, whose parent holds `can_manage_keys`
+and whose daughter still sees only its own single group.
+
+**Gates** (re-run this pass against the shipped commit): `cargo check --all-targets` clean;
+`cargo clippy --all-targets -- -D warnings` clean; `cargo test` **347 passed**, 0 failed;
+`./scripts/test_e2e.sh` **756 checks passed** (up from 738: +18, all §34), 0 failed; peers pulled
+fresh by the gate (`simply_hook_executor` `d6070d3`, `simply_ip_exporter` `c2da8f2`, `simply_ip_sync`
+`e1b7cf9`); `./scripts/verify_convergence.sh` **62 matching, 1 documented divergence, 0 unexplained**,
+exit 0. `RBAC_MODEL.md` untouched.
