@@ -3391,6 +3391,169 @@ async fn test_list_ips_iplist_format_returns_deduplicated_address_list() {
     }
 }
 
+/// `GET /api/ips` without `include_total` must keep returning the bare root array — the
+/// historical contract every existing exporter/sync worker parses. `include_total` is opt-in
+/// precisely so this shape never changes underneath a client that never asked for the envelope.
+#[tokio::test]
+async fn test_list_ips_without_include_total_returns_bare_array() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state);
+
+    let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    let ban = |addr: &'static str| {
+        signed(inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/ban")
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json")), json!({ "target_address": addr, "group_name": "no-envelope-group" }).to_string())
+    };
+    assert_eq!(app.clone().oneshot(ban("203.0.113.10")).await.unwrap().status(), StatusCode::OK);
+
+    // Omitted entirely.
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=no-envelope-group")
+        .header("X-API-Key", &master_key)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(parsed.is_array(), "expected a bare array with include_total omitted, got {parsed:?}");
+    assert_eq!(parsed.as_array().unwrap().len(), 1);
+
+    // Explicit `false` behaves identically to omission.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=no-envelope-group&include_total=false")
+        .header("X-API-Key", &master_key)), 1, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(parsed.is_array(), "expected a bare array with include_total=false, got {parsed:?}");
+}
+
+/// `GET /api/ips?include_total=true` wraps the response in `{data, total, limit, offset,
+/// total_pages}`, with `total`/`total_pages` computed across every page, not just the one
+/// returned — a page of 3 out of 7 records must still report the full 7.
+#[tokio::test]
+async fn test_list_ips_include_total_returns_accurate_envelope() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state);
+
+    let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+
+    for i in 0..7u8 {
+        let req = signed_later(inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/ban")
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json")),
+            i as i64,
+            json!({ "target_address": format!("203.0.114.{i}"), "group_name": "envelope-group" }).to_string());
+        assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    }
+
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=envelope-group&limit=3&offset=0&include_total=true")
+        .header("X-API-Key", &master_key)), 100, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert_eq!(parsed["data"].as_array().unwrap().len(), 3, "page size should be respected: {parsed:?}");
+    assert_eq!(parsed["total"], 7);
+    assert_eq!(parsed["limit"], 3);
+    assert_eq!(parsed["offset"], 0);
+    assert_eq!(parsed["total_pages"], 3, "ceil(7 / 3) == 3");
+    // The envelope's `data` entries are otherwise full `IpRecordResponse` rows, not a stripped shape.
+    assert!(parsed["data"][0].get("target_address").is_some());
+    assert!(parsed["data"][0].get("group_name").is_some());
+
+    // A page that starts past the end still reports the same total, with an empty `data`.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=envelope-group&limit=3&offset=6&include_total=true")
+        .header("X-API-Key", &master_key)), 101, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["data"].as_array().unwrap().len(), 1, "record #7 is the only one at offset 6");
+    assert_eq!(parsed["total"], 7);
+    assert_eq!(parsed["total_pages"], 3);
+}
+
+/// `total` under `include_total=true` must respect the same RBAC group-read scoping as `data` —
+/// a non-master key counts only the records in groups it holds `can_read` on, never records in a
+/// group it cannot see, even though those records genuinely exist in the database.
+#[tokio::test]
+async fn test_list_ips_include_total_respects_rbac_group_scoping() {
+    let db = setup_test_db().await;
+    let (webhook_tx, _rx) = tokio::sync::mpsc::channel(100);
+    let state = AppState::with_trusted_proxies(db.clone(), webhook_tx, Vec::new());
+    let app = create_app(state);
+
+    let (_id, master_key) = insert_key(&db, "Master", true, true, true, true).await;
+    let (restricted_id, restricted_key) = insert_key(&db, "Restricted", false, false, false, false).await;
+
+    let visible_group = insert_group_row(&db, "rbac-total-visible").await;
+    let _hidden_group = insert_group_row(&db, "rbac-total-hidden").await;
+    grant_perm(&db, restricted_id, visible_group, true, false, false, false).await;
+    // Deliberately no permission row at all for `hidden_group` — the restricted key has no
+    // access to it whatsoever, matching §4's "not a member" case rather than "read-denied".
+
+    let ban = |addr: &'static str, group: &'static str| {
+        signed(inject_connect_info(Request::builder()
+            .method("POST")
+            .uri("/api/ban")
+            .header("X-API-Key", &master_key)
+            .header("Content-Type", "application/json")), json!({ "target_address": addr, "group_name": group }).to_string())
+    };
+    assert_eq!(app.clone().oneshot(ban("203.0.115.1", "rbac-total-visible")).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(app.clone().oneshot(ban("203.0.115.2", "rbac-total-visible")).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(app.clone().oneshot(ban("203.0.115.3", "rbac-total-hidden")).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(app.clone().oneshot(ban("203.0.115.4", "rbac-total-hidden")).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(app.clone().oneshot(ban("203.0.115.5", "rbac-total-hidden")).await.unwrap().status(), StatusCode::OK);
+
+    // Master sees all 5 across both groups.
+    let req = signed_later(inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=rbac-total-visible,rbac-total-hidden&include_total=true")
+        .header("X-API-Key", &master_key)), 1, "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["total"], 5, "master should count both groups: {parsed:?}");
+
+    // The restricted key, asking for the same two groups by name, sees only the 2 it can read —
+    // never an error and never the hidden group's 3, matching §4 oracle discipline.
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/ips?groups=rbac-total-visible,rbac-total-hidden&include_total=true")
+        .header("X-API-Key", &restricted_key)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["total"], 2, "restricted key must not count the hidden group's records: {parsed:?}");
+    assert_eq!(parsed["data"].as_array().unwrap().len(), 2);
+
+    // A restricted key with no readable groups at all still gets `200` with an empty, zeroed
+    // envelope, not an error — the same early-return path `format=iplist` and the bare array take.
+    let (_isolated_id, isolated_key) = insert_key(&db, "Isolated", false, false, false, false).await;
+    let req = signed(inject_connect_info(Request::builder()
+        .uri("/api/ips?include_total=true")
+        .header("X-API-Key", &isolated_key)), "");
+    let res = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let body = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(parsed["total"], 0);
+    assert_eq!(parsed["total_pages"], 0);
+    assert_eq!(parsed["data"].as_array().unwrap().len(), 0);
+}
+
 /// `GET /api/ips` must order results by `updated_at DESC` — the most recently added or
 /// re-registered record always sorts first, regardless of insertion order.
 #[tokio::test]

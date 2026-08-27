@@ -228,8 +228,10 @@ holds `can_read` on. Master sees everything.
 | `offset` | u64 | no | `0` | Page offset |
 | `format` | string | no | — | `iplist` returns a flat address list instead of full records |
 | `mode` | string | no | — | Synonym for `format` |
+| `include_total` | bool | no | `false` | Wrap the response in a `{data, total, limit, offset, total_pages}` envelope instead of the bare array. Ignored under `format=iplist`/`mode=iplist` |
 
-**Response `200`** — array of `IpRecordResponse`, ordered by `updated_at` descending:
+**Response `200`** — by default, an array of `IpRecordResponse`, ordered by `updated_at`
+descending:
 
 ```json
 [{
@@ -245,9 +247,33 @@ holds `can_read` on. Master sees everything.
 With `format=iplist` or `mode=iplist`, the shape is instead `{"ip_list": ["192.0.2.10", ...]}` —
 sorted and de-duplicated, skipping the per-row group lookup.
 
+With `include_total=true` (and no `format`/`mode=iplist`), the same array is returned under `data`,
+alongside pagination metadata:
+
+```json
+{
+  "data": [ /* IpRecordResponse[], identical shape and ordering to the bare-array response */ ],
+  "total": 3214,
+  "limit": 50,
+  "offset": 0,
+  "total_pages": 65
+}
+```
+
+`total` counts every record matching all other filters (RBAC scoping included) across every page,
+not just this one — it is a `COUNT(*)` over the same filtered query `data` is drawn from, taken
+before `limit`/`offset` apply. `total_pages` is `ceil(total / limit)`, and is `0` (not `1`) when
+`total` is `0` or `limit` is `0` — there is nothing to page through either way. `limit`/`offset`
+echo the effective values used for this response (`50`/`0` when omitted from the request).
+
+> **Backward compatible by construction.** `include_total` is opt-in and defaults to `false`,
+> so the root-array response every existing exporter/sync worker already parses is unchanged
+> unless a caller asks for the envelope.
+>
 > **Naming a group the caller cannot read is not an error.** It contributes nothing, exactly as a
 > nonexistent group would. Refusing would turn this endpoint into an existence oracle over group
-> names (§4).
+> names (§4). A non-master with no readable groups at all gets `total: 0`/`total_pages: 0` under
+> `include_total=true`, the same empty result the bare-array form returns as `[]`.
 >
 > `deleted_by` is withheld from non-masters even under `include_deleted`: §4 limits what one key may
 > learn about another to id, name, and rights on a *shared* resource.

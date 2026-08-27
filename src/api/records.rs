@@ -7,9 +7,9 @@ use axum::{Extension, extract::{Json, State}, response::IntoResponse};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, QueryFilter,
-    QueryOrder, QuerySelect, SqliteTransactionMode, TransactionOptions, TransactionTrait,
-    sea_query::OnConflict, SqlErr,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, SqliteTransactionMode, TransactionOptions,
+    TransactionTrait, sea_query::OnConflict, SqlErr,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -425,6 +425,12 @@ pub struct QueryFilters {
     /// discipline: answering `403` here would tell an unauthorised caller that the group exists,
     /// which is precisely the distinction §4 forbids a caller from drawing.
     pub include_deleted: Option<bool>,
+    /// Wrap the response in a `{"data": [...], "total": ..., "limit": ..., "offset": ...,
+    /// "total_pages": ...}` envelope instead of returning the bare array. `false`/omitted (the
+    /// default) keeps the historical root-array shape, so an existing client that expects `[...]`
+    /// is unaffected by this parameter's existence. Ignored under `format=iplist`/`mode=iplist`,
+    /// which has its own fixed `{"ip_list": [...]}` shape.
+    pub include_total: Option<bool>,
 }
 
 
@@ -470,6 +476,29 @@ pub struct IpRecordResponse {
 }
 
 
+/// Response envelope for `GET /api/ips?include_total=true`.
+///
+/// Opt-in via `include_total` rather than the default shape: the root array `[...]` is this
+/// endpoint's contract since before pagination metadata existed, and every exporter/sync worker
+/// polling it expects to deserialize a bare list. Switching the default would break every one of
+/// them silently; requiring the flag makes the wider shape something a client asks for.
+#[derive(Serialize)]
+pub struct IpRecordsEnvelope {
+    /// The page of records, identical in shape and ordering to the bare-array response.
+    pub data: Vec<IpRecordResponse>,
+    /// Total records matching every filter *except* `limit`/`offset` — i.e. across all pages, not
+    /// just this one. Scoped by the same RBAC/group filtering as `data`.
+    pub total: u64,
+    /// Echoes the effective `limit` this response was paginated with.
+    pub limit: u64,
+    /// Echoes the effective `offset` this response was paginated with.
+    pub offset: u64,
+    /// `ceil(total / limit)`, or `0` when `total` is `0` or `limit` is `0` (there is nothing, or
+    /// no page size to divide it by, either way no page count to report).
+    pub total_pages: u64,
+}
+
+
 /// Handles GET /api/v1/ips to list IP records
 pub async fn list_ips(
     State(state): State<AppState>,
@@ -499,6 +528,15 @@ pub async fn list_ips(
         query = query.filter(ip_record::Column::IsDeleted.eq(false));
     }
 
+    // Resolved up front so the early "no accessible groups" return below can build the same
+    // envelope shape the normal path does, instead of forcing that caller through a second
+    // request just to learn the page size it already asked for.
+    let format_iplist = matches!(filters.format.as_deref(), Some("iplist"))
+        || matches!(filters.mode.as_deref(), Some("iplist"));
+    let include_total = filters.include_total.unwrap_or(false) && !format_iplist;
+    let limit = filters.limit.unwrap_or(50);
+    let offset = filters.offset.unwrap_or(0);
+
     if !key.is_master {
         let accessible_groups: Vec<Uuid> = api_key_group_permission::Entity::find()
             .filter(
@@ -513,6 +551,16 @@ pub async fn list_ips(
             .collect();
 
         if accessible_groups.is_empty() {
+            if include_total {
+                return Ok(Json(IpRecordsEnvelope {
+                    data: Vec::new(),
+                    total: 0,
+                    limit,
+                    offset,
+                    total_pages: 0,
+                })
+                .into_response());
+            }
             return Ok(Json(Vec::<IpRecordResponse>::new()).into_response());
         }
 
@@ -629,8 +677,16 @@ pub async fn list_ips(
         query = query.filter(window);
     }
 
-    let limit = filters.limit.unwrap_or(50);
-    let offset = filters.offset.unwrap_or(0);
+    // Counted from a clone of the fully-filtered query, taken before `.order_by`/`.limit`/`.offset`
+    // are applied below — so it shares every filter and RBAC scope above with the page it counts,
+    // and nothing about pagination itself narrows it. `SelectTwo::count` wraps the query as
+    // `SELECT COUNT(*) FROM (<query without its own LIMIT/OFFSET>) AS sub_query`, which is exactly
+    // "how many rows would `data` cover across every page", not just this one.
+    let total = if include_total {
+        Some(query.clone().count(&state.db).await?)
+    } else {
+        None
+    };
 
     // Latest activity first: whichever record was most recently added or re-registered (a ban
     // "renewed" by a fresh match) sorts to the top, matching AGENT.MD's ordering requirement.
@@ -641,8 +697,6 @@ pub async fn list_ips(
         .all(&state.db)
         .await?;
 
-    let format_iplist = matches!(filters.format.as_deref(), Some("iplist"))
-        || matches!(filters.mode.as_deref(), Some("iplist"));
     if format_iplist {
         // Lightweight path: skip the per-row group lookup below entirely (not needed for a flat
         // address list), and de-duplicate — an address matched via multiple group memberships in
@@ -679,6 +733,11 @@ pub async fn list_ips(
             // deleted, never *which key* did it.
             deleted_by: if key.is_master { record.deleted_by } else { None },
         });
+    }
+
+    if let Some(total) = total {
+        let total_pages = if limit == 0 { 0 } else { total.div_ceil(limit) };
+        return Ok(Json(IpRecordsEnvelope { data: items, total, limit, offset, total_pages }).into_response());
     }
 
     Ok(Json(items).into_response())

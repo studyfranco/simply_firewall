@@ -9678,3 +9678,70 @@ was not asked for and is a judgement for whoever maintains that hierarchy.
 `cargo test` **347 passed**, 0 failed; `./scripts/test_e2e.sh` **756 checks passed**, 0 failed;
 `./scripts/verify_convergence.sh` **62 matching, 1 documented divergence, 0 unexplained**, exit 0.
 All unchanged from the previous round, as expected for a documentation-only commit.
+
+### Addendum 12 — `include_total` on `GET /api/ips`: an opt-in envelope, not a new default
+
+`QueryFilters` gained one field, `include_total: Option<bool>`. Default/`false` behaviour — the bare
+root array `[...]` — is untouched byte-for-byte; every exporter and sync worker that already parses
+that shape keeps working without noticing this round happened. Only `include_total=true` switches the
+response to `{"data": [...], "total", "limit", "offset", "total_pages"}`.
+
+**How the count shares the filters instead of duplicating them.** `list_ips` builds one `SelectTwo`
+query (the M:N join over `ip_record_group_membership`/`ip_record`), threading every filter —
+`include_deleted`, RBAC group-scoping, `groups`/`group_name`/`group_id`, `status`, `ip`, `cause`,
+`max_age`, `since` — onto it exactly as before. What changed is *when* pagination joins the query:
+`total` is now taken from `query.clone().count(&state.db)` **before** `.order_by`/`.limit`/`.offset`
+are applied, so the count and the page it describes are provably the same filtered set — there is no
+second, hand-written WHERE clause that could quietly drift from the first. `SelectTwo<E, F>`
+implementing `PaginatorTrait` (confirmed by reading `sea-orm 2.0.0`'s source directly, since the docs
+don't advertise it) is what makes this a `.clone()` and one call rather than a parallel query built by
+hand — worth recording because the obvious-looking alternative (a second `Entity::find().join(...)`
+mirroring every `.filter()` call above) is exactly the kind of duplication that drifts.
+
+**Edge cases, resolved once and reused everywhere `total` is produced:** `total_pages` is
+`total.div_ceil(limit)`, except `0` (not `1`) when `limit == 0` or `total == 0` — division by zero is
+avoided by the same branch that makes "there is nothing" render as "no pages" rather than "one empty
+page". The non-master, zero-accessible-groups early return (previously a bare `return Ok(Json(vec![]))`
+before any filter ran) now branches three ways instead of two: bare `[]` unchanged when
+`include_total` wasn't asked for, the zeroed envelope (`total: 0, total_pages: 0, data: []`) when it
+was, both **still `200`**, never `403` — widening this response shape must not regress the §4 oracle
+discipline Addendum 10 fixed. `format=iplist`/`mode=iplist` ignores `include_total` outright
+(computed as `include_total = filters.include_total.unwrap_or(false) && !format_iplist`) rather than
+erroring on the combination — the iplist shape has its own fixed contract and adding a `total`
+alongside a flat address array would be a shape nobody asked for.
+
+**Dashboard: extended the existing chunked-prefetch cache rather than replacing it.** `PagedCache`
+(driving the IP records, audit log, and executions tabs) fetches in 100-row chunks and infers
+"more on the server" from `chunk.length === chunkSize` — it has never known an exact total, only
+that its local page count is a lower bound with a trailing "+". Rather than rearchitect it into a
+classic offset/total pager (touching all three tabs, none of which asked for this), `fetchChunk`'s
+contract was widened to optionally return `{items, total}` instead of a bare array; `PagedCache`
+absorbs whichever shape comes back and remembers `serverTotal` if one was reported. Only
+`fetchIpsChunk` now sends `include_total=true` and returns the wider shape — `fetchAuditLogsChunk`/
+`fetchExecutionsChunk` are untouched and keep returning bare arrays, so `serverTotal` stays `null`
+for those two caches and their pagination footer renders exactly as before. Deliberately **not**
+touched: `totalLocalPages`, `hasNextPage`, and `goToPage`'s fetch-until-covered loop, all of which
+already worked correctly off the fetched-so-far item count and have no dependency on knowing the
+total up front — extending them was avoidable risk to logic that several rounds of use have already
+exercised. The one thing `serverTotal` changes is display: `updatePaginationUI()` shows the exact
+page count and a new `(N records)` label next to the pager instead of the old "N+" hedge, but only
+when `cache.filterFn` is unset — the client-side date-range upper bound (`date-to`, applied locally
+in `ipDateFilter()` because the API has no server-side upper-bound parameter) can shrink the visible
+set below what the server counted, and showing the server's total next to a filtered table would be
+wrong in exactly the cases where the filter does something.
+
+**Tests.** Three new integration tests: the envelope stays opt-in (bare array on omission *and* on
+explicit `include_total=false`); the envelope reports an accurate `total`/`total_pages` across pages,
+including the trailing partial page; and `total` respects RBAC group-read scoping — a non-master
+sees only the count of records in groups it can read, a master sees everything, and a key with no
+readable groups at all gets `total: 0` at `200`, never `403`. 24 new `test_e2e.sh` checks (§19b) cover
+the same three shapes live end to end, plus a dedicated zero-permission key to check the RBAC/oracle
+case against a real server rather than the in-process harness.
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` **350 passed**, 0 failed; `./scripts/test_e2e.sh` **780 checks passed**, 0 failed;
+`./scripts/verify_convergence.sh` **63 matching, 0 documented divergences, 0 unexplained**, exit 0 —
+the peer repos (`example/`) were `git pull`ed before this run and had picked up their own
+`API_REFERENCE.md` catalogs plus a `simply_hook_executor` change that resolved the one previously-
+documented divergence (its per-key `hmac_mode` retirement to `CANONICAL_V1`-only, foreshadowed in
+Addendum 11's Pillar 5 note); nothing in this round touched that file or that pillar.

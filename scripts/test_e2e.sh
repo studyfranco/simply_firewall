@@ -1450,6 +1450,50 @@ api_call GET "/api/ips?groups=ordering-e2e-group&mode=iplist" "$MASTER_KEY"
 check "200" "mode=iplist request succeeds"
 check_jq "(.ip_list | length)" "3" "same result via the mode= synonym"
 
+# ── 19b. include_total pagination envelope ──────────────────────────────────
+
+log_section "19b. GET /api/ips?include_total=true Pagination Envelope"
+
+log "Seeding 5 records in a dedicated group..."
+for n in 1 2 3 4 5; do
+    api_call POST "/api/ban" "$MASTER_KEY" "{\"target_address\":\"198.51.100.21${n}\",\"group_name\":\"include-total-e2e-group\"}"
+    check "200" "seed record #$n"
+done
+
+log "Without include_total, the response is still the bare root array..."
+api_call GET "/api/ips?groups=include-total-e2e-group" "$MASTER_KEY"
+check "200" "list without include_total"
+check_true '(. | type) == "array"' "the response is a bare array"
+check_jq "(. | length)" "5" "all 5 records are present"
+
+log "include_total=true wraps the same page in a {data,total,limit,offset,total_pages} envelope..."
+api_call GET "/api/ips?groups=include-total-e2e-group&limit=2&offset=0&include_total=true" "$MASTER_KEY"
+check "200" "list with include_total=true, page 1"
+check_true '(.data | type) == "array"' "the envelope's data field is an array"
+check_jq "(.data | length)" "2" "the page respects limit=2"
+check_jq ".total" "5" "total counts across every page, not just this one"
+check_jq ".limit" "2" "limit is echoed back"
+check_jq ".offset" "0" "offset is echoed back"
+check_jq ".total_pages" "3" "ceil(5 / 2) == 3"
+
+log "The last, partial page still reports the same total..."
+api_call GET "/api/ips?groups=include-total-e2e-group&limit=2&offset=4&include_total=true" "$MASTER_KEY"
+check "200" "list with include_total=true, last page"
+check_jq "(.data | length)" "1" "only 1 record remains at offset 4"
+check_jq ".total" "5" "total is unchanged by which page was requested"
+check_jq ".total_pages" "3" "total_pages is unchanged by which page was requested"
+
+log "A key with no readable groups at all gets a zeroed envelope, not an error..."
+api_call POST "/api/keys" "$MASTER_KEY" '{"name":"include_total_isolated_key","bound_ips":"0.0.0.0/0"}'
+check "200" "create a key with zero group grants"
+register_key_secret "$(echo "$RESP_BODY" | jq -r '.plaintext_key')" "$(echo "$RESP_BODY" | jq -r '.signing_secret')"
+ISOLATED_TOTAL_KEY=$(echo "$RESP_BODY" | jq -r '.plaintext_key')
+api_call GET "/api/ips?include_total=true" "$ISOLATED_TOTAL_KEY"
+check "200" "an isolated key still gets 200, never 403 (RBAC_MODEL.md §4 oracle discipline)"
+check_jq ".total" "0" "an isolated key counts nothing, including the 5 records seeded above"
+check_jq ".total_pages" "0" "total_pages is 0, not 1, when total is 0"
+check_jq "(.data | length)" "0" "data is an empty array, not omitted"
+
 # ── 20. Readable audit log details (human-readable key names) ──────────────
 
 log_section "20. Readable Audit Log Details"

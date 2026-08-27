@@ -237,7 +237,10 @@ class PagedCache {
     constructor({ chunkSize = 100, pageSize = 15, fetchChunk }) {
         this.chunkSize = chunkSize;
         this.pageSize = pageSize;
-        this.fetchChunk = fetchChunk; // async (serverOffset, chunkSize) => Array<item>
+        // async (serverOffset, chunkSize) => Array<item>, or => {items: Array<item>, total: number}
+        // when the fetcher can report an exact server-side count (currently only the IP records
+        // tab's `include_total=true` fetch does) — see `_absorbChunk`.
+        this.fetchChunk = fetchChunk;
         this.reset();
     }
 
@@ -248,6 +251,19 @@ class PagedCache {
         this.localPage = 0;
         this.prefetching = null; // in-flight prefetch promise, if any
         this._visible = null;    // memoized filter result, invalidated whenever items change
+        // Exact total reported by the server's `include_total` envelope, if the fetcher provides
+        // one. `null` means "unknown" — the fetched-so-far estimate (`totalLocalPages`) is all
+        // there is, same as before this existed.
+        this.serverTotal = null;
+    }
+
+    // Normalizes a `fetchChunk` result into a plain item array, capturing `total` along the way
+    // when the fetcher reported one. Kept separate from `fetchChunk` itself so `loadFirstChunk`/
+    // `fetchNextChunk` don't each need to know both response shapes.
+    _absorbChunk(result) {
+        if (Array.isArray(result)) return result;
+        if (result && typeof result.total === 'number') this.serverTotal = result.total;
+        return result?.items ?? [];
     }
 
     // Changes how many rows a local page holds, keeping the user roughly where they were: the
@@ -303,7 +319,7 @@ class PagedCache {
         const filterFn = this.filterFn;
         this.reset();
         this.filterFn = filterFn; // survives a reload: it describes the view, not the data
-        const chunk = await this.fetchChunk(0, this.chunkSize);
+        const chunk = this._absorbChunk(await this.fetchChunk(0, this.chunkSize));
         this.items = chunk;
         this._visible = null;
         this.serverOffset = chunk.length;
@@ -316,7 +332,7 @@ class PagedCache {
         if (!this.hasMoreOnServer) return;
         if (this.prefetching) return this.prefetching;
         this.prefetching = (async () => {
-            const chunk = await this.fetchChunk(this.serverOffset, this.chunkSize);
+            const chunk = this._absorbChunk(await this.fetchChunk(this.serverOffset, this.chunkSize));
             this.items = [...this.items, ...chunk];
             this._visible = null;
             this.serverOffset += chunk.length;
@@ -1034,7 +1050,7 @@ class FirewallClient {
         const causeQ = document.getElementById('cause-filter').value;
         const statQ = document.getElementById('status-filter').value;
 
-        const params = new URLSearchParams({ limit, offset });
+        const params = new URLSearchParams({ limit, offset, include_total: 'true' });
         if (ipQ) params.append('ip', ipQ);
         if (groupQ) params.append('group_name', groupQ);
         if (causeQ) params.append('cause', causeQ);
@@ -1053,7 +1069,12 @@ class FirewallClient {
             }
         }
 
-        return await this.apiFetch(`/ips?${params.toString()}`);
+        // `include_total=true` above wraps the response as `{data, total, ...}` instead of the
+        // bare array `GET /api/ips` returns by default; re-shaped here to the `{items, total}`
+        // form `PagedCache._absorbChunk` expects, so PagedCache itself stays ignorant of which
+        // tab's fetcher happens to report an exact count.
+        const body = await this.apiFetch(`/ips?${params.toString()}`);
+        return { items: body.data ?? [], total: body.total };
     }
 
     // Client-side half of the date range: the upper bound. Returns null when no bound is set, so
@@ -1697,7 +1718,16 @@ class FirewallClient {
     updatePaginationUI() {
         const cache = this.ipCache;
         const page = cache.localPage + 1;
-        const total = cache.totalLocalPages;
+
+        // `GET /api/ips?include_total=true` reports an exact server-side count, but only trust it
+        // while nothing is being excluded client-side: the date range's upper bound (`date-to`) is
+        // applied locally in `ipDateFilter()`, and the server total counts rows before that filter
+        // runs. With no client-side filter active, `visibleItems` and the server's count describe
+        // the same set, so the exact figure is safe to show instead of the fetched-so-far estimate.
+        const exactTotal = cache.serverTotal !== null && !cache.filterFn;
+        const total = exactTotal
+            ? Math.max(1, Math.ceil(cache.serverTotal / cache.pageSize))
+            : cache.totalLocalPages;
 
         // The conflict view lists every match at once rather than paging, so its controls would do
         // nothing. Disabled rather than hidden: a control that vanishes and reappears is more
@@ -1717,9 +1747,17 @@ class FirewallClient {
         input.max = String(total);
 
         // A trailing "+" is the honest rendering of a total that isn't known yet: pages are counted
-        // from what has been fetched so far, and more may still be on the server. Claiming a precise
-        // total would mean either lying or fetching the entire table to count it.
-        document.getElementById('page-total').textContent = cache.hasMoreOnServer ? `${total}+` : `${total}`;
+        // from what has been fetched so far, and more may still be on the server. Once the server
+        // has reported an exact count (and nothing client-side is hiding rows from it), there is
+        // nothing left to hedge.
+        document.getElementById('page-total').textContent =
+            exactTotal || !cache.hasMoreOnServer ? `${total}` : `${total}+`;
+
+        const recordsTotal = document.getElementById('records-total');
+        recordsTotal.hidden = !exactTotal;
+        if (exactTotal) {
+            recordsTotal.textContent = `(${cache.serverTotal.toLocaleString()} record${cache.serverTotal === 1 ? '' : 's'})`;
+        }
 
         // Date filtering is client-side for the upper bound, so the visible count can be smaller
         // than what was fetched — surface that rather than leaving an unexplained short page.
