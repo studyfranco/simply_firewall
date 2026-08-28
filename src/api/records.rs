@@ -7,9 +7,9 @@ use axum::{Extension, extract::{Json, State}, response::IntoResponse};
 use chrono::Utc;
 use ipnetwork::IpNetwork;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, SqliteTransactionMode, TransactionOptions,
-    TransactionTrait, sea_query::OnConflict, SqlErr,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, Condition, EntityTrait, JoinType,
+    QueryFilter, QueryOrder, QuerySelect, RelationTrait, SqliteTransactionMode,
+    TransactionOptions, TransactionTrait, sea_query::{Expr, Func, OnConflict}, SqlErr,
 };
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -499,6 +499,23 @@ pub struct IpRecordsEnvelope {
 }
 
 
+/// The empty-result shape for [`list_ips`], in whichever response form the caller asked for.
+///
+/// Shared by every early return that already knows the answer is "nothing" before a data query
+/// ever runs — a non-master with no readable groups at all, or a set of group filters that
+/// intersect to nothing — so the three response shapes (`iplist`, the `include_total` envelope,
+/// the bare array) can never drift out of sync with what the equivalent non-empty response looks
+/// like for the same request.
+fn empty_ips_response(format_iplist: bool, include_total: bool, limit: u64, offset: u64) -> axum::response::Response {
+    if format_iplist {
+        return Json(serde_json::json!({ "ip_list": Vec::<String>::new() })).into_response();
+    }
+    if include_total {
+        return Json(IpRecordsEnvelope { data: Vec::new(), total: 0, limit, offset, total_pages: 0 }).into_response();
+    }
+    Json(Vec::<IpRecordResponse>::new()).into_response()
+}
+
 /// Handles GET /api/v1/ips to list IP records
 pub async fn list_ips(
     State(state): State<AppState>,
@@ -507,7 +524,7 @@ pub async fn list_ips(
 ) -> Result<impl IntoResponse, AppError> {
 
     // Manual join fetching because of M:N
-    let mut query = ip_record_group_membership::Entity::find()
+    let query = ip_record_group_membership::Entity::find()
         .find_also_related(ip_record::Entity);
 
     // Soft-deleted records are excluded unless the caller asks for them. Applied here, before every
@@ -523,22 +540,40 @@ pub async fn list_ips(
     // What is *not* done here is equally deliberate: no caller is refused for naming a group it
     // cannot read. Such a group simply contributes nothing, exactly as a nonexistent one would.
     // Refusing would turn this endpoint into an existence oracle over group names, which §4 forbids.
+    // Resolved up front so every early return below can build the same response shape the normal
+    // path would, instead of forcing the caller through a second request just to learn the page
+    // size or format it already asked for.
     let include_deleted = filters.include_deleted.unwrap_or(false);
-    if !include_deleted {
-        query = query.filter(ip_record::Column::IsDeleted.eq(false));
-    }
-
-    // Resolved up front so the early "no accessible groups" return below can build the same
-    // envelope shape the normal path does, instead of forcing that caller through a second
-    // request just to learn the page size it already asked for.
     let format_iplist = matches!(filters.format.as_deref(), Some("iplist"))
         || matches!(filters.mode.as_deref(), Some("iplist"));
     let include_total = filters.include_total.unwrap_or(false) && !format_iplist;
     let limit = filters.limit.unwrap_or(50);
     let offset = filters.offset.unwrap_or(0);
 
+    // Every filter below is accumulated into one `Condition` instead of chained onto `query`
+    // directly, so the exact same condition can be applied to both the data query and (when
+    // `include_total` asks for one) the count query further down. Two independently maintained
+    // `.filter()` chains covering "the same" rows is exactly how a count and the page it describes
+    // drift apart over time — sharing one `Condition` makes that impossible by construction rather
+    // than by discipline.
+    let mut condition = Condition::all();
+
+    if !include_deleted {
+        condition = condition.add(ip_record::Column::IsDeleted.eq(false));
+    }
+
+    // Every `group_id` constraint — RBAC read-scoping, the `groups`/`group_name`/`group_id`
+    // params, and `status` — is collected as its own set here and intersected in Rust, rather than
+    // chained onto the query as separate `IN (...)` clauses on the same column. Both forms are
+    // correct SQL (ANDing several `IN` clauses on one column *is* their intersection), but a
+    // caller can supply more than one of these at once, and computing the intersection here —
+    // rather than asking the query planner to discover it during execution — means a request whose
+    // accessible groups and requested groups don't overlap gets answered without touching the
+    // database at all, the same shortcut the "no accessible groups" case below already took.
+    let mut group_constraints: Vec<std::collections::HashSet<Uuid>> = Vec::new();
+
     if !key.is_master {
-        let accessible_groups: Vec<Uuid> = api_key_group_permission::Entity::find()
+        let accessible_groups: std::collections::HashSet<Uuid> = api_key_group_permission::Entity::find()
             .filter(
                 Condition::all()
                     .add(api_key_group_permission::Column::ApiKeyId.eq(key.id))
@@ -551,20 +586,10 @@ pub async fn list_ips(
             .collect();
 
         if accessible_groups.is_empty() {
-            if include_total {
-                return Ok(Json(IpRecordsEnvelope {
-                    data: Vec::new(),
-                    total: 0,
-                    limit,
-                    offset,
-                    total_pages: 0,
-                })
-                .into_response());
-            }
-            return Ok(Json(Vec::<IpRecordResponse>::new()).into_response());
+            return Ok(empty_ips_response(format_iplist, include_total, limit, offset));
         }
 
-        query = query.filter(ip_record_group_membership::Column::GroupId.is_in(accessible_groups));
+        group_constraints.push(accessible_groups);
     }
 
     // `groups` (comma-separated) and `group_name` (single) both narrow by group name.
@@ -582,7 +607,7 @@ pub async fn list_ips(
     }
     // `group_id` narrows the same way, just by ID instead of by name; combined with any
     // name-based matches above using OR semantics (both are just ways to pick "these groups").
-    let mut gids: Vec<Uuid> = Vec::new();
+    let mut gids: std::collections::HashSet<Uuid> = std::collections::HashSet::new();
     let mut group_filter_requested = false;
     if !group_names.is_empty() {
         group_filter_requested = true;
@@ -597,10 +622,10 @@ pub async fn list_ips(
     }
     if let Some(gid) = filters.group_id {
         group_filter_requested = true;
-        gids.push(gid);
+        gids.insert(gid);
     }
     if group_filter_requested {
-        query = query.filter(ip_record_group_membership::Column::GroupId.is_in(gids));
+        group_constraints.push(gids);
     }
 
     if let Some(status) = &filters.status
@@ -611,14 +636,27 @@ pub async fn list_ips(
             "white" | "whitelist" => "whitelist",
             other => return Err(AppError::InvalidInput(format!("Invalid status filter: {other}"))),
         };
-        let gids: Vec<Uuid> = ip_group::Entity::find()
+        let gids: std::collections::HashSet<Uuid> = ip_group::Entity::find()
             .filter(ip_group::Column::GroupType.eq(group_type))
             .all(&state.db)
             .await?
             .into_iter()
             .map(|g| g.id)
             .collect();
-        query = query.filter(ip_record_group_membership::Column::GroupId.is_in(gids));
+        group_constraints.push(gids);
+    }
+
+    if !group_constraints.is_empty() {
+        // Popping the first set as the accumulator and retaining against the rest computes the
+        // intersection of all of them without an extra allocation per constraint.
+        let mut intersected = group_constraints.pop().expect("just checked non-empty");
+        for set in &group_constraints {
+            intersected.retain(|g| set.contains(g));
+        }
+        if intersected.is_empty() {
+            return Ok(empty_ips_response(format_iplist, include_total, limit, offset));
+        }
+        condition = condition.add(ip_record_group_membership::Column::GroupId.is_in(intersected));
     }
 
     if let Some(ip) = &filters.ip
@@ -628,18 +666,18 @@ pub async fn list_ips(
         // caller pastes "188.190.74.128/32" to look up a record stored as the bare host form),
         // normalize it so the substring match still finds it. A genuine partial fragment like
         // "74.128" doesn't parse and passes through unchanged, preserving substring search.
-        query = query.filter(ip_record::Column::TargetAddress.contains(normalize_ip_or_cidr(ip.trim())));
+        condition = condition.add(ip_record::Column::TargetAddress.contains(normalize_ip_or_cidr(ip.trim())));
     }
 
     if let Some(cause) = &filters.cause
         && !cause.is_empty()
     {
-        query = query.filter(ip_record::Column::Cause.contains(cause.trim()));
+        condition = condition.add(ip_record::Column::Cause.contains(cause.trim()));
     }
 
     if let Some(age) = filters.max_age {
         let threshold = Utc::now().naive_utc() - chrono::Duration::seconds(age);
-        query = query.filter(ip_record::Column::LastSeenAt.gte(threshold));
+        condition = condition.add(ip_record::Column::LastSeenAt.gte(threshold));
     }
 
     // The differential-sync cutoff. Two columns can put a record on the near side of it, and using
@@ -674,28 +712,63 @@ pub async fn list_ips(
                     .add(ip_record::Column::DeletedAt.gte(threshold)),
             );
         }
-        query = query.filter(window);
+        condition = condition.add(window);
     }
 
-    // Counted from a clone of the fully-filtered query, taken before `.order_by`/`.limit`/`.offset`
-    // are applied below — so it shares every filter and RBAC scope above with the page it counts,
-    // and nothing about pagination itself narrows it. `SelectTwo::count` wraps the query as
-    // `SELECT COUNT(*) FROM (<query without its own LIMIT/OFFSET>) AS sub_query`, which is exactly
-    // "how many rows would `data` cover across every page", not just this one.
-    let total = if include_total {
-        Some(query.clone().count(&state.db).await?)
-    } else {
-        None
-    };
+    // Count and page share one transaction whenever both are needed, so a write landing between
+    // the two queries cannot make `total` describe a different snapshot than `data` does. A plain
+    // (deferred) transaction takes no lock for read-only statements, so this only costs one held
+    // connection across two round trips instead of two separately-pooled ones — not the
+    // `Immediate` write-lock pattern the mutating handlers in this file use.
+    //
+    // No subquery, no column projection beyond the count itself: the historical
+    // `PaginatorTrait::count()` wraps the fully-projected two-entity join in
+    // `SELECT COUNT(*) FROM (<12-column SELECT ... FROM ... LEFT JOIN ...>) AS sub_query`, which
+    // makes SQLite materialize every matched row's columns just to discard them. This instead
+    // drives the count directly off a single-entity `Select`, the same `.select_only()` +
+    // typed-tuple pattern `readiness_check` (`src/api/health.rs`) already uses for its own
+    // as-cheap-as-possible probe query.
+    let (total, memberships) = if include_total {
+        let txn = state.db.begin().await?;
 
-    // Latest activity first: whichever record was most recently added or re-registered (a ban
-    // "renewed" by a fresh match) sorts to the top, matching AGENT.MD's ordering requirement.
-    let memberships = query
-        .order_by_desc(ip_record::Column::UpdatedAt)
-        .limit(limit)
-        .offset(offset)
-        .all(&state.db)
-        .await?;
+        let count: Option<i64> = ip_record_group_membership::Entity::find()
+            .join(JoinType::LeftJoin, ip_record_group_membership::Relation::IpRecord.def())
+            .filter(condition.clone())
+            .select_only()
+            .expr_as(
+                Func::count(Expr::col((
+                    ip_record_group_membership::Entity,
+                    ip_record_group_membership::Column::IpRecordId,
+                ))),
+                "row_count",
+            )
+            .into_tuple::<i64>()
+            .one(&txn)
+            .await?;
+        let total = count.unwrap_or(0).max(0) as u64;
+
+        // Latest activity first: whichever record was most recently added or re-registered (a ban
+        // "renewed" by a fresh match) sorts to the top, matching AGENT.MD's ordering requirement.
+        let page = query
+            .filter(condition)
+            .order_by_desc(ip_record::Column::UpdatedAt)
+            .limit(limit)
+            .offset(offset)
+            .all(&txn)
+            .await?;
+
+        txn.commit().await?;
+        (Some(total), page)
+    } else {
+        let page = query
+            .filter(condition)
+            .order_by_desc(ip_record::Column::UpdatedAt)
+            .limit(limit)
+            .offset(offset)
+            .all(&state.db)
+            .await?;
+        (None, page)
+    };
 
     if format_iplist {
         // Lightweight path: skip the per-row group lookup below entirely (not needed for a flat

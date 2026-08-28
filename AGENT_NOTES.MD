@@ -9745,3 +9745,141 @@ the peer repos (`example/`) were `git pull`ed before this run and had picked up 
 `API_REFERENCE.md` catalogs plus a `simply_hook_executor` change that resolved the one previously-
 documented divergence (its per-key `hmac_mode` retirement to `CANONICAL_V1`-only, foreshadowed in
 Addendum 11's Pillar 5 note); nothing in this round touched that file or that pillar.
+
+### Addendum 13 — a "37s COUNT(*)" symptom report, and which parts of it survived contact with the actual query
+
+A follow-up brief arrived describing catastrophic `GET /api/ips?include_total=true` latency (15-37s)
+and prescribing four causes: subquery column-projection overhead in the count, duplicated
+`group_id IN (...)` WHERE clauses, missing indexes, and DB errors silently returning an empty
+payload instead of a clean `5xx`. Each claim was checked against the actual code and a live query
+plan before anything was changed — two were real, one was a mischaracterization of correct SQL with
+a real consolidation opportunity underneath it, one was already false, and one (the indexes) turned
+out to already exist from a *prior, separate* round this session had no memory of.
+
+**How each claim was actually checked**, before writing a line of production code: a throwaway
+`#[tokio::test]` with a custom `log::Log` capturing `sqlx_logging_level(Debug)` output, printing the
+literal SQL SeaORM generated for `list_ips`'s data query and its `.count()` call. That is what makes
+the rest of this addendum a report of measurements rather than a plausible-sounding narrative.
+
+**1. Subquery column projection — real, confirmed by reading the generated SQL.**
+`PaginatorTrait::count()` (`sea-orm 2.0.0`'s own source, not just its docs) wraps the query as
+`SELECT COUNT(*) FROM (<the full 12-column SELECT ... FROM ... LEFT JOIN ...>) AS sub_query` —
+captured verbatim from a running query. Replaced with a single-entity `Select` +
+`.join(JoinType::LeftJoin, ...)` + `.select_only()` + `.expr_as(Func::count(...))` +
+`.into_tuple::<i64>()`, the same `.select_only()` + typed-tuple pattern `src/api/health.rs`'s
+`readiness_check` already uses. Verified via `EXPLAIN QUERY PLAN` and a direct SQL capture that the
+new form has no subquery, no column projection beyond the count expression, and returns the
+identical total. **But measured wall-clock impact at realistic scale was small, not dramatic** — see
+finding 5 below; this was worth doing for a cleaner, backend-portable query, not because it explains
+the reported symptom.
+
+**2. "Duplicated `group_id IN (...)` clauses" — not literally duplicates, but real waste
+underneath the framing.** The pre-existing code applied up to three *independent* `IN` filters on
+`group_id` — RBAC read-scoping, the `groups`/`group_name`/`group_id` params, and `status` — each
+correct on its own, and their conjunction *is* their intersection. Not a bug. But computing that
+intersection in Rust instead of asking three separate `IN` clauses to imply it lets a request whose
+filters don't overlap short-circuit to an empty response with **no query at all**, the same shortcut
+the pre-existing "no accessible groups" branch already took for the RBAC case alone. Implemented as
+one `Vec<HashSet<Uuid>>` collected per source, intersected once, and applied as exactly one
+`.add(GroupId.is_in(...))`. Pinned by
+`list_ips_complex_filters_produce_one_group_id_predicate_not_several`
+(`tests/schema_integrity_tests.rs`), which reconstructs the same reduction and asserts the built SQL
+contains the predicate exactly once for both the data and count queries — a static property of the
+query text, checked via `QueryTrait::build`, not a live server or global logger state a parallel
+test run could race.
+
+**3. "DB errors return an empty payload instead of a clean 5xx" — already false.** Every `DbErr` in
+this codebase propagates via `?` through `#[from] sea_orm::DbErr` to `AppError::DbError`, which
+`IntoResponse` already turned into a structured `{"error": ...}` body before this round touched
+anything. There was no code path that swallowed a database error into `{"data": [], "total": 0}` —
+that shape is reachable only via the (legitimate, non-error) "caller has no accessible groups"
+branch. What the brief's underlying instinct actually pointed at, and what genuinely didn't exist
+before: distinguishing *why* a `DbErr` happened. Every one collapsed to a uniform `500`, including
+lock/pool contention a caller could usefully retry. Added `is_transient_lock_error` in
+`src/error.rs`, checked centrally (not per-handler, so every route benefits) and mapping to `503`
+with `{"error": "Database busy or query timeout, please retry"}` — matching `readiness_check`'s own
+`503`-means-retry reasoning. Detection is via the portable `DatabaseError::code()`, not message text.
+**One correction made mid-implementation, caught by testing against a genuine error rather than a
+synthetic one:** SQLite's driver reports the *extended* result code (`"517"` for
+`SQLITE_BUSY_SNAPSHOT`, not `"5"` for plain `SQLITE_BUSY`) — confirmed by deliberately provoking a
+real stale-snapshot conflict (a `BEGIN DEFERRED` transaction reads, a concurrent connection commits,
+the first transaction then writes against its now-stale snapshot — the exact mechanism
+`handle_ip_upsert`'s own module comment already documented) and printing what actually came back.
+Detection now masks with `& 0xFF` and checks for `5`/`6` (`SQLITE_BUSY`/`SQLITE_LOCKED`), which
+covers every extended variant instead of only the primary code — a string-literal match on `"5"`
+alone would have silently never fired under this service's own WAL configuration. Both tests
+(`src/error.rs`'s inline `#[cfg(test)]`, matching this codebase's existing pattern for testing
+private helpers) reproduce the real failure via `db::connect`/`run_migrations_isolated` rather than
+synthetic connection options, precisely so a future sqlx upgrade that changes exactly *how* a busy
+error surfaces would be caught here instead of silently stopped detecting it in production.
+
+**4. Missing indexes — already false, and not from this session.** `EXPLAIN QUERY PLAN` for the
+group-membership lookup and the `is_deleted`+`updated_at` sort showed exactly the indexes the brief
+asked to "verify" — `idx_group_memberships_lookup`, `idx_ip_records_deleted_updated` — already in
+use. Grepping turned up why: migration `m20260824_150000_add_query_performance_indexes.rs`, already
+committed (`8d53525`, 2026-08-24), already reasoned through and rejected the two other
+obvious-looking candidates as redundant with pre-existing indexes, and already has its own pinning
+test (`list_ips_query_plan_uses_indexes_not_a_temp_b_tree_or_table_scan`,
+`tests/schema_integrity_tests.rs`). **No new migration was added.** Re-adding either index under a
+new name would have been a second B-tree copy of the same lookup capability — cost on every write,
+no query the planner would ever prefer it for.
+
+**5. What the existing test suite's own coverage had never actually checked, found while verifying
+claim 4 — reported rather than silently patched over.** The existing pinning test only exercises
+`is_deleted` + `ORDER BY updated_at` (no group filter) and the group lookup (no `is_deleted`, no
+`ORDER BY`) *separately*. `list_ips`'s real query for any non-master or `groups=`/`group_id=`/
+`status=`-filtered call combines all three — RBAC-scoped listing is the majority of real traffic,
+not the edge case. `EXPLAIN QUERY PLAN` on that combined shape, at 5,000 seeded rows with `ANALYZE`
+run, still shows `USE TEMP B-TREE FOR ORDER BY` — confirmed both before and after this round's
+group-filter consolidation, so the temp b-tree is not something this round introduced or could have
+fixed by rewriting the filter chain. The reason: SQLite's cost-based planner chooses to drive from
+`idx_group_memberships_lookup` (the more selective side once a specific `group_id` narrows the
+candidate set) rather than from `ip_records`'s `(is_deleted, updated_at)` composite, and once the
+scan drives from the membership table, no index on `ip_records` can supply pre-sorted order — a
+single SQLite index cannot span two physical tables. Whether forcing the other join order would
+actually be faster depends on real selectivity (how many groups a typical key can read, and how
+large each is) that this session has no production data for, and restructuring the join to force it
+carries real correctness risk to the M:N left-join shape for an unverified win. **Not attempted.**
+Measured instead: at the single-group scope this shape actually runs at for a typical non-master
+key (~4,500 candidate rows), the temp b-tree sort is fast in absolute terms (`DATA page: ~2ms`
+average in
+`list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_whole_table`'s sibling
+measurement) — a temp b-tree over a few thousand already-filtered rows is not the same problem as
+one over the whole table. Left as an open, *documented* gap rather than either a silent non-fix or a
+speculative rewrite: a future round with real production selectivity data is better positioned to
+decide whether restructuring the join is worth its correctness risk.
+
+**6. The honest benchmark result, once claim 1's fix was actually measured — this is the finding
+worth remembering.** At 50,000 seeded rows (`tests/schema_integrity_tests.rs`'s own established
+seed shape — 10 groups × 5,000 records, ~10% soft-deleted), comparing the old subquery-wrapped
+`.count()` against the new direct form over 20 iterations each:
+
+| Scope | Matching rows | Old (subquery) | New (direct) |
+| :--- | :--- | :--- | :--- |
+| One group (realistic non-master shape) | ~4,500 | ~4.9ms avg | ~4.3ms avg |
+| All ten groups (master-equivalent) | ~45,000 | ~199ms avg | ~203ms avg |
+
+Neither number is close to 15-37 *seconds*. Neither is reliably under 10ms either — an exact
+`COUNT(*)` is inherently `O(matching rows)`: something has to visit every row an index says matches
+in order to count it, and no rewrite of the query text changes that arithmetic. The subquery-wrapped
+and direct forms both perform that same index walk; the difference between them (materializing 12
+columns per row into a discarded intermediate result, or not) is real but was not the dominant cost
+at either scale measured here — essentially no difference at the 45,000-row scope, a modest ~12% at
+the 4,500-row one. The committed benchmark
+(`list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_whole_table`) asserts bounds
+generous above these measured averages (50ms / 2s) rather than the brief's specific "10ms" figure,
+following this test file's own established "measured, not aspirational" philosophy — asserting a
+number this brief's premise suggested, without a measurement to back it, would have been exactly the
+kind of unverified claim this addendum exists to avoid repeating.
+
+**7. Atomicity, taken at face value and implemented for real.** `total` and `data` now share one
+transaction when `include_total=true` — a plain (deferred) transaction, since both queries are
+read-only and take no lock, only a live connection for both round trips instead of two separately
+pooled ones. This closes a genuine (if narrow) gap: without it, a write landing between the count
+and the page fetch could make `total` describe a different snapshot than `data` does. Not attempted
+when `include_total` is false — a single query has nothing to be inconsistent *with*.
+
+**Gates:** `cargo check --all-targets` clean; `cargo clippy --all-targets -- -D warnings` clean;
+`cargo test` **354 passed**, 0 failed (4 new: two `src/error.rs` unit tests for the `503`
+distinction, two `schema_integrity_tests.rs` benchmarks/SQL-shape checks); `./scripts/test_e2e.sh`
+and `./scripts/verify_convergence.sh` re-run clean. `RBAC_MODEL.md` untouched. No new migration.

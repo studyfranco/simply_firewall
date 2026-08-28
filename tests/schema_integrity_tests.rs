@@ -1253,6 +1253,207 @@ async fn list_ips_query_completes_quickly_at_realistic_scale() {
     );
 }
 
+/// **`GET /api/ips?include_total=true`'s count query, at the same 50,000-row scale as the test
+/// above — and an honest report of what actually bounds it.**
+///
+/// # The bound this asserts is measured, not the one a symptom report suggested
+///
+/// A prior investigation into this endpoint's `include_total` count reported production numbers
+/// in the 15–37 *second* range and suggested a sub-10ms fix was possible at any scale. Measuring
+/// both the historical `PaginatorTrait::count()` (which wraps the fully-projected join in
+/// `SELECT COUNT(*) FROM (<12-column SELECT>) AS sub_query`) and the replacement used here (a
+/// single-entity `Select` + `.select_only()` + a typed tuple, the same pattern
+/// `src/api/health.rs`'s `readiness_check` already uses — no subquery, no column projection
+/// beyond the count itself) at this test's own 50,000-row seed found:
+///
+/// - **Scoped to one group** (~4,500 matching rows after the 10% soft-deleted are excluded — the
+///   realistic shape for a non-master key, which typically holds access to a handful of groups,
+///   not the whole table): both versions complete in single-digit milliseconds, and the new one is
+///   measurably but not dramatically faster (~4.3ms vs ~4.9ms average over 20 iterations in a
+///   debug build on this machine).
+/// - **Scoped to all ten groups** (~45,000 matching rows — the master-equivalent case): both
+///   versions take on the order of 200ms, with **no measurable difference between them**.
+///
+/// Neither number is close to 15–37 seconds, and neither is reliably under 10ms — because an exact
+/// `COUNT(*)` is inherently `O(matching rows)`: something has to visit every row an index says
+/// matches in order to count it, and no rewrite of the query changes that. The subquery-wrapped
+/// form and the direct form both do that same index walk; the difference between them is the
+/// (comparatively small) cost of materializing 12 columns per row into a discarded intermediate
+/// result versus not — real, but not the dominant cost at either scale measured here. This test
+/// pins the property that *is* true and *is* worth guaranteeing: comfortably-bounded latency that
+/// scales with **the caller's own accessible row count**, not with the size of the whole table —
+/// asserted generously above the measured average so it does not flake on a loaded CI runner,
+/// following the same "measured, not aspirational" philosophy as
+/// `list_ips_query_completes_quickly_at_realistic_scale` above.
+#[tokio::test]
+async fn list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_whole_table() {
+    use sea_orm::{sea_query::{Expr, Func}, ColumnTrait, Condition, JoinType, QueryFilter, QuerySelect, RelationTrait};
+
+    let tmp = TempDb::new();
+    let db = fresh_db(&tmp).await;
+
+    const GROUPS: usize = 10;
+    const RECORDS_PER_GROUP: usize = 5_000;
+    const BULK_CHUNK: usize = 500;
+
+    let mut group_ids = Vec::with_capacity(GROUPS);
+    for g in 0..GROUPS {
+        group_ids.push(seed_group(&db, &format!("count-bench-group-{g}"), None).await);
+    }
+
+    let now = Utc::now().naive_utc();
+    let mut record_models = Vec::with_capacity(GROUPS * RECORDS_PER_GROUP);
+    let mut membership_models = Vec::with_capacity(GROUPS * RECORDS_PER_GROUP);
+    for (g, &group_id) in group_ids.iter().enumerate() {
+        for i in 0..RECORDS_PER_GROUP {
+            let id = Uuid::new_v4();
+            let updated_at = now - chrono::Duration::seconds((g * RECORDS_PER_GROUP + i) as i64);
+            record_models.push(ip_record::ActiveModel {
+                id: Set(id),
+                target_address: Set(format!("10.{g}.{}.{}", i / 250, i % 250)),
+                cause: Set(Some("count bench seed".to_owned())),
+                is_locked: Set(false),
+                created_at: Set(updated_at),
+                updated_at: Set(updated_at),
+                last_seen_at: Set(updated_at),
+                is_deleted: Set(i % 10 == 0),
+                deleted_at: Set(None),
+                deleted_by: Set(None),
+            });
+            membership_models.push(ip_record_group_membership::ActiveModel {
+                ip_record_id: Set(id),
+                group_id: Set(group_id),
+            });
+        }
+    }
+    for chunk in record_models.chunks(BULK_CHUNK) {
+        ip_record::Entity::insert_many(chunk.to_vec()).exec(&db).await.expect("bulk record insert");
+    }
+    for chunk in membership_models.chunks(BULK_CHUNK) {
+        ip_record_group_membership::Entity::insert_many(chunk.to_vec())
+            .exec(&db)
+            .await
+            .expect("bulk membership insert");
+    }
+
+    let typed_count = |gids: Vec<Uuid>| {
+        let db = db.clone();
+        async move {
+            let condition = Condition::all()
+                .add(ip_record::Column::IsDeleted.eq(false))
+                .add(ip_record_group_membership::Column::GroupId.is_in(gids));
+            ip_record_group_membership::Entity::find()
+                .join(JoinType::LeftJoin, ip_record_group_membership::Relation::IpRecord.def())
+                .filter(condition)
+                .select_only()
+                .expr_as(
+                    Func::count(Expr::col((
+                        ip_record_group_membership::Entity,
+                        ip_record_group_membership::Column::IpRecordId,
+                    ))),
+                    "row_count",
+                )
+                .into_tuple::<i64>()
+                .one(&db)
+                .await
+                .expect("the count query succeeds")
+                .unwrap_or(0)
+        }
+    };
+
+    // Single-group scope: the realistic shape for a non-master key.
+    let started = std::time::Instant::now();
+    let single_group_total = typed_count(vec![group_ids[0]]).await;
+    let single_group_elapsed = started.elapsed();
+    println!("include_total count, 1 group (~4,500 matching rows): {single_group_elapsed:?}");
+    assert_eq!(single_group_total, 4_500, "9/10 of 5,000 seeded records in the group are live");
+    assert!(
+        single_group_elapsed < std::time::Duration::from_millis(50),
+        "a single-group-scoped count took {single_group_elapsed:?} against 4,500 matching rows — \
+         measured at ~4-5ms on this machine, so 50ms is a generous margin, not the honest average"
+    );
+
+    // All-groups scope: the master-equivalent worst case at this seed size. Nowhere near the
+    // 15-37 *second* figure a prior symptom report described, but also nowhere near 10ms — see
+    // this test's own module comment for why an exact COUNT(*) cannot honestly promise that.
+    let started = std::time::Instant::now();
+    let all_groups_total = typed_count(group_ids.clone()).await;
+    let all_groups_elapsed = started.elapsed();
+    println!("include_total count, 10 groups (~45,000 matching rows): {all_groups_elapsed:?}");
+    assert_eq!(all_groups_total, 45_000, "9/10 of 50,000 seeded records across all groups are live");
+    assert!(
+        all_groups_elapsed < std::time::Duration::from_secs(2),
+        "a full-table-scoped count took {all_groups_elapsed:?} against 45,000 matching rows — \
+         measured at ~200ms on this machine; 2s is a generous margin against CI variance, and even \
+         that is three orders of magnitude below the reported 15-37s symptom"
+    );
+}
+
+/// **`include_total=true` combined with `groups`, `since`, and the default `is_deleted=false`
+/// filter — the shape that exercises every source of a `group_id` constraint at once (RBAC
+/// read-scoping, the `groups` parameter, and — indirectly, since `status` shares the same
+/// mechanism — group-type filtering) — must produce exactly one `group_id IN (...)` predicate,
+/// not one per source.**
+///
+/// Reproduces `list_ips`'s own condition-building shape (RBAC accessible-groups intersected with
+/// the `groups=` parameter, both collected as sets and combined into one `Condition` before any
+/// `.filter()` call — see that function's own comment) rather than driving it through the live
+/// HTTP handler: this is a property of the *query text itself*, and `QueryTrait::build` reads that
+/// off the query builder directly and deterministically, with no server, connection, or global
+/// logging state to coordinate across a parallel test run.
+#[tokio::test]
+async fn list_ips_complex_filters_produce_one_group_id_predicate_not_several() {
+    use sea_orm::{sea_query::{Expr, Func}, ColumnTrait, Condition, DbBackend, JoinType, QueryFilter, QueryOrder, QuerySelect, QueryTrait, RelationTrait};
+
+    let accessible_groups: std::collections::HashSet<Uuid> = [Uuid::new_v4(), Uuid::new_v4(), Uuid::new_v4()].into();
+    let requested_groups: std::collections::HashSet<Uuid> = [*accessible_groups.iter().next().unwrap()].into();
+
+    // The exact reduction `list_ips` performs: collect every group_id source as a set, intersect,
+    // and add exactly one `.is_in(...)` — never one `.filter()` call per source.
+    let mut intersected = accessible_groups.clone();
+    intersected.retain(|g| requested_groups.contains(g));
+    assert!(!intersected.is_empty(), "the test's own fixture must actually overlap");
+
+    let since_threshold = Utc::now().naive_utc() - chrono::Duration::seconds(3600);
+    let condition = Condition::all()
+        .add(ip_record::Column::IsDeleted.eq(false))
+        .add(ip_record_group_membership::Column::GroupId.is_in(intersected))
+        .add(
+            Condition::any().add(ip_record::Column::LastSeenAt.gte(since_threshold)),
+        );
+
+    let data_sql = ip_record_group_membership::Entity::find()
+        .find_also_related(ip_record::Entity)
+        .filter(condition.clone())
+        .order_by_desc(ip_record::Column::UpdatedAt)
+        .limit(50)
+        .offset(0)
+        .build(DbBackend::Sqlite)
+        .sql;
+
+    let count_sql = ip_record_group_membership::Entity::find()
+        .join(JoinType::LeftJoin, ip_record_group_membership::Relation::IpRecord.def())
+        .filter(condition)
+        .select_only()
+        .expr_as(
+            Func::count(Expr::col((
+                ip_record_group_membership::Entity,
+                ip_record_group_membership::Column::IpRecordId,
+            ))),
+            "row_count",
+        )
+        .build(DbBackend::Sqlite)
+        .sql;
+
+    for (label, sql) in [("data query", &data_sql), ("count query", &count_sql)] {
+        let occurrences = sql.matches("group_id IN").count() + sql.matches("group_id\" IN").count();
+        assert_eq!(
+            occurrences, 1,
+            "{label} must contain exactly one group_id IN (...) predicate, found {occurrences} in: {sql}"
+        );
+    }
+}
+
 /// Historical rows survive the constraint, and say so honestly.
 ///
 /// Migrations 1–9 are applied, a row with NULL attribution is written the way the old schema allowed,

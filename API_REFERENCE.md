@@ -102,8 +102,11 @@ Every failure on every route returns the same envelope, defined once in `src/err
 | `409 Conflict` | `Conflict` | Unique-name collision (e.g. duplicate group name) |
 | `409 Conflict` | `ConflictWithDetails` | §6 pre-flight inventory: body carries `error` **plus** top-level `owned_entities` / `subtree_key_count` / `unresolved` |
 | `413 Payload Too Large` | `BodyRejected` | Body exceeds `MAX_BODY_SIZE_MIB` (default **10 MiB**), applied router-wide including the static fallback |
-| `500 Internal Server Error` | `DbError`, `Internal` | Database failure or unreachable internal state. Detail is logged, never returned |
-| `503 Service Unavailable` | — | Readiness probe only; see [§4](#4-health--readiness-unauthenticated) |
+| `500 Internal Server Error` | `DbError` | A genuine database failure — a query the driver rejected, a constraint the caller couldn't have known about. Detail is logged, never returned |
+| `503 Service Unavailable` | `DbError` | The readiness probe (see [§4](#4-health--readiness-unauthenticated)) **or any authenticated route**, when the underlying `sea_orm::DbErr` is a transient lock/pool-contention failure — SQLite's `SQLITE_BUSY`/`SQLITE_LOCKED` (any extended-code variant, e.g. a stale-snapshot write conflict), Postgres's `lock_not_available`/`serialization_failure`/`deadlock_detected`, or the connection pool timing out. Body is `{"error": "Database busy or query timeout, please retry"}` — the request did nothing wrong, it lost a race, and a well-behaved caller should retry rather than treat it as a hard failure |
+| `500 Internal Server Error` | `Internal` | Unreachable internal state |
+
+**`500` vs `503` on a database error is decided once, centrally** (`src/error.rs`'s `is_transient_lock_error`), not per-handler — every route that touches `state.db` gets this distinction automatically. `busy_timeout` (10s by default; see `SCHEMA.MD`/`AGENT_NOTES.MD`) already makes SQLite *wait* for ordinary lock contention rather than fail immediately, so a `503` here means that wait was exhausted or the failure was the kind `busy_timeout` cannot absorb at all (a stale read snapshot under a `BEGIN DEFERRED` transaction, refused instantly regardless of the timeout).
 
 **Oracle discipline (`RBAC_MODEL.md` §4).** An id outside the caller's visibility scope returns the
 **identical status and body** a nonexistent id would — `404`, not `403`. This applies to keys,
@@ -265,6 +268,15 @@ not just this one — it is a `COUNT(*)` over the same filtered query `data` is 
 before `limit`/`offset` apply. `total_pages` is `ceil(total / limit)`, and is `0` (not `1`) when
 `total` is `0` or `limit` is `0` — there is nothing to page through either way. `limit`/`offset`
 echo the effective values used for this response (`50`/`0` when omitted from the request).
+
+`total` and `data` are fetched inside one shared transaction, so a write landing between the two
+queries cannot make them describe different snapshots of the table — `total` will never disagree
+with what `data` itself implies across pages. The count query is a direct, unprojected
+`SELECT COUNT(...)` (no subquery, no column materialization beyond the count) rather than a naive
+`SELECT *`-wrapped count, but at the row counts this endpoint actually sees, latency is bounded by
+how many rows match the caller's own filters — typically the groups one API key can read — not by
+the size of the whole table; see `list_ips_include_total_count_scales_with_the_callers_own_rows_not_the_whole_table`
+in `tests/schema_integrity_tests.rs` for measured figures.
 
 > **Backward compatible by construction.** `include_total` is opt-in and defaults to `false`,
 > so the root-array response every existing exporter/sync worker already parses is unchanged
